@@ -13,7 +13,7 @@ This repo is a Claude Code plugin marketplace. In Claude Code:
 /plugin install isoplan@isoplan
 ```
 
-Then point it at your office server: `server` in `packages/mod/config.json`.
+Then point it at your office server: set `server` in `~/.claude/isoplan/config.json`, for example `{ "server": "wss://your-office.example/data-layer" }`. Any key in that file overrides the plugin's defaults in `packages/mod/config.json`.
 
 ## What leaves your machine
 
