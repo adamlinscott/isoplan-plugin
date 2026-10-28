@@ -85,6 +85,28 @@ export const ReportFactSchema = z.object({
   extra: Extra,
 });
 
+/**
+ * A question an agent asked its owner, open until it is answered, so the floor can show it and the
+ * owner can answer it there. One of the named cases of session-derived text leaving a machine: the
+ * server keeps it only for the retention period. `id` is the tool call's own id.
+ */
+export const QuestionFactSchema = z.object({
+  id: z.string().min(1),
+  agent: z.string().min(1),
+  at: Time,
+  questions: z
+    .array(
+      z.object({
+        question: z.string().min(1),
+        header: z.string(),
+        options: z.array(z.object({ label: z.string().min(1), description: z.string() })),
+        multiSelect: z.boolean(),
+      }),
+    )
+    .min(1),
+  extra: Extra,
+});
+
 export const FactsSchema = z.object({
   session: SessionFactSchema,
   agents: z.array(AgentFactSchema),
@@ -92,6 +114,8 @@ export const FactsSchema = z.object({
   reads: z.array(FileFactSchema),
   waits: z.array(WaitFactSchema),
   reports: z.array(ReportFactSchema),
+  /** Absent from a data layer that doesn't report questions, which is the same as none. */
+  questions: z.array(QuestionFactSchema).optional(),
 });
 
 /** The records that changed, each replacing the one with the same key. */
@@ -102,13 +126,15 @@ export const FactUpsertSchema = z.object({
   reads: z.array(FileFactSchema).optional(),
   waits: z.array(WaitFactSchema).optional(),
   reports: z.array(ReportFactSchema).optional(),
+  questions: z.array(QuestionFactSchema).optional(),
 });
 
 const FileKey = FileFactSchema.pick({ agent: true, file: true });
 
 /**
  * The keys of records that went away: an agent by its id, an edit or read by agent and file, a
- * wait by waiter and on, a report by its agent. The session itself goes with the connection.
+ * wait by waiter and on, a report by its agent, a question by its id. The session itself goes with
+ * the connection.
  */
 export const FactRemoveSchema = z.object({
   agents: z.array(z.string().min(1)).optional(),
@@ -116,6 +142,7 @@ export const FactRemoveSchema = z.object({
   reads: z.array(FileKey).optional(),
   waits: z.array(WaitFactSchema.pick({ waiter: true, on: true })).optional(),
   reports: z.array(z.string().min(1)).optional(),
+  questions: z.array(z.string().min(1)).optional(),
 });
 
 export type Source = z.infer<typeof SourceSchema>;
@@ -124,6 +151,7 @@ export type AgentFact = z.infer<typeof AgentFactSchema>;
 export type FileFact = z.infer<typeof FileFactSchema>;
 export type WaitFact = z.infer<typeof WaitFactSchema>;
 export type ReportFact = z.infer<typeof ReportFactSchema>;
+export type QuestionFact = z.infer<typeof QuestionFactSchema>;
 export type Facts = z.infer<typeof FactsSchema>;
 export type FactUpsert = z.infer<typeof FactUpsertSchema>;
 export type FactRemove = z.infer<typeof FactRemoveSchema>;

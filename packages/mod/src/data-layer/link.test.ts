@@ -1,5 +1,5 @@
 import type { AddressInfo } from "node:net";
-import type { Facts, HelloMessage } from "@isoplan/protocol";
+import { PROTOCOL_VERSION, type Facts, type HelloMessage } from "@isoplan/protocol";
 import { afterEach, expect, test } from "vitest";
 import { WebSocketServer, type WebSocket as ServerSocket } from "ws";
 import type { DataLayerLine } from "../lines.js";
@@ -8,7 +8,7 @@ import { createLink, type Link, type LinkOptions } from "./link.js";
 const at = "2026-10-20T09:00:00.000Z";
 const hello: HelloMessage = {
   type: "hello",
-  v: 1,
+  v: PROTOCOL_VERSION,
   source: "claude-code",
   account: { id: "claude:4f9c", name: "Ada" },
   machine: { name: "sevengill" },
@@ -82,7 +82,7 @@ test("link: hello, then full, then only what changed, seq going up by one", asyn
   await until(() => s.got.length === 2);
   expect(types(s.got)).toEqual(["hello", "full 0"]);
   expect(s.got[0]).toMatchObject(hello);
-  expect(s.got[1]).toMatchObject({ v: 1, facts: facts("active") });
+  expect(s.got[1]).toMatchObject({ v: PROTOCOL_VERSION, facts: facts("active") });
 
   l.update(facts("active")); // nothing changed: nothing sent
   l.update(facts("idle", ["a.md"]));
@@ -98,7 +98,7 @@ test("link: a repair gets the facts in full again", async () => {
   await until(() => s.got.length === 2);
   l.update(facts("idle"));
   await until(() => s.got.length === 3);
-  s.sockets[0]!.send(JSON.stringify({ type: "repair", v: 1, reason: "missed seq 1" }));
+  s.sockets[0]!.send(JSON.stringify({ type: "repair", v: PROTOCOL_VERSION, reason: "missed seq 1" }));
   await until(() => s.got.length === 4);
   expect(types(s.got)).toEqual(["hello", "full 0", "changes 1", "full 2"]);
   expect(s.got[3]).toMatchObject({ facts: facts("idle") });
@@ -152,18 +152,18 @@ test("link: the server's conflict notes and errors go out as lines; a message it
   const { link: l, lines } = link(s.url, { minIntervalMs: 0 });
   l.update(facts("active"));
   await until(() => s.got.length === 2);
-  const conflict = { type: "conflict", v: 1, agent: "claude-code:s:lead", file: "a.md", text: "Bea's agent edited a.md 3 minutes ago." };
+  const conflict = { type: "conflict", v: PROTOCOL_VERSION, agent: "claude-code:s:lead", file: "a.md", text: "Bea's agent edited a.md 3 minutes ago." };
   s.sockets[0]!.send(JSON.stringify(conflict));
-  s.sockets[0]!.send(JSON.stringify({ type: "error", v: 1, code: "not-paired", message: "Pair this machine first." }));
-  s.sockets[0]!.send(JSON.stringify({ type: "conflict", v: 2 }));
+  s.sockets[0]!.send(JSON.stringify({ type: "error", v: PROTOCOL_VERSION, code: "not-paired", message: "Pair this machine first." }));
+  s.sockets[0]!.send(JSON.stringify({ type: "conflict", v: PROTOCOL_VERSION + 1 }));
   await until(() => lines.length >= 5);
-  expect(lines.slice(2)).toEqual([conflict, { type: "error", v: 1, code: "not-paired", message: "Pair this machine first." }, { type: "log", text: expect.stringContaining("unsupported-version") }]);
+  expect(lines.slice(2)).toEqual([conflict, { type: "error", v: PROTOCOL_VERSION, code: "not-paired", message: "Pair this machine first." }, { type: "log", text: expect.stringContaining("unsupported-version") }]);
 });
 
 test("link: not-wanted is passed on, then the link waits and asks again only after notWantedRetryMs", async () => {
   const s = await server();
   s.wss.on("connection", (ws) => {
-    ws.send(JSON.stringify({ type: "error", v: 1, code: "not-wanted", message: "this project isn't in any office on this server" }));
+    ws.send(JSON.stringify({ type: "error", v: PROTOCOL_VERSION, code: "not-wanted", message: "this project isn't in any office on this server" }));
     ws.close(1008, "not-wanted");
   });
   let told = 0;
@@ -171,7 +171,7 @@ test("link: not-wanted is passed on, then the link waits and asks again only aft
   l.update(facts("active"));
   await until(() => lines.some((x) => x.type === "status" && x.state === "not-wanted"));
   expect(told).toBe(1);
-  expect(lines).toContainEqual({ type: "error", v: 1, code: "not-wanted", message: "this project isn't in any office on this server" });
+  expect(lines).toContainEqual({ type: "error", v: PROTOCOL_VERSION, code: "not-wanted", message: "this project isn't in any office on this server" });
   expect(lines.some((x) => x.type === "status" && x.state === "disconnected")).toBe(false);
   await new Promise((r) => setTimeout(r, 150)); // the fast backoff would have tried again by now
   expect(s.sockets.length).toBe(1);
@@ -183,7 +183,7 @@ test("link: a conflict note for an agent outside this session is not passed on",
   const { link: l, lines } = link(s.url, { minIntervalMs: 0 });
   l.update(facts("active"));
   await until(() => s.got.length === 2);
-  s.sockets[0]!.send(JSON.stringify({ type: "conflict", v: 1, agent: "claude-code:someone-else", file: "a.md", text: "Not yours." }));
+  s.sockets[0]!.send(JSON.stringify({ type: "conflict", v: PROTOCOL_VERSION, agent: "claude-code:someone-else", file: "a.md", text: "Not yours." }));
   await until(() => lines.length >= 3);
   expect(lines[2]).toEqual({ type: "log", text: expect.stringContaining("not an agent of this session") });
 });

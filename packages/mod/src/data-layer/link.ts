@@ -161,12 +161,14 @@ export function createLink({
     } else if (message.type === "conflict" && !latest?.agents.some((a) => a.id === message.agent)) {
       // A note reaches a model's context, so only one for an agent of this session is taken.
       emit({ type: "log", text: `the office server sent a note for ${message.agent}, not an agent of this session` });
-    } else {
+    } else if (message.type === "conflict" || message.type === "error") {
       emit(message);
       if (message.type === "error" && message.code === "not-wanted") {
         isUnwanted = true;
         onNotWanted?.();
       }
+    } else {
+      emit({ type: "log", text: `the office server sent a ${message.type} message, which this data layer doesn't handle yet` });
     }
   }
 

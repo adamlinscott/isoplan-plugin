@@ -1,4 +1,5 @@
 import { beforeEach, expect, test, vi } from "vitest";
+import { PROTOCOL_VERSION } from "@isoplan/protocol";
 import type { DataLayerLine } from "../lines.js";
 import type { Host, On, ToolCallInput, ToolCallResult } from "./host.js";
 
@@ -102,7 +103,7 @@ test("hooks: a data layer that keeps dying soon after starting backs off, whatev
 });
 
 test("hooks: when the session goes on under a new id (a /clear, a resume), the data layer starts again for it", async () => {
-  const h = await start([{ type: "conflict", v: 1, agent: "claude-code:s1:lead", file: "a.md", text: "Old note." }], { stays: true });
+  const h = await start([{ type: "conflict", v: PROTOCOL_VERSION, agent: "claude-code:s1:lead", file: "a.md", text: "Old note." }], { stays: true });
   await vi.waitFor(() => expect(h.spawned).toHaveLength(1));
   h.session.id = "s2";
   await hooks["session.end"]!(h.$, { reason: "clear", sessionId: "s1" }, async () => ({ sessionId: "s1" }));
@@ -115,8 +116,8 @@ test("hooks: when the session goes on under a new id (a /clear, a resume), the d
 test("hooks: a conflict note goes on that agent's next tool result that ran, once, cut to 1,000 characters", async () => {
   const long = "x".repeat(5000);
   const h = await start([
-    { type: "conflict", v: 1, agent: "claude-code:w1", file: "a.md", text: "Bea's agent edited a.md 3 minutes ago." },
-    { type: "conflict", v: 1, agent: "claude-code:s1:lead", file: "b.md", text: long },
+    { type: "conflict", v: PROTOCOL_VERSION, agent: "claude-code:w1", file: "a.md", text: "Bea's agent edited a.md 3 minutes ago." },
+    { type: "conflict", v: PROTOCOL_VERSION, agent: "claude-code:s1:lead", file: "b.md", text: long },
   ]);
   await stopped(h);
   expect(await call(h, { agentId: "w1" }, { deny: "no" })).toEqual({ deny: "no" });
@@ -143,7 +144,7 @@ test("hooks: the backoff stops at 30 s; a data layer that never starts says Node
 });
 
 test("hooks: a failed tool call leaves the note for the next; a hook that threw answers with what the tool settled to", async () => {
-  const h = await start([{ type: "conflict", v: 1, agent: "claude-code:s1:lead", file: "a.md", text: "Bea is in a.md." }]);
+  const h = await start([{ type: "conflict", v: PROTOCOL_VERSION, agent: "claude-code:s1:lead", file: "a.md", text: "Bea is in a.md." }]);
   await stopped(h);
   expect(await call(h, {}, { result: "boom", isError: true })).toEqual({ result: "boom", isError: true });
   expect(await call(h, {})).toEqual({ result: "ok", context: ["Bea is in a.md."] });

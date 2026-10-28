@@ -2,8 +2,10 @@ import { describe, expect, test } from "vitest";
 import {
   parseDataLayerMessage,
   parseOfficeServerMessage,
+  PROTOCOL_VERSION,
   type AgentFact,
   type Facts,
+  type Handoff,
   type ParseResult,
 } from "./index.js";
 
@@ -65,42 +67,134 @@ const facts: Facts = {
   reads: [{ agent: worker.id, file: "src/b.ts", at }],
   waits: [{ waiter: lead.id, on: worker.id, since: at }],
   reports: [{ agent: worker.id, at, text: "Done." }],
+  questions: [
+    {
+      id: "toolu_01",
+      agent: lead.id,
+      at,
+      questions: [
+        {
+          question: "Which branch should the fix go on?",
+          header: "Branch",
+          options: [
+            { label: "main", description: "Straight to main." },
+            { label: "A new branch", description: "" },
+          ],
+          multiSelect: false,
+        },
+      ],
+    },
+  ],
+};
+
+const v = PROTOCOL_VERSION;
+const adam = { id: "4f9c6a2e-0000-4000-8000-000000000000", name: "Adam" };
+const sam = { id: "7d21b0c4-0000-4000-8000-000000000000", name: "Sam" };
+const handoff: Handoff = {
+  id: "h7k2",
+  brief: "The tests in src/a.ts fail on Windows paths; the fix is half done.",
+  repos: [
+    { path: ".", remote: "github.com/adamlinscott/isoplan", branch: "isoplan/handoff/h7k2", commit: "0123456789abcdef0123456789abcdef01234567" },
+    { path: "libs/core", remote: "github.com/adamlinscott/core", branch: "isoplan/handoff/h7k2", commit: "89abcdef0123456789abcdef0123456789abcdef" },
+  ],
 };
 
 const valid = {
   hello: {
     type: "hello",
-    v: 1,
+    v,
     source: "claude-code",
-    account: { id: "4f9c6a2e-0000-4000-8000-000000000000", name: "Adam" },
+    account: adam,
     machine: { name: "sevengill" },
     session: "claude-code:s1",
     project: { id: "github.com/adamlinscott/isoplan", name: "isoplan" },
   },
-  full: { type: "full", v: 1, seq: 0, facts },
-  changes: { type: "changes", v: 1, seq: 1, upsert: {}, remove: {} },
-  repair: { type: "repair", v: 1, reason: "missed seq 4" },
-  conflict: { type: "conflict", v: 1, agent: worker.id, file: "src/a.ts", text: "Another agent edited src/a.ts." },
-  error: { type: "error", v: 1, code: "not-paired", message: "Pair this machine first." },
+  runner: { type: "runner", v, account: adam, machine: { name: "sevengill" } },
+  full: { type: "full", v, seq: 0, facts },
+  changes: { type: "changes", v, seq: 1, upsert: {}, remove: {} },
+  "reply answer-question": { type: "reply", v, id: "r1", kind: "answer-question", answer: "Because of the CRLF check." },
+  "reply write-brief": { type: "reply", v, id: "r2", kind: "write-brief", handoff },
+  "reply owner-answer": { type: "reply", v, id: "r3", kind: "owner-answer" },
+  "refusal over-cap": { type: "refusal", v, id: "r1", reason: "over-cap", cap: "owner-tokens" },
+  "refusal withheld": { type: "refusal", v, id: "r1", reason: "withheld" },
+  "refusal unavailable": { type: "refusal", v, id: "r2", reason: "unavailable", detail: "The session's folder is gone." },
+  "hand-over": { type: "hand-over", v, to: "sam@example.com", handoff },
+  take: { type: "take", v, code: "K4P9-2QX" },
+  taken: { type: "taken", v, handoff: "h7k2", failures: [{ step: "setup", output: "pnpm: command not found" }, { step: "checkout", repo: "libs/core", output: "" }] },
+  repair: { type: "repair", v, reason: "missed seq 4" },
+  conflict: { type: "conflict", v, agent: worker.id, file: "src/a.ts", text: "Another agent edited src/a.ts." },
+  error: { type: "error", v, code: "not-paired", message: "Pair this machine first." },
+  "request answer-question": {
+    type: "request",
+    v,
+    id: "r1",
+    kind: "answer-question",
+    session: "claude-code:s1",
+    room: "room:claude-code:s1",
+    from: sam,
+    question: "Why does the CRLF check exist?",
+  },
+  "request write-brief": { type: "request", v, id: "r2", kind: "write-brief", session: "claude-code:s1", room: "room:claude-code:s1", handoff: "h7k2", to: sam },
+  "request owner-answer": {
+    type: "request",
+    v,
+    id: "r3",
+    kind: "owner-answer",
+    session: "claude-code:s1",
+    question: "toolu_01",
+    answers: { "Which branch should the fix go on?": "A new branch" },
+  },
+  release: { type: "release", v, id: "r1" },
+  handoff: { type: "handoff", v, handoff },
 };
 
 const parsers = {
   hello: parseDataLayerMessage,
+  runner: parseDataLayerMessage,
   full: parseDataLayerMessage,
   changes: parseDataLayerMessage,
+  "reply answer-question": parseDataLayerMessage,
+  "reply write-brief": parseDataLayerMessage,
+  "reply owner-answer": parseDataLayerMessage,
+  "refusal over-cap": parseDataLayerMessage,
+  "refusal withheld": parseDataLayerMessage,
+  "refusal unavailable": parseDataLayerMessage,
+  "hand-over": parseDataLayerMessage,
+  take: parseDataLayerMessage,
+  taken: parseDataLayerMessage,
   repair: parseOfficeServerMessage,
   conflict: parseOfficeServerMessage,
   error: parseOfficeServerMessage,
+  "request answer-question": parseOfficeServerMessage,
+  "request write-brief": parseOfficeServerMessage,
+  "request owner-answer": parseOfficeServerMessage,
+  release: parseOfficeServerMessage,
+  handoff: parseOfficeServerMessage,
 } satisfies Record<keyof typeof valid, (value: unknown) => ParseResult<unknown>>;
 
 // Each message with one field made wrong, and the path the error should name.
 const broken: Record<keyof typeof valid, [unknown, string]> = {
   hello: [{ ...valid.hello, project: { id: "github.com/a/b" } }, "project.name"],
+  runner: [{ ...valid.runner, machine: {} }, "machine.name"],
   full: [{ ...valid.full, facts: { ...facts, agents: [{ ...lead, status: "busy" }] } }, "facts.agents[0].status"],
   changes: [{ ...valid.changes, seq: -1 }, "seq"],
+  "reply answer-question": [{ ...valid["reply answer-question"], answer: "" }, "answer"],
+  "reply write-brief": [{ ...valid["reply write-brief"], handoff: { ...handoff, repos: [] } }, "handoff.repos"],
+  "reply owner-answer": [{ ...valid["reply owner-answer"], id: "" }, "id"],
+  "refusal over-cap": [{ ...valid["refusal over-cap"], cap: "per-week" }, "cap"],
+  "refusal withheld": [{ ...valid["refusal withheld"], reason: "secret" }, "reason"],
+  "refusal unavailable": [{ ...valid["refusal unavailable"], detail: undefined }, "detail"],
+  "hand-over": [{ ...valid["hand-over"], handoff: { ...handoff, id: "H 7" } }, "handoff.id"],
+  take: [{ ...valid.take, code: "" }, "code"],
+  taken: [{ ...valid.taken, failures: [{ step: "push", output: "" }] }, "failures[0].step"],
   repair: [{ ...valid.repair, reason: 4 }, "reason"],
   conflict: [{ ...valid.conflict, file: undefined }, "file"],
   error: [{ ...valid.error, code: "" }, "code"],
+  "request answer-question": [{ ...valid["request answer-question"], room: undefined }, "room"],
+  "request write-brief": [{ ...valid["request write-brief"], to: { name: "Sam" } }, "to.id"],
+  "request owner-answer": [{ ...valid["request owner-answer"], answers: { q: 1 } }, "answers.q"],
+  release: [{ ...valid.release, id: 3 }, "id"],
+  handoff: [{ ...valid.handoff, handoff: { ...handoff, repos: [{ ...handoff.repos[0], commit: "0123abc" }] } }, "handoff.repos[0].commit"],
 };
 
 describe.each(Object.keys(valid) as (keyof typeof valid)[])("%s", (type) => {
@@ -117,36 +211,55 @@ describe.each(Object.keys(valid) as (keyof typeof valid)[])("%s", (type) => {
     expect(!result.ok && result.error).toContain(path);
   });
 
-  test("rejects another protocol version as unsupported", () => {
-    const result = parse({ ...valid[type], v: 2 });
+  test.each([v - 1, v + 1])("rejects protocol version %i as unsupported", (other) => {
+    const result = parse({ ...valid[type], v: other });
     expect(result).toEqual({
       ok: false,
       kind: "unsupported-version",
-      error: "protocol version 2 is not supported; this side speaks version 1",
+      error: `protocol version ${other} is not supported; this side speaks version ${v}`,
     });
   });
 });
 
 test("a version that isn't a number is invalid, not unsupported", () => {
-  expect(parseDataLayerMessage({ ...valid.hello, v: "1" })).toMatchObject({ ok: false, kind: "invalid" });
+  expect(parseDataLayerMessage({ ...valid.hello, v: String(v) })).toMatchObject({ ok: false, kind: "invalid" });
 });
 
 test("each side refuses the other side's messages", () => {
-  expect(parseDataLayerMessage(valid.repair)).toMatchObject({ ok: false, kind: "invalid" });
-  expect(parseOfficeServerMessage(valid.hello)).toMatchObject({ ok: false, kind: "invalid" });
+  for (const type of Object.keys(valid) as (keyof typeof valid)[]) {
+    const other = parsers[type] === parseDataLayerMessage ? parseOfficeServerMessage : parseDataLayerMessage;
+    expect(other(valid[type])).toMatchObject({ ok: false, kind: "invalid" });
+  }
+});
+
+test("a reply or request of a kind the channel doesn't have is invalid, naming the kind", () => {
+  for (const message of [
+    { ...valid["reply owner-answer"], kind: "approve" },
+    { ...valid["request owner-answer"], kind: "approve" },
+  ]) {
+    const result = message.type === "reply" ? parseDataLayerMessage(message) : parseOfficeServerMessage(message);
+    expect(result).toMatchObject({ ok: false, kind: "invalid" });
+    expect(!result.ok && result.error).toContain("kind");
+  }
+});
+
+test("facts from a data layer that doesn't report questions still parse", () => {
+  const { questions: _, ...older } = facts;
+  expect(parseDataLayerMessage({ ...valid.full, facts: older })).toEqual({ ok: true, message: { ...valid.full, facts: older } });
 });
 
 describe("changes", () => {
   test("carries upserted records and the keys of removed ones", () => {
     const message = {
       ...valid.changes,
-      upsert: { session: facts.session, agents: [worker], edits: facts.edits, reports: facts.reports },
+      upsert: { session: facts.session, agents: [worker], edits: facts.edits, reports: facts.reports, questions: facts.questions },
       remove: {
         agents: ["claude-code:w0"],
         edits: [{ agent: lead.id, file: "src/old.ts" }],
         reads: [{ agent: worker.id, file: "src/b.ts" }],
         waits: [{ waiter: lead.id, on: worker.id }],
         reports: ["claude-code:w0"],
+        questions: ["toolu_00"],
       },
     };
     expect(parseDataLayerMessage(message)).toEqual({ ok: true, message });

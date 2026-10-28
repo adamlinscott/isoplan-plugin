@@ -5,7 +5,7 @@ import { FactRemoveSchema, FactsSchema, FactUpsertSchema, SourceSchema } from ".
  * The protocol version every message carries as `v`. Adding optional fields doesn't change it;
  * changing what a field means, or removing one, does.
  */
-export const PROTOCOL_VERSION = 1;
+export const PROTOCOL_VERSION = 2;
 
 const Version = z.literal(PROTOCOL_VERSION);
 const Seq = z.number().int().nonnegative();
@@ -15,6 +15,30 @@ export const ProjectSchema = z.object({
   name: z.string().min(1),
 });
 
+const Account = z.object({ id: z.string().min(1), name: z.string() });
+const Machine = z.object({ name: z.string().min(1) });
+
+/** Matches a request with its reply or refusal. */
+const RequestId = z.string().min(1);
+
+/** A handoff's id. It names the handoff's branch, `isoplan/handoff/<id>`, so it keeps to safe characters. */
+const HandoffId = z.string().regex(/^[a-z0-9][a-z0-9-]*$/, "lowercase letters, digits and dashes");
+
+/** One repo a handoff pushed: its path in the session's folder (`.` for the folder itself), remote, branch and commit. */
+export const HandoffRepoSchema = z.object({
+  path: z.string().min(1),
+  remote: z.string().min(1),
+  branch: z.string().min(1),
+  commit: z.string().regex(/^[0-9a-f]{40}$/, "a full commit hash"),
+});
+
+/** What the receiver gets: the brief, and every repo pushed for it. */
+export const HandoffSchema = z.object({
+  id: HandoffId,
+  brief: z.string().min(1),
+  repos: z.array(HandoffRepoSchema).min(1),
+});
+
 // Data layer → office server.
 
 /** The first message on a connection: who is reporting, from where, about which session. */
@@ -22,10 +46,18 @@ export const HelloMessageSchema = z.object({
   type: z.literal("hello"),
   v: Version,
   source: SourceSchema,
-  account: z.object({ id: z.string().min(1), name: z.string() }),
-  machine: z.object({ name: z.string().min(1) }),
+  account: Account,
+  machine: Machine,
   session: z.string().min(1),
   project: ProjectSchema,
+});
+
+/** The first message on a runner's link: the one link per machine that answers requests for its rooms. */
+export const RunnerHelloMessageSchema = z.object({
+  type: z.literal("runner"),
+  v: Version,
+  account: Account,
+  machine: Machine,
 });
 
 /** All of the session's facts. Sent on connect and on repair. */
@@ -45,10 +77,77 @@ export const ChangesMessageSchema = z.object({
   remove: FactRemoveSchema,
 });
 
+/** The answer to a request, carrying the request's id and kind. */
+export const ReplyMessageSchema = z.discriminatedUnion("kind", [
+  z.object({ type: z.literal("reply"), v: Version, id: RequestId, kind: z.literal("answer-question"), answer: z.string().min(1) }),
+  z.object({ type: z.literal("reply"), v: Version, id: RequestId, kind: z.literal("write-brief"), handoff: HandoffSchema }),
+  // The owner's answer reached the question that was waiting for it.
+  z.object({ type: z.literal("reply"), v: Version, id: RequestId, kind: z.literal("owner-answer") }),
+]);
+
+/**
+ * A request the machine won't answer, sent in place of its reply. `over-cap` names the cap it would
+ * go over. `withheld` means the secret scan matched; the reply follows if the owner releases it.
+ * `unavailable` is anything else that stops the room answering now, such as its checkout being gone,
+ * its lead being mid-turn or a push being rejected.
+ */
+export const RefusalMessageSchema = z.discriminatedUnion("reason", [
+  z.object({
+    type: z.literal("refusal"),
+    v: Version,
+    id: RequestId,
+    reason: z.literal("over-cap"),
+    cap: z.enum(["room-hour", "owner-day", "owner-tokens"]),
+  }),
+  z.object({ type: z.literal("refusal"), v: Version, id: RequestId, reason: z.literal("withheld") }),
+  z.object({ type: z.literal("refusal"), v: Version, id: RequestId, reason: z.literal("unavailable"), detail: z.string().min(1) }),
+]);
+
+/**
+ * The sender's session handed its room over with the command: its agent wrote the brief and pushed.
+ * `to` is the receiver as the sender named them, for the server to find in the office.
+ */
+export const HandOverMessageSchema = z.object({
+  type: z.literal("hand-over"),
+  v: Version,
+  to: z.string().min(1),
+  handoff: HandoffSchema,
+});
+
+/** The receiver's session asks for the handoff a take code stands for. */
+export const TakeMessageSchema = z.object({
+  type: z.literal("take"),
+  v: Version,
+  code: z.string().min(1),
+});
+
+/**
+ * The receiver took the handoff and joins its room. Each step that failed is listed with the repo it
+ * was for and the end of its output; the session opens anyway.
+ */
+export const TakenMessageSchema = z.object({
+  type: z.literal("taken"),
+  v: Version,
+  handoff: HandoffId,
+  failures: z.array(
+    z.object({
+      step: z.enum(["worktree", "setup", "checkout", "open"]),
+      repo: z.string().min(1).optional(),
+      output: z.string(),
+    }),
+  ),
+});
+
 export const DataLayerMessageSchema = z.discriminatedUnion("type", [
   HelloMessageSchema,
+  RunnerHelloMessageSchema,
   FullMessageSchema,
   ChangesMessageSchema,
+  ReplyMessageSchema,
+  RefusalMessageSchema,
+  HandOverMessageSchema,
+  TakeMessageSchema,
+  TakenMessageSchema,
 ]);
 
 // Office server → data layer.
@@ -77,20 +176,93 @@ export const ErrorMessageSchema = z.object({
   message: z.string(),
 });
 
+/**
+ * Something for the machine to answer, with a reply or a refusal carrying the same id. `session` is
+ * the session it concerns: the lead whose fork answers or writes the brief, or the session whose
+ * agent asked its owner. `room` is the room the caps count against.
+ */
+export const RequestMessageSchema = z.discriminatedUnion("kind", [
+  // Someone the room was handed to asks it a question.
+  z.object({
+    type: z.literal("request"),
+    v: Version,
+    id: RequestId,
+    kind: z.literal("answer-question"),
+    session: z.string().min(1),
+    room: z.string().min(1),
+    from: Account,
+    question: z.string().min(1),
+  }),
+  // The sender handed the room over from the floor: write the brief and push, for this handoff.
+  z.object({
+    type: z.literal("request"),
+    v: Version,
+    id: RequestId,
+    kind: z.literal("write-brief"),
+    session: z.string().min(1),
+    room: z.string().min(1),
+    handoff: HandoffId,
+    to: Account,
+  }),
+  // The owner answered their agent's question from the floor. `question` is the question fact's id,
+  // and `answers` maps each question's text to its answer.
+  z.object({
+    type: z.literal("request"),
+    v: Version,
+    id: RequestId,
+    kind: z.literal("owner-answer"),
+    session: z.string().min(1),
+    question: z.string().min(1),
+    answers: z.record(z.string(), z.string()),
+  }),
+]);
+
+/** The owner released a reply the secret scan withheld, so the machine sends it now. */
+export const ReleaseMessageSchema = z.object({
+  type: z.literal("release"),
+  v: Version,
+  id: RequestId,
+});
+
+/**
+ * A handoff for the receiver to take: sent to their runner when they take it from the floor, or to
+ * their session in answer to a take code.
+ */
+export const HandoffMessageSchema = z.object({
+  type: z.literal("handoff"),
+  v: Version,
+  handoff: HandoffSchema,
+});
+
 export const OfficeServerMessageSchema = z.discriminatedUnion("type", [
   RepairMessageSchema,
   ConflictMessageSchema,
   ErrorMessageSchema,
+  RequestMessageSchema,
+  ReleaseMessageSchema,
+  HandoffMessageSchema,
 ]);
 
 export type Project = z.infer<typeof ProjectSchema>;
+export type HandoffRepo = z.infer<typeof HandoffRepoSchema>;
+export type Handoff = z.infer<typeof HandoffSchema>;
 export type HelloMessage = z.infer<typeof HelloMessageSchema>;
+export type RunnerHelloMessage = z.infer<typeof RunnerHelloMessageSchema>;
 export type FullMessage = z.infer<typeof FullMessageSchema>;
 export type ChangesMessage = z.infer<typeof ChangesMessageSchema>;
+export type ReplyMessage = z.infer<typeof ReplyMessageSchema>;
+export type RefusalMessage = z.infer<typeof RefusalMessageSchema>;
+export type HandOverMessage = z.infer<typeof HandOverMessageSchema>;
+export type TakeMessage = z.infer<typeof TakeMessageSchema>;
+export type TakenMessage = z.infer<typeof TakenMessageSchema>;
 export type DataLayerMessage = z.infer<typeof DataLayerMessageSchema>;
 export type RepairMessage = z.infer<typeof RepairMessageSchema>;
 export type ConflictMessage = z.infer<typeof ConflictMessageSchema>;
 export type ErrorMessage = z.infer<typeof ErrorMessageSchema>;
+export type RequestMessage = z.infer<typeof RequestMessageSchema>;
+export type RequestKind = RequestMessage["kind"];
+export type ReleaseMessage = z.infer<typeof ReleaseMessageSchema>;
+export type HandoffMessage = z.infer<typeof HandoffMessageSchema>;
 export type OfficeServerMessage = z.infer<typeof OfficeServerMessageSchema>;
 
 /**
