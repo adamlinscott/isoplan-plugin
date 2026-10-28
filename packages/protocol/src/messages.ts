@@ -5,7 +5,7 @@ import { FactRemoveSchema, FactsSchema, FactUpsertSchema, SourceSchema } from ".
  * The protocol version every message carries as `v`. Adding optional fields doesn't change it;
  * changing what a field means, or removing one, does.
  */
-export const PROTOCOL_VERSION = 2;
+export const PROTOCOL_VERSION = 1;
 
 const Version = z.literal(PROTOCOL_VERSION);
 const Seq = z.number().int().nonnegative();
@@ -22,22 +22,44 @@ const Machine = z.object({ name: z.string().min(1) });
 const RequestId = z.string().min(1);
 
 /** A handoff's id. It names the handoff's branch, `isoplan/handoff/<id>`, so it keeps to safe characters. */
-const HandoffId = z.string().regex(/^[a-z0-9][a-z0-9-]*$/, "lowercase letters, digits and dashes");
+const HandoffId = z
+  .string()
+  .max(64)
+  .regex(/^[a-z0-9][a-z0-9-]*$/, "lowercase letters, digits and dashes");
 
-/** One repo a handoff pushed: its path in the session's folder (`.` for the folder itself), remote, branch and commit. */
+/**
+ * One repo a handoff pushed: its path in the session's folder (`.` for the folder itself), remote,
+ * branch and commit. A handoff drives git on the receiver's machine, so the path stays inside the
+ * folder and the remote can't name a transport helper such as `ext::`, which runs a command.
+ */
 export const HandoffRepoSchema = z.object({
-  path: z.string().min(1),
-  remote: z.string().min(1),
+  path: z
+    .string()
+    .min(1)
+    .refine((path) => !/^([\\/]|[A-Za-z]:)/.test(path), "a path relative to the session's folder")
+    .refine((path) => !path.split(/[\\/]/).includes(".."), "a path inside the session's folder, with no `..`"),
+  remote: z
+    .string()
+    .min(1)
+    .refine((remote) => !/^[A-Za-z0-9+.-]+::/.test(remote), "a remote with no transport helper (`<transport>::`)"),
   branch: z.string().min(1),
-  commit: z.string().regex(/^[0-9a-f]{40}$/, "a full commit hash"),
+  commit: z.string().regex(/^([0-9a-f]{40}|[0-9a-f]{64})$/, "a full commit hash"),
 });
 
-/** What the receiver gets: the brief, and every repo pushed for it. */
-export const HandoffSchema = z.object({
-  id: HandoffId,
-  brief: z.string().min(1),
-  repos: z.array(HandoffRepoSchema).min(1),
-});
+/** What the receiver gets: the brief, and every repo pushed for it, each on the handoff's own branch. */
+export const HandoffSchema = z
+  .object({
+    id: HandoffId,
+    brief: z.string().min(1),
+    repos: z.array(HandoffRepoSchema).min(1),
+  })
+  .superRefine((handoff, context) => {
+    handoff.repos.forEach((repo, i) => {
+      if (repo.branch !== `isoplan/handoff/${handoff.id}`) {
+        context.addIssue({ code: "custom", path: ["repos", i, "branch"], message: `the handoff's branch, isoplan/handoff/${handoff.id}` });
+      }
+    });
+  });
 
 // Data layer → office server.
 

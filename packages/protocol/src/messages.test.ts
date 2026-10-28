@@ -248,6 +248,43 @@ test("facts from a data layer that doesn't report questions still parse", () => 
   expect(parseDataLayerMessage({ ...valid.full, facts: older })).toEqual({ ok: true, message: { ...valid.full, facts: older } });
 });
 
+describe("handoff", () => {
+  const [repo] = handoff.repos;
+  const withRepo = (change: object) => ({ ...valid.handoff, handoff: { ...handoff, repos: [{ ...repo, ...change }] } });
+
+  test.each([
+    ["an absolute POSIX path", withRepo({ path: "/home/sam/repo" }), "handoff.repos[0].path"],
+    ["a Windows drive path", withRepo({ path: "C:\\work\\repo" }), "handoff.repos[0].path"],
+    ["a drive-relative path", withRepo({ path: "C:repo" }), "handoff.repos[0].path"],
+    ["a UNC path", withRepo({ path: "\\\\server\\share\\repo" }), "handoff.repos[0].path"],
+    ["a path with ..", withRepo({ path: "libs/../../outside" }), "handoff.repos[0].path"],
+    ["a path with .. and backslashes", withRepo({ path: "libs\\..\\.." }), "handoff.repos[0].path"],
+    ["an ext:: remote", withRepo({ remote: "ext::sh -c touch% /tmp/pwned" }), "handoff.repos[0].remote"],
+    ["another transport helper", withRepo({ remote: "fd::17" }), "handoff.repos[0].remote"],
+    ["a branch that isn't the handoff's", withRepo({ branch: "main" }), "handoff.repos[0].branch"],
+    ["another handoff's branch", withRepo({ branch: "isoplan/handoff/other" }), "handoff.repos[0].branch"],
+    ["an id over 64 characters", { ...valid.handoff, handoff: { ...handoff, id: "a".repeat(65) } }, "handoff.id"],
+    ["a short commit hash", withRepo({ commit: "0123456" }), "handoff.repos[0].commit"],
+  ])("refuses %s", (_, message, path) => {
+    const result = parseOfficeServerMessage(message);
+    expect(result).toMatchObject({ ok: false, kind: "invalid" });
+    expect(!result.ok && result.error).toContain(path);
+  });
+
+  test.each([
+    ["the folder itself", { path: "." }],
+    ["a scp-style remote", { remote: "git@github.com:adamlinscott/isoplan.git" }],
+    ["an ssh remote", { remote: "ssh://git@github.com/adamlinscott/isoplan.git" }],
+    ["an https remote", { remote: "https://github.com/adamlinscott/isoplan.git" }],
+    ["a file remote", { remote: "file:///C:/remotes/isoplan.git" }],
+    ["a local bare remote", { remote: "C:\\remotes\\isoplan.git" }],
+    ["a SHA-256 commit", { commit: "0123456789abcdef".repeat(4) }],
+  ])("accepts %s", (_, change) => {
+    const message = withRepo(change);
+    expect(parseOfficeServerMessage(message)).toEqual({ ok: true, message });
+  });
+});
+
 describe("changes", () => {
   test("carries upserted records and the keys of removed ones", () => {
     const message = {
