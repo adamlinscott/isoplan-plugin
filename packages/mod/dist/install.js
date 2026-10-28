@@ -1178,6 +1178,7 @@ function datetime$1(args) {
 const anyString = /^[\s\S]{0,}$/;
 const integer = /^-?\d+$/;
 const number$1 = /^-?\d+(?:\.\d+)?$/;
+const boolean$1 = /^(?:true|false)$/i;
 const lowercase = /^[^A-Z]*$/;
 const uppercase = /^[^a-z]*$/;
 //#endregion
@@ -1980,6 +1981,24 @@ const $ZodNumber = /*@__PURE__*/ $constructor("$ZodNumber", (inst, def) => {
 const $ZodNumberFormat = /*@__PURE__*/ $constructor("$ZodNumberFormat", (inst, def) => {
 	$ZodCheckNumberFormat.init(inst, def);
 	$ZodNumber.init(inst, def);
+});
+const $ZodBoolean = /*@__PURE__*/ $constructor("$ZodBoolean", (inst, def) => {
+	$ZodType.init(inst, def);
+	inst._zod.pattern = boolean$1;
+	inst._zod.parse = (payload, _ctx) => {
+		if (def.coerce) try {
+			payload.value = Boolean(payload.value);
+		} catch (_) {}
+		const input = payload.value;
+		if (typeof input === "boolean") return payload;
+		payload.issues.push({
+			expected: "boolean",
+			code: "invalid_type",
+			input,
+			inst
+		});
+		return payload;
+	};
 });
 const $ZodUnknown = /*@__PURE__*/ $constructor("$ZodUnknown", (inst, def) => {
 	$ZodType.init(inst, def);
@@ -3662,6 +3681,13 @@ function _int(Class, params) {
 	});
 }
 // @__NO_SIDE_EFFECTS__
+function _boolean(Class, params) {
+	return new Class({
+		type: "boolean",
+		...normalizeParams(params)
+	});
+}
+// @__NO_SIDE_EFFECTS__
 function _unknown(Class) {
 	return new Class({ type: "unknown" });
 }
@@ -4439,6 +4465,9 @@ const numberProcessor = (schema, ctx, _json, params) => {
 		if (first !== void 0) json.multipleOf = first;
 		if (rest.length) json.allOf = [...json.allOf ?? [], ...rest.map((m) => ({ multipleOf: m }))];
 	}
+};
+const booleanProcessor = (_schema, _ctx, json, _params) => {
+	json.type = "boolean";
 };
 const neverProcessor = (_schema, _ctx, json, _params) => {
 	json.not = {};
@@ -5313,6 +5342,14 @@ const ZodNumberFormat = /*@__PURE__*/ $constructor("ZodNumberFormat", (inst, def
 function int(params) {
 	return /* @__PURE__ */ _int(ZodNumberFormat, params);
 }
+const ZodBoolean = /*@__PURE__*/ $constructor("ZodBoolean", (inst, def) => {
+	$ZodBoolean.init(inst, def);
+	ZodType.init(inst, def);
+	inst._zod.processJSONSchema = (ctx, json, params) => booleanProcessor(inst, ctx, json, params);
+});
+function boolean(params) {
+	return /* @__PURE__ */ _boolean(ZodBoolean, params);
+}
 const ZodUnknown = /*@__PURE__*/ $constructor("ZodUnknown", (inst, def) => {
 	$ZodUnknown.init(inst, def);
 	ZodType.init(inst, def);
@@ -5781,13 +5818,35 @@ const ReportFactSchema = object({
 	text: string(),
 	extra: Extra
 });
+/**
+* A question an agent asked its owner, open until it is answered, so the floor can show it and the
+* owner can answer it there. One of the named cases of session-derived text leaving a machine: the
+* server keeps it only for the retention period. `id` is the tool call's own id.
+*/
+const QuestionFactSchema = object({
+	id: string().min(1),
+	agent: string().min(1),
+	at: Time,
+	questions: array(object({
+		question: string().min(1),
+		header: string(),
+		options: array(object({
+			label: string().min(1),
+			description: string()
+		})),
+		multiSelect: boolean()
+	})).min(1),
+	extra: Extra
+});
 const FactsSchema = object({
 	session: SessionFactSchema,
 	agents: array(AgentFactSchema),
 	edits: array(FileFactSchema),
 	reads: array(FileFactSchema),
 	waits: array(WaitFactSchema),
-	reports: array(ReportFactSchema)
+	reports: array(ReportFactSchema),
+	/** Absent from a data layer that doesn't report questions, which is the same as none. */
+	questions: array(QuestionFactSchema).optional()
 });
 /** The records that changed, each replacing the one with the same key. */
 const FactUpsertSchema = object({
@@ -5796,7 +5855,8 @@ const FactUpsertSchema = object({
 	edits: array(FileFactSchema).optional(),
 	reads: array(FileFactSchema).optional(),
 	waits: array(WaitFactSchema).optional(),
-	reports: array(ReportFactSchema).optional()
+	reports: array(ReportFactSchema).optional(),
+	questions: array(QuestionFactSchema).optional()
 });
 const FileKey = FileFactSchema.pick({
 	agent: true,
@@ -5804,7 +5864,8 @@ const FileKey = FileFactSchema.pick({
 });
 /**
 * The keys of records that went away: an agent by its id, an edit or read by agent and file, a
-* wait by waiter and on, a report by its agent. The session itself goes with the connection.
+* wait by waiter and on, a report by its agent, a question by its id. The session itself goes with
+* the connection.
 */
 const FactRemoveSchema = object({
 	agents: array(string().min(1)).optional(),
@@ -5814,7 +5875,8 @@ const FactRemoveSchema = object({
 		waiter: true,
 		on: true
 	})).optional(),
-	reports: array(string().min(1)).optional()
+	reports: array(string().min(1)).optional(),
+	questions: array(string().min(1)).optional()
 });
 const Version = literal(1);
 const Seq = number().int().nonnegative();
@@ -5822,18 +5884,59 @@ const ProjectSchema = object({
 	id: string().min(1),
 	name: string().min(1)
 });
+const Account = object({
+	id: string().min(1),
+	name: string()
+});
+const Machine = object({ name: string().min(1) });
+/** Matches a request with its reply or refusal. */
+const RequestId = string().min(1);
+/** A handoff's id. It names the handoff's branch, `isoplan/handoff/<id>`, so it keeps to safe characters. */
+const HandoffId = string().max(64).regex(/^[a-z0-9][a-z0-9-]*$/, "lowercase letters, digits and dashes");
+/**
+* One repo a handoff pushed: its path in the session's folder (`.` for the folder itself), remote,
+* branch and commit. A handoff drives git on the receiver's machine, so the path stays inside the
+* folder and the remote can't name a transport helper such as `ext::`, which runs a command.
+*/
+const HandoffRepoSchema = object({
+	path: string().min(1).refine((path) => !/^([\\/]|[A-Za-z]:)/.test(path), "a path relative to the session's folder").refine((path) => !path.split(/[\\/]/).includes(".."), "a path inside the session's folder, with no `..`").refine((path) => !path.startsWith("-"), "a path that doesn't start with `-`, which git would read as an option"),
+	remote: string().min(1).refine((remote) => !/^[A-Za-z0-9+.-]+::/.test(remote), "a remote with no transport helper (`<transport>::`)").refine((remote) => !remote.startsWith("-"), "a remote that doesn't start with `-`, which git would read as an option"),
+	branch: string().min(1),
+	commit: string().regex(/^([0-9a-f]{40}|[0-9a-f]{64})$/, "a full commit hash")
+});
+/** What the receiver gets: the brief, and every repo pushed for it, each on the handoff's own branch. */
+const HandoffSchema = object({
+	id: HandoffId,
+	brief: string().min(1),
+	repos: array(HandoffRepoSchema).min(1)
+}).superRefine((handoff, context) => {
+	handoff.repos.forEach((repo, i) => {
+		if (repo.branch !== `isoplan/handoff/${handoff.id}`) context.addIssue({
+			code: "custom",
+			path: [
+				"repos",
+				i,
+				"branch"
+			],
+			message: `the handoff's branch, isoplan/handoff/${handoff.id}`
+		});
+	});
+});
 discriminatedUnion("type", [
 	object({
 		type: literal("hello"),
 		v: Version,
 		source: SourceSchema,
-		account: object({
-			id: string().min(1),
-			name: string()
-		}),
-		machine: object({ name: string().min(1) }),
+		account: Account,
+		machine: Machine,
 		session: string().min(1),
 		project: ProjectSchema
+	}),
+	object({
+		type: literal("runner"),
+		v: Version,
+		account: Account,
+		machine: Machine
 	}),
 	object({
 		type: literal("full"),
@@ -5847,6 +5950,80 @@ discriminatedUnion("type", [
 		seq: Seq,
 		upsert: FactUpsertSchema,
 		remove: FactRemoveSchema
+	}),
+	discriminatedUnion("kind", [
+		object({
+			type: literal("reply"),
+			v: Version,
+			id: RequestId,
+			kind: literal("answer-question"),
+			answer: string().min(1)
+		}),
+		object({
+			type: literal("reply"),
+			v: Version,
+			id: RequestId,
+			kind: literal("write-brief"),
+			handoff: HandoffSchema
+		}),
+		object({
+			type: literal("reply"),
+			v: Version,
+			id: RequestId,
+			kind: literal("owner-answer")
+		})
+	]),
+	discriminatedUnion("reason", [
+		object({
+			type: literal("refusal"),
+			v: Version,
+			id: RequestId,
+			reason: literal("over-cap"),
+			cap: _enum([
+				"room-hour",
+				"owner-day",
+				"owner-tokens"
+			])
+		}),
+		object({
+			type: literal("refusal"),
+			v: Version,
+			id: RequestId,
+			reason: literal("withheld")
+		}),
+		object({
+			type: literal("refusal"),
+			v: Version,
+			id: RequestId,
+			reason: literal("unavailable"),
+			detail: string().min(1)
+		})
+	]),
+	object({
+		type: literal("hand-over"),
+		v: Version,
+		to: string().min(1),
+		handoff: HandoffSchema
+	}),
+	object({
+		type: literal("take"),
+		v: Version,
+		code: string().min(1)
+	}),
+	object({
+		type: literal("taken"),
+		v: Version,
+		handoff: HandoffId,
+		failures: array(object({
+			step: _enum([
+				"worktree",
+				"setup",
+				"checkout",
+				"open"
+			]),
+			repo: string().min(1).optional(),
+			output: string()
+		}))
 	})
 ]);
 discriminatedUnion("type", [
@@ -5867,6 +6044,47 @@ discriminatedUnion("type", [
 		v: Version,
 		code: string().min(1),
 		message: string()
+	}),
+	discriminatedUnion("kind", [
+		object({
+			type: literal("request"),
+			v: Version,
+			id: RequestId,
+			kind: literal("answer-question"),
+			session: string().min(1),
+			room: string().min(1),
+			from: Account,
+			question: string().min(1)
+		}),
+		object({
+			type: literal("request"),
+			v: Version,
+			id: RequestId,
+			kind: literal("write-brief"),
+			session: string().min(1),
+			room: string().min(1),
+			handoff: HandoffId,
+			to: Account
+		}),
+		object({
+			type: literal("request"),
+			v: Version,
+			id: RequestId,
+			kind: literal("owner-answer"),
+			session: string().min(1),
+			question: string().min(1),
+			answers: record(string(), string())
+		})
+	]),
+	object({
+		type: literal("release"),
+		v: Version,
+		id: RequestId
+	}),
+	object({
+		type: literal("handoff"),
+		v: Version,
+		handoff: HandoffSchema
 	})
 ]);
 //#endregion
