@@ -37,11 +37,13 @@ export const HandoffRepoSchema = z.object({
     .string()
     .min(1)
     .refine((path) => !/^([\\/]|[A-Za-z]:)/.test(path), "a path relative to the session's folder")
-    .refine((path) => !path.split(/[\\/]/).includes(".."), "a path inside the session's folder, with no `..`"),
+    .refine((path) => !path.split(/[\\/]/).includes(".."), "a path inside the session's folder, with no `..`")
+    .refine((path) => !path.startsWith("-"), "a path that doesn't start with `-`, which git would read as an option"),
   remote: z
     .string()
     .min(1)
-    .refine((remote) => !/^[A-Za-z0-9+.-]+::/.test(remote), "a remote with no transport helper (`<transport>::`)"),
+    .refine((remote) => !/^[A-Za-z0-9+.-]+::/.test(remote), "a remote with no transport helper (`<transport>::`)")
+    .refine((remote) => !remote.startsWith("-"), "a remote that doesn't start with `-`, which git would read as an option"),
   branch: z.string().min(1),
   commit: z.string().regex(/^([0-9a-f]{40}|[0-9a-f]{64})$/, "a full commit hash"),
 });

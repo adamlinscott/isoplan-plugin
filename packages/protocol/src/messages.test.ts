@@ -259,6 +259,8 @@ describe("handoff", () => {
     ["a UNC path", withRepo({ path: "\\\\server\\share\\repo" }), "handoff.repos[0].path"],
     ["a path with ..", withRepo({ path: "libs/../../outside" }), "handoff.repos[0].path"],
     ["a path with .. and backslashes", withRepo({ path: "libs\\..\\.." }), "handoff.repos[0].path"],
+    ["a path that starts with -", withRepo({ path: "--upload-pack=touch pwned" }), "handoff.repos[0].path"],
+    ["a remote that starts with -", withRepo({ remote: "--upload-pack=touch pwned" }), "handoff.repos[0].remote"],
     ["an ext:: remote", withRepo({ remote: "ext::sh -c touch% /tmp/pwned" }), "handoff.repos[0].remote"],
     ["another transport helper", withRepo({ remote: "fd::17" }), "handoff.repos[0].remote"],
     ["a branch that isn't the handoff's", withRepo({ branch: "main" }), "handoff.repos[0].branch"],
@@ -273,6 +275,8 @@ describe("handoff", () => {
 
   test.each([
     ["the folder itself", { path: "." }],
+    ["a path with a dash inside it", { path: "libs/my-core" }],
+    ["a remote with a dash inside it", { remote: "https://github.com/adamlinscott/isoplan-plugin.git" }],
     ["a scp-style remote", { remote: "git@github.com:adamlinscott/isoplan.git" }],
     ["an ssh remote", { remote: "ssh://git@github.com/adamlinscott/isoplan.git" }],
     ["an https remote", { remote: "https://github.com/adamlinscott/isoplan.git" }],
