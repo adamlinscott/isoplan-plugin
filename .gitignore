@@ -1,0 +1,17 @@
+node_modules/
+dist/
+# The mod runs from a checkout, so its bundle is committed.
+!packages/mod/dist/
+coverage/
+*.tsbuildinfo
+.env
+.env.*
+
+# OS and editor cruft
+.DS_Store
+Thumbs.db
+desktop.ini
+*.swp
+*~
+.vscode/
+.idea/

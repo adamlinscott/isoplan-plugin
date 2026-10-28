@@ -1,0 +1,12 @@
+{
+  "name": "isoplan",
+  "owner": { "name": "Adam Linscott" },
+  "description": "Isoplan: a live view of every agent working across a team, drawn as an office floor.",
+  "plugins": [
+    {
+      "name": "isoplan",
+      "source": "./packages/mod",
+      "description": "Isoplan's Claude Code plugin: streams each session's facts to a team's office server, set in config.json."
+    }
+  ]
+}

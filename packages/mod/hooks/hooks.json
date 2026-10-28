@@ -1,0 +1,4 @@
+{
+  "description": "Isoplan's data layer: reports this session's facts to an office server",
+  "modules": ["../dist/hooks.js"]
+}

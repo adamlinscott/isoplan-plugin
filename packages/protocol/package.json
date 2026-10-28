@@ -1,0 +1,33 @@
+{
+  "name": "@isoplan/protocol",
+  "version": "0.1.0",
+  "description": "The wire protocol between Isoplan's Claude Code plugin and an office server: message and fact types, with zod parsers.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/adamlinscott/isoplan-plugin.git",
+    "directory": "packages/protocol"
+  },
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "prepublishOnly": "tsc -p tsconfig.build.json"
+  },
+  "dependencies": {
+    "zod": "^4.6.7"
+  }
+}

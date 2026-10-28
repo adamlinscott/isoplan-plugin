@@ -1,0 +1,3 @@
+# The mod's committed bundle is built with LF on every OS; keep checkouts the same, so CI's
+# freshness check compares like with like.
+packages/mod/dist/** text eol=lf
