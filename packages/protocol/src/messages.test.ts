@@ -118,7 +118,7 @@ const valid = {
   "reply owner-answer": { type: "reply", v, id: "r3", kind: "owner-answer" },
   "refusal over-cap": { type: "refusal", v, id: "r1", reason: "over-cap", cap: "owner-tokens" },
   "refusal withheld": { type: "refusal", v, id: "r1", reason: "withheld" },
-  "refusal withheld commit": { type: "refusal", v, id: "r2", reason: "withheld", file: "config/dev.ts" },
+  "refusal withheld commit": { type: "refusal", v, id: "r2", reason: "withheld", file: "config/dev.ts", unchecked: ["assets/logo.png"] },
   "refusal unavailable": { type: "refusal", v, id: "r2", reason: "unavailable", detail: "The session's folder is gone." },
   "hand-over": { type: "hand-over", v, to: "sam@example.com", handoff },
   "hand-over-check": { type: "hand-over-check", v, to: "Sam", handoff: "h7k2" },
@@ -152,6 +152,7 @@ const valid = {
   handoff: { type: "handoff", v, handoff },
   "handed-over": { type: "handed-over", v, handoff: "h7k2", to: sam },
   "hand-over-ready": { type: "hand-over-ready", v, handoff: "h7k2", to: sam },
+  drop: { type: "drop", v, id: "r2" },
   "handoff to a runner": { type: "handoff", v, handoff, mode: "headless", session: "0b5c4d3e-0000-4000-8000-000000000001" },
 };
 
@@ -183,6 +184,7 @@ const parsers = {
   handoff: parseOfficeServerMessage,
   "handed-over": parseOfficeServerMessage,
   "hand-over-ready": parseOfficeServerMessage,
+  drop: parseOfficeServerMessage,
   "handoff to a runner": parseOfficeServerMessage,
 } satisfies Record<keyof typeof valid, (value: unknown) => ParseResult<unknown>>;
 
@@ -215,6 +217,7 @@ const broken: Record<keyof typeof valid, [unknown, string]> = {
   handoff: [{ ...valid.handoff, handoff: { ...handoff, repos: [{ ...handoff.repos[0], commit: "0123abc" }] } }, "handoff.repos[0].commit"],
   "handed-over": [{ ...valid["handed-over"], to: { id: "", name: "Sam" } }, "to.id"],
   "hand-over-ready": [{ ...valid["hand-over-ready"], to: { name: "Sam" } }, "to.id"],
+  drop: [{ ...valid.drop, id: "" }, "id"],
   "handoff to a runner": [{ ...valid["handoff to a runner"], mode: "window" }, "mode"],
 };
 
