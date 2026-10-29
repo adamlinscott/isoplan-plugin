@@ -78,10 +78,15 @@ export const WaitFactSchema = z.object({
   extra: Extra,
 });
 
+/**
+ * An agent's final report. One the secret scan matched, and its owner hasn't released, is
+ * `withheld`: its `text` then only says so, and the report follows once the owner releases it.
+ */
 export const ReportFactSchema = z.object({
   agent: z.string().min(1),
   at: Time,
   text: z.string(),
+  withheld: z.literal(true).optional(),
   extra: Extra,
 });
 

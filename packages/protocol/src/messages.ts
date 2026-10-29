@@ -241,7 +241,11 @@ export const RequestMessageSchema = z.discriminatedUnion("kind", [
   }),
 ]);
 
-/** The owner released a reply the secret scan withheld, so the machine sends it now. */
+/**
+ * The owner released what the secret scan withheld, so the machine sends it now. On the runner's
+ * link `id` is the request whose reply was withheld; on a session's link it is the agent whose
+ * report was.
+ */
 export const ReleaseMessageSchema = z.object({
   type: z.literal("release"),
   v: Version,

@@ -38,7 +38,7 @@ Its log is `~/.claude/isoplan/logs/runner.log`, and its count of answers and tok
 
 ## What leaves your machine
 
-By default only facts: which sessions and agents are running and what kind of work each is doing, in which repository and branch, which files they touched, and when they wait. Session-derived text leaves only in named cases, each kept by the server for a set period and then deleted: an agent's final report, questions an agent asks its owner, and the questions, answers and briefs in a room that was handed over.
+By default only facts: which sessions and agents are running and what kind of work each is doing, in which repository and branch, which files they touched, and when they wait. Session-derived text leaves only in named cases, each kept by the server for a set period and then deleted: an agent's final report, questions an agent asks its owner, and the questions, answers and briefs in a room that was handed over. A report is checked for secrets on your machine before it is sent, as answers and briefs are, and one that matches is held, with only a note saying so sent in its place, until you release it from the floor.
 
 ## What is here
 
