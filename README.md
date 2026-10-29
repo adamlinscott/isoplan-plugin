@@ -15,6 +15,31 @@ This repo is a Claude Code plugin marketplace. In Claude Code:
 
 Then point it at your office server: set `server` in `~/.claude/isoplan/config.json`, for example `{ "server": "wss://your-office.example/data-layer" }`. Any key in that file overrides the plugin's defaults in `packages/mod/config.json`.
 
+The plugin needs Node.js on `PATH`. When it first starts it puts a small hook in your `~/.claude/settings.json` (on `UserPromptSubmit` and `Stop`), so sessions that don't load the plugin are seen too, and copies the runner (below) into `~/.claude/isoplan/`.
+
+## Disable or uninstall
+
+Claude Code runs nothing of a plugin's when you disable or uninstall it, so the hook in your settings looks for itself, each time a session takes a prompt, at what Claude Code records: `installed_plugins.json`, and `enabledPlugins` in your settings, the project's settings and a `managed-settings.json` file (not managed settings from MDM or the claude.ai console, which it can't read). The project is the session's `CLAUDE_PROJECT_DIR`, or its folder. An install at project or local scope counts only for that project's sessions.
+
+**Disable** it (`/plugin disable isoplan@isoplan`, the plugin manager, or `claude plugin disable`) and reporting stops: the hook stops the runner and starts nothing, and the sessions' data layers stop. Every file stays, the pairing credential too. Disabled in one project only, that project's sessions aren't reported. Enable it again and the next prompt starts them again.
+
+**Uninstall** it (`/plugin uninstall isoplan@isoplan`, the plugin manager, or `claude plugin uninstall isoplan@isoplan`) and, the next time a session takes a prompt, the hook takes everything out in the background. That happens only once Claude Code lists no install of `isoplan` at all, from any marketplace and at any scope, and no folder in `CLAUDE_CODE_PLUGIN_DIRS` holds it, so moving to another marketplace isn't an uninstall. A copy you load with `--plugin-dir` leaves nothing it can find, so remove the marketplace install only once you no longer want it. What it takes out:
+
+- the runner, which it stops;
+- what the plugin wrote in `~/.claude/isoplan/`: the runner's copy and its records (`runner/`: the app, `environment.json`, the ledger, the lock), the machine's pairing credential (`pairing.json`), the session locks (`live/`), the logs (`logs/`), the title files (`titles/`), the hashes of reports you released (`released/`), and `claude-binary.json` unless you set it by hand;
+- last, the hook in `~/.claude/settings.json` (every other hook and setting is kept), the hook script and its record (`wake.mjs`, `wake.json`), and the uninstall's own lock and log (`uninstall.json`, `uninstall.log`).
+
+The files you write are kept: `config.json`, `runner.json`, `secret-patterns.json`, and a `claude-binary.json` you set by hand, so a reinstall picks them up again. Delete `~/.claude/isoplan/` yourself to take those too; once nothing is left in it, uninstall removes the folder.
+
+It asks Claude Code before each step whether the plugin is still uninstalled, and stops if you installed it again. A session that already had the plugin loaded stops reporting, but Claude Code keeps the plugin loaded there until the session ends or you run `/reload-plugins`; if it wrote its files again meanwhile, the hook stays and the next prompt finishes the job. If it can't finish while the hook is still in place, for example because `settings.json` doesn't parse, it says why in `~/.claude/isoplan/uninstall.log` and the hook tries again a day later; delete `~/.claude/isoplan/uninstall.json` to have the next prompt try at once. If a step fails after the hook has gone, nothing is left to try again: what remains of `~/.claude/isoplan/` stays until you delete it, or until you install the plugin again, which clears it.
+
+Two things it can't help:
+
+- It writes `settings.json` whole, as Claude Code does, and there is no lock to share with Claude Code, so a change Claude Code writes to that file at the same moment can be lost. Check the file if you changed a setting right then.
+- A session that was open when the hook went may still run it until that session restarts, and shows Claude Code's non-blocking hook error each turn, since `wake.mjs` has gone.
+
+From a checkout, `pnpm isoplan-uninstall` takes out the same things at once, and leaves `~/.claude/isoplan/wake.json` as `{ "disabled": true }` (written before the hook comes out), so the plugin, if it is still installed, doesn't put the hook back when it next starts, and finishes anything the uninstall left; `pnpm isoplan-install` takes that away. An install waits for an uninstall that is still running.
+
 ## The runner
 
 Each machine runs one runner (`packages/mod/dist/runner.js`, which install copies to `~/.claude/isoplan/runner/app/dist/runner.mjs` with its defaults beside it, so a plugin update doesn't delete the files it runs from), which answers the office server's questions and handoff briefs for the machine's rooms. It answers from a fork of the room's lead session: a one-off `claude -p --resume --fork-session` with no tools, no MCP servers and no settings files, which is never saved. Install, the plugin and the wake hook start it, a newer copy replaces an older one as it starts, and it stops once every room on the machine has gone lights-off. Before an answer or brief leaves the machine, it is checked for secrets, and one that matches is withheld until you release it from the floor.
@@ -60,7 +85,11 @@ pnpm sweep        # run the repo sweep from the built plugin
 pnpm isoplan-install / pnpm isoplan-uninstall
 ```
 
-To release the protocol, bump `packages/protocol/package.json`'s version and run `pnpm publish` in `packages/protocol`.
+## Release
+
+The plugin's version is in three places, kept the same: `packages/mod/.claude-plugin/plugin.json`, its entry in `.claude-plugin/marketplace.json`, and `packages/mod/package.json`. Claude Code installs and updates by that version, so users get new commits only once it changes: bump all three, rebuild `dist/`, and commit.
+
+To release the protocol, set its version in `packages/protocol/package.json`, and publish a GitHub release for the tag `protocol-v<version>`, such as `protocol-v0.3.0`. That runs `.github/workflows/publish-protocol.yml`, which fails unless the tag matches the package's version, waits for approval if the `npm-publish` environment asks for it, and publishes `@isoplan/protocol` to npm unless that version is there already. It uses npm trusted publishing, so no npm token is stored in the repository, and each version carries a provenance statement. Releases for other tags publish nothing.
 
 Earlier history of both packages is in Isoplan's private repository.
 

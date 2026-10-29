@@ -1,8 +1,9 @@
-import { execFile, spawn } from "node:child_process";
+import { execFile, spawn, spawnSync } from "node:child_process";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { promisify } from "node:util";
 //#region src/data-layer/git.ts
 function isAbsolute(p) {
 	return /^[A-Za-z]:[\\/]/.test(p) || p.startsWith("/") || p.startsWith("\\");
@@ -59,8 +60,8 @@ async function loadConfig(io, defaultsPath, userPath) {
 }
 /** The same per-key override for any settings file of the mod's, such as the runner's runner.json. */
 async function loadSettings(io, defaultsPath, userPath) {
-	const defaults = await readJson(io, defaultsPath);
-	const user = await readJson(io, userPath, true);
+	const defaults = await readJson$1(io, defaultsPath);
+	const user = await readJson$1(io, userPath, true);
 	const config = {};
 	for (const [key, fallback] of Object.entries(defaults)) config[key] = fits(key, user[key], fallback) ? user[key] : fallback;
 	return config;
@@ -88,7 +89,7 @@ function isWebSocketUrl(value) {
 	const url = new URL(value);
 	return url.protocol === "wss:" || url.protocol === "ws:" && LOOPBACK.has(url.hostname);
 }
-async function readJson(io, p, optional = false) {
+async function readJson$1(io, p, optional = false) {
 	if (optional && !await io.stat(p)) return {};
 	try {
 		const value = JSON.parse(await io.read(p));
@@ -533,7 +534,7 @@ function slugify(input) {
 	return input.toLowerCase().trim().replace(/[^\w\s-]/g, "").replace(/[\s_-]+/g, "-").replace(/^-+|-+$/g, "");
 }
 const captureStackTrace = "captureStackTrace" in Error ? Error.captureStackTrace : (..._args) => {};
-function isObject(data) {
+function isObject$1(data) {
 	return typeof data === "object" && data !== null && !Array.isArray(data);
 }
 const allowsEval = /* @__PURE__*/ cached(() => {
@@ -547,12 +548,12 @@ const allowsEval = /* @__PURE__*/ cached(() => {
 	}
 });
 function isPlainObject(o) {
-	if (isObject(o) === false) return false;
+	if (isObject$1(o) === false) return false;
 	const ctor = o.constructor;
 	if (ctor === void 0) return true;
 	if (typeof ctor !== "function") return true;
 	const prot = ctor.prototype;
-	if (isObject(prot) === false) return false;
+	if (isObject$1(prot) === false) return false;
 	if (Object.prototype.hasOwnProperty.call(prot, "isPrototypeOf") === false) return false;
 	return true;
 }
@@ -2446,7 +2447,7 @@ const $ZodObject = /*@__PURE__*/ $constructor("$ZodObject", (inst, def) => {
 		}
 		return propValues;
 	});
-	const isObject$1 = isObject;
+	const isObject = isObject$1;
 	const catchall = def.catchall;
 	let value;
 	const memo = globalConfig.memoizer;
@@ -2454,7 +2455,7 @@ const $ZodObject = /*@__PURE__*/ $constructor("$ZodObject", (inst, def) => {
 	inst._zod.parse = (payload, ctx) => {
 		value ?? (value = _normalized.value);
 		const input = payload.value;
-		if (!isObject$1(input)) {
+		if (!isObject(input)) {
 			payload.issues.push({
 				expected: "object",
 				code: "invalid_type",
@@ -2584,7 +2585,7 @@ const $ZodObjectJIT = /*@__PURE__*/ $constructor("$ZodObjectJIT", (inst, def) =>
 		return doc.compile();
 	};
 	let fastpass;
-	const isObject$2 = isObject;
+	const isObject = isObject$1;
 	const jit = !globalConfig.jitless;
 	const fastEnabled = jit && allowsEval.value;
 	const catchall = def.catchall;
@@ -2592,7 +2593,7 @@ const $ZodObjectJIT = /*@__PURE__*/ $constructor("$ZodObjectJIT", (inst, def) =>
 	inst._zod.parse = (payload, ctx) => {
 		value ?? (value = _normalized.value);
 		const input = payload.value;
-		if (!isObject$2(input)) {
+		if (!isObject(input)) {
 			payload.issues.push({
 				expected: "object",
 				code: "invalid_type",
@@ -2703,7 +2704,7 @@ const $ZodDiscriminatedUnion = /*@__PURE__*/ $constructor("$ZodDiscriminatedUnio
 	const disc = cached(() => discriminatorMap(def));
 	inst._zod.parse = (payload, ctx) => {
 		const input = payload.value;
-		if (!isObject(input)) {
+		if (!isObject$1(input)) {
 			payload.issues.push({
 				code: "invalid_type",
 				expected: "object",
@@ -6409,6 +6410,113 @@ async function backfill(found, { claudeDir, dataLayer, spawn, isAlive = alive, p
 	return started;
 }
 //#endregion
+//#region src/install/state.ts
+/** Claude Code's plugins folder: $CLAUDE_CODE_PLUGIN_CACHE_DIR when it is set, else <claude dir>/plugins. */
+const pluginsDir = (claudeDir, env) => env.CLAUDE_CODE_PLUGIN_CACHE_DIR || path.join(claudeDir, "plugins");
+/** The folders $CLAUDE_CODE_PLUGIN_DIRS names. */
+const pluginDirsOf = (env) => (env.CLAUDE_CODE_PLUGIN_DIRS ?? "").split(path.delimiter).filter(Boolean);
+/** The system folder Claude Code reads managed-settings.json from. */
+function managedDir(platform) {
+	if (platform === "win32") return "C:\\Program Files\\ClaudeCode";
+	if (platform === "darwin") return "/Library/Application Support/ClaudeCode";
+	return "/etc/claude-code";
+}
+/** A path as compared: resolved, with forward slashes, and on Windows and macOS without regard to case. */
+function normalPath(p, platform = process.platform) {
+	const resolved = path.resolve(p).replace(/\\/g, "/");
+	return platform === "win32" || platform === "darwin" ? resolved.toLowerCase() : resolved;
+}
+/** The id, `<plugin>@<marketplace>`, of the marketplace install `file` is part of; null for a file outside the plugin cache. */
+function pluginIdOf(plugins, file) {
+	const relative = path.relative(path.join(plugins, "cache"), path.resolve(file));
+	if (path.isAbsolute(relative)) return null;
+	const parts = relative.split(path.sep);
+	return parts.length >= 4 && parts[0] !== ".." ? `${parts[1]}@${parts[0]}` : null;
+}
+const nameOf = (id) => id.slice(0, id.lastIndexOf("@"));
+/** Every install installed_plugins.json records; null when it is missing, can't be read, or isn't the shape known. */
+async function installs(plugins) {
+	const record = await readJson(path.join(plugins, "installed_plugins.json"));
+	const list = record?.plugins;
+	if (record?.version !== 2 || !isObject(list) || !Object.values(list).every(Array.isArray)) return null;
+	return Object.entries(list).flatMap(([id, entries]) => entries.map((entry) => {
+		const e = isObject(entry) ? entry : {};
+		return {
+			id,
+			scope: typeof e.scope === "string" ? e.scope : null,
+			projectPath: typeof e.projectPath === "string" ? e.projectPath : null
+		};
+	}));
+}
+/** Whether `enabledPlugins` names the plugin `id` enabled, disabled, or not at all (null). */
+async function enabledIn(file, id) {
+	const value = (await readJson(file))?.enabledPlugins;
+	return isObject(value) && typeof value[id] === "boolean" ? value[id] : null;
+}
+/**
+* What Claude Code says of the plugin `dataLayer` belongs to. With `project` (a session's project
+* folder) the project's settings and installs count too; without, only the machine's: the
+* managed files, the user's settings, and every install.
+*/
+async function pluginState(place, dataLayer, project) {
+	const id = pluginIdOf(place.plugins, dataLayer);
+	if (!id) return "enabled";
+	const name = nameOf(id);
+	const all = await installs(place.plugins);
+	let ids = [id];
+	if (all) {
+		const mine = all.filter((i) => nameOf(i.id) === name);
+		if (!mine.length) return await isInPluginDirs(place.pluginDirs ?? [], name) ? "enabled" : "uninstalled";
+		const here = project ? mine.filter((i) => !(i.scope === "project" || i.scope === "local") || !i.projectPath || normalPath(i.projectPath) === normalPath(project)) : mine;
+		if (!here.length) return "disabled";
+		ids = [...new Set(here.map((i) => i.id))];
+	}
+	return (await Promise.all(ids.map((one) => enabledFor(place, one, project)))).includes(true) ? "enabled" : "disabled";
+}
+async function enabledFor(place, id, project) {
+	const managed = await Promise.all((await managedFiles(place.managed)).map((file) => enabledIn(file, id)));
+	if (managed.includes(false)) return false;
+	if (managed.includes(true)) return true;
+	for (const file of await ownFiles(place, project)) {
+		const enabled = await enabledIn(file, id);
+		if (enabled !== null) return enabled;
+	}
+	return true;
+}
+async function isInPluginDirs(dirs, name) {
+	for (const dir of dirs) if ((await readJson(path.join(dir, ".claude-plugin", "plugin.json")))?.name === name) return true;
+	return false;
+}
+async function managedFiles(managed) {
+	const dropIns = await fs.readdir(path.join(managed, "managed-settings.d")).then((names) => names.filter((n) => n.endsWith(".json")).map((n) => path.join(managed, "managed-settings.d", n)), () => []);
+	return [path.join(managed, "managed-settings.json"), ...dropIns];
+}
+async function ownFiles({ claudeDir }, project) {
+	const files = [];
+	if (project) {
+		const root = await gitRoot(project);
+		if (root && normalPath(root) !== normalPath(project)) files.push(path.join(root, ".claude", "settings.local.json"));
+		files.push(path.join(project, ".claude", "settings.local.json"), path.join(project, ".claude", "settings.json"));
+	}
+	files.push(path.join(claudeDir, "settings.json"));
+	return files;
+}
+async function gitRoot(dir) {
+	for (let at = path.resolve(dir);; at = path.dirname(at)) {
+		if (await fs.stat(path.join(at, ".git")).then(() => true, () => false)) return at;
+		if (path.dirname(at) === at) return null;
+	}
+}
+const isObject = (value) => !!value && typeof value === "object" && !Array.isArray(value);
+async function readJson(file) {
+	try {
+		const value = JSON.parse((await fs.readFile(file, "utf8")).replace(/^\uFEFF/, ""));
+		return isObject(value) ? value : null;
+	} catch {
+		return null;
+	}
+}
+//#endregion
 //#region src/install/install.ts
 const WAKE_EVENTS = ["UserPromptSubmit", "Stop"];
 const TIMEOUT_SECONDS = 10;
@@ -6426,20 +6534,50 @@ const RUNNER_FILES = [
 ];
 /** A file's name in the copy: the bundle is an ES module and no package.json beside the copy says so, so it is .mjs, as wake.mjs is. */
 const copiedAs = (file) => file.replace(/\.js$/, ".mjs");
+/** The uninstall's lock, which also holds off a retry once one has failed. */
+const uninstallLockPath = (claudeDir) => path.join(claudeDir, "isoplan", "uninstall.json");
+/** Where an uninstall in the background says what stopped it. */
+const uninstallLogPath = (claudeDir) => path.join(claudeDir, "isoplan", "uninstall.log");
 /**
 * The hook's command. Shell form, quoted, with forward slashes, so Git Bash, PowerShell and sh all
 * read the path the same way.
 */
 const wakeCommand = (script) => `node "${script.replace(/\\/g, "/")}"`;
-const isWake = (hook) => typeof hook?.command === "string" && /isoplan[\\/]+wake\.mjs/.test(hook.command);
+/** The script a hook command runs with node, as `node "<script>"` or `node <script>`; null for any other command. */
+function nodeScriptOf(command) {
+	const m = /^\s*node(?:\.exe)?\s+(?:"([^"]+)"|'([^']+)'|(\S+))\s*$/i.exec(command);
+	return m ? m[1] ?? m[2] ?? m[3] : null;
+}
+const isWakeFor = (claudeDir) => {
+	const script = normalPath(wakeScriptPath(claudeDir));
+	return (hook) => {
+		const command = hook?.command;
+		const runs = typeof command === "string" ? nodeScriptOf(command) : null;
+		return runs !== null && normalPath(runs) === script;
+	};
+};
 /**
 * Copies `wakeSource` (dist/wake.js) into place, records `dataLayer`, and adds or updates the hooks.
 * With `runnerFrom` (the plugin's folder) it copies the runner too, and records the copy.
 * Returns what it changed, [] when it was all there. Throws when settings.json can't be merged.
-* With `auto` (the plugin's data layer) it does nothing once the hook has been uninstalled.
+* With `auto` (the plugin's data layer) it does nothing once the hook has been uninstalled, but
+* finish what that uninstall left (a wake.mjs no hook names), or once Claude Code lists the plugin
+* `dataLayer` belongs to as uninstalled: a session that loaded it before then still runs it.
+*
+* A background uninstall that is running is waited for, up to `waitMs`; one still running then
+* leaves the plugin's data layer doing nothing (its next start tries again), and the install
+* script failing. An uninstall that failed, or whose process has gone, leaves its lock and log,
+* which go now, since the plugin is wanted after all.
 */
-async function installWake({ claudeDir, settings }, dataLayer, wakeSource, { auto = false, runnerFrom, findClaude } = {}) {
-	if (auto && await isOptedOut(claudeDir)) return [];
+async function installWake(paths, dataLayer, wakeSource, { auto = false, runnerFrom, findClaude, waitMs = INSTALL_WAIT_MS } = {}) {
+	const { claudeDir, settings } = paths;
+	if (auto && await isOptedOut(claudeDir)) return finishOptOut(paths);
+	if (auto && await pluginState(paths, dataLayer) === "uninstalled") return [];
+	if (!await waitForUninstall(claudeDir, waitMs)) {
+		if (auto) return [];
+		throw new Error(`an uninstall is running (${uninstallLockPath(claudeDir)}); try again once it is done`);
+	}
+	const isWake = isWakeFor(claudeDir);
 	const current = await readSettings(settings);
 	const script = wakeScriptPath(claudeDir);
 	const hooks = current.hooks ??= {};
@@ -6491,19 +6629,186 @@ async function installWake({ claudeDir, settings }, dataLayer, wakeSource, { aut
 	await fs.mkdir(path.dirname(script), { recursive: true });
 	if (await writeIfChanged(script, await fs.readFile(wakeSource, "utf8"))) changes.push(`copied the wake hook to ${script}`);
 	if (await writeIfChanged(wakeRecordPath(claudeDir), JSON.stringify(record, null, 2) + "\n")) changes.push(`recorded the data layer at ${dataLayer}${runner ? ` and the runner at ${runner}` : ""}`);
-	const claude = findClaude && !await isHandSet(claudeBinaryPath(claudeDir)) ? await findClaude() : null;
-	if (claude && await writeIfChanged(claudeBinaryPath(claudeDir), JSON.stringify({
+	const binary = claudeBinaryPath(claudeDir);
+	const kind = await binaryRecord(binary);
+	if (kind === "broken") changes.push(`kept ${binary}, which doesn't parse: it may have been edited by hand`);
+	const claude = findClaude && (kind === "none" || kind === "auto") ? await findClaude() : null;
+	if (claude && await writeIfChanged(binary, JSON.stringify({
 		path: claude,
 		auto: true
 	}, null, 2) + "\n")) changes.push(`recorded the claude binary at ${claude}`);
+	for (const file of [uninstallLogPath(claudeDir), uninstallLockPath(claudeDir)]) if (await fs.rm(file).then(() => true, () => false)) changes.push(`removed ${file}, left by an uninstall that didn't finish`);
 	if (done.length) await writeSettings(settings, current);
 	return [...changes, ...done];
 }
+/** How long an install waits for a running background uninstall. */
+const INSTALL_WAIT_MS = 15e3;
+async function waitForUninstall(claudeDir, waitMs) {
+	const file = uninstallLockPath(claudeDir);
+	for (const until = Date.now() + waitMs;; await new Promise((r) => setTimeout(r, 250))) {
+		const pid = (await readLock(file))?.pid;
+		if (!pid || !alive(pid)) return true;
+		if (Date.now() >= until) return false;
+	}
+}
+async function finishOptOut({ claudeDir, settings }) {
+	const isWake = isWakeFor(claudeDir);
+	const hooks = await readSettings(settings).then((current) => current.hooks, () => void 0);
+	const named = !!hooks && typeof hooks === "object" && Object.values(hooks).some((groups) => Array.isArray(groups) && groups.some((g) => Array.isArray(g?.hooks) && g.hooks.some(isWake)));
+	const changes = [];
+	if (named || !await waitForUninstall(claudeDir, 0)) return changes;
+	for (const file of [
+		wakeScriptPath(claudeDir),
+		uninstallLogPath(claudeDir),
+		uninstallLockPath(claudeDir)
+	]) if (await fs.rm(file).then(() => true, () => false)) changes.push(`removed ${file}, left by an uninstall`);
+	return changes;
+}
+const WRITTEN = [
+	"runner",
+	"pairing.json",
+	"live",
+	"logs",
+	"titles",
+	"released"
+];
+const SESSION_TRACES = [
+	"live",
+	"titles",
+	"released"
+];
 /**
-* Takes out the wake hooks and wake.mjs, and marks wake.json as uninstalled; nothing else. Returns
-* what it changed.
+* Takes out everything install and the plugin put in place, in this order: the running runner;
+* under <claude dir>/isoplan the session locks (a detached data layer stops once its lock isn't
+* its own); a wait of `settleMs`; the runner's copy and its records (environment, ledger, lock),
+* the pairing credential, the logs, the title files and the released-report hashes, and
+* claude-binary.json unless it was set by hand; then the wake
+* hooks in settings.json, and wake.mjs and wake.json. What else is in the folder, the files a
+* person writes, is kept, and the folder goes once it is empty. Throws when settings.json can't be
+* merged, with the hooks and wake.mjs still in place and settings.json not written.
 */
-async function uninstallWake({ claudeDir, settings }) {
+async function uninstall$1(paths, { optOut = false, settleMs = 0, confirm, runner = {} } = {}) {
+	const changes = [];
+	const dir = path.dirname(wakeScriptPath(paths.claudeDir));
+	const remove = async (file) => {
+		if (!await exists(file)) return;
+		await fs.rm(file, {
+			recursive: true,
+			force: true,
+			maxRetries: 5
+		});
+		if (!changes.includes(`removed ${file}`)) changes.push(`removed ${file}`);
+	};
+	const isStillGone = async () => !confirm || await confirm();
+	const stopped = (why) => ({
+		changes: [...changes, why],
+		isDone: false
+	});
+	const reinstalled = "stopped: Claude Code lists the plugin as installed again";
+	if (!await isStillGone()) return stopped(reinstalled);
+	if (await stopOurRunner(paths.claudeDir, runner)) changes.push("stopped the runner, which answered for this machine's rooms");
+	await remove(path.join(dir, "live"));
+	if (settleMs) await new Promise((r) => setTimeout(r, settleMs));
+	for (const name of WRITTEN) {
+		if (!await isStillGone()) return stopped(reinstalled);
+		await remove(path.join(dir, name));
+	}
+	const binary = claudeBinaryPath(paths.claudeDir);
+	const kind = await binaryRecord(binary);
+	if (kind === "auto") await remove(binary);
+	if (kind === "broken") changes.push(`kept ${binary}, which doesn't parse: it may have been edited by hand`);
+	if (confirm && (await Promise.all(SESSION_TRACES.map((name) => exists(path.join(dir, name))))).includes(true)) return stopped("stopped: a session still running the plugin wrote its files again; the hook stays, to try again on a later prompt");
+	if (!await isStillGone()) return stopped(reinstalled);
+	const record = wakeRecordPath(paths.claudeDir);
+	if (optOut) {
+		if (await writeIfChanged(record, JSON.stringify({ disabled: true }, null, 2) + "\n")) changes.push(`marked the wake hook as uninstalled in ${record}, so the plugin won't put it back`);
+	}
+	changes.push(...await uninstallHooks(paths));
+	await remove(wakeScriptPath(paths.claudeDir));
+	if (!optOut) await remove(record);
+	await remove(uninstallLogPath(paths.claudeDir));
+	await remove(uninstallLockPath(paths.claudeDir));
+	if (await fs.rmdir(dir).then(() => true, () => false)) changes.push(`removed ${dir}`);
+	return {
+		changes,
+		isDone: true
+	};
+}
+/**
+* How long uninstall waits for a detached data layer to see its lock has gone: two of its passes
+* (`streamSeconds`, with `defaultsPath` the mod's config.json and the person's config.json over
+* it) and a second. Ten seconds when the config can't be read.
+*/
+async function settleMs(claudeDir, defaultsPath) {
+	const config = await loadConfig(nodeIo(), defaultsPath, path.join(claudeDir, "isoplan", "config.json")).catch(() => null);
+	return config ? (2 * config.streamSeconds + 1) * 1e3 : 1e4;
+}
+/**
+* Ends the runner its lock names, and waits up to `waitMs` for it to exit; its worker and forks
+* follow its supervisor. One whose lock is stale (not kept fresh, after a sleep, say) is ended only
+* when its pid is alive and its command line runs this folder's copy of the runner, since after a
+* reboot the pid may name another process. True when one was ended.
+*/
+async function stopOurRunner(claudeDir, { isAlive = alive, kill = killTree, now = Date.now, commandOf, waitMs = 0 } = {}) {
+	const file = runnerLockPath(claudeDir);
+	const lock = await readLock(file);
+	const pid = lock?.pid;
+	if (!lock || !pid || !isAlive(pid)) return false;
+	if (now() - lock.mtimeMs >= 9e4) {
+		const command = commandOf ? await commandOf(pid) : null;
+		const runner = normalPath(path.join(runnerAppDir(claudeDir), copiedAs("dist/runner.js")));
+		if (!command || !command.replace(/\\/g, "/").toLowerCase().includes(runner.toLowerCase())) return false;
+	}
+	try {
+		kill(pid);
+	} catch {}
+	for (const until = now() + waitMs; isAlive(pid) && now() < until;) await new Promise((r) => setTimeout(r, 100));
+	await releaseLock(file, pid);
+	return true;
+}
+/**
+* Ends `pid` and what it started. On Windows a child outlives its parent, so the whole tree goes
+* at once (taskkill /T, hidden), and no fork keeps the runner's files open; elsewhere the
+* supervisor's worker follows it, as its stdin closes, and ends its forks.
+*/
+function killTree(pid) {
+	if (process.platform === "win32") spawnSync("taskkill", [
+		"/pid",
+		String(pid),
+		"/T",
+		"/F"
+	], {
+		windowsHide: true,
+		stdio: "ignore"
+	});
+	else process.kill(pid);
+}
+/** The command line of process `pid`; null when it can't be read. */
+async function processCommand(pid, platform = process.platform) {
+	try {
+		if (platform === "linux") return (await fs.readFile(`/proc/${pid}/cmdline`, "utf8")).replace(/\0/g, " ").trim() || null;
+		const [file, args] = platform === "win32" ? ["powershell.exe", [
+			"-NoProfile",
+			"-NonInteractive",
+			"-Command",
+			`(Get-CimInstance Win32_Process -Filter "ProcessId=${pid}").CommandLine`
+		]] : ["ps", [
+			"-o",
+			"command=",
+			"-p",
+			String(pid)
+		]];
+		const { stdout } = await promisify(execFile)(file, args, {
+			windowsHide: true,
+			timeout: 15e3
+		});
+		return stdout.trim() || null;
+	} catch {
+		return null;
+	}
+}
+async function uninstallHooks({ claudeDir, settings }) {
+	const isWake = isWakeFor(claudeDir);
 	const current = await readSettings(settings);
 	const changes = [];
 	const hooks = current.hooks;
@@ -6526,19 +6831,22 @@ async function uninstallWake({ claudeDir, settings }) {
 		if (changes.length && !Object.keys(hooks).length) delete current.hooks;
 	}
 	if (changes.length) await writeSettings(settings, current);
-	const script = wakeScriptPath(claudeDir);
-	if (await fs.rm(script).then(() => true, () => false)) changes.push(`removed ${script}`);
-	const record = { disabled: true };
-	await fs.mkdir(path.dirname(script), { recursive: true });
-	if (await writeIfChanged(wakeRecordPath(claudeDir), JSON.stringify(record, null, 2) + "\n")) changes.push(`marked the wake hook as uninstalled in ${wakeRecordPath(claudeDir)}, so the plugin won't put it back`);
 	return changes;
 }
-async function isHandSet(file) {
+const exists = (file) => fs.stat(file).then(() => true, () => false);
+async function binaryRecord(file) {
+	let text;
 	try {
-		const record = JSON.parse(await fs.readFile(file, "utf8"));
-		return typeof record.path === "string" && record.path !== "" && record.auto !== true;
+		text = await fs.readFile(file, "utf8");
 	} catch {
-		return false;
+		return "none";
+	}
+	try {
+		const record = JSON.parse(text);
+		if (record?.auto === true) return "auto";
+		return typeof record?.path === "string" && record.path !== "" ? "hand" : "broken";
+	} catch {
+		return "broken";
 	}
 }
 async function isOptedOut(claudeDir) {
@@ -6591,8 +6899,12 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 const claudeDir = claudePaths(process.env, os.homedir()).dir;
 const paths = {
 	claudeDir,
-	settings: path.join(claudeDir, "settings.json")
+	settings: path.join(claudeDir, "settings.json"),
+	plugins: pluginsDir(claudeDir, process.env),
+	managed: managedDir(process.platform),
+	pluginDirs: pluginDirsOf(process.env)
 };
+const RUNNER_EXIT_MS = 1e4;
 const uninstall = process.argv.includes("--uninstall");
 const start = (args, cwd, env) => spawn(process.execPath, args, {
 	cwd,
@@ -6602,14 +6914,20 @@ const start = (args, cwd, env) => spawn(process.execPath, args, {
 	windowsHide: true
 }).on("error", () => {}).unref();
 try {
-	const changes = uninstall ? await uninstallWake(paths) : await installWake(paths, path.join(here, "data-layer.js"), path.join(here, "wake.js"), {
+	const settle = () => settleMs(claudeDir, path.join(here, "..", "config.json"));
+	const changes = uninstall ? (await uninstall$1(paths, {
+		optOut: true,
+		settleMs: await settle(),
+		runner: {
+			commandOf: processCommand,
+			waitMs: RUNNER_EXIT_MS
+		}
+	})).changes : await installWake(paths, path.join(here, "data-layer.js"), path.join(here, "wake.js"), {
 		runnerFrom: path.join(here, ".."),
 		findClaude: () => findClaude(process.env, process.platform, os.homedir())
 	});
 	for (const change of changes) console.log(change);
-	if (!changes.length) console.log(uninstall ? "The wake hook wasn't installed; nothing to remove." : "The wake hook is already installed; nothing changed.");
-	if (uninstall && await stopRunner(claudeDir)) console.log("Stopped the runner, which answered for this machine's rooms.");
-	if (uninstall && await fs.rm(runnerEnvPath(claudeDir)).then(() => true, () => false)) console.log(`removed the runner's environment, ${runnerEnvPath(claudeDir)}`);
+	if (!changes.length) console.log(uninstall ? "Nothing of Isoplan's was installed; nothing to remove." : "The wake hook is already installed; nothing changed.");
 	if (!uninstall) {
 		if (!await fs.stat(claudeBinaryPath(claudeDir)).catch(() => null)) console.log("Couldn't find the claude binary, so the runner can't answer for this machine's rooms; set its path in " + claudeBinaryPath(claudeDir) + " as { \"path\": \"...\" }.");
 		if (await recordEnv(claudeDir, process.env)) console.log(`recorded the runner's environment in ${runnerEnvPath(claudeDir)}`);
