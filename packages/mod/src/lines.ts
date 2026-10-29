@@ -6,12 +6,15 @@ import type { ConflictMessage, ErrorMessage } from "@isoplan/protocol";
 
 /**
  * The link to the office server. `waiting`: nothing to report yet, so not connected.
- * `not-wanted`: the server holds this project in no office, so it isn't reported.
+ * `not-wanted`: the server holds this project in no office, so it isn't reported. `pairing`: the
+ * machine's link to pair it (the last `pair` line) waits to be clicked. `taken`: the session belongs to
+ * someone else on the office, so it isn't reported. `insecure`: the server is plain ws:// to another
+ * machine, so nothing is sent to it.
  */
 export interface StatusLine {
   type: "status";
   server: string;
-  state: "waiting" | "connecting" | "connected" | "disconnected" | "not-wanted";
+  state: "waiting" | "connecting" | "connected" | "disconnected" | "not-wanted" | "pairing" | "taken" | "insecure";
   /** With `disconnected`: when the next try is. */
   retryInMs?: number;
 }
@@ -30,6 +33,17 @@ export interface TitleAskLine {
   file: string;
 }
 
+/**
+ * The office server wants this machine paired (src/data-layer/pairing.ts): its person clicks `url`
+ * on this computer, before `expires`, and approves it on the floor.
+ */
+export interface PairLine {
+  type: "pair";
+  server: string;
+  url: string;
+  expires: string;
+}
+
 /** A problem worth a line in the debug log. */
 export interface LogLine {
   type: "log";
@@ -43,4 +57,4 @@ export interface TitleReply {
 }
 
 /** Office server messages are passed on as the server sent them (repair is the data layer's own). */
-export type DataLayerLine = StatusLine | TitleAskLine | LogLine | ConflictMessage | ErrorMessage;
+export type DataLayerLine = StatusLine | TitleAskLine | PairLine | LogLine | ConflictMessage | ErrorMessage;

@@ -1,5 +1,6 @@
 {
   "server": "ws://127.0.0.1:4747/data-layer",
+  "allowPlainWs": false,
   "activeMinutes": 2,
   "idleMinutes": 30,
   "lightsOffHours": 24,

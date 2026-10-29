@@ -63,6 +63,14 @@ export const HandoffSchema = z
     });
   });
 
+/**
+ * The machine's access token from pairing, which an office server that signs people in requires.
+ * It refuses a hello without one as `not-paired`, an expired or unknown one as `token-expired`, one
+ * whose pairing was revoked or has lapsed as `pairing-ended`, and one for a session another paired
+ * machine reports as `forged-hello`. A server that signs nobody in ignores it.
+ */
+const Token = z.string().min(1).max(200).optional();
+
 // Data layer → office server.
 
 /** The first message on a connection: who is reporting, from where, about which session. */
@@ -74,6 +82,7 @@ export const HelloMessageSchema = z.object({
   machine: Machine,
   session: z.string().min(1),
   project: ProjectSchema,
+  token: Token,
 });
 
 /** The first message on a runner's link: the one link per machine that answers requests for its rooms. */
@@ -82,6 +91,7 @@ export const RunnerHelloMessageSchema = z.object({
   v: Version,
   account: Account,
   machine: Machine,
+  token: Token,
 });
 
 /** All of the session's facts. Sent on connect and on repair. */

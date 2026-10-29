@@ -56,7 +56,13 @@ function claudePaths(env, home) {
 //#endregion
 //#region src/data-layer/config.ts
 async function loadConfig(io, defaultsPath, userPath) {
-	return loadSettings(io, defaultsPath, userPath);
+	const config = await loadSettings(io, defaultsPath, userPath);
+	const asked = (await readJson$1(io, userPath, true)).server;
+	if (typeof asked === "string" && URL.canParse(asked) && new URL(asked).protocol === "ws:" && !LOOPBACK.has(new URL(asked).hostname)) {
+		if (config.allowPlainWs) config.server = asked;
+		else config.plainRefused = asked;
+	}
+	return config;
 }
 /** The same per-key override for any settings file of the mod's, such as the runner's runner.json. */
 async function loadSettings(io, defaultsPath, userPath) {
@@ -6193,6 +6199,13 @@ const HandoffSchema = object({
 		});
 	});
 });
+/**
+* The machine's access token from pairing, which an office server that signs people in requires.
+* It refuses a hello without one as `not-paired`, an expired or unknown one as `token-expired`, one
+* whose pairing was revoked or has lapsed as `pairing-ended`, and one for a session another paired
+* machine reports as `forged-hello`. A server that signs nobody in ignores it.
+*/
+const Token = string().min(1).max(200).optional();
 discriminatedUnion("type", [
 	object({
 		type: literal("hello"),
@@ -6201,13 +6214,15 @@ discriminatedUnion("type", [
 		account: Account,
 		machine: Machine,
 		session: string().min(1),
-		project: ProjectSchema
+		project: ProjectSchema,
+		token: Token
 	}),
 	object({
 		type: literal("runner"),
 		v: Version,
 		account: Account,
-		machine: Machine
+		machine: Machine,
+		token: Token
 	}),
 	object({
 		type: literal("full"),
@@ -6726,6 +6741,8 @@ async function finishOptOut({ claudeDir, settings }) {
 const WRITTEN = [
 	"runner",
 	"pairing.json",
+	"pairing.lock",
+	"pairing.write.lock",
 	"live",
 	"logs",
 	"titles",

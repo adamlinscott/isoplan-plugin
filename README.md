@@ -17,6 +17,20 @@ Then point it at your office server: set `server` in `~/.claude/isoplan/config.j
 
 The plugin needs Node.js on `PATH`. When it first starts it puts a small hook in your `~/.claude/settings.json` (on `UserPromptSubmit` and `Stop`), so sessions that don't load the plugin are seen too, and copies the runner (below) into `~/.claude/isoplan/`.
 
+### Pairing this machine
+
+An office server that signs people in reports a machine only once someone has paired it, and what the machine reports is then that person's. The first time a session reports, Claude Code's status line shows a **Pair this machine** link, such as `https://your-office.example/#pair=...`, and the transcript shows it once per session start. Click it on this computer: the office asks you to sign in if you aren't, shows the machine, the Claude account it names and when it asked, and you approve it. Your browser is then sent back to this machine, to `http://127.0.0.1:<port>/...`, where the data layer that asked is listening, and it finishes pairing there with a secret it never sent. A link sent to someone else can't pair your machine to them, or theirs to you. The plugin never opens a browser itself, and nothing needs typing in a terminal. A session the plugin doesn't run in, and the runner, write the same link to their logs.
+
+The machine's credentials and access tokens are kept in `~/.claude/isoplan/pairing.json` (in `$CLAUDE_CONFIG_DIR/isoplan/` when that is set), with a random id the machine makes for itself the first time and one entry per Claude account, readable by you only (on Windows it takes the folder's permissions). `pairing.write.lock` beside it is held while the file is changed, and `pairing.lock` names the one process answering a link while one waits to be clicked. Pointing `server` elsewhere pairs that account again. The token lasts about an hour and is renewed on its own, and the link reconnects at once when the office closes it as the token runs out. If the pairing is revoked on the floor, or lapses after 30 days without the machine connecting, the next session shows a new link. Deleting the file unpairs the machine on this side; revoke it on the floor too.
+
+A session belongs to the person whose machine first reported it. If the office says it belongs to someone else, the status line says so and the session isn't reported; it asks again an hour later, in case an admin released it.
+
+A credential is never sent over plain `ws://` to another machine: such a `server` isn't used, and the status line says why, unless config.json sets `"allowPlainWs": true`, which sends facts and credentials unencrypted.
+
+One limit can't be designed out: a process already running as you on this machine could start a pairing of its own and show you its link. Approve only a pairing you started on this computer.
+
+A machine with no browser (a headless server) can't be paired yet.
+
 ## Disable or uninstall
 
 Claude Code runs nothing of a plugin's when you disable or uninstall it, so the hook in your settings looks for itself, each time a session takes a prompt, at what Claude Code records: `installed_plugins.json`, and `enabledPlugins` in your settings, the project's settings and a `managed-settings.json` file (not managed settings from MDM or the claude.ai console, which it can't read). The project is the session's `CLAUDE_PROJECT_DIR`, or its folder. An install at project or local scope counts only for that project's sessions.
@@ -26,7 +40,7 @@ Claude Code runs nothing of a plugin's when you disable or uninstall it, so the 
 **Uninstall** it (`/plugin uninstall isoplan@isoplan`, the plugin manager, or `claude plugin uninstall isoplan@isoplan`) and, the next time a session takes a prompt, the hook takes everything out in the background. That happens only once Claude Code lists no install of `isoplan` at all, from any marketplace and at any scope, and no folder in `CLAUDE_CODE_PLUGIN_DIRS` holds it, so moving to another marketplace isn't an uninstall. A copy you load with `--plugin-dir` leaves nothing it can find, so remove the marketplace install only once you no longer want it. What it takes out:
 
 - the runner, which it stops;
-- what the plugin wrote in `~/.claude/isoplan/`: the runner's copy and its records (`runner/`: the app, `environment.json`, the ledger, the lock), the machine's pairing credential (`pairing.json`), the session locks (`live/`), the logs (`logs/`), the title files (`titles/`), the hashes of reports you released (`released/`), and `claude-binary.json` unless you set it by hand;
+- what the plugin wrote in `~/.claude/isoplan/`: the runner's copy and its records (`runner/`: the app, `environment.json`, the ledger, the lock), the machine's pairing credential (`pairing.json`) and the lock of a pairing under way (`pairing.lock`), the session locks (`live/`), the logs (`logs/`), the title files (`titles/`), the hashes of reports you released (`released/`), and `claude-binary.json` unless you set it by hand;
 - last, the hook in `~/.claude/settings.json` (every other hook and setting is kept), the hook script and its record (`wake.mjs`, `wake.json`), and the uninstall's own lock and log (`uninstall.json`, `uninstall.log`).
 
 The files you write are kept: `config.json`, `runner.json`, `secret-patterns.json`, and a `claude-binary.json` you set by hand, so a reinstall picks them up again. Delete `~/.claude/isoplan/` yourself to take those too; once nothing is left in it, uninstall removes the folder.

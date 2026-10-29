@@ -4,6 +4,7 @@ import { afterEach, expect, test } from "vitest";
 import { WebSocketServer, type WebSocket as ServerSocket } from "ws";
 import type { DataLayerLine } from "../lines.js";
 import { createLink, type Link, type LinkOptions, type ServerAsk } from "./link.js";
+import type { Refusal } from "./pairing.js";
 
 const at = "2026-10-20T09:00:00.000Z";
 const hello: HelloMessage = {
@@ -220,4 +221,109 @@ test("link: replies kept while down are bounded, the oldest dropped first", asyn
   await until(() => s.got.length === 102);
   await new Promise((r) => setTimeout(r, 50));
   expect(s.got.slice(2).map((m) => m.id)).toEqual(Array.from({ length: 100 }, (_, i) => `q${i + 1}`));
+});
+
+test("link: a hello refused for its token is told to pairing, which pairs or renews, and the link tries again", async () => {
+  const s = await server();
+  // The server takes only the fresh token: no token is not-paired, an old one has expired.
+  s.wss.on("connection", (ws) => {
+    ws.once("message", (data) => {
+      const { token } = JSON.parse(String(data)) as { token?: string };
+      if (token === "fresh") return;
+      const code = token ? "token-expired" : "not-paired";
+      ws.send(JSON.stringify({ type: "error", v: PROTOCOL_VERSION, code, message: code === "not-paired" ? "Pair this machine first." : "expired" }));
+      ws.close(1008, code);
+    });
+  });
+  const refused: [string, string | undefined][] = [];
+  const answers: (string | null | undefined)[] = [undefined, null, "old", "fresh"];
+  const pairing = {
+    token: async () => answers.shift(),
+    refused: async (code: Refusal, sent: string | undefined) => void refused.push([code, sent]),
+    close: async () => {},
+  };
+  const { link: l, lines } = link(s.url, { pairing, pairPollMs: 20, retryBaseMs: 20, retryCapMs: 40 });
+  l.update(facts("active"));
+  await until(() => s.got.at(-1)?.type === "full" && s.got.at(-2)?.token === "fresh");
+  expect(refused).toEqual([["not-paired", undefined], ["token-expired", "old"]]);
+  expect(s.got.filter((m) => m.type === "hello").map((m) => m.token)).toEqual([undefined, "old", "fresh"]);
+  expect(lines.some((x) => x.type === "status" && x.state === "pairing")).toBe(true);
+  // The server's words on how to pair are shown; the renewal only logged.
+  expect(lines).toContainEqual({ type: "error", v: PROTOCOL_VERSION, code: "not-paired", message: "Pair this machine first." });
+  expect(lines.some((x) => x.type === "error" && x.code === "token-expired")).toBe(false);
+});
+
+test("link: hellos refused again and again back off, doubling up to the cap, though each socket opened", async () => {
+  const s = await server();
+  s.wss.on("connection", (ws) => {
+    ws.once("message", () => {
+      ws.send(JSON.stringify({ type: "error", v: PROTOCOL_VERSION, code: "not-paired", message: "no token here" }));
+      ws.close(1008, "not-paired");
+    });
+  });
+  const pairing = { token: async () => "unread" + "-token", refused: async () => {}, close: async () => {} };
+  const { link: l, lines } = link(s.url, { pairing, retryBaseMs: 20, retryCapMs: 80 });
+  l.update(facts("active"));
+  await until(() => lines.filter((x) => x.type === "status" && x.state === "disconnected").length >= 5);
+  const waits = lines.flatMap((x) => (x.type === "status" && x.state === "disconnected" ? [x.retryInMs] : []));
+  expect(waits.slice(0, 5)).toEqual([20, 40, 80, 80, 80]);
+});
+
+test("link: a runner's hello carries the machine's token too, and pairing-ended is told once the credential is dropped", async () => {
+  const s = await server();
+  s.wss.on("connection", (ws) => {
+    ws.once("message", () => {
+      ws.send(JSON.stringify({ type: "error", v: PROTOCOL_VERSION, code: "pairing-ended", message: "revoked" }));
+      ws.close(1008, "pairing-ended");
+    });
+  });
+  const events: string[] = [];
+  const pairing = {
+    token: async () => "machine" + "-token",
+    refused: async (code: Refusal) => void events.push(`refused ${code}`),
+    close: async () => {},
+  };
+  const runnerHello: RunnerHelloMessage = { type: "runner", v: PROTOCOL_VERSION, account: hello.account, machine: hello.machine };
+  link(s.url, { hello: runnerHello, pairing, onPairingEnded: () => events.push("ended") });
+  await until(() => events.includes("ended"));
+  expect(s.got[0]).toMatchObject({ type: "runner", token: "machine-token" });
+  expect(events.slice(0, 2)).toEqual(["refused pairing-ended", "ended"]);
+});
+
+test("link: forged-hello is shown and stops the link, which asks again only after takenRetryMs", async () => {
+  const s = await server();
+  s.wss.on("connection", (ws) => {
+    ws.once("message", () => {
+      ws.send(JSON.stringify({ type: "error", v: PROTOCOL_VERSION, code: "forged-hello", message: "session claude-code:s belongs to someone else on this office" }));
+      ws.close(1008, "forged-hello");
+    });
+  });
+  const pairing = { token: async () => "machine" + "-token", refused: async () => {}, close: async () => {} };
+  const { link: l, lines } = link(s.url, { pairing, takenRetryMs: 300 });
+  l.update(facts("active"));
+  await until(() => lines.some((x) => x.type === "status" && x.state === "taken"));
+  expect(lines).toContainEqual({ type: "error", v: PROTOCOL_VERSION, code: "forged-hello", message: "session claude-code:s belongs to someone else on this office" });
+  await new Promise((r) => setTimeout(r, 150)); // the fast backoff would have tried again by now
+  expect(s.sockets.length).toBe(1);
+  await until(() => s.sockets.length === 2);
+});
+
+test("link: a token that runs out on a link that stayed up is renewed and the link opened again at once, unseen", async () => {
+  const s = await server();
+  let opened = 0;
+  s.wss.on("connection", (ws) => {
+    if (++opened > 1) return;
+    // The first link is up a while, then its token runs out.
+    setTimeout(() => {
+      ws.send(JSON.stringify({ type: "error", v: PROTOCOL_VERSION, code: "token-expired", message: "expired" }));
+      ws.close(1008, "token-expired");
+    }, 20);
+  });
+  const tokens = ["first" + "-token", "second" + "-token"];
+  const pairing = { token: async () => tokens.shift() ?? "second" + "-token", refused: async () => {}, close: async () => {} };
+  const { link: l, lines } = link(s.url, { pairing, retryBaseMs: 1000, retryCapMs: 1000 });
+  l.update(facts("active"));
+  await until(() => s.got.filter((m) => m.type === "runner" || m.type === "hello").length === 2, 500);
+  expect(s.got.filter((m) => m.type === "hello").map((m) => m.token)).toEqual(["first-token", "second-token"]);
+  expect(lines.some((x) => x.type === "status" && x.state === "disconnected")).toBe(false);
 });

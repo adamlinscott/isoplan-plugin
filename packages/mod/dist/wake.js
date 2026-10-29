@@ -5,7 +5,13 @@ import fs from "node:fs/promises";
 import { promisify } from "node:util";
 //#region src/data-layer/config.ts
 async function loadConfig(io, defaultsPath, userPath) {
-	return loadSettings(io, defaultsPath, userPath);
+	const config = await loadSettings(io, defaultsPath, userPath);
+	const asked = (await readJson$1(io, userPath, true)).server;
+	if (typeof asked === "string" && URL.canParse(asked) && new URL(asked).protocol === "ws:" && !LOOPBACK.has(new URL(asked).hostname)) {
+		if (config.allowPlainWs) config.server = asked;
+		else config.plainRefused = asked;
+	}
+	return config;
 }
 /** The same per-key override for any settings file of the mod's, such as the runner's runner.json. */
 async function loadSettings(io, defaultsPath, userPath) {
@@ -493,6 +499,8 @@ async function recordedState(paths, cwd) {
 const WRITTEN = [
 	"runner",
 	"pairing.json",
+	"pairing.lock",
+	"pairing.write.lock",
 	"live",
 	"logs",
 	"titles",

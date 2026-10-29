@@ -5,7 +5,7 @@ import { NOW, line, session, tempRoot, touch } from "../data-layer/fixture.js";
 import { nodeIo } from "../data-layer/io.js";
 import { holdOff, lockHolder, refreshLock, takeLock } from "../wake/lock.js";
 import { wakeRecordPath } from "../wake/wake.js";
-import { anyRoomSince, askableMs, MAX_FAST_FAILURES, NOT_WANTED_CODE, supervise } from "./lifecycle.js";
+import { anyRoomSince, askableMs, MAX_FAST_FAILURES, NOT_WANTED_CODE, supervise, UNPAIRED_CODE } from "./lifecycle.js";
 import { applyClaudeDir, RUNNER_FRESH_MS, runnerCode, runnerLockPath, startRunner, stopRunner } from "./start.js";
 
 const OTHER = 4242; // a pid that isn't this process
@@ -128,6 +128,8 @@ test("lifecycle: a worker that keeps dying as it starts is given up on, with the
   expect(s.runs()).toBe(MAX_FAST_FAILURES);
   expect(s.logs.at(-1)).toContain(`the ${MAX_FAST_FAILURES}th time in a row within a minute of starting; giving up`);
   expect(await supervised([NOT_WANTED_CODE]).stopped).toBe("not-wanted");
+  // A pairing that ended stops it too, without counting as a crash.
+  expect(await supervised([UNPAIRED_CODE]).stopped).toBe("unpaired");
 });
 
 test("lifecycle: the worker stays while any room is inside its lights-off window", async () => {

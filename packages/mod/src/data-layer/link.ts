@@ -11,6 +11,17 @@
 // and waits, asking again once an hour rather than backing off fast. Only the plugin's data layer
 // sees that hour out; a detached one exits on `onNotWanted` (main.ts).
 //
+// An office server that signs people in wants the machine paired (pairing.ts): each try first takes
+// a token from `pairing`, and sends it in the hello. A hello refused as `not-paired`,
+// `pairing-ended` or `token-expired` is told to `pairing`, which pairs or renews, and the link tries
+// again: after retryBaseMs the first time, then backing off, doubling up to retryCapMs, until a
+// link stays up STABLE_MS. A token that ran out on a link that stayed up (the server closes it then)
+// is renewed and the link opened again at once, with no `disconnected` in between. While a link to
+// pair waits to be clicked the link shows `pairing` and looks again every `pairPollMs`.
+//
+// `forged-hello` means the session belongs to someone else on the office: the link shows `taken`
+// and stops, asking again only after `takenRetryMs`, in case an admin has released it.
+//
 // The runner (src/runner) uses the same link with its own hello and no facts. The server's
 // requests, releases and handoffs go to `onMessage`, and the runner's replies and refusals go out
 // through `send`. One sent while the link is down waits, and goes out after the next hello, within
@@ -33,6 +44,10 @@ import {
 } from "@isoplan/protocol";
 import type { DataLayerLine } from "../lines.js";
 import { diffFacts } from "./changes.js";
+import type { Pairing } from "./pairing.js";
+
+// A link up this long without being refused counts as let in: refusals are counted from zero again.
+const STABLE_MS = 30000;
 
 // Replies kept while the link is down: at most this many, the oldest dropped first, and none older
 // than this, which the server will have asked again for by then.
@@ -50,9 +65,17 @@ export interface LinkOptions {
   retryCapMs?: number;
   /** How long a link the server didn't want waits before asking again. */
   notWantedRetryMs?: number;
+  /** How long a link refused as forged-hello waits before asking again. */
+  takenRetryMs?: number;
   onNotWanted?: () => void;
+  /** The server said this machine's pairing has ended, once `pairing` has dropped the credential. */
+  onPairingEnded?: () => void;
   /** Takes the server's requests, releases and handoffs; without it they are logged as not handled. */
   onMessage?: (message: ServerAsk) => void;
+  /** Where the hello's token comes from, for a server that signs people in. */
+  pairing?: Pairing;
+  /** How often a link waiting for its code to be approved asks again. */
+  pairPollMs?: number;
   random?: () => number;
 }
 
@@ -78,8 +101,12 @@ export function createLink({
   retryBaseMs = 1000,
   retryCapMs = 30000,
   notWantedRetryMs = 3600000,
+  takenRetryMs = 3600000,
   onNotWanted,
+  onPairingEnded,
   onMessage,
+  pairing,
+  pairPollMs = 5000,
   random = Math.random,
 }: LinkOptions): Link {
   const outbox: { message: Outgoing; at: number }[] = [];
@@ -94,18 +121,46 @@ export function createLink({
   let retry: ReturnType<typeof setTimeout> | null = null;
   let isClosed = false;
   let isUnwanted = false; // the server said not-wanted on this connection
+  let sentToken: string | undefined; // the token this connection's hello carried
+  let refusing: Promise<void> = Promise.resolve(); // telling `pairing` of a refused hello
+  let isRefused = false; // the server refused this connection's hello for its token
+  let refusedFor: string | null = null; // why
+  let isTaken = false; // the server said the session belongs to someone else
+  let refusals = 0; // hellos refused for their token, in a row
+  let stable: ReturnType<typeof setTimeout> | null = null; // counts refusals from zero once the link has stayed up
 
   function connect() {
     retry = null;
+    if (!pairing) return open(undefined);
+    void refusing
+      .then(() => pairing.token())
+      .then(
+        (token) => {
+          if (isClosed) return;
+          if (token !== null) return open(token);
+          emit({ type: "status", server: url, state: "pairing" });
+          retry = setTimeout(connect, pairPollMs);
+        },
+        (err: unknown) => {
+          if (isClosed) return;
+          emit({ type: "log", text: `couldn't pair with the office server: ${String((err as Error)?.message ?? err)}` });
+          dropped();
+        },
+      );
+  }
+
+  function open(token: string | undefined) {
     emit({ type: "status", server: url, state: "connecting" });
     const ws = new WebSocket(url);
     socket = ws;
+    sentToken = token;
     ws.onopen = () => {
       if (socket !== ws) return;
       failures = 0;
       isOpen = true;
       seq = 0;
-      send(hello);
+      stable = setTimeout(() => (refusals = 0), STABLE_MS);
+      send(token ? { ...hello, token } : hello);
       for (const { message, at } of outbox.splice(0)) if (Date.now() - at < OUTBOX_MAX_AGE_MS) send(message);
       sendFull();
       emit({ type: "status", server: url, state: "connected" });
@@ -135,7 +190,29 @@ export function createLink({
     sent = null;
     if (pacing) clearTimeout(pacing);
     pacing = null;
+    if (stable) clearTimeout(stable);
+    stable = null;
     if (isClosed) return;
+    if (isTaken) {
+      isTaken = false;
+      emit({ type: "status", server: url, state: "taken" });
+      retry = setTimeout(connect, takenRetryMs);
+      return;
+    }
+    // Refusals back off on their own count: the socket opened each time, which resets `failures`.
+    if (isRefused) {
+      isRefused = false;
+      // A token that ran out on a link that had stayed up is renewed at once, unseen.
+      if (refusedFor === "token-expired" && refusals === 0) {
+        refusals++;
+        retry = setTimeout(connect, 0);
+        return;
+      }
+      const delay = Math.min(retryCapMs, retryBaseMs * 2 ** refusals++);
+      emit({ type: "status", server: url, state: "disconnected", retryInMs: delay });
+      retry = setTimeout(connect, delay);
+      return;
+    }
     if (isUnwanted) {
       isUnwanted = false;
       failures = 0;
@@ -198,6 +275,16 @@ export function createLink({
     } else if (message.type === "conflict" && !latest?.agents.some((a) => a.id === message.agent)) {
       // A note reaches a model's context, so only one for an agent of this session is taken.
       emit({ type: "log", text: `the office server sent a note for ${message.agent}, not an agent of this session` });
+    } else if (pairing && message.type === "error" && (message.code === "not-paired" || message.code === "pairing-ended" || message.code === "token-expired")) {
+      isRefused = true;
+      refusedFor = message.code;
+      refusing = pairing.refused(message.code, sentToken).catch(() => {});
+      if (message.code === "pairing-ended" && onPairingEnded) void refusing.then(onPairingEnded);
+      // The server's own words on how to pair are passed on; a renewal is the link's own business.
+      emit(message.code === "token-expired" ? { type: "log", text: "the office server says this machine's token has expired; renewing it" } : message);
+    } else if (message.type === "error" && message.code === "forged-hello") {
+      isTaken = true;
+      emit(message);
     } else if (message.type === "conflict" || message.type === "error") {
       emit(message);
       if (message.type === "error" && message.code === "not-wanted") {
@@ -230,6 +317,8 @@ export function createLink({
       isClosed = true;
       if (pacing) clearTimeout(pacing);
       if (retry) clearTimeout(retry);
+      if (stable) clearTimeout(stable);
+      void pairing?.close();
       socket?.close();
     },
   };

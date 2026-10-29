@@ -18,6 +18,9 @@ export const MAX_FAST_FAILURES = 5;
 /** The worker's exit code when the office server doesn't want this machine's runner. */
 export const NOT_WANTED_CODE = 3;
 
+/** The worker's exit code when the office server says this machine's pairing has ended. */
+export const UNPAIRED_CODE = 4;
+
 export interface SuperviseOptions {
   /** Runs the worker until it exits; its exit code, or null for a signal. */
   run: () => Promise<number | null>;
@@ -27,7 +30,7 @@ export interface SuperviseOptions {
 }
 
 /** Why the supervisor stopped. */
-export type Stopped = "done" | "not-wanted" | "gave-up";
+export type Stopped = "done" | "not-wanted" | "unpaired" | "gave-up";
 
 /** Runs the worker until it exits cleanly, starting it again after each crash, up to MAX_FAST_FAILURES in a row. */
 export async function supervise({ run, log, sleep = (ms) => new Promise((r) => setTimeout(r, ms)), now = Date.now }: SuperviseOptions): Promise<Stopped> {
@@ -37,6 +40,7 @@ export async function supervise({ run, log, sleep = (ms) => new Promise((r) => s
     const code = await run();
     if (code === 0) return "done";
     if (code === NOT_WANTED_CODE) return "not-wanted";
+    if (code === UNPAIRED_CODE) return "unpaired";
     failures = now() - startedAt >= STABLE_MS ? 1 : failures + 1;
     const how = code === null ? "was killed" : `exited with code ${code}`;
     if (failures >= MAX_FAST_FAILURES) {

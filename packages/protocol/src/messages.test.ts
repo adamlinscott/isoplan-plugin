@@ -110,6 +110,8 @@ const valid = {
     project: { id: "github.com/adamlinscott/isoplan", name: "isoplan" },
   },
   runner: { type: "runner", v, account: adam, machine: { name: "sevengill" } },
+  "hello with a token": { type: "hello", v, source: "claude-code", account: adam, machine: { name: "sevengill" }, session: "claude-code:s1", project: { id: "github.com/adamlinscott/isoplan", name: "isoplan" }, token: "a1b2" + ".c3d4" },
+  "runner with a token": { type: "runner", v, account: adam, machine: { name: "sevengill" }, token: "a1b2" + ".c3d4" },
   full: { type: "full", v, seq: 0, facts },
   changes: { type: "changes", v, seq: 1, upsert: {}, remove: {} },
   "reply answer-question": { type: "reply", v, id: "r1", kind: "answer-question", answer: "Because of the CRLF check." },
@@ -159,6 +161,8 @@ const valid = {
 const parsers = {
   hello: parseDataLayerMessage,
   runner: parseDataLayerMessage,
+  "hello with a token": parseDataLayerMessage,
+  "runner with a token": parseDataLayerMessage,
   full: parseDataLayerMessage,
   changes: parseDataLayerMessage,
   "reply answer-question": parseDataLayerMessage,
@@ -192,6 +196,8 @@ const parsers = {
 const broken: Record<keyof typeof valid, [unknown, string]> = {
   hello: [{ ...valid.hello, project: { id: "github.com/a/b" } }, "project.name"],
   runner: [{ ...valid.runner, machine: {} }, "machine.name"],
+  "hello with a token": [{ ...valid["hello with a token"], token: "" }, "token"],
+  "runner with a token": [{ ...valid["runner with a token"], token: 7 }, "token"],
   full: [{ ...valid.full, facts: { ...facts, agents: [{ ...lead, status: "busy" }] } }, "facts.agents[0].status"],
   changes: [{ ...valid.changes, seq: -1 }, "seq"],
   "reply answer-question": [{ ...valid["reply answer-question"], answer: "" }, "answer"],
