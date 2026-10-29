@@ -114,6 +114,7 @@ const valid = {
   changes: { type: "changes", v, seq: 1, upsert: {}, remove: {} },
   "reply answer-question": { type: "reply", v, id: "r1", kind: "answer-question", answer: "Because of the CRLF check." },
   "reply write-brief": { type: "reply", v, id: "r2", kind: "write-brief", handoff },
+  "reply write-brief fallback": { type: "reply", v, id: "r2", kind: "write-brief", handoff, fallback: true },
   "reply owner-answer": { type: "reply", v, id: "r3", kind: "owner-answer" },
   "refusal over-cap": { type: "refusal", v, id: "r1", reason: "over-cap", cap: "owner-tokens" },
   "refusal withheld": { type: "refusal", v, id: "r1", reason: "withheld" },
@@ -121,6 +122,7 @@ const valid = {
   "hand-over": { type: "hand-over", v, to: "sam@example.com", handoff },
   take: { type: "take", v, code: "K4P9-2QX" },
   taken: { type: "taken", v, handoff: "h7k2", failures: [{ step: "setup", output: "pnpm: command not found" }, { step: "checkout", repo: "libs/core", output: "" }] },
+  "taken by a runner": { type: "taken", v, handoff: "h7k2", session: "claude-code:0b5c", failures: [] },
   repair: { type: "repair", v, reason: "missed seq 4" },
   conflict: { type: "conflict", v, agent: worker.id, file: "src/a.ts", text: "Another agent edited src/a.ts." },
   error: { type: "error", v, code: "not-paired", message: "Pair this machine first." },
@@ -146,6 +148,7 @@ const valid = {
   },
   release: { type: "release", v, id: "r1" },
   handoff: { type: "handoff", v, handoff },
+  "handed-over": { type: "handed-over", v, handoff: "h7k2", to: sam },
 };
 
 const parsers = {
@@ -155,6 +158,7 @@ const parsers = {
   changes: parseDataLayerMessage,
   "reply answer-question": parseDataLayerMessage,
   "reply write-brief": parseDataLayerMessage,
+  "reply write-brief fallback": parseDataLayerMessage,
   "reply owner-answer": parseDataLayerMessage,
   "refusal over-cap": parseDataLayerMessage,
   "refusal withheld": parseDataLayerMessage,
@@ -162,6 +166,7 @@ const parsers = {
   "hand-over": parseDataLayerMessage,
   take: parseDataLayerMessage,
   taken: parseDataLayerMessage,
+  "taken by a runner": parseDataLayerMessage,
   repair: parseOfficeServerMessage,
   conflict: parseOfficeServerMessage,
   error: parseOfficeServerMessage,
@@ -170,6 +175,7 @@ const parsers = {
   "request owner-answer": parseOfficeServerMessage,
   release: parseOfficeServerMessage,
   handoff: parseOfficeServerMessage,
+  "handed-over": parseOfficeServerMessage,
 } satisfies Record<keyof typeof valid, (value: unknown) => ParseResult<unknown>>;
 
 // Each message with one field made wrong, and the path the error should name.
@@ -180,6 +186,7 @@ const broken: Record<keyof typeof valid, [unknown, string]> = {
   changes: [{ ...valid.changes, seq: -1 }, "seq"],
   "reply answer-question": [{ ...valid["reply answer-question"], answer: "" }, "answer"],
   "reply write-brief": [{ ...valid["reply write-brief"], handoff: { ...handoff, repos: [] } }, "handoff.repos"],
+  "reply write-brief fallback": [{ ...valid["reply write-brief fallback"], fallback: false }, "fallback"],
   "reply owner-answer": [{ ...valid["reply owner-answer"], id: "" }, "id"],
   "refusal over-cap": [{ ...valid["refusal over-cap"], cap: "per-week" }, "cap"],
   "refusal withheld": [{ ...valid["refusal withheld"], reason: "secret" }, "reason"],
@@ -187,6 +194,7 @@ const broken: Record<keyof typeof valid, [unknown, string]> = {
   "hand-over": [{ ...valid["hand-over"], handoff: { ...handoff, id: "H 7" } }, "handoff.id"],
   take: [{ ...valid.take, code: "" }, "code"],
   taken: [{ ...valid.taken, failures: [{ step: "push", output: "" }] }, "failures[0].step"],
+  "taken by a runner": [{ ...valid["taken by a runner"], session: "" }, "session"],
   repair: [{ ...valid.repair, reason: 4 }, "reason"],
   conflict: [{ ...valid.conflict, file: undefined }, "file"],
   error: [{ ...valid.error, code: "" }, "code"],
@@ -195,6 +203,7 @@ const broken: Record<keyof typeof valid, [unknown, string]> = {
   "request owner-answer": [{ ...valid["request owner-answer"], answers: { q: 1 } }, "answers.q"],
   release: [{ ...valid.release, id: 3 }, "id"],
   handoff: [{ ...valid.handoff, handoff: { ...handoff, repos: [{ ...handoff.repos[0], commit: "0123abc" }] } }, "handoff.repos[0].commit"],
+  "handed-over": [{ ...valid["handed-over"], to: { id: "", name: "Sam" } }, "to.id"],
 };
 
 describe.each(Object.keys(valid) as (keyof typeof valid)[])("%s", (type) => {

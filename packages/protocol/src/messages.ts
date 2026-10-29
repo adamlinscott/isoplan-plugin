@@ -104,7 +104,9 @@ export const ChangesMessageSchema = z.object({
 /** The answer to a request, carrying the request's id and kind. */
 export const ReplyMessageSchema = z.discriminatedUnion("kind", [
   z.object({ type: z.literal("reply"), v: Version, id: RequestId, kind: z.literal("answer-question"), answer: z.string().min(1) }),
-  z.object({ type: z.literal("reply"), v: Version, id: RequestId, kind: z.literal("write-brief"), handoff: HandoffSchema }),
+  // `fallback`: the fork couldn't write the brief, so `brief` is only the runner's note of what was
+  // pushed, and the server writes the rest from the room's feed. The branch is pushed either way.
+  z.object({ type: z.literal("reply"), v: Version, id: RequestId, kind: z.literal("write-brief"), handoff: HandoffSchema, fallback: z.literal(true).optional() }),
   // The owner's answer reached the question that was waiting for it.
   z.object({ type: z.literal("reply"), v: Version, id: RequestId, kind: z.literal("owner-answer") }),
 ]);
@@ -147,12 +149,15 @@ export const TakeMessageSchema = z.object({
 
 /**
  * The receiver took the handoff and joins its room. Each step that failed is listed with the repo it
- * was for and the end of its output; the session opens anyway.
+ * was for and the end of its output; the session opens anyway. From a runner, `session` is the
+ * session it opened, which joins the room; without one no session opened (no clone to work in, or
+ * no terminal), so the handoff is still there to take. From a session, the session itself joins.
  */
 export const TakenMessageSchema = z.object({
   type: z.literal("taken"),
   v: Version,
   handoff: HandoffId,
+  session: z.string().min(1).optional(),
   failures: z.array(
     z.object({
       step: z.enum(["worktree", "setup", "checkout", "open"]),
@@ -262,6 +267,14 @@ export const HandoffMessageSchema = z.object({
   handoff: HandoffSchema,
 });
 
+/** The sender's hand-over reached the room: `to` is the receiver the server found for the name given. */
+export const HandedOverMessageSchema = z.object({
+  type: z.literal("handed-over"),
+  v: Version,
+  handoff: HandoffId,
+  to: Account,
+});
+
 export const OfficeServerMessageSchema = z.discriminatedUnion("type", [
   RepairMessageSchema,
   ConflictMessageSchema,
@@ -269,6 +282,7 @@ export const OfficeServerMessageSchema = z.discriminatedUnion("type", [
   RequestMessageSchema,
   ReleaseMessageSchema,
   HandoffMessageSchema,
+  HandedOverMessageSchema,
 ]);
 
 export type Project = z.infer<typeof ProjectSchema>;
@@ -291,6 +305,7 @@ export type RequestMessage = z.infer<typeof RequestMessageSchema>;
 export type RequestKind = RequestMessage["kind"];
 export type ReleaseMessage = z.infer<typeof ReleaseMessageSchema>;
 export type HandoffMessage = z.infer<typeof HandoffMessageSchema>;
+export type HandedOverMessage = z.infer<typeof HandedOverMessageSchema>;
 export type OfficeServerMessage = z.infer<typeof OfficeServerMessageSchema>;
 
 /**
