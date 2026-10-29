@@ -8,7 +8,9 @@
 // The session is $CLAUDE_CODE_SESSION_ID and its folder $CLAUDE_PROJECT_DIR (else this process's
 // folder, which a cd in the agent's shell may have moved), both of which Claude Code sets for the
 // commands it runs. Each talks to the office server over its own short link (connection.ts), as that
-// session.
+// session. With sign-in on, its hello carries this machine's pairing token (#23), renewed once when
+// the server says it has run out; the commands never pair the machine, and say what to do when the
+// server refuses them for it.
 //
 // On the command path the live agent writes the brief, in its own turn, then runs hand-over. That
 // adds the runner's note (the branch and the untracked files), scans the brief for secrets, asks
@@ -32,8 +34,9 @@ import { accountOf, claudePaths, projectOf } from "../data-layer/identity.js";
 import { nodeIo } from "../data-layer/io.js";
 import { fill, loadPrompts } from "../runner/prompts.js";
 import { loadPatterns, scan } from "../runner/scan.js";
-import { openSideLink } from "./connection.js";
-import { createRunGit, gitFailed, handoffBranch, handoffNote, HandoffGitError, newHandoffId, prepare, pushHandoff, untrackedLine } from "./git.js";
+import { createPairing, pairingLockPath, pairingPath, pairingWriteLockPath, postJson, readPairing } from "../data-layer/pairing.js";
+import { openPairedLink, PairingRefused, type CommandPairing } from "./connection.js";
+import { createRunGit, gitFailed, handoffBranch, handoffNote, HandoffGitError, newHandoffId, prepare, pushHandoff, repoBranch, untrackedLine } from "./git.js";
 import { checkoutHere, handoffDir, setupCommand, type TakeSettings } from "./take.js";
 
 const ANSWER_MS = 20000;
@@ -73,7 +76,7 @@ const stop = (text: string): never => {
 };
 
 async function settings() {
-  return loadSettings<TakeSettings>(io, path.join(modDir, "runner.json"), path.join(isoplanDir, "runner.json"));
+  return loadSettings<TakeSettings & { repoSearchDepth: number }>(io, path.join(modDir, "runner.json"), path.join(isoplanDir, "runner.json"));
 }
 
 async function hello(cwd: string): Promise<HelloMessage> {
@@ -92,8 +95,53 @@ async function hello(cwd: string): Promise<HelloMessage> {
   };
 }
 
-async function server(): Promise<string> {
-  return (await loadConfig(io, path.join(modDir, "config.json"), path.join(isoplanDir, "config.json"))).server;
+/**
+ * The office server and this machine's pairing with it (#23), as a command uses it: the token goes
+ * in the hello when the machine holds a credential, and is renewed as the data layer would. A
+ * command never pairs the machine: it never asks the server to start a pairing, which the session's
+ * data layer does, with its link in the status line.
+ */
+async function office(): Promise<{ server: string; pairing: CommandPairing & { close(): Promise<void> } }> {
+  const config = await loadConfig(io, path.join(modDir, "config.json"), path.join(isoplanDir, "config.json"));
+  const file = pairingPath(claudeDir);
+  // The pairing is the machine's, whichever folder the session is in.
+  const account = await accountOf({ readText: (p) => fs.readFile(p, "utf8").catch(() => null), run: io.run }, claudeJson, os.homedir());
+  const pairing = createPairing({
+    file,
+    lock: pairingLockPath(claudeDir),
+    writeLock: pairingWriteLockPath(claudeDir),
+    server: config.server,
+    account,
+    machine: os.hostname(),
+    emit: () => {},
+    allowPlainWs: config.allowPlainWs,
+    post: (url, body) => (new URL(url).pathname.endsWith("/pair") ? Promise.reject(new Error("a command doesn't pair this machine")) : postJson(url, body)),
+  });
+  return {
+    server: config.server,
+    pairing: {
+      async token() {
+        const entry = (await readPairing(file)).accounts[account.id];
+        if (!entry?.credential || entry.server !== config.server) return undefined;
+        return (await pairing.token().catch((err: Error) => stop(`This machine's pairing token couldn't be had: ${err.message}`))) ?? undefined;
+      },
+      refused: (code, sent) => pairing.refused(code, sent),
+      close: () => pairing.close(),
+    },
+  };
+}
+
+// The link and its first answer, as this machine's pairing; a refusal for the pairing stops the command.
+async function exchange<T extends OfficeServerMessage>(cwd: string, first: Parameters<typeof openPairedLink>[3], wanted: (m: OfficeServerMessage) => m is T, before = "") {
+  const { server, pairing } = await office();
+  try {
+    return await openPairedLink(server, await hello(cwd), pairing, first, wanted, ANSWER_MS);
+  } catch (err) {
+    if (err instanceof PairingRefused) stop(`${before}${err.message}`);
+    throw err;
+  } finally {
+    await pairing.close();
+  }
 }
 
 const said = (m: Extract<OfficeServerMessage, { type: "error" }>) => `The office server says: ${m.message}`;
@@ -118,11 +166,12 @@ async function prepareCommand(argv: string[]): Promise<string> {
   await fs.mkdir(folder, { recursive: true });
   const brief = fill((await loadPrompts(path.join(modDir, "prompts"))).brief, { to, untracked: untrackedLine(prepared.files) });
   const subs = prepared.repos.filter((r) => r.path !== ".");
-  const repos = subs.length ? [`Repos, by path in this folder: ${prepared.repos.map((r) => `${r.path}${r.from ? ` (from ${r.from})` : ""}`).join(", ")}`] : [];
-  return [`Handoff id: ${id}`, `Brief file: ${path.join(folder, "brief.md")}`, `Branch: ${handoffBranch(id)}${prepared.from ? `, made from ${prepared.from}` : ""}`, ...repos, "", brief].join("\n");
+  const repos = subs.length ? [`Repos, by path in this folder: ${prepared.repos.map((r) => `${r.path} (${repoBranch(id, r)}${r.from ? `, from ${r.from}` : ""})`).join(", ")}`] : [];
+  const left = prepared.left.length ? [`Left out: ${prepared.left.map((l) => `${l.path} (${l.why})`).join("; ")}`] : [];
+  return [`Handoff id: ${id}`, `Brief file: ${path.join(folder, "brief.md")}`, `Branch: ${handoffBranch(id)}${prepared.from ? `, made from ${prepared.from}` : ""}`, ...repos, ...left, "", brief].join("\n");
 }
 
-// --push-anyway <commit> for the session folder's own repo, or <repo>=<commit> for one under it, as often as there are held repos.
+// --push-anyway <commit> for the session folder's own repo, or <repo>=<commit> for one under it, once per held repo.
 function pushAnywayOf(argv: string[]): Record<string, string> {
   const out: Record<string, string> = {};
   argv.forEach((arg, i) => {
@@ -147,27 +196,30 @@ async function handOverCommand(argv: string[]): Promise<string> {
   const cwd = sessionDir();
   const s = await settings();
   const timeoutMs = s.gitTimeoutSeconds * 1000;
-  const { from, files, repos, left } = await prepare(run, cwd, timeoutMs, s.repoSearchDepth).catch((err: unknown) => stop(err instanceof HandoffGitError ? `Can't hand over from here: ${gitFailed(err)}.` : String(err)));
+  // Prepared once: the note names the repos the push then hands over.
+  const prepared = await prepare(run, cwd, timeoutMs, s.repoSearchDepth).catch((err: unknown) => stop(err instanceof HandoffGitError ? `Can't hand over from here: ${gitFailed(err)}.` : String(err)));
+  const { from, files, repos, left } = prepared;
   const brief = `${written}\n\n${handoffNote({ branch: handoffBranch(id), from, files, at: new Date(), repos, left })}`;
   const patterns = await loadPatterns(path.join(modDir, "secret-patterns.json"), path.join(isoplanDir, "secret-patterns.json"), () => {});
   const matched = scan(brief, patterns);
   if (matched) stop(`The brief wasn't sent: it matches the secret pattern "${matched}". Take that out of ${file} and run hand-over again.`);
 
-  const link = await openSideLink(await server(), await hello(cwd), ANSWER_MS);
+  // The server says whether it would take this hand-over before anything is pushed.
+  const { link, answer: ready } = await exchange(cwd, { type: "hand-over-check", v: PROTOCOL_VERSION, to, handoff: id }, (m): m is HandOverReadyMessage => m.type === "hand-over-ready" && m.handoff === id, "Nothing was pushed. ");
   try {
-    // The server says whether it would take this hand-over before anything is pushed.
-    link.send({ type: "hand-over-check", v: PROTOCOL_VERSION, to, handoff: id });
-    const ready = await link.next((m): m is HandOverReadyMessage => m.type === "hand-over-ready" && m.handoff === id, ANSWER_MS);
     if (ready.type === "error") stop(`Nothing was pushed. ${said(ready)}`);
-    const pushed = await pushHandoff(run, cwd, id, timeoutMs, { scan: async (text) => scan(text, patterns), pushAnyway, depth: s.repoSearchDepth }).catch((err: unknown) =>
-      stop(err instanceof HandoffGitError ? `The handoff wasn't sent: ${gitFailed(err)}.\n${err.detail}` : String(err)),
+    const pushed = await pushHandoff(run, cwd, id, timeoutMs, { scan: async (text) => scan(text, patterns), pushAnyway, prepared }).catch((err: unknown) =>
+      stop(
+        err instanceof HandoffGitError
+          ? `The handoff wasn't sent: ${gitFailed(err)}.${err.pushed.length ? ` Run hand-over again with --id ${id} once that is fixed: it pushes the rest.` : ""}\n${err.detail}`
+          : String(err),
+      ),
     );
     if ("held" in pushed) {
       const unchecked = pushed.unchecked.length ? ` These files couldn't be checked (binary): ${pushed.unchecked.join(", ")}.` : "";
-      const where = pushed.repo === "." ? "" : ` (in the repo ${pushed.repo})`;
-      const again = pushed.repo === "." ? pushed.commit : `${pushed.repo}=${pushed.commit}`;
+      const again = Object.entries(pushed.commits).map(([repo, commit]) => `--push-anyway ${repo === "." ? commit : `${repo}=${commit}`}`);
       const kept = Object.keys(pushAnyway).length ? ", keeping the --push-anyway you gave already" : "";
-      stop(`Nothing was pushed: the lines the push would send to ${pushed.held}${where} match a secret pattern.${unchecked} Take the secret out, or, if it isn't one, run hand-over again with --push-anyway ${again}${kept}, to push that exact commit.`);
+      stop(`Nothing was pushed: the lines the push would send to ${pushed.held.join(", ")} match a secret pattern.${unchecked} Take the secrets out, or, if they aren't any, run hand-over again with ${again.join(" ")}${kept}, to push those exact commits.`);
     }
     const { repos: sent } = pushed as { repos: HandoffRepo[] };
     const branch = handoffBranch(id);
@@ -176,7 +228,7 @@ async function handOverCommand(argv: string[]): Promise<string> {
     if (answer.type === "error") stop(`${said(answer)}\nThe branch ${branch} is pushed; run hand-over again with the same id once that is fixed.`);
     const name = (answer as HandedOverMessage).to.name || (answer as HandedOverMessage).to.id;
     if (path.resolve(path.dirname(file)) === path.resolve(outDir(id))) await fs.rm(outDir(id), { recursive: true, force: true }).catch(() => {});
-    const inRepos = sent.some((r) => r.path !== ".") ? ` in ${sent.map((r) => r.path).join(", ")}` : "";
+    const inRepos = sent.some((r) => r.path !== ".") ? ` in ${sent.map((r) => (r.branch === branch ? r.path : `${r.path} (as ${r.branch})`)).join(", ")}` : "";
     return `Handed over to ${name}, on ${branch}${inRepos}. They will see a Take handoff button in the room on the floor.`;
   } finally {
     await link.close();
@@ -190,31 +242,28 @@ async function takeCommand(argv: string[]): Promise<string> {
   const s = await settings();
   const timeoutMs = s.gitTimeoutSeconds * 1000;
   const patterns = await loadPatterns(path.join(modDir, "secret-patterns.json"), path.join(isoplanDir, "secret-patterns.json"), () => {});
-  const link = await openSideLink(await server(), await hello(cwd), ANSWER_MS);
+  const { link, answer } = await exchange(cwd, { type: "take", v: PROTOCOL_VERSION, code }, (m): m is HandoffMessage => m.type === "handoff");
   try {
-    link.send({ type: "take", v: PROTOCOL_VERSION, code });
-    const answer = await link.next((m): m is HandoffMessage => m.type === "handoff", ANSWER_MS);
     if (answer.type === "error") stop(said(answer));
     const { handoff } = answer as HandoffMessage;
-    const { failures, remote } = await checkoutHere(run, cwd, handoff, handoffDir(claudeDir, handoff.id), timeoutMs);
+    const { failures, remote, dir } = await checkoutHere(run, cwd, handoff, handoffDir(claudeDir, handoff.id), timeoutMs);
     // Git's output leaves this machine only after the scan.
     const sent = failures.map((f) => (scan(f.output, patterns) ? { ...f, output: "The end of its output is withheld here: it matches a secret pattern." } : f));
     link.send({ type: "taken", v: PROTOCOL_VERSION, handoff: handoff.id, failures: sent });
     const branch = handoffBranch(handoff.id);
     const own = failures.find((f) => !f.repo);
-    const subs = handoff.repos.filter((r) => r.path !== ".").map((r) => r.path);
-    const done = subs.filter((p) => !failures.some((f) => f.repo === p));
+    const done = handoff.repos.filter((r) => r.path !== "." && !failures.some((f) => f.repo === r.path));
     const checkout = own
-      ? `The checkout of ${branch} failed, so this folder is as it was:\n${own.output}`
+      ? `The checkout of ${branch} failed, so this folder and the repos in it are as they were:\n${own.output}`
       : [
-          handoff.repos.some((r) => r.path === ".") ? `This folder is now on ${branch}.` : "",
-          done.length ? `These repos in it are now on ${branch}: ${done.join(", ")}.` : "",
-          ...failures.map((f) => `The checkout of ${branch} in ${f.repo} failed, so that repo is as it was:\n${f.output}`),
+          handoff.repos.some((r) => r.path === ".") ? `The repo at ${dir} is now on ${branch}.` : "",
+          done.length ? `These repos in ${dir} are now on their handoff branches: ${done.map((r) => `${r.path} (${r.branch})`).join(", ")}.` : "",
+          ...failures.map((f) => `The checkout of ${f.repo} failed, so that repo is as it was:\n${f.output}`),
         ]
           .filter(Boolean)
           .join("\n");
     // No setup runs on this path; the agent is told when the repo has one, in case it matters here.
-    const setup = remote ? await setupCommand(run, { dir: cwd, remote }, process.platform, timeoutMs) : null;
+    const setup = remote ? await setupCommand(run, { dir, remote }, process.platform, timeoutMs) : null;
     const setupNote = setup ? [`The repo's worktree setup script has NOT been run here: \`${setup}\` (from isoplan.json). Run it only if this folder isn't set up yet.`] : [];
     return [`You have taken Isoplan handoff ${handoff.id}, and this session is in its room now.`, checkout, ...setupNote, "", "The brief:", "", handoff.brief].join("\n");
   } finally {

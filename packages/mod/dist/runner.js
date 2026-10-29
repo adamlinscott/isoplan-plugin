@@ -5,6 +5,8 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import http from "node:http";
+import { realpath } from "node:fs";
+import { promisify } from "node:util";
 //#region ../../node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/core/util.js
 function getEnumValues(entries) {
 	const numericValues = Object.values(entries).filter((v) => typeof v === "number");
@@ -5807,32 +5809,42 @@ const Machine = object({ name: string().min(1) });
 const RequestId = string().min(1);
 /** A handoff's id. It names the handoff's branch, `isoplan/handoff/<id>`, so it keeps to safe characters. */
 const HandoffId = string().max(64).regex(/^[a-z0-9][a-z0-9-]*$/, "lowercase letters, digits and dashes");
+const isGitFolder$1 = (segment) => {
+	const name = segment.replace(/[. ]+$/, "").toLowerCase();
+	return name === ".git" || /^git~\d+$/.test(name);
+};
 /**
 * One repo a handoff pushed: its path in the session's folder (`.` for the folder itself), remote,
 * branch and commit. A handoff drives git on the receiver's machine, so the path stays inside the
-* folder and the remote can't name a transport helper such as `ext::`, which runs a command.
+* folder, out of any `.git` folder (in any spelling Windows reads as one: `.GIT.`, `.git `, `GIT~1`),
+* and the remote can't name a transport helper such as `ext::`, which runs a command.
 */
 const HandoffRepoSchema = object({
-	path: string().min(1).refine((path) => !/^([\\/]|[A-Za-z]:)/.test(path), "a path relative to the session's folder").refine((path) => !path.split(/[\\/]/).includes(".."), "a path inside the session's folder, with no `..`").refine((path) => !path.startsWith("-"), "a path that doesn't start with `-`, which git would read as an option"),
+	path: string().min(1).refine((path) => !/^([\\/]|[A-Za-z]:)/.test(path), "a path relative to the session's folder").refine((path) => !path.split(/[\\/]/).includes(".."), "a path inside the session's folder, with no `..`").refine((path) => !path.startsWith("-"), "a path that doesn't start with `-`, which git would read as an option").refine((path) => !path.split(/[\\/]/).some(isGitFolder$1), "a path that isn't in a `.git` folder"),
 	remote: string().min(1).refine((remote) => !/^[A-Za-z0-9+.-]+::/.test(remote), "a remote with no transport helper (`<transport>::`)").refine((remote) => !remote.startsWith("-"), "a remote that doesn't start with `-`, which git would read as an option"),
 	branch: string().min(1),
 	commit: string().regex(/^([0-9a-f]{40}|[0-9a-f]{64})$/, "a full commit hash")
 });
-/** What the receiver gets: the brief, and every repo pushed for it, each on the handoff's own branch. */
+/**
+* What the receiver gets: the brief, and every repo pushed for it, each on the handoff's own branch,
+* `isoplan/handoff/<id>`. Repos that push to the same remote can't share one, so each after the
+* first has `isoplan/handoff/<id>--<its path, as lowercase letters, digits and dashes>`.
+*/
 const HandoffSchema = object({
 	id: HandoffId,
 	brief: string().min(1),
 	repos: array(HandoffRepoSchema).min(1)
 }).superRefine((handoff, context) => {
 	handoff.repos.forEach((repo, i) => {
-		if (repo.branch !== `isoplan/handoff/${handoff.id}`) context.addIssue({
+		const own = `isoplan/handoff/${handoff.id}`;
+		if (repo.branch !== own && !(repo.branch.startsWith(`${own}--`) && /^[a-z0-9]+(-[a-z0-9]+)*$/.test(repo.branch.slice(own.length + 2)))) context.addIssue({
 			code: "custom",
 			path: [
 				"repos",
 				i,
 				"branch"
 			],
-			message: `the handoff's branch, isoplan/handoff/${handoff.id}`
+			message: `the handoff's branch, isoplan/handoff/${handoff.id} or isoplan/handoff/${handoff.id}--<slug>`
 		});
 	});
 });
@@ -8551,16 +8563,19 @@ var HandoffGitError = class extends Error {
 	kind;
 	detail;
 	repo;
-	constructor(kind, detail, repo = ".") {
+	pushed;
+	constructor(kind, detail, repo = ".", pushed = []) {
 		super(detail);
 		this.kind = kind;
 		this.detail = detail;
 		this.repo = repo;
+		this.pushed = pushed;
 	}
 };
 /** What the server is told for each kind of git failure. */
 const GIT_FAILED = {
 	"not-a-repo": "the session's folder isn't in a git repo, and has none in it",
+	"too-wide": "the session's folder is the home folder or a drive's root, too wide a folder to hand over from",
 	"no-work": "none of the repos in the session's folder has work that isn't on its default branch",
 	"no-commit": "the session's repo has no commit to hand over from",
 	"no-remote": "the session's repo has no remote to push the handoff's branch to",
@@ -8569,10 +8584,14 @@ const GIT_FAILED = {
 	rejected: "the remote rejected the handoff's branch",
 	failed: "git couldn't push the handoff's branch"
 };
-/** What the server is told for a git failure, naming the repo when it is one under the session's folder. */
+/**
+* What the server is told for a git failure: naming the repo when it is one under the session's
+* folder, and the repos already pushed when some were, which handing over again finishes.
+*/
 const gitFailed = (err) => {
 	const text = GIT_FAILED[err.kind];
-	return err.repo === "." ? text : `${text.replace("the session's repo", "a repo in the session's folder")} (in ${err.repo})`;
+	const said = err.repo === "." ? text : `${text.replace("the session's repo", "a repo in the session's folder")} (in ${err.repo})`;
+	return err.pushed.length ? `${said}; the branch was pushed already in ${err.pushed.join(", ")}, and handing it over again with the same id pushes the rest` : said;
 };
 const REPO_VARIABLES = [
 	"GIT_DIR",
@@ -8715,6 +8734,8 @@ async function untracked(run, cwd, timeoutMs) {
 const listed = (files) => files.slice(0, UNTRACKED_MAX).map((f) => `\`${f}\``).join(", ") + (files.length > UNTRACKED_MAX ? `, and ${files.length - UNTRACKED_MAX} more` : "");
 /** The brief request's last line: the untracked files the brief should say the purpose of. */
 const untrackedLine = (files) => files === null ? "The untracked files couldn't be listed, so don't name any." : files.length ? `The untracked files are: ${listed(files)}. Say what each is for.` : "There are no untracked files.";
+/** A repo's handoff branch: isoplan/handoff/<id>, or with its own suffix when it shares a remote with an earlier one. */
+const repoBranch = (id, repo) => repo.suffix ? `${handoffBranch(id)}--${repo.suffix}` : handoffBranch(id);
 /**
 * The runner's note at the end of every brief: what is pushed, from where, and what isn't, as of
 * `at` (a brief withheld and released later still describes the tree as it was then). With repos
@@ -8722,8 +8743,12 @@ const untrackedLine = (files) => files === null ? "The untracked files couldn't 
 */
 function handoffNote({ branch, from, files, at, repos = [], left = [] }) {
 	const when = at.toISOString().slice(0, 16).replace("T", " ") + " UTC";
-	const lines = repos.some((r) => r.path !== ".") ? [`Handed over by Isoplan on the branch ${branch} in each of these repos, by their paths in the session's folder, with each one's tracked changes in a work-in-progress commit: ${repos.map((r) => `\`${r.path}\`${r.from ? ` (made from ${r.from})` : ""}`).join(", ")}. This describes the work trees as of ${when}.`] : [`Handed over by Isoplan on the branch ${branch}${from ? `, made from ${from}` : ""}, with the tracked changes in a work-in-progress commit. This describes the work tree as of ${when}.`];
-	for (const why of new Set(left.map((l) => l.why))) lines.push(`Repos not handed over, ${why}: ${listed(left.filter((l) => l.why === why).map((l) => l.path))}.`);
+	const each = (r) => {
+		const said = [r.from ? `made from ${r.from}` : "", r.suffix ? `on ${branch}--${r.suffix}, since it pushes to the same remote as a repo before it` : ""].filter(Boolean).join(", ");
+		return `\`${r.path}\`${said ? ` (${said})` : ""}`;
+	};
+	const lines = repos.some((r) => r.path !== ".") ? [`Handed over by Isoplan on the branch ${branch} in each of these repos, by their paths in the session's folder, with each one's tracked changes in a work-in-progress commit: ${repos.map(each).join(", ")}. This describes the work trees as of ${when}.`] : [`Handed over by Isoplan on the branch ${branch}${from ? `, made from ${from}` : ""}, with the tracked changes in a work-in-progress commit. This describes the work tree as of ${when}.`];
+	for (const why of new Set(left.map((l) => l.why))) lines.push(`Not handed over, ${why}: ${listed(left.filter((l) => l.why === why).map((l) => l.path))}.`);
 	if (files === null) lines.push("Untracked files: unknown, since git couldn't list them.");
 	else if (files.length) lines.push(`Untracked files, not handed over: ${listed(files)}.`);
 	return lines.join("\n");
@@ -8732,7 +8757,14 @@ const WHY = {
 	unchanged: "since they have no work that isn't on their remote's default branch",
 	"no-commit": "since they have no commit yet",
 	"no-remote": "since they have no remote to push to",
-	submodule: "since they are git submodules, which a handoff doesn't carry"
+	submodule: "since they are git submodules, which a handoff doesn't carry",
+	unreadable: "since git couldn't read them",
+	slow: "since git took too long in them",
+	deep: "since they are deeper than repoSearchDepth",
+	dot: "since their folders' names start with a dot, which aren't looked in",
+	modules: "since they are node_modules folders, which aren't looked in",
+	link: "since they are reached through a link, which isn't followed",
+	folder: "since these folders couldn't be read, so any repos in them weren't looked for"
 };
 function gitIn(run, cwd, timeoutMs, repo) {
 	const git = async (args, env) => {
@@ -8756,23 +8788,45 @@ function gitIn(run, cwd, timeoutMs, repo) {
 }
 /**
 * The folders under `root` that hold a repo (a `.git` folder or file), by path from it, at most
-* `depth` folders down. Folders whose names start with a dot, node_modules and symlinks aren't
-* looked in.
+* `depth` folders down; and what wasn't looked in, by why, when it holds a repo itself: a folder
+* whose name starts with a dot, node_modules, a link, or one a level past `depth`, and any folder
+* that couldn't be read.
 */
 async function reposUnder(root, depth) {
 	const found = [];
+	const skipped = [];
+	const holdsGit = (sub) => fs.stat(path.join(root, sub, ".git")).then(() => true, () => false);
 	const walk = async (rel, level) => {
-		if (level >= depth) return;
-		const entries = await fs.readdir(path.join(root, rel), { withFileTypes: true }).catch(() => []);
+		let entries;
+		try {
+			entries = await fs.readdir(path.join(root, rel), { withFileTypes: true });
+		} catch {
+			if (rel) skipped.push({
+				path: rel,
+				why: WHY.folder
+			});
+			return;
+		}
 		for (const entry of entries.sort((a, b) => a.name < b.name ? -1 : 1)) {
-			if (!entry.isDirectory() || entry.name.startsWith(".") || entry.name === "node_modules") continue;
 			const sub = rel ? `${rel}/${entry.name}` : entry.name;
-			if (await fs.lstat(path.join(root, sub, ".git")).then(() => true, () => false)) found.push(sub);
+			const why = entry.isSymbolicLink() ? WHY.link : !entry.isDirectory() || entry.name === ".git" ? null : entry.name.startsWith(".") ? WHY.dot : entry.name === "node_modules" ? WHY.modules : level >= depth ? WHY.deep : "";
+			if (why === null) continue;
+			if (why) {
+				if (await holdsGit(sub)) skipped.push({
+					path: sub,
+					why
+				});
+				continue;
+			}
+			if (await holdsGit(sub)) found.push(sub);
 			await walk(sub, level + 1);
 		}
 	};
 	await walk("", 0);
-	return found;
+	return {
+		found,
+		skipped
+	};
 }
 /** The current branch, or null when HEAD is detached. */
 async function branchOf(run, dir, timeoutMs, repo) {
@@ -8802,41 +8856,65 @@ async function pushRemote(run, dir, from, timeoutMs, repo) {
 		remotes
 	};
 }
-async function workOf(run, dir, repo, timeoutMs) {
-	const { git } = gitIn(run, dir, timeoutMs, repo);
+async function inspect(run, dir, repo, timeoutMs) {
+	const { git, must } = gitIn(run, dir, timeoutMs, repo);
+	const top = await git(["rev-parse", "--show-toplevel"]);
+	if (top.code !== 0 || pathKey(top.stdout.trim()) !== pathKey(dir)) return "unreadable";
 	if ((await git([
 		"rev-parse",
 		"--verify",
 		"-q",
 		"HEAD"
 	])).code !== 0) return "no-commit";
-	const { remote } = await pushRemote(run, dir, await branchOf(run, dir, timeoutMs, repo), timeoutMs, repo);
+	const from = await branchOf(run, dir, timeoutMs, repo);
+	const { remote } = await pushRemote(run, dir, from, timeoutMs, repo);
 	if (!remote) return "no-remote";
+	const found = {
+		path: repo,
+		dir,
+		from,
+		remote,
+		url: await must([
+			"remote",
+			"get-url",
+			"--push",
+			remote
+		])
+	};
 	if ((await git([
 		"status",
 		"--porcelain",
 		"--untracked-files=no"
-	])).stdout.trim()) return "work";
+	])).stdout.trim()) return found;
 	const fallback = (await git([
 		"symbolic-ref",
 		"-q",
 		`refs/remotes/${remote}/HEAD`
 	])).stdout.trim();
-	if (!fallback) return "work";
+	const upstream = (await git([
+		"rev-parse",
+		"--verify",
+		"-q",
+		"--symbolic-full-name",
+		"@{upstream}"
+	])).stdout.trim();
 	const ahead = await git([
 		"rev-list",
 		"--count",
 		"HEAD",
 		"--not",
-		fallback
+		...fallback ? [fallback] : [`--remotes=${remote}`, ...upstream ? [upstream] : []]
 	]);
-	return ahead.code !== 0 || Number(ahead.stdout.trim()) > 0 ? "work" : "unchanged";
+	return ahead.code !== 0 || Number(ahead.stdout.trim()) > 0 ? found : "unchanged";
 }
+const tooWide = (dir, home) => pathKey(dir) === pathKey(home) || path.parse(path.resolve(dir)).root === path.resolve(dir);
+const slug = (p) => p.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 40).replace(/-+$/, "") || "repo";
 /**
-* What a handoff from `cwd` would start from: the session's folder, the repos in it to hand over,
-* their untracked files and the repos left out. Throws a HandoffGitError.
+* What a handoff from `cwd` would start from: the session's folder, the repos in it to hand over
+* with where each pushes, their untracked files and what is left out. The folder's own repo failing
+* throws a HandoffGitError; a repo under it that git can't read is left out, with why.
 */
-async function prepare(run, cwd, timeoutMs, depth = 3) {
+async function prepare(run, cwd, timeoutMs, depth = 3, home = os.homedir()) {
 	const top = await run(["rev-parse", "--show-toplevel"], {
 		cwd,
 		timeoutMs
@@ -8844,22 +8922,36 @@ async function prepare(run, cwd, timeoutMs, depth = 3) {
 	if (top.timedOut) throw new HandoffGitError("timed-out", `git rev-parse in ${cwd} took longer than ${Math.round(timeoutMs / 1e3)} s`);
 	const inRepo = top.code === 0;
 	const toplevel = inRepo ? top.stdout.trim() : path.resolve(cwd);
-	const found = await reposUnder(toplevel, depth);
+	if (tooWide(toplevel, home)) throw new HandoffGitError("too-wide", `${toplevel} is the home folder or a drive's root, so repos aren't looked for under it`);
+	const { found, skipped } = await reposUnder(toplevel, depth);
 	if (!inRepo && !found.length) throw new HandoffGitError("not-a-repo", `${cwd} isn't in a git repo and has none under it: ${top.stderr.trim()}`);
 	const dirOf = (p) => p === "." ? toplevel : path.join(toplevel, p);
 	const from = inRepo ? await branchOf(run, toplevel, timeoutMs, ".") : null;
-	const repos = inRepo ? [{
-		path: ".",
-		dir: toplevel,
-		from
-	}] : [];
-	const left = [];
+	const repos = [];
+	if (inRepo) {
+		const { remote, remotes } = await pushRemote(run, toplevel, from, timeoutMs, ".");
+		if (!remote) throw new HandoffGitError("no-remote", `${toplevel} has ${remotes.length ? `several remotes and none is origin: ${remotes.join(", ")}` : "no remote"}`);
+		repos.push({
+			path: ".",
+			dir: toplevel,
+			from,
+			remote,
+			url: await gitIn(run, toplevel, timeoutMs, ".").must([
+				"remote",
+				"get-url",
+				"--push",
+				remote
+			], "no-remote")
+		});
+	}
+	const left = [...skipped];
 	const listedRepos = inRepo ? ["."] : [];
-	for (const sub of found) {
+	for (const sub of found) try {
 		const above = [...inRepo ? ["."] : [], ...found].filter((p) => p === "." || sub.startsWith(`${p}/`)).sort((a, b) => a.length - b.length).at(-1);
 		if (above) {
 			const inside = above === "." ? sub : sub.slice(above.length + 1);
 			if ((await gitIn(run, dirOf(above), timeoutMs, above).git([
+				"--literal-pathspecs",
 				"ls-files",
 				"--stage",
 				"--",
@@ -8872,19 +8964,35 @@ async function prepare(run, cwd, timeoutMs, depth = 3) {
 				continue;
 			}
 		}
-		listedRepos.push(sub);
-		const state = await workOf(run, dirOf(sub), sub, timeoutMs);
-		if (state === "work") repos.push({
-			path: sub,
-			dir: dirOf(sub),
-			from: await branchOf(run, dirOf(sub), timeoutMs, sub)
-		});
-		else left.push({
+		const state = await inspect(run, dirOf(sub), sub, timeoutMs);
+		if (typeof state === "string") left.push({
 			path: sub,
 			why: WHY[state]
 		});
+		else repos.push(state);
+		if (state !== "unreadable") listedRepos.push(sub);
+	} catch (err) {
+		if (!(err instanceof HandoffGitError)) throw err;
+		left.push({
+			path: sub,
+			why: err.kind === "timed-out" ? WHY.slow : WHY.unreadable
+		});
 	}
 	if (!repos.length) throw new HandoffGitError("no-work", `none of the repos under ${toplevel} has work that isn't on its remote's default branch`);
+	const suffixes = /* @__PURE__ */ new Set();
+	const prepared = repos.map((r, i) => {
+		if (!repos.slice(0, i).some((o) => sameRemote(o.url, r.url))) return {
+			...r,
+			suffix: null
+		};
+		let suffix = slug(r.path);
+		for (let n = 2; suffixes.has(suffix); n++) suffix = `${slug(r.path)}-${n}`;
+		suffixes.add(suffix);
+		return {
+			...r,
+			suffix
+		};
+	});
 	let files = [];
 	for (const p of listedRepos) {
 		const own = await untracked(run, dirOf(p), timeoutMs);
@@ -8899,7 +9007,7 @@ async function prepare(run, cwd, timeoutMs, depth = 3) {
 		toplevel,
 		from,
 		files: files && files.sort(),
-		repos,
+		repos: prepared,
 		left
 	};
 }
@@ -8935,52 +9043,61 @@ const IDENTITY = {
 };
 /**
 * Commits the tracked changes in each repo `prepare` finds at `cwd` and pushes that commit alone to
-* isoplan/handoff/<id> in each, with force, since the branch is the handoff's own and a second
+* its handoff branch (repoBranch), with force, since the branch is the handoff's own and a second
 * hand-over of the same room replaces it. A repo's remote is the one its current branch pushes to
 * (branch.<x>.pushRemote, remote.pushDefault, then branch.<x>.remote, then origin), and the repo it
 * records names its push URL, where the branch is. Nothing is pushed until every repo's commit is
-* made and scanned. Throws a HandoffGitError.
+* made and scanned. A push that fails after others went names them. Throws a HandoffGitError.
 */
-async function pushHandoff(run, cwd, id, timeoutMs, { scan, pushAnyway = {}, depth } = {}) {
-	const branch = handoffBranch(id);
-	const { repos } = await prepare(run, cwd, timeoutMs, depth);
+async function pushHandoff(run, cwd, id, timeoutMs, { scan, pushAnyway = {}, depth, prepared } = {}) {
+	const { repos } = prepared ?? await prepare(run, cwd, timeoutMs, depth);
 	const temp = await fs.mkdtemp(path.join(os.tmpdir(), "isoplan-handoff-"));
 	const ready = [];
 	try {
-		for (const [n, repo] of repos.entries()) {
-			const r = await commitIn(run, repo, id, branch, path.join(temp, `index-${n}`), timeoutMs, pushAnyway[repo.path] ?? null, scan);
-			if ("held" in r) return r;
-			ready.push(r);
-		}
+		for (const [n, repo] of repos.entries()) ready.push(await commitIn(run, repo, id, path.join(temp, `index-${n}`), timeoutMs, pushAnyway[repo.path] ?? null, scan));
 	} finally {
 		await fs.rm(temp, {
 			recursive: true,
 			force: true
 		}).catch(() => {});
 	}
+	const held = ready.filter((r) => r.held.length);
+	if (held.length) return {
+		held: held.flatMap((r) => r.held),
+		commits: Object.fromEntries(held.map((r) => [r.path, r.commit])),
+		unchecked: ready.flatMap((r) => r.unchecked)
+	};
 	const pushed = [];
 	for (const r of ready) {
 		const { git } = gitIn(run, r.dir, timeoutMs, r.path);
-		const sent = await git([
-			"push",
-			"--no-verify",
-			"--porcelain",
-			r.remote,
-			`+${r.commit}:refs/heads/${branch}`
-		]);
-		if (sent.code !== 0) throw new HandoffGitError(/rejected|denied|declined/i.test(sent.stderr + sent.stdout) ? "rejected" : "failed", `git push ${r.remote} ${branch} in ${r.dir}: ${(sent.stderr || sent.stdout).trim()}`, r.path);
+		const done = pushed.map((p) => p.path);
+		try {
+			const sent = await git([
+				"push",
+				"--no-verify",
+				"--porcelain",
+				r.remote,
+				`+${r.commit}:refs/heads/${r.branch}`
+			]);
+			if (sent.code !== 0) throw new HandoffGitError(/rejected|denied|declined/i.test(sent.stderr + sent.stdout) ? "rejected" : "failed", `git push ${r.remote} ${r.branch} in ${r.dir}: ${(sent.stderr || sent.stdout).trim()}`, r.path, done);
+		} catch (err) {
+			if (err instanceof HandoffGitError && !err.pushed.length && done.length) throw new HandoffGitError(err.kind, err.detail, err.repo, done);
+			throw err;
+		}
 		pushed.push({
 			path: r.path,
 			remote: withoutCredentials(r.url),
-			branch,
+			branch: r.branch,
 			commit: r.commit
 		});
 	}
 	return { repos: pushed };
 }
-async function commitIn(run, { path: at, dir, from }, id, branch, index, timeoutMs, pushAnyway, scan) {
+async function commitIn(run, repo, id, index, timeoutMs, pushAnyway, scan) {
+	const { path: at, dir, from, remote } = repo;
 	const { git, must } = gitIn(run, dir, timeoutMs, at);
 	const inFolder = (file) => at === "." ? file : `${at}/${file}`;
+	const branch = repoBranch(id, repo);
 	const head = await git([
 		"rev-parse",
 		"--verify",
@@ -8989,14 +9106,6 @@ async function commitIn(run, { path: at, dir, from }, id, branch, index, timeout
 	]);
 	if (head.code !== 0) throw new HandoffGitError("no-commit", `${dir} has no commit yet`, at);
 	const parent = head.stdout.trim();
-	const { remote, remotes } = await pushRemote(run, dir, from, timeoutMs, at);
-	if (!remote) throw new HandoffGitError("no-remote", `${dir} has ${remotes.length ? `several remotes and none is origin: ${remotes.join(", ")}` : "no remote"}`, at);
-	const url = await must([
-		"remote",
-		"get-url",
-		"--push",
-		remote
-	], "no-remote");
 	const fallback = (await git([
 		"symbolic-ref",
 		"--short",
@@ -9016,6 +9125,13 @@ async function commitIn(run, { path: at, dir, from }, id, branch, index, timeout
 			"**/.gitattributes"
 		])).code === 0) throw new HandoffGitError("lfs", `${dir} uses Git LFS`, at);
 	};
+	const ready = (commit, held = [], unchecked = []) => ({
+		...repo,
+		branch,
+		commit,
+		held,
+		unchecked
+	});
 	if (pushAnyway) {
 		if ((await git([
 			"cat-file",
@@ -9023,13 +9139,7 @@ async function commitIn(run, { path: at, dir, from }, id, branch, index, timeout
 			`${pushAnyway}^{commit}`
 		])).code !== 0) throw new HandoffGitError("failed", `the held commit ${pushAnyway} is gone from ${dir}`, at);
 		await lfs(pushAnyway);
-		return {
-			path: at,
-			dir,
-			remote,
-			url,
-			commit: pushAnyway
-		};
+		return ready(pushAnyway);
 	}
 	const real = path.resolve(dir, await must([
 		"rev-parse",
@@ -9062,34 +9172,23 @@ async function commitIn(run, { path: at, dir, from }, id, branch, index, timeout
 		], "failed", named ? void 0 : IDENTITY);
 	}
 	await lfs(commit);
-	if (scan) {
-		const { lines, binary } = addedLines(await must([
-			"log",
-			"-p",
-			"-U0",
-			"--no-color",
-			"--no-ext-diff",
-			"--no-renames",
-			"--diff-merges=first-parent",
-			"--format=",
-			commit,
-			"--not",
-			`--remotes=${remote}`
-		]));
-		for (const [file, text] of lines) if (await scan(text)) return {
-			held: inFolder(file),
-			repo: at,
-			commit,
-			unchecked: binary.map(inFolder)
-		};
-	}
-	return {
-		path: at,
-		dir,
-		remote,
-		url,
-		commit
-	};
+	if (!scan) return ready(commit);
+	const { lines, binary } = addedLines(await must([
+		"log",
+		"-p",
+		"-U0",
+		"--no-color",
+		"--no-ext-diff",
+		"--no-renames",
+		"--diff-merges=first-parent",
+		"--format=",
+		commit,
+		"--not",
+		`--remotes=${remote}`
+	]));
+	const held = [];
+	for (const [file, text] of lines) if (await scan(text)) held.push(inFolder(file));
+	return ready(commit, held, binary.map(inFolder));
 }
 //#endregion
 //#region src/handoff/take.ts
@@ -9153,7 +9252,7 @@ async function findWorkspace(io, run, projectsDir, repos, since, timeoutMs) {
 		if (top.code === 0) {
 			const at = top.stdout.trim();
 			for (const repo of repos) {
-				const above = path.resolve(at, ...repo.path.split("/").map(() => ".."));
+				const above = aboveOf(at, repo.path);
 				if (pathKey(path.join(above, repo.path)) === pathKey(at)) candidates.push(above);
 			}
 		}
@@ -9526,8 +9625,8 @@ async function takeHandoff(message, o) {
 	try {
 		const s = await o.settings();
 		const timeoutMs = s.gitTimeoutSeconds * 1e3;
-		const branch = handoffBranch(handoff.id);
 		const repo = handoff.repos.find((r) => r.path === ".");
+		const branch = repo?.branch ?? handoffBranch(handoff.id);
 		const subs = byDepth(handoff.repos.filter((r) => r.path !== "."));
 		const since = (o.now ?? Date.now)() - s.cloneSearchDays * 864e5;
 		const projects = path.join(o.claudeDir, "projects");
@@ -9603,7 +9702,7 @@ async function takeHandoff(message, o) {
 		}
 		const failedRepos = [];
 		for (const sub of subs) {
-			const error = await repoAt(o.run, dir, sub, branch, folder, timeoutMs);
+			const error = await repoAt(o.run, dir, sub, folder, timeoutMs, o.cloneFrom ?? onTheWire);
 			if (!error) continue;
 			failedRepos.push(sub.path);
 			await fail("checkout", error, sub.path);
@@ -9782,32 +9881,59 @@ async function checkoutIn(run, cwd, repo, branch, folder, timeoutMs) {
 	return moved.code === 0 ? ok() : failed(`${branch} couldn't be moved to the handoff as handed over now:\n${moved.stderr}`, name);
 }
 const byDepth = (repos) => [...repos].sort((a, b) => a.path.split("/").length - b.path.split("/").length);
+const aboveOf = (at, p) => path.resolve(at, ...p.split("/").map(() => ".."));
 /**
-* A repo under the folder (#56) on the handoff's branch at its path in `base`: switched where a
-* clone of it is there, cloned where there is nothing or an empty folder. The error, else null.
+* Whether a missing repo may be cloned from `remote`: https, ssh or scp-style (host:path) only, so
+* a handoff never points git at a local path, a file:// URL or a \\server share on this machine.
 */
-async function repoAt(run, base, repo, branch, folder, timeoutMs) {
-	if (repo.path.split(/[\\/]/).some((part) => part.toLowerCase() === ".git")) return `${repo.path} is inside a .git folder, so nothing was checked out there.`;
+function onTheWire(remote) {
+	const url = /^([a-z][a-z0-9+.-]*):\/\//i.exec(remote);
+	if (url) return [
+		"https",
+		"ssh",
+		"git+ssh",
+		"ssh+git"
+	].includes(url[1].toLowerCase());
+	const scp = /^([^/\\]*):/.exec(remote);
+	return !!scp && scp[1].length > 1 && !remote.startsWith("\\");
+}
+const realpathNative = promisify(realpath.native);
+const isGitFolder = (segment) => {
+	const name = segment.replace(/[. ]+$/, "").toLowerCase();
+	return name === ".git" || /^git~\d+$/.test(name);
+};
+/**
+* A repo under the folder (#56) on its handoff branch at its path in `base`: switched where a clone
+* of it is there, cloned where there is nothing or an empty folder, from a remote `cloneFrom`
+* allows, with Git LFS's download off (a handoff never carries LFS files). The error, else null.
+*/
+async function repoAt(run, base, repo, folder, timeoutMs, cloneFrom) {
+	if (repo.path.split(/[\\/]/).some(isGitFolder)) return `${repo.path} is inside a .git folder, so nothing was checked out there.`;
 	const target = path.join(base, repo.path);
 	let existing = target;
 	while (!await fs.lstat(existing).then(() => true, () => false)) existing = path.dirname(existing);
-	if (pathKey(await fs.realpath(existing)) !== pathKey(path.join(await fs.realpath(base), path.relative(base, existing)))) return `${target} leads outside ${base} through a link, so nothing was checked out there.`;
+	const realBase = await realpathNative(base);
+	const real = await realpathNative(existing);
+	if (pathKey(real) !== pathKey(path.join(realBase, path.relative(base, existing)))) return `${target} leads outside ${base} through a link, so nothing was checked out there.`;
+	if (path.relative(realBase, real).split(/[\\/]/).some(isGitFolder)) return `${repo.path} is inside a .git folder, so nothing was checked out there.`;
 	const st = await fs.lstat(target).catch(() => null);
 	if (st && !st.isDirectory()) return `${target} is there already and isn't a folder, so ${repo.remote} wasn't cloned there.`;
 	if (!st || (await fs.readdir(target)).length === 0) {
+		if (!cloneFrom(repo.remote)) return `${repo.path} isn't here, and ${repo.remote} isn't an https, ssh or host:path remote, so it wasn't cloned: a handoff never clones from a local path, a file:// URL or a \\\\server share. Clone it at ${target} yourself, then take the handoff again.`;
 		await fs.mkdir(path.dirname(target), { recursive: true });
 		const cloned = await run([
 			...await noHooks(),
 			"clone",
 			"-q",
 			"--branch",
-			branch,
+			repo.branch,
 			"--",
 			repo.remote,
 			target
 		], {
 			cwd: base,
-			timeoutMs
+			timeoutMs,
+			env: { GIT_LFS_SKIP_SMUDGE: "1" }
 		});
 		if (cloned.code !== 0) return `git clone ${repo.remote} ${repo.path} failed${cloned.timedOut ? " (it took too long)" : ""}:\n${cloned.stderr}`;
 		await recordTaken(folder, await resolved(run, target, "HEAD", timeoutMs) ?? repo.commit);
@@ -9818,7 +9944,7 @@ async function repoAt(run, base, repo, branch, folder, timeoutMs) {
 		timeoutMs
 	});
 	if (top.code !== 0 || pathKey(top.stdout.trim()) !== pathKey(target)) return `${target} is there already and isn't a repo of its own, so ${repo.remote} wasn't cloned into it.`;
-	return (await checkoutIn(run, target, repo, branch, folder, timeoutMs)).error;
+	return (await checkoutIn(run, target, repo, repo.branch, folder, timeoutMs)).error;
 }
 async function worktreeFor(run, clone, remote, branch, id, exempt, timeoutMs) {
 	const tip = `refs/remotes/${remote}/${branch}`;
@@ -10023,11 +10149,12 @@ function createRunner({ answerer, ledger, settings, prompts, scan, send, log, is
 				return unavailable(id, err instanceof PushFailed ? err.message : "the handoff's branch couldn't be pushed");
 			}
 			if (!Array.isArray(pushed)) {
-				const { held: file, repo, commit, unchecked } = pushed;
-				log(`withheld the handoff's commit ${commit} for ${id} in ${room}: the lines it adds to ${file} match a secret pattern`);
+				const { held: files, commits, unchecked } = pushed;
+				const file = files.join(", ");
+				log(`withheld the handoff's commits ${Object.values(commits).join(", ")} for ${id} in ${room}: the lines they add to ${file} match a secret pattern`);
 				hold(id, () => pushAndReply({
 					...pushAnyway,
-					[repo]: commit
+					...commits
 				}));
 				return {
 					type: "refusal",
@@ -10236,6 +10363,7 @@ function applyClaudeDir(argv, env, home) {
 //#region src/runner/main.ts
 const LOG_CAP_BYTES = 262144;
 const CHECK_MS = 6e4;
+const MAX_PREPARED = 20;
 const self = fileURLToPath(import.meta.url);
 const here = path.dirname(self);
 const appDir = path.join(here, "..");
@@ -10336,6 +10464,7 @@ async function worker() {
 	};
 	const scanText = async (text) => scan(text, await loadPatterns(path.join(appDir, "secret-patterns.json"), path.join(isoplanDir, "secret-patterns.json"), log));
 	let send = () => {};
+	const preparedFor = /* @__PURE__ */ new Map();
 	const runner = createRunner({
 		answerer,
 		ledger: await openLedger(path.join(isoplanDir, "runner", "ledger.json")),
@@ -10352,7 +10481,10 @@ async function worker() {
 			return Date.now() - lead.lastActive <= askableMs(await config().catch(() => first));
 		},
 		prepareBrief: async (lead, handoff) => {
-			const { from, files, repos, left } = await prepare(git, lead.cwd, await gitMs(), (await settings()).repoSearchDepth).catch((err) => Promise.reject(told(err)));
+			const ready = await prepare(git, lead.cwd, await gitMs(), (await settings()).repoSearchDepth).catch((err) => Promise.reject(told(err)));
+			preparedFor.set(handoff, ready);
+			if (preparedFor.size > MAX_PREPARED) preparedFor.delete(preparedFor.keys().next().value);
+			const { from, files, repos, left } = ready;
 			return {
 				files,
 				note: handoffNote({
@@ -10369,6 +10501,7 @@ async function worker() {
 			const pushed = await pushHandoff(git, lead.cwd, handoff, await gitMs(), {
 				scan: scanText,
 				depth: (await settings()).repoSearchDepth,
+				prepared: preparedFor.get(handoff),
 				...pushAnyway ? { pushAnyway } : {}
 			}).catch((err) => Promise.reject(told(err)));
 			return "held" in pushed ? pushed : pushed.repos;

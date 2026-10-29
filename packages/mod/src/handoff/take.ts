@@ -22,8 +22,10 @@
 //    One there already (the setup script's clone, say) with the handoff's remote is fetched and
 //    switched to the handoff's branch, by the shortcut's rules below: never over uncommitted changes
 //    to tracked files or commits of the receiver's own. Where there is none, or only an empty
-//    folder, it is cloned from the recorded remote on that branch. A path through a link, or into
-//    a .git folder, is refused. One that fails is reported with its path, and the rest go on.
+//    folder, it is cloned from the recorded remote on that branch, only when that is an https, ssh
+//    or host:path remote (never a local path, file:// or a \server share), with Git LFS's download
+//    off. A path through a link, or into a .git folder by any name Windows gives one, is refused.
+//    The setup script runs before this, so it sees only the repos it clones itself. One that fails is reported with its path, and the rest go on.
 //    A handoff from a folder that isn't a repo itself (a plain folder above several) has no
 //    worktree to make: its folder is a new plain folder, <workspace>-handoff-<id>, beside the
 //    receiver's own workspace, which is the most recent session folder holding a clone of one of
@@ -46,10 +48,12 @@
 
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import { realpath } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { PROTOCOL_VERSION, type Handoff, type HandoffMessage, type HandoffRepo, type TakenMessage } from "@isoplan/protocol";
 import os from "node:os";
+import { promisify } from "node:util";
 import { normalize, pathKey } from "../data-layer/git.js";
 import type { NodeIo } from "../data-layer/io.js";
 import { claudeCommand } from "../runner/claude-binary.js";
@@ -68,8 +72,6 @@ export interface TakeSettings {
   gitTimeoutSeconds: number;
   setupTimeoutMinutes: number;
   cloneSearchDays: number;
-  /** How many folders down from the session's folder repos are looked for (#56). */
-  repoSearchDepth: number;
 }
 
 /** What opens a terminal: a launcher script written to `file`, then the command that runs it. */
@@ -110,6 +112,8 @@ export interface TakeOptions {
   confirmMs?: number;
   now?: () => number;
   newSession?: () => string;
+  /** Which remotes a missing repo under the folder may be cloned from: by default `onTheWire`. */
+  cloneFrom?: (remote: string) => boolean;
 }
 
 /** The handoff's folder on this machine: its brief, launcher and setup log. */
@@ -157,7 +161,7 @@ export async function findWorkspace(io: NodeIo, run: RunGit, projectsDir: string
     if (top.code === 0) {
       const at = top.stdout.trim();
       for (const repo of repos) {
-        const above = path.resolve(at, ...repo.path.split("/").map(() => ".."));
+        const above = aboveOf(at, repo.path);
         if (pathKey(path.join(above, repo.path)) === pathKey(at)) candidates.push(above);
       }
     }
@@ -438,8 +442,8 @@ export async function takeHandoff(message: Pick<HandoffMessage, "handoff" | "mod
   try {
     const s = await o.settings();
     const timeoutMs = s.gitTimeoutSeconds * 1000;
-    const branch = handoffBranch(handoff.id);
     const repo = handoff.repos.find((r) => r.path === ".");
+    const branch = repo?.branch ?? handoffBranch(handoff.id);
     const subs = byDepth(handoff.repos.filter((r) => r.path !== "."));
     const now = (o.now ?? Date.now)();
     const since = now - s.cloneSearchDays * 86400000;
@@ -507,7 +511,7 @@ export async function takeHandoff(message: Pick<HandoffMessage, "handoff" | "mod
     // The repos under the folder, after setup, which may have cloned some of them on main.
     const failedRepos: string[] = [];
     for (const sub of subs) {
-      const error = await repoAt(o.run, dir, sub, branch, folder, timeoutMs);
+      const error = await repoAt(o.run, dir, sub, folder, timeoutMs, o.cloneFrom ?? onTheWire);
       if (!error) continue;
       failedRepos.push(sub.path);
       await fail("checkout", error, sub.path);
@@ -587,30 +591,40 @@ async function resolved(run: RunGit, cwd: string, ref: string, timeoutMs: number
  * changes to tracked files is left as it is, rather than carrying them over. A local branch of that
  * name moves to the fetched tip, unless it has commits that are neither in the tip nor ones this
  * machine took of the handoff before (recorded in `folder`), which would be lost: then it is left as
- * it is. The repos under the folder (#56) follow, each at its path in the repo's top (or in `cwd`,
- * for a handoff from a plain folder), cloned where missing, as on the floor; they are left alone
- * when the folder's own repo fails. No setup script runs: the person, or their harness, set up this
- * folder. Returns the failed steps, each with the end of git's output and the repo it was in when
- * that is one under the folder, and the folder's own repo's remote name.
+ * it is. The repos under the folder (#56) follow, each at its path in the folder, cloned where
+ * missing, as on the floor; they are left alone when the folder's own repo fails. The folder is the
+ * session's repo's top, or the session's folder for a handoff from a plain folder; a session in one
+ * of the handoff's repos under the folder works from the folder above it, and a plain folder's
+ * handoff isn't taken inside some other repo. No setup script runs: the person, or their harness,
+ * set up this folder. Returns the failed steps, each with the end of git's output and the repo it
+ * was in when that is one under the folder, and the folder's own repo's remote name.
  */
-export async function checkoutHere(run: RunGit, cwd: string, handoff: Handoff, folder: string, timeoutMs: number): Promise<{ failures: Failure[]; remote: string | null }> {
+export async function checkoutHere(run: RunGit, cwd: string, handoff: Handoff, folder: string, timeoutMs: number, { cloneFrom = onTheWire }: { cloneFrom?: (remote: string) => boolean } = {}): Promise<{ failures: Failure[]; remote: string | null; dir: string }> {
   const repo = handoff.repos.find((r) => r.path === ".");
-  const branch = handoffBranch(handoff.id);
-  let base = cwd;
+  const subs = byDepth(handoff.repos.filter((r) => r.path !== "."));
+  const refused = (output: string, remote: string | null = null) => ({ failures: [{ step: "checkout" as const, output: tail(output) }], remote, dir: at ?? cwd });
+  const top = await run(["rev-parse", "--show-toplevel"], { cwd, timeoutMs });
+  const at = top.code === 0 ? top.stdout.trim() : null;
+  let inside: HandoffRepo | undefined;
+  for (const sub of at ? subs : []) {
+    if (pathKey(path.join(aboveOf(at!, sub.path), sub.path)) !== pathKey(at!)) continue;
+    if ((await remotesOf(run, at!, timeoutMs))?.some((r) => r.urls.some((url) => sameRemote(url, sub.remote)))) inside = sub;
+  }
+  const base = inside ? aboveOf(at!, inside.path) : (at ?? cwd);
   let remote: string | null = null;
   if (repo) {
-    const top = await run(["rev-parse", "--show-toplevel"], { cwd, timeoutMs });
-    const own = top.code === 0 ? await checkoutIn(run, cwd, repo, branch, folder, timeoutMs) : { error: `${cwd} isn't in a git repo.`, remote: null };
-    if (own.error) return { failures: [{ step: "checkout", output: tail(own.error) }], remote: own.remote };
-    base = top.stdout.trim();
+    const own = at ? await checkoutIn(run, base, repo, repo.branch, folder, timeoutMs) : { error: `${cwd} isn't in a git repo.`, remote: null };
+    if (own.error) return refused(own.error, own.remote);
     remote = own.remote;
+  } else if (at && !inside) {
+    return refused(`${cwd} is inside the repo at ${at}, which isn't one of this handoff's repos (${subs.map((r) => r.path).join(", ")}), so nothing was cloned into it. Take it from the folder that holds them, or an empty one.`);
   }
   const failures: Failure[] = [];
-  for (const sub of byDepth(handoff.repos.filter((r) => r.path !== "."))) {
-    const error = await repoAt(run, base, sub, branch, folder, timeoutMs);
+  for (const sub of subs) {
+    const error = await repoAt(run, base, sub, folder, timeoutMs, cloneFrom);
     if (error) failures.push({ step: "checkout", repo: sub.path, output: tail(error) });
   }
-  return { failures, remote };
+  return { failures, remote, dir: base };
 }
 
 // The handoff's branch checked out in the repo at `cwd`, by the shortcut's rules; the error, else null.
@@ -648,30 +662,59 @@ async function checkoutIn(run: RunGit, cwd: string, repo: HandoffRepo, branch: s
 // Repos parents first, so one under another is checked out after it.
 const byDepth = (repos: HandoffRepo[]) => [...repos].sort((a, b) => a.path.split("/").length - b.path.split("/").length);
 
+// The folder above a repo at `at` whose path in that folder is `p`.
+const aboveOf = (at: string, p: string) => path.resolve(at, ...p.split("/").map(() => ".."));
+
 /**
- * A repo under the folder (#56) on the handoff's branch at its path in `base`: switched where a
- * clone of it is there, cloned where there is nothing or an empty folder. The error, else null.
+ * Whether a missing repo may be cloned from `remote`: https, ssh or scp-style (host:path) only, so
+ * a handoff never points git at a local path, a file:// URL or a \\server share on this machine.
  */
-async function repoAt(run: RunGit, base: string, repo: HandoffRepo, branch: string, folder: string, timeoutMs: number): Promise<string | null> {
-  if (repo.path.split(/[\\/]/).some((part) => part.toLowerCase() === ".git")) return `${repo.path} is inside a .git folder, so nothing was checked out there.`;
+export function onTheWire(remote: string): boolean {
+  const url = /^([a-z][a-z0-9+.-]*):\/\//i.exec(remote);
+  if (url) return ["https", "ssh", "git+ssh", "ssh+git"].includes(url[1]!.toLowerCase());
+  // scp-style: a colon before any slash, after more than a drive letter.
+  const scp = /^([^/\\]*):/.exec(remote);
+  return !!scp && scp[1]!.length > 1 && !remote.startsWith("\\");
+}
+
+// The real path, with Windows' short 8.3 names spelled out long.
+const realpathNative = promisify(realpath.native);
+
+// A path segment Windows reads as `.git`: trailing dots and spaces dropped, in any case, or a short 8.3 name.
+const isGitFolder = (segment: string) => {
+  const name = segment.replace(/[. ]+$/, "").toLowerCase();
+  return name === ".git" || /^git~\d+$/.test(name);
+};
+
+/**
+ * A repo under the folder (#56) on its handoff branch at its path in `base`: switched where a clone
+ * of it is there, cloned where there is nothing or an empty folder, from a remote `cloneFrom`
+ * allows, with Git LFS's download off (a handoff never carries LFS files). The error, else null.
+ */
+async function repoAt(run: RunGit, base: string, repo: HandoffRepo, folder: string, timeoutMs: number, cloneFrom: (remote: string) => boolean): Promise<string | null> {
+  if (repo.path.split(/[\\/]/).some(isGitFolder)) return `${repo.path} is inside a .git folder, so nothing was checked out there.`;
   const target = path.join(base, repo.path);
-  // The path stays inside the folder: no link on the way (one the handoff's branch made, say) leads out.
+  // The path stays inside the folder: no link on the way (one the handoff's branch made, say)
+  // leads out, and no folder on it is a .git folder by its real, long name.
   let existing = target;
   while (!(await fs.lstat(existing).then(() => true, () => false))) existing = path.dirname(existing);
-  const real = pathKey(await fs.realpath(existing));
-  if (real !== pathKey(path.join(await fs.realpath(base), path.relative(base, existing)))) return `${target} leads outside ${base} through a link, so nothing was checked out there.`;
+  const realBase = await realpathNative(base);
+  const real = await realpathNative(existing);
+  if (pathKey(real) !== pathKey(path.join(realBase, path.relative(base, existing)))) return `${target} leads outside ${base} through a link, so nothing was checked out there.`;
+  if (path.relative(realBase, real).split(/[\\/]/).some(isGitFolder)) return `${repo.path} is inside a .git folder, so nothing was checked out there.`;
   const st = await fs.lstat(target).catch(() => null);
   if (st && !st.isDirectory()) return `${target} is there already and isn't a folder, so ${repo.remote} wasn't cloned there.`;
   if (!st || (await fs.readdir(target)).length === 0) {
+    if (!cloneFrom(repo.remote)) return `${repo.path} isn't here, and ${repo.remote} isn't an https, ssh or host:path remote, so it wasn't cloned: a handoff never clones from a local path, a file:// URL or a \\\\server share. Clone it at ${target} yourself, then take the handoff again.`;
     await fs.mkdir(path.dirname(target), { recursive: true });
-    const cloned = await run([...(await noHooks()), "clone", "-q", "--branch", branch, "--", repo.remote, target], { cwd: base, timeoutMs });
+    const cloned = await run([...(await noHooks()), "clone", "-q", "--branch", repo.branch, "--", repo.remote, target], { cwd: base, timeoutMs, env: { GIT_LFS_SKIP_SMUDGE: "1" } });
     if (cloned.code !== 0) return `git clone ${repo.remote} ${repo.path} failed${cloned.timedOut ? " (it took too long)" : ""}:\n${cloned.stderr}`;
     await recordTaken(folder, (await resolved(run, target, "HEAD", timeoutMs)) ?? repo.commit);
     return null;
   }
   const top = await run(["rev-parse", "--show-toplevel"], { cwd: target, timeoutMs });
   if (top.code !== 0 || pathKey(top.stdout.trim()) !== pathKey(target)) return `${target} is there already and isn't a repo of its own, so ${repo.remote} wasn't cloned into it.`;
-  return (await checkoutIn(run, target, repo, branch, folder, timeoutMs)).error;
+  return (await checkoutIn(run, target, repo, repo.branch, folder, timeoutMs)).error;
 }
 
 // The worktree for the handoff: one already made on its branch, moved to the new tip when nothing

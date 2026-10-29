@@ -4,9 +4,9 @@ import type { Handoff } from "@isoplan/protocol";
 import { expect, test } from "vitest";
 import { tempRoot } from "../data-layer/fixture.js";
 import { nodeIo } from "../data-layer/io.js";
-import { createRunGit, pushHandoff } from "./git.js";
+import { createRunGit, pushHandoff, type RunGit } from "./git.js";
 import { git, remoteAndClone, workspace } from "./fixture.js";
-import { checkoutHere, findClone, findWorkspace, launch, parseSetup, sessionArgv, takeHandoff, trustFolder, trustKey, type Background, type Launch, type TakeOptions } from "./take.js";
+import { checkoutHere, findClone, findWorkspace, launch, onTheWire, parseSetup, sessionArgv, takeHandoff, trustFolder, trustKey, type Background, type Launch, type TakeOptions } from "./take.js";
 
 const run = createRunGit();
 const SETTINGS = { gitTimeoutSeconds: 30, setupTimeoutMinutes: 15, cloneSearchDays: 30, repoSearchDepth: 3 };
@@ -59,6 +59,8 @@ async function handedOver(id: string, setup?: unknown) {
     start: async (h) => void started.push(h),
     agents: async () => started.map((h) => h.argv[h.argv.indexOf("--session-id") + 1]!),
     confirmMs: 200,
+    // The tests' remotes are local bare repos, which a real take never clones from.
+    cloneFrom: () => true,
   };
   return { root, sender, receiver, handoff, options, opened, started, claudeDir, claudeJson };
 }
@@ -279,6 +281,7 @@ test("on a Mac the launcher is a .command file Terminal opens, with the config f
 // Several repos (#56): a sender's workspace with its changes handed over as `id`, and a receiver
 // whose one session ran in their own copy of the workspace.
 const SLOW = 120000;
+const LOCAL = { cloneFrom: () => true };
 async function severalHandedOver(id: string, { parent = true, setup }: { parent?: boolean; setup?: (remotes: Record<string, string>) => string } = {}) {
   const t = await handedOver(id);
   const sender = workspace(t.root, "ws-sender", { parent });
@@ -362,14 +365,14 @@ test("the shortcut with several repos: the folder's repo, then each under it, sw
   const t = await severalHandedOver("m5");
   const folder = path.join(t.claudeDir, "isoplan", "handoffs", "m5");
   fs.rmSync(path.join(t.receiver.dir, "web"), { recursive: true, force: true });
-  expect((await checkoutHere(run, t.receiver.dir, t.handoff, folder, 30000)).failures).toEqual([]);
+  expect((await checkoutHere(run, t.receiver.dir, t.handoff, folder, 30000, LOCAL)).failures).toEqual([]);
   for (const dir of [t.receiver.dir, path.join(t.receiver.dir, "api"), path.join(t.receiver.dir, "web")]) expect(onBranch(dir, "m5")).toBe(true);
 
   // A dirty folder repo leaves every repo as it was.
   git(t.receiver.dir, "switch", "-q", "main");
   git(path.join(t.receiver.dir, "api"), "switch", "-q", "main");
   fs.writeFileSync(path.join(t.receiver.dir, "README.md"), "mine\n");
-  expect((await checkoutHere(run, t.receiver.dir, t.handoff, folder, 30000)).failures).toEqual([{ step: "checkout", output: expect.stringContaining("uncommitted changes") }]);
+  expect((await checkoutHere(run, t.receiver.dir, t.handoff, folder, 30000, LOCAL)).failures).toEqual([{ step: "checkout", output: expect.stringContaining("uncommitted changes") }]);
   expect(git(path.join(t.receiver.dir, "api"), "branch", "--show-current")).toBe("main");
 
   const elsewhere = path.join(t.root, "elsewhere");
@@ -386,9 +389,70 @@ test("the shortcut with several repos: the folder's repo, then each under it, sw
       { path: ".git/hooks", remote: t.sender.remotes.web!, branch: "isoplan/handoff/m5", commit },
     ],
   };
-  expect((await checkoutHere(run, plain, odd, folder, 30000)).failures).toEqual([
+  expect((await checkoutHere(run, plain, odd, folder, 30000, LOCAL)).failures).toEqual([
     { step: "checkout", repo: "api", output: expect.stringContaining("leads outside") },
     { step: "checkout", repo: ".git/hooks", output: expect.stringContaining("inside a .git folder") },
   ]);
   expect(fs.readdirSync(elsewhere)).toEqual([]);
+}, SLOW);
+
+test("a missing repo is cloned only from https, ssh or host:path, with Git LFS's download off", async () => {
+  for (const remote of ["https://github.com/team/api.git", "ssh://git@github.com/team/api.git", "git@github.com:team/api.git", "github.com:team/api.git"]) expect(onTheWire(remote), remote).toBe(true);
+  for (const remote of ["C:\remotes\api.git", "C:/remotes/api.git", "/srv/git/api.git", "\\server\share\api.git", "//server/share/api.git", "file:///C:/remotes/api.git", "http://github.com/team/api.git", "api.git"]) expect(onTheWire(remote), remote).toBe(false);
+  const t = await severalHandedOver("w1", { parent: false });
+  const plain = path.join(t.root, "plain");
+  fs.mkdirSync(plain);
+  const folder = path.join(t.claudeDir, "isoplan", "handoffs", "w1");
+  expect((await checkoutHere(run, plain, t.handoff, folder, 30000)).failures).toEqual([
+    { step: "checkout", repo: "api", output: expect.stringContaining("isn't an https, ssh or host:path remote, so it wasn't cloned") },
+    { step: "checkout", repo: "web", output: expect.stringContaining("never clones from a local path") },
+  ]);
+  expect(fs.readdirSync(plain)).toEqual([]);
+  const envs: (Record<string, string> | undefined)[] = [];
+  const watched: RunGit = (args, opts) => (args.includes("clone") && envs.push(opts.env), run(args, opts));
+  expect((await checkoutHere(watched, plain, t.handoff, folder, 30000, LOCAL)).failures).toEqual([]);
+  expect(envs).toEqual([{ GIT_LFS_SKIP_SMUDGE: "1" }, { GIT_LFS_SKIP_SMUDGE: "1" }]);
+}, SLOW);
+
+test("a path Windows reads as .git, in any spelling, is refused", async () => {
+  const t = await severalHandedOver("w2", { parent: false });
+  const plain = path.join(t.root, "plain");
+  fs.mkdirSync(plain);
+  const [api] = t.handoff.repos;
+  const odd: Handoff = { ...t.handoff, repos: [".GIT./hooks", ".git /hooks", "GIT~1/hooks", "a/.Git. ./b"].map((p) => ({ ...api!, path: p })) };
+  const { failures } = await checkoutHere(run, plain, odd, path.join(t.claudeDir, "isoplan", "handoffs", "w2"), 30000, LOCAL);
+  expect(failures.map((f) => f.output)).toEqual(Array(4).fill(expect.stringContaining("is inside a .git folder")));
+  expect(fs.readdirSync(plain)).toEqual([]);
+}, SLOW);
+
+test("repos that pushed to one remote are each taken from their own branch", async () => {
+  const t = await handedOver("w3");
+  const sender = workspace(t.root, "ws-sender", { parent: false });
+  git(path.join(sender.dir, "web"), "remote", "set-url", "origin", sender.remotes.api!);
+  git(path.join(sender.dir, "web"), "fetch", "-q", "origin");
+  fs.writeFileSync(path.join(sender.dir, "api", "server.js"), "listen('api');\n");
+  fs.writeFileSync(path.join(sender.dir, "web", "index.html"), "<p>web</p>\n");
+  const r = await pushHandoff(run, sender.dir, "w3", 30000);
+  if ("held" in r) throw new Error("held");
+  const plain = path.join(t.root, "plain");
+  fs.mkdirSync(plain);
+  expect((await checkoutHere(run, plain, { id: "w3", brief: "b", repos: r.repos }, path.join(t.claudeDir, "isoplan", "handoffs", "w3"), 30000, LOCAL)).failures).toEqual([]);
+  expect(git(path.join(plain, "api"), "branch", "--show-current")).toBe("isoplan/handoff/w3");
+  expect(git(path.join(plain, "web"), "branch", "--show-current")).toBe("isoplan/handoff/w3--web");
+  expect(git(path.join(plain, "web"), "show", "HEAD:index.html")).toBe("<p>web</p>");
+}, SLOW);
+
+test("the shortcut from inside one of the receiver's repos works from the folder above it; a plain folder's handoff isn't taken inside another repo", async () => {
+  const t = await severalHandedOver("w4");
+  const folder = path.join(t.claudeDir, "isoplan", "handoffs", "w4");
+  const taken = await checkoutHere(run, path.join(t.receiver.dir, "api"), t.handoff, folder, 30000, LOCAL);
+  expect(taken).toMatchObject({ failures: [], dir: path.resolve(t.receiver.dir) });
+  for (const dir of [t.receiver.dir, path.join(t.receiver.dir, "api"), path.join(t.receiver.dir, "web")]) expect(onBranch(dir, "w4")).toBe(true);
+  expect(fs.existsSync(path.join(t.receiver.dir, "api", "web"))).toBe(false);
+
+  const plain = await severalHandedOver("w5", { parent: false });
+  // The first fixture's receiver clone is a repo that isn't one of the handoff's.
+  const refused = await checkoutHere(run, path.join(plain.root, "receiver"), plain.handoff, folder, 30000, LOCAL);
+  expect(refused.failures).toEqual([{ step: "checkout", output: expect.stringContaining("which isn't one of this handoff's repos (api, web)") }]);
+  expect(fs.existsSync(path.join(plain.root, "receiver", "api"))).toBe(false);
 }, SLOW);

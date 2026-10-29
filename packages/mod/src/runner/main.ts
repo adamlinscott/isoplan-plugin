@@ -45,7 +45,7 @@ import { createClaudeAnswerer, forkableId } from "./claude.js";
 import { claudeBinary } from "./claude-binary.js";
 import { anyRoomSince, askableMs, NOT_WANTED_CODE, supervise, UNPAIRED_CODE } from "./lifecycle.js";
 import { loadPrompts } from "./prompts.js";
-import { createRunGit, gitFailed, handoffBranch, handoffNote, HandoffGitError, prepare, pushHandoff } from "../handoff/git.js";
+import { createRunGit, gitFailed, handoffBranch, handoffNote, HandoffGitError, prepare, pushHandoff, type Prepared } from "../handoff/git.js";
 import { takeHandoff, type TakeSettings } from "../handoff/take.js";
 import { createRunner, PushFailed, type RunnerSettings } from "./runner.js";
 import { loadPatterns, scan } from "./scan.js";
@@ -56,6 +56,8 @@ import { applyClaudeDir, LOCK_REFRESH_MS, RUNNER_FRESH_MS, runnerCode, runnerLoc
 const LOG_CAP_BYTES = 256 * 1024;
 // How often the worker checks whether any room is still lit.
 const CHECK_MS = 60000;
+// Prepares kept for their pushes; past this the oldest goes.
+const MAX_PREPARED = 20;
 
 const self = fileURLToPath(import.meta.url);
 const here = path.dirname(self);
@@ -126,7 +128,7 @@ async function supervisor(): Promise<number> {
 async function worker(): Promise<number> {
   const io = nodeIo();
   const config = () => loadConfig(io, path.join(appDir, "config.json"), path.join(isoplanDir, "config.json"));
-  const settings = () => loadSettings<RunnerSettings & TakeSettings & { claudeModel: string }>(io, path.join(appDir, "runner.json"), path.join(isoplanDir, "runner.json"));
+  const settings = () => loadSettings<RunnerSettings & TakeSettings & { claudeModel: string; repoSearchDepth: number }>(io, path.join(appDir, "runner.json"), path.join(isoplanDir, "runner.json"));
   const first = await config();
   // Plain ws:// to another machine would send the machine's credential unencrypted.
   if (first.plainRefused) {
@@ -153,6 +155,8 @@ async function worker(): Promise<number> {
   };
   const scanText = async (text: string) => scan(text, await loadPatterns(path.join(appDir, "secret-patterns.json"), path.join(isoplanDir, "secret-patterns.json"), log));
   let send: Parameters<typeof createRunner>[0]["send"] = () => {};
+  // What each brief's prepare found, by handoff, for its push and any push anyway after it.
+  const preparedFor = new Map<string, Prepared>();
   const runner = createRunner({
     answerer,
     ledger: await openLedger(path.join(isoplanDir, "runner", "ledger.json")),
@@ -174,11 +178,15 @@ async function worker(): Promise<number> {
     // The handoff (#48): the brief names the untracked files, then the branch is pushed, both from
     // the lead's folder, in the background, with no prompts and under gitTimeoutSeconds.
     prepareBrief: async (lead, handoff) => {
-      const { from, files, repos, left } = await prepare(git, lead.cwd, await gitMs(), (await settings()).repoSearchDepth).catch((err) => Promise.reject(told(err)));
+      const ready = await prepare(git, lead.cwd, await gitMs(), (await settings()).repoSearchDepth).catch((err) => Promise.reject(told(err)));
+      // The push hands over the repos the brief's note names (#56).
+      preparedFor.set(handoff, ready);
+      if (preparedFor.size > MAX_PREPARED) preparedFor.delete(preparedFor.keys().next().value!);
+      const { from, files, repos, left } = ready;
       return { files, note: handoffNote({ branch: handoffBranch(handoff), from, files, at: new Date(), repos, left }) };
     },
     push: async (_session, lead, handoff, pushAnyway) => {
-      const pushed = await pushHandoff(git, lead.cwd, handoff, await gitMs(), { scan: scanText, depth: (await settings()).repoSearchDepth, ...(pushAnyway ? { pushAnyway } : {}) }).catch((err) => Promise.reject(told(err)));
+      const pushed = await pushHandoff(git, lead.cwd, handoff, await gitMs(), { scan: scanText, depth: (await settings()).repoSearchDepth, prepared: preparedFor.get(handoff), ...(pushAnyway ? { pushAnyway } : {}) }).catch((err) => Promise.reject(told(err)));
       return "held" in pushed ? pushed : pushed.repos;
     },
     take: (message) =>
