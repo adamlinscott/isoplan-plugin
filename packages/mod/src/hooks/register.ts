@@ -18,9 +18,10 @@
 //
 // An agent's question to its owner (AskUserQuestion) is in the terminal and on the floor at once,
 // and the first answer wins (#50): the call goes ahead at once, so its dialog shows, while the hook
-// waits for an answer from the floor too. One that comes first ends the call with the answers as the
-// reason it was refused, which closes the dialog; the agent reads them and goes on. One answered in
-// the terminal first just ends the wait. Nothing times out: the terminal has the question all along.
+// waits for an answer from the floor too. One that comes first answers the call in the dialog's
+// place, which closes it: the agent reads the answers as the tool's own result, as if they had been
+// picked in the terminal. One answered in the terminal first just ends the wait. Nothing times out:
+// the terminal has the question all along.
 //
 // The data layer talks back as JSON lines on stdout (src/lines.ts). Claude Code closes the child's
 // stdin at launch, so what goes the other way, a title, goes through a file the line names. A data
@@ -68,7 +69,7 @@ let lastError: string | null = null;
 let pairing: PairLine | null = null; // the link waiting to be clicked, last shown
 let pairSaid = false; // a link was put in the transcript since the session started
 // The questions waiting for an answer from the floor too, by their call's id: each ends its call.
-const floorWaits = new Map<string, (reason: string) => void>();
+const floorWaits = new Map<string, (answers: Record<string, string>) => void>();
 
 export function register(on: On): void {
   on("session.start", async ($, e, next) => {
@@ -114,34 +115,30 @@ export function register(on: On): void {
   }).catch(($, e, next) => next(e));
 }
 
-// Runs the question's call, so the terminal shows it, and ends it with the floor's answer if that
-// comes first. Returning while the call is still running ends it, dialog and all. The hook's own
-// time doesn't count while `next` runs, so a wait of any length stays inside its budget.
+// Runs the question's call, so the terminal shows it, and answers it with the floor's answers if
+// they come first: the tool's own result, its questions and their answers, which the engine checks
+// and gives the model as it gives a dialog's. Returning while the call is still running ends it,
+// dialog and all. The hook's own time doesn't count while `next` runs, so a wait of any length stays
+// inside its budget.
 async function askBoth(e: ToolCallInput, next: (e: ToolCallInput) => Promise<ToolCallResult>): Promise<ToolCallResult> {
   const ran = next(e);
   ran.catch(() => {});
-  let answer!: (reason: string) => void;
-  const floor = new Promise<string>((resolve) => (answer = resolve));
+  let answer!: (answers: Record<string, string>) => void;
+  const floor = new Promise<Record<string, string>>((resolve) => (answer = resolve));
   floorWaits.set(e.tool_use_id, answer);
   try {
-    const first = await Promise.race([ran.then((r) => ({ r })), floor.then((reason) => ({ reason }))]);
-    return "r" in first ? first.r : { deny: first.reason };
+    const first = await Promise.race([ran.then((r) => ({ r })), floor.then((answers) => ({ answers }))]);
+    return "r" in first ? first.r : { result: { questions: e.questions, answers: first.answers } };
   } finally {
     floorWaits.delete(e.tool_use_id);
   }
-}
-
-/** What the agent reads when its owner answered on the floor. */
-export function answerReason(answers: Record<string, string>): string {
-  const lines = Object.entries(answers).map(([question, answer]) => `"${question}" = "${answer}"`);
-  return ["Your owner answered on the Isoplan office floor, so the question was closed in the terminal. Their answers:", ...lines, "Go on with these answers."].join("\n");
 }
 
 // The floor's answer to a question: it ends the call if the call still waits, and the data layer is
 // told whether it did.
 function ownerAnswer($: Host, line: OwnerAnswerLine): void {
   const answer = floorWaits.get(line.question);
-  answer?.(answerReason(line.answers));
+  answer?.(line.answers);
   const taken: AnswerTaken = { question: line.question, taken: !!answer };
   $.fs.write(line.file, JSON.stringify(taken)).catch((err) => $.ui.log("isoplan: could not say whether the floor's answer was taken: " + message(err), { to: "debug" }));
 }

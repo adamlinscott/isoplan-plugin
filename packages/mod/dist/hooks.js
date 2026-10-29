@@ -88,23 +88,18 @@ async function askBoth(e, next) {
 	const floor = new Promise((resolve) => answer = resolve);
 	floorWaits.set(e.tool_use_id, answer);
 	try {
-		const first = await Promise.race([ran.then((r) => ({ r })), floor.then((reason) => ({ reason }))]);
-		return "r" in first ? first.r : { deny: first.reason };
+		const first = await Promise.race([ran.then((r) => ({ r })), floor.then((answers) => ({ answers }))]);
+		return "r" in first ? first.r : { result: {
+			questions: e.questions,
+			answers: first.answers
+		} };
 	} finally {
 		floorWaits.delete(e.tool_use_id);
 	}
 }
-/** What the agent reads when its owner answered on the floor. */
-function answerReason(answers) {
-	return [
-		"Your owner answered on the Isoplan office floor, so the question was closed in the terminal. Their answers:",
-		...Object.entries(answers).map(([question, answer]) => `"${question}" = "${answer}"`),
-		"Go on with these answers."
-	].join("\n");
-}
 function ownerAnswer($, line) {
 	const answer = floorWaits.get(line.question);
-	answer?.(answerReason(line.answers));
+	answer?.(line.answers);
 	const taken = {
 		question: line.question,
 		taken: !!answer
@@ -360,4 +355,4 @@ function writeTitle($, ask) {
 }
 const message = (err) => String(err && err.message || err);
 //#endregion
-export { answerReason, register };
+export { register };

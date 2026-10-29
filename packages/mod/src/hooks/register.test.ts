@@ -279,15 +279,14 @@ test("hooks: a late reply goes to the subagent that asked while it runs, and to 
   expect(await call(h, { agentId: "w1" })).toEqual({ result: "ok", context: [expect.stringContaining("main (q-1).")] });
 });
 
-test("hooks: a question runs at once, so the terminal shows it; an answer from the floor that comes first ends it with the answers", async () => {
-  const { answerReason } = await import("./register.js");
+test("hooks: a question runs at once, so the terminal shows it; an answer from the floor that comes first is the call's result", async () => {
   const file = "C:/Users/ada/.claude/isoplan/answers/s1-1.json";
   const next = vi.fn(() => new Promise<ToolCallResult>(() => {})); // the dialog, still open
-  const asked = hooks["tool.call"]!(host([]).$, { tool: "AskUserQuestion", tool_use_id: "toolu_1" }, next) as Promise<ToolCallResult>;
+  const questions = [{ question: "Which branch?", header: "Branch", options: [{ label: "main", description: "" }], multiSelect: false }];
+  const asked = hooks["tool.call"]!(host([]).$, { tool: "AskUserQuestion", tool_use_id: "toolu_1", questions }, next) as Promise<ToolCallResult>;
   expect(next).toHaveBeenCalledTimes(1);
   const h = await start([{ type: "owner-answer", question: "toolu_1", answers: { "Which branch?": "main" }, file }]);
-  expect(await asked).toEqual({ deny: answerReason({ "Which branch?": "main" }) });
-  expect(answerReason({ "Which branch?": "main" })).toContain('"Which branch?" = "main"');
+  expect(await asked).toEqual({ result: { questions, answers: { "Which branch?": "main" } } });
   await vi.waitFor(() => expect(h.written).toEqual([[file, JSON.stringify({ question: "toolu_1", taken: true })]]));
 });
 
