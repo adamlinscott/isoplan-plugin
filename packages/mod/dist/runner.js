@@ -6452,6 +6452,7 @@ function createLink({ url, hello, emit, minIntervalMs = 1e3, retryBaseMs = 1e3, 
 }
 //#endregion
 //#region src/wake/lock.ts
+const lockPath = (claudeDir, sessionId) => path.join(claudeDir, "isoplan", "live", `${sessionId}.json`);
 const HOLD_OFF_MS = 36e5;
 async function readText(file) {
 	try {
@@ -6493,8 +6494,10 @@ const held = (lock, now, { isAlive = alive, freshMs }) => !!lock && (lock.until 
 *
 * A new lock is created exclusively, so of two takers at once only one gets it. A stale one is
 * moved aside by rename, which only one taker can do to the same file, and the taker checks that
-* what it moved is the lock it judged stale: one that moved another taker's new lock instead puts
-* it back and loses.
+* what it moved is the lock it judged stale, by its text and its write time, so a lock its holder
+* refreshed meanwhile isn't taken: one that moved another's lock instead puts it back and loses.
+* With `force` a lock that can't be moved (on Windows a scanner may have it open) is tried again
+* after a short wait, then overwritten, so the plugin's data layer always gets it.
 */
 async function takeLock(file, pid, isAlive = alive, force = false, now = Date.now(), { freshMs, extra = {} } = {}) {
 	await fs.mkdir(path.dirname(file), { recursive: true });
@@ -6503,6 +6506,7 @@ async function takeLock(file, pid, isAlive = alive, force = false, now = Date.no
 		...extra
 	});
 	for (let tries = 0; tries < 5; tries++) {
+		if (tries && force) await new Promise((r) => setTimeout(r, 20 * tries));
 		try {
 			await fs.writeFile(file, body, { flag: "wx" });
 			return true;
@@ -6528,7 +6532,9 @@ async function takeLock(file, pid, isAlive = alive, force = false, now = Date.no
 			].includes(err.code ?? "")) continue;
 			throw err;
 		}
-		if (await fs.readFile(aside, "utf8").catch(() => null) !== seen.text) {
+		const moved = await fs.readFile(aside, "utf8").catch(() => null);
+		const movedAt = (await fs.stat(aside).catch(() => null))?.mtimeMs;
+		if (moved !== seen.text || movedAt !== seen.mtimeMs) {
 			await fs.link(aside, file).catch(() => {});
 			await fs.rm(aside, { force: true });
 			if (!force) return false;
@@ -6536,11 +6542,21 @@ async function takeLock(file, pid, isAlive = alive, force = false, now = Date.no
 		}
 		await fs.rm(aside, { force: true });
 	}
-	return false;
+	if (!force) return false;
+	await fs.writeFile(file, body);
+	return true;
 }
-/** Marks the lock `pid` holds as fresh; false when another has taken it. */
-async function refreshLock(file, pid, now = Date.now()) {
-	if (await lockHolder(file) !== pid) return false;
+/**
+* Marks the lock `pid` holds as fresh; false when another has taken it. A lock briefly missing (a
+* taker moved it aside to look, and is putting it back) is looked at again once, after `retryMs`.
+*/
+async function refreshLock(file, pid, now = Date.now(), retryMs = 250) {
+	let holder = await lockHolder(file);
+	if (holder === null) {
+		await new Promise((r) => setTimeout(r, retryMs));
+		holder = await lockHolder(file);
+	}
+	if (holder !== pid) return false;
 	const t = new Date(now);
 	await fs.utimes(file, t, t);
 	return true;
@@ -6549,11 +6565,12 @@ async function refreshLock(file, pid, now = Date.now()) {
 async function releaseLock(file, pid) {
 	if (await lockHolder(file) === pid) await fs.rm(file, { force: true });
 }
-/** Turns the lock `pid` holds into a hold-off until `until`; one another has taken is left. */
-async function holdOff(file, pid, until) {
+/** Turns the lock `pid` holds into a hold-off until `until`, with `extra` beside it; one another has taken is left. */
+async function holdOff(file, pid, until, extra = {}) {
 	if (await lockHolder(file) === pid) await fs.writeFile(file, JSON.stringify({
 		pid: 0,
-		until
+		until,
+		...extra
 	}));
 }
 function alive(pid) {
@@ -6614,9 +6631,15 @@ async function openLedger(file) {
 			const held = { ...entry };
 			entries = [...recent(entry.at), held];
 			save().catch(() => {});
-			return (usage) => {
-				held.usage = usage;
-				return save();
+			return {
+				settle(usage) {
+					held.usage = usage;
+					return save();
+				},
+				cancel() {
+					entries = entries.filter((e) => e !== held);
+					return save();
+				}
 			};
 		}
 	};
@@ -7112,7 +7135,8 @@ function createClaudeCode(io) {
 			cwd: t.cwd,
 			working: t.turnOpen && now - st.mtimeMs <= config.stalledMinutes * 6e4,
 			compacted: t.compacted,
-			context: t.usage?.context ?? 0
+			context: t.usage?.context ?? 0,
+			lastActive: st.mtimeMs
 		};
 	}
 	async function locate(sessionId, cwd, now) {
@@ -7980,12 +8004,24 @@ const FAILED = {
 	failed: "the fork couldn't answer",
 	"not-set-up": "this machine can't run the fork; its owner can see why in the runner's log"
 };
-function createRunner({ answerer, ledger, settings, prompts, scan, send, log, isDir, push, now = Date.now }) {
+const REMEMBER_DROPPED = 200;
+function createRunner({ answerer, ledger, settings, prompts, scan, send, log, isDir, isReported, push, now = Date.now }) {
 	const rooms = /* @__PURE__ */ new Map();
 	const running = /* @__PURE__ */ new Set();
 	const finished = /* @__PURE__ */ new Map();
 	const held = /* @__PURE__ */ new Map();
 	const released = /* @__PURE__ */ new Set();
+	const dropped = /* @__PURE__ */ new Set();
+	let forking = 0;
+	const waiting = [];
+	async function forkSlot(max) {
+		while (forking >= max) await new Promise((resolve) => waiting.push(resolve));
+		forking++;
+		return () => {
+			forking--;
+			waiting.shift()?.();
+		};
+	}
 	const unavailable = (id, detail) => ({
 		type: "refusal",
 		v: 1,
@@ -8010,6 +8046,10 @@ function createRunner({ answerer, ledger, settings, prompts, scan, send, log, is
 		const { id, room, session } = request;
 		const lead = await answerer.lead(session);
 		if (!lead) return unavailable(id, "this machine has no such session");
+		if (!await isReported(session, lead)) {
+			log(`${id}: ${session} isn't a session this machine reports, so it isn't answered for`);
+			return unavailable(id, "this machine doesn't report that session");
+		}
 		if (!await isDir(lead.cwd)) {
 			log(`${id}: the folder of ${session}, ${lead.cwd}, is gone`);
 			return unavailable(id, "the session's folder is gone, so its lead can't be asked");
@@ -8021,7 +8061,7 @@ function createRunner({ answerer, ledger, settings, prompts, scan, send, log, is
 		const expected = estimate(lead.context, s);
 		const cap = overCap(ledger.entries(now()), room, expected, now(), s);
 		if (cap) return overCapRefusal(id, cap);
-		const settle = ledger.reserve({
+		const reservation = ledger.reserve({
 			at: now(),
 			room,
 			usage: expected
@@ -8031,12 +8071,13 @@ function createRunner({ answerer, ledger, settings, prompts, scan, send, log, is
 			from: request.from.name || request.from.id,
 			question: request.question
 		});
+		const free = await forkSlot(s.maxForks);
 		const answered = await answerer.ask(session, lead, {
 			instructions: p.instructions,
 			request: text,
 			timeoutMs: (isBrief ? s.briefTimeoutSeconds : s.answerTimeoutSeconds) * 1e3
-		});
-		await settle(answered.usage ?? expected).catch((err) => log(`couldn't record ${id} in the ledger: ${err.message}`));
+		}).finally(free);
+		await (!answered.ok && answered.kind === "not-set-up" ? reservation.cancel() : reservation.settle(answered.usage ?? expected)).catch((err) => log(`couldn't record ${id} in the ledger: ${err.message}`));
 		if (!answered.ok) {
 			log(`${id}: ${answered.detail}`);
 			return unavailable(id, FAILED[answered.kind]);
@@ -8070,6 +8111,8 @@ function createRunner({ answerer, ledger, settings, prompts, scan, send, log, is
 		if (held.size > 50) {
 			const oldest = held.keys().next().value;
 			held.delete(oldest);
+			dropped.add(oldest);
+			if (dropped.size > REMEMBER_DROPPED) dropped.delete(dropped.values().next().value);
 			log(`dropped the withheld reply for ${oldest}: more than 50 are held`);
 		}
 		return {
@@ -8088,6 +8131,7 @@ function createRunner({ answerer, ledger, settings, prompts, scan, send, log, is
 			}
 			const sent = finished.get(id);
 			if (sent?.type === "reply") send(sent);
+			else if (dropped.has(id)) send(unavailable(id, `its withheld reply was dropped to make room: more than 50 were held at once, so ask again`));
 			else send(unavailable(id, "nothing is withheld under this id here; the runner may have restarted since, so ask again"));
 			return;
 		}
@@ -8192,6 +8236,18 @@ async function runnerCode(file) {
 	const st = await fs.stat(file).catch(() => null);
 	return st && st.isFile() ? `${st.size}-${Math.round(st.mtimeMs)}` : null;
 }
+/**
+* Makes the runner use the config folder `--claude-dir` names, whatever it inherited: the default
+* ~/.claude takes CLAUDE_CONFIG_DIR away (Claude Code then looks there, and for ~/.claude.json);
+* any other folder is set as CLAUDE_CONFIG_DIR, for the runner and its forks.
+*/
+function applyClaudeDir(argv, env, home) {
+	const i = argv.indexOf("--claude-dir");
+	const dir = i >= 0 ? argv[i + 1] : void 0;
+	if (!dir || dir.startsWith("--")) return;
+	if (path.resolve(dir) === path.resolve(home, ".claude")) delete env.CLAUDE_CONFIG_DIR;
+	else env.CLAUDE_CONFIG_DIR = dir;
+}
 //#endregion
 //#region src/runner/main.ts
 const LOG_CAP_BYTES = 262144;
@@ -8199,8 +8255,7 @@ const CHECK_MS = 6e4;
 const self = fileURLToPath(import.meta.url);
 const here = path.dirname(self);
 const appDir = path.join(here, "..");
-const dirFlag = process.argv.indexOf("--claude-dir");
-if (dirFlag >= 0 && process.argv[dirFlag + 1] && path.resolve(process.argv[dirFlag + 1]) !== path.resolve(os.homedir(), ".claude")) process.env.CLAUDE_CONFIG_DIR = process.argv[dirFlag + 1];
+applyClaudeDir(process.argv, process.env, os.homedir());
 const { dir: claudeDir, json: claudeJson } = claudePaths(process.env, os.homedir());
 const isoplanDir = path.join(claudeDir, "isoplan");
 const logFile = path.join(isoplanDir, "logs", "runner.log");
@@ -8257,12 +8312,16 @@ async function supervisor() {
 		})
 	});
 	clearInterval(refresh);
-	if (stopped === "not-wanted") {
-		log(`runner ${process.pid} stopped: the office server doesn't want this machine's runner; it won't start again for ${HOLD_OFF_MS / 6e4} minutes`);
-		await holdOff(lock, process.pid, Date.now() + HOLD_OFF_MS).catch(() => {});
-	} else {
-		if (stopped === "done") log(`runner ${process.pid} stopped: no room on this machine is lit`);
+	if (stopped === "done") {
+		log(`runner ${process.pid} stopped: no room on this machine is lit`);
 		await releaseLock(lock, process.pid).catch(() => {});
+	} else {
+		const why = stopped === "not-wanted" ? "the office server doesn't want this machine's runner" : "its worker kept crashing as it started";
+		log(`runner ${process.pid} stopped: ${why}; it won't start again for ${HOLD_OFF_MS / 6e4} minutes`);
+		await holdOff(lock, process.pid, Date.now() + HOLD_OFF_MS, {
+			reason: stopped,
+			code
+		}).catch(() => {});
 	}
 	return 0;
 }
@@ -8288,7 +8347,13 @@ async function worker() {
 		scan: async (text) => scan(text, await loadPatterns(path.join(appDir, "secret-patterns.json"), path.join(isoplanDir, "secret-patterns.json"), log)),
 		send: (message) => send(message),
 		log,
-		isDir: (p) => fs.stat(p).then((s) => s.isDirectory(), () => false)
+		isDir: (p) => fs.stat(p).then((s) => s.isDirectory(), () => false),
+		isReported: async (session, lead) => {
+			const id = forkableId(session);
+			const lock = id ? await readLock(lockPath(claudeDir, id)) : null;
+			if (!id || lock && lock.pid === null && lock.until !== null && lock.until > Date.now()) return false;
+			return Date.now() - lead.lastActive <= askableMs(await config().catch(() => first));
+		}
 	});
 	let notWanted = false;
 	let wake = () => {};

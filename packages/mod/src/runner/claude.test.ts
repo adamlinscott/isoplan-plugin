@@ -87,7 +87,7 @@ function fake(mode = "") {
   const logFile = path.join(root, "log.jsonl");
   fs.writeFileSync(bin, FAKE);
   const cwd = fs.mkdtempSync(path.join(root, "lead-"));
-  const lead: Lead = { cwd, working: false, compacted: false, context: 572000 };
+  const lead: Lead = { cwd, working: false, compacted: false, context: 572000, lastActive: Date.now() };
   const answerer = createClaudeAnswerer({
     claudeDir: path.join(root, ".claude"),
     binary: async () => bin,

@@ -2,15 +2,18 @@
 // (write-brief) is answered from a fork of the room's lead, through the answerer (answerer.ts):
 //
 // 1. One at a time per room: a request waits for the one before it in the same room to finish.
-// 2. The lead: a session this machine doesn't have, a folder that is gone or a lead mid-turn is
-//    refused `unavailable`. A compacted lead is answered, with a note saying so.
+// 2. The lead: a session this machine doesn't have or doesn't report (`isReported`), a folder that
+//    is gone or a lead mid-turn is refused `unavailable`. A compacted lead is answered, with a
+//    note saying so. The server names the session, so this is what keeps it to this machine's rooms.
 // 3. Caps (caps.ts): over one, it is refused `over-cap` with the cap's name. One that passes
 //    reserves its estimate at once, so a request in another room counts it.
-// 4. The fork answers, and the reservation is settled to what it used.
+// 4. The fork answers, at most `maxForks` at once across rooms; the rest wait their turn, and a
+//    request's timeout runs from when its fork starts. The reservation is settled to what the fork
+//    used, or taken back when no fork could be started.
 // 5. The secret scan (scan.ts): a match is refused `withheld` and the reply is held; the owner's
 //    `release` sends it. A release that arrives while its request is still running is applied
-//    when the reply lands. Held replies are kept in memory, at most MAX_HELD, so a runner that
-//    restarted refuses a release with the reason.
+//    when the reply lands. Held replies are kept in memory, at most MAX_HELD, so a release after a
+//    restart, or after its reply was dropped to make room, is refused with the reason.
 //
 // Nothing from the fork's output, or from the machine's folders, leaves without the scan: an
 // `unavailable` refusal says only what kind of problem it was, and the details go to the local log.
@@ -32,6 +35,7 @@ import { fill, type Prompts } from "./prompts.js";
 export interface RunnerSettings extends CapSettings {
   answerTimeoutSeconds: number;
   briefTimeoutSeconds: number;
+  maxForks: number;
 }
 
 type Outgoing = ReplyMessage | RefusalMessage;
@@ -48,6 +52,8 @@ export interface RunnerOptions {
   send: (message: Outgoing) => void;
   log: (text: string) => void;
   isDir: (path: string) => Promise<boolean>;
+  /** Whether the data layer would report this session, so the server may ask about it. */
+  isReported: (session: string, lead: Lead) => Promise<boolean>;
   /** Pushes the handoff's work and returns its repos (#48); without it, briefs are refused. */
   push?: (session: string, lead: Lead, handoff: string) => Promise<HandoffRepo[]>;
   now?: () => number;
@@ -75,12 +81,28 @@ const FAILED: Record<FailureKind, string> = {
   "not-set-up": "this machine can't run the fork; its owner can see why in the runner's log",
 };
 
-export function createRunner({ answerer, ledger, settings, prompts, scan, send, log, isDir, push, now = Date.now }: RunnerOptions): Runner {
+// Ids of replies dropped from the held set, remembered so a release for one says so.
+const REMEMBER_DROPPED = 200;
+
+export function createRunner({ answerer, ledger, settings, prompts, scan, send, log, isDir, isReported, push, now = Date.now }: RunnerOptions): Runner {
   const rooms = new Map<string, Promise<void>>(); // each room's last queued request
   const running = new Set<string>(); // ids queued or running
   const finished = new Map<string, Outgoing>(); // id → what was last sent for it
   const held = new Map<string, () => Promise<ReplyMessage>>(); // withheld replies, by id, oldest first
   const released = new Set<string>(); // released while still running
+  const dropped = new Set<string>(); // dropped from `held` to make room, oldest first
+  let forking = 0; // forks running now
+  const waiting: (() => void)[] = []; // requests waiting for a fork, in order
+
+  // Waits for one of `max` fork slots; the returned function gives it back.
+  async function forkSlot(max: number): Promise<() => void> {
+    while (forking >= max) await new Promise<void>((resolve) => waiting.push(resolve));
+    forking++;
+    return () => {
+      forking--;
+      waiting.shift()?.();
+    };
+  }
 
   const unavailable = (id: string, detail: string): RefusalMessage => ({ type: "refusal", v: PROTOCOL_VERSION, id, reason: "unavailable", detail });
   const overCapRefusal = (id: string, cap: Cap): RefusalMessage => ({ type: "refusal", v: PROTOCOL_VERSION, id, reason: "over-cap", cap });
@@ -96,6 +118,10 @@ export function createRunner({ answerer, ledger, settings, prompts, scan, send, 
     const { id, room, session } = request;
     const lead = await answerer.lead(session);
     if (!lead) return unavailable(id, "this machine has no such session");
+    if (!(await isReported(session, lead))) {
+      log(`${id}: ${session} isn't a session this machine reports, so it isn't answered for`);
+      return unavailable(id, "this machine doesn't report that session");
+    }
     if (!(await isDir(lead.cwd))) {
       log(`${id}: the folder of ${session}, ${lead.cwd}, is gone`);
       return unavailable(id, "the session's folder is gone, so its lead can't be asked");
@@ -109,13 +135,16 @@ export function createRunner({ answerer, ledger, settings, prompts, scan, send, 
     // Checked and reserved with no await between, so two rooms can't both take the last of a cap.
     const cap = overCap(ledger.entries(now()), room, expected, now(), s);
     if (cap) return overCapRefusal(id, cap);
-    const settle = ledger.reserve({ at: now(), room, usage: expected });
+    const reservation = ledger.reserve({ at: now(), room, usage: expected });
 
     const isBrief = request.kind === "write-brief";
     const text = isBrief ? fill(p.brief, { to: request.to.name || request.to.id }) : fill(p.question, { from: request.from.name || request.from.id, question: request.question });
-    const answered = await answerer.ask(session, lead, { instructions: p.instructions, request: text, timeoutMs: (isBrief ? s.briefTimeoutSeconds : s.answerTimeoutSeconds) * 1000 });
-    // A fork that failed before it was metered keeps its estimate.
-    await settle(answered.usage ?? expected).catch((err: unknown) => log(`couldn't record ${id} in the ledger: ${(err as Error).message}`));
+    const free = await forkSlot(s.maxForks);
+    const answered = await answerer.ask(session, lead, { instructions: p.instructions, request: text, timeoutMs: (isBrief ? s.briefTimeoutSeconds : s.answerTimeoutSeconds) * 1000 }).finally(free);
+    // No fork ran when it couldn't be set up: the answer and its tokens are given back. One that ran
+    // but failed before it was metered keeps its estimate.
+    const recorded = !answered.ok && answered.kind === "not-set-up" ? reservation.cancel() : reservation.settle(answered.usage ?? expected);
+    await recorded.catch((err: unknown) => log(`couldn't record ${id} in the ledger: ${(err as Error).message}`));
     if (!answered.ok) {
       log(`${id}: ${answered.detail}`);
       return unavailable(id, FAILED[answered.kind]);
@@ -136,6 +165,8 @@ export function createRunner({ answerer, ledger, settings, prompts, scan, send, 
     if (held.size > MAX_HELD) {
       const oldest = held.keys().next().value!;
       held.delete(oldest);
+      dropped.add(oldest);
+      if (dropped.size > REMEMBER_DROPPED) dropped.delete(dropped.values().next().value!);
       log(`dropped the withheld reply for ${oldest}: more than ${MAX_HELD} are held`);
     }
     return { type: "refusal", v: PROTOCOL_VERSION, id, reason: "withheld" };
@@ -150,6 +181,7 @@ export function createRunner({ answerer, ledger, settings, prompts, scan, send, 
       }
       const sent = finished.get(id);
       if (sent?.type === "reply") send(sent);
+      else if (dropped.has(id)) send(unavailable(id, `its withheld reply was dropped to make room: more than ${MAX_HELD} were held at once, so ask again`));
       else send(unavailable(id, "nothing is withheld under this id here; the runner may have restarted since, so ask again"));
       return;
     }

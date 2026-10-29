@@ -143,6 +143,7 @@ export function createClaudeCode(io: SourceIo) {
       working: t.turnOpen && now - st.mtimeMs <= config.stalledMinutes * 60000,
       compacted: t.compacted,
       context: t.usage?.context ?? 0,
+      lastActive: st.mtimeMs,
     };
   }
 
@@ -403,6 +404,8 @@ export interface LeadState {
   compacted: boolean;
   /** Its newest reply's prompt in tokens (input and both cache counts); 0 before any reply. */
   context: number;
+  /** When its transcript was last written, in ms since the epoch. */
+  lastActive: number;
 }
 
 // The transcript's types: what the source reads off a file, before it becomes facts.

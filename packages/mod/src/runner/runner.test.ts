@@ -31,7 +31,7 @@ function stub(lead: Partial<Lead> = {}) {
   const asks: { session: string; ask: Ask; settle: (a: Answered) => void }[] = [];
   const root = tempRoot();
   const answerer: Answerer = {
-    lead: async (session) => (session.startsWith("claude-code:") ? { cwd: root, working: false, compacted: false, context: 100000, ...lead } : null),
+    lead: async (session) => (session.startsWith("claude-code:") ? { cwd: root, working: false, compacted: false, context: 100000, lastActive: NOW, ...lead } : null),
     ask: (session, _lead, ask) => new Promise((settle) => asks.push({ session, ask, settle })),
     close: () => {},
   };
@@ -59,6 +59,7 @@ async function setup({ lead, settings, entries, ...opts }: Partial<Omit<RunnerOp
     send: (m) => sent.push(m),
     log: (t) => logs.push(t),
     isDir: async (p) => fs.existsSync(p) && fs.statSync(p).isDirectory(),
+    isReported: async () => true,
     now: () => NOW,
     ...opts,
   });
@@ -291,7 +292,7 @@ test("runner: at most MAX_HELD replies are held; the oldest goes first", async (
   t.runner.take({ type: "release", v: PROTOCOL_VERSION, id: `q${MAX_HELD}` });
   await t.sentN(MAX_HELD + 3);
   expect(t.sent.slice(-2)).toEqual([
-    { type: "refusal", v: PROTOCOL_VERSION, id: "q0", reason: "unavailable", detail: expect.stringContaining("nothing is withheld") },
+    { type: "refusal", v: PROTOCOL_VERSION, id: "q0", reason: "unavailable", detail: `its withheld reply was dropped to make room: more than ${MAX_HELD} were held at once, so ask again` },
     { type: "reply", v: PROTOCOL_VERSION, id: `q${MAX_HELD}`, kind: "answer-question", answer: "AKIAABCDEFGHIJKLMNOP" },
   ]);
 });
@@ -304,6 +305,44 @@ test("runner: the ledger entry of an unmetered failure keeps its estimate", asyn
   await t.runner.settled();
   // Unmetered, it counts at its estimate.
   expect(t.ledger.entries(NOW)).toEqual([{ at: NOW, room: "room-1", usage: { input: 0, output: 2000, cacheWrite: 100000, cacheRead: 200000 } }]);
+});
+
+test("runner: a fork that couldn't be started gives its answer and tokens back", async () => {
+  const t = await setup({ settings: { answersPerMachinePerDay: 1 } });
+  t.runner.take(question("q1"));
+  await t.asked(1);
+  t.asks[0]!.settle({ ok: false, kind: "not-set-up", detail: "the claude binary wasn't found", usage: null });
+  await t.runner.settled();
+  expect(t.sent[0]).toMatchObject({ id: "q1", reason: "unavailable", detail: expect.stringContaining("can't run the fork") });
+  expect(t.ledger.entries(NOW)).toEqual([]);
+  // The one answer the day allows is still there.
+  t.runner.take(question("q2"));
+  await t.asked(2);
+});
+
+test("runner: at most maxForks run at once across rooms; the rest wait, their timeout not yet running", async () => {
+  const t = await setup({ settings: { maxForks: 2 } });
+  for (const room of ["a", "b", "c"]) t.runner.take(question(`q-${room}`, room));
+  await t.asked(2);
+  await new Promise((r) => setTimeout(r, 50));
+  expect(t.asks).toHaveLength(2);
+  t.asks[0]!.settle(ok("one"));
+  await t.asked(3);
+  expect(t.asks[2]!.ask.timeoutMs).toBe(defaults.answerTimeoutSeconds * 1000);
+  t.asks[1]!.settle(ok("two"));
+  t.asks[2]!.settle(ok("three"));
+  await t.runner.settled();
+  expect(t.sent).toHaveLength(3);
+});
+
+test("runner: a session this machine doesn't report isn't answered for, whatever the server asks", async () => {
+  const seen: string[] = [];
+  const t = await setup({ isReported: async (session) => (seen.push(session), false) });
+  t.runner.take(question("q1", "room-1", "claude-code:not-reported"));
+  await t.runner.settled();
+  expect(t.asks).toEqual([]);
+  expect(seen).toEqual(["claude-code:not-reported"]);
+  expect(t.sent).toEqual([{ type: "refusal", v: PROTOCOL_VERSION, id: "q1", reason: "unavailable", detail: "this machine doesn't report that session" }]);
 });
 
 test("runner: an owner's answer isn't the runner's; a handoff to take is logged", async () => {

@@ -6,7 +6,7 @@ import { nodeIo } from "../data-layer/io.js";
 import { holdOff, lockHolder, refreshLock, takeLock } from "../wake/lock.js";
 import { wakeRecordPath } from "../wake/wake.js";
 import { anyRoomSince, askableMs, MAX_FAST_FAILURES, NOT_WANTED_CODE, supervise } from "./lifecycle.js";
-import { RUNNER_FRESH_MS, runnerCode, runnerLockPath, startRunner, stopRunner } from "./start.js";
+import { applyClaudeDir, RUNNER_FRESH_MS, runnerCode, runnerLockPath, startRunner, stopRunner } from "./start.js";
 
 const OTHER = 4242; // a pid that isn't this process
 
@@ -28,13 +28,13 @@ async function machine({ runner = true } = {}) {
 
 test("one runner: started when none holds the lock, not while one lives; a dead one's lock is taken over", async () => {
   const m = await machine();
-  expect(await m.start()).toBe(true);
+  expect(await m.start()).toBe("started");
   expect(m.spawned).toEqual([{ args: [m.runnerJs, "--claude-dir", m.claudeDir], cwd: m.claudeDir }]);
   expect(await m.hold(OTHER)).toBe(true);
   expect(await takeLock(m.lock, OTHER + 1, () => true)).toBe(false);
-  expect(await m.start(() => true)).toBe(false);
+  expect(await m.start(() => true)).toBe("running");
   // It crashed hard and left its lock: the next start takes over.
-  expect(await m.start(() => false)).toBe(true);
+  expect(await m.start(() => false)).toBe("started");
   expect(await takeLock(m.lock, OTHER + 1, () => false)).toBe(true);
   expect(await lockHolder(m.lock)).toBe(OTHER + 1);
   expect(m.spawned).toHaveLength(2);
@@ -59,19 +59,19 @@ test("one runner: a lock not kept fresh is stale though its pid is live, so a re
   fs.utimesSync(m.lock, old, old);
   expect(await stopRunner(m.claudeDir, m.opts())).toBe(false);
   expect(m.killed).toEqual([]);
-  expect(await m.start()).toBe(true);
+  expect(await m.start()).toBe("started");
   // The runner keeps its lock fresh, and then it counts again.
   expect(await refreshLock(m.lock, OTHER)).toBe(true);
   expect(await refreshLock(m.lock, OTHER + 1)).toBe(false);
-  expect(await m.start()).toBe(false);
+  expect(await m.start()).toBe("running");
 });
 
 test("one runner: a runner on older code is stopped and a new one started; uninstall stops one and clears its lock", async () => {
   const m = await machine();
   await m.hold(OTHER);
-  expect(await m.start()).toBe(false);
+  expect(await m.start()).toBe("running");
   fs.writeFileSync(m.runnerJs, "// v2, from a plugin update");
-  expect(await m.start()).toBe(true);
+  expect(await m.start()).toBe("started");
   expect(m.killed).toEqual([OTHER]);
   expect(fs.existsSync(m.lock)).toBe(false);
   expect(m.spawned).toHaveLength(1);
@@ -86,13 +86,13 @@ test("one runner: a hold-off keeps it from starting; nothing starts when install
   const held = await machine();
   await held.hold(OTHER);
   await holdOff(held.lock, OTHER, Date.now() + 60000);
-  expect(await held.start(() => false)).toBe(false);
+  expect(await held.start(() => false)).toBe("held-off");
   expect(await stopRunner(held.claudeDir, held.opts())).toBe(false);
   const none = await machine({ runner: false });
-  expect(await none.start()).toBe(false);
+  expect(await none.start()).toBe("not-installed");
   const gone = await machine();
   fs.rmSync(gone.runnerJs);
-  expect(await gone.start()).toBe(false);
+  expect(await gone.start()).toBe("not-installed");
   expect([...held.spawned, ...none.spawned, ...gone.spawned]).toEqual([]);
 });
 
@@ -142,4 +142,43 @@ test("lifecycle: the worker stays while any room is inside its lights-off window
   // With lights-off at 0, a room stays askable through its idle window.
   expect(askableMs({ lightsOffHours: 0, idleMinutes: 30 })).toBe(30 * 60000);
   expect(await anyRoomSince(nodeIo(), path.join(home, "missing"), 0)).toBe(false);
+});
+
+test("one runner: a starter acting on an old read doesn't stop the runner another starter just put in its place", async () => {
+  const m = await machine();
+  await m.hold(OTHER);
+  const old = { pid: OTHER, code: await runnerCode(m.runnerJs) };
+  // Starter A replaces the outdated runner with S1, on new code.
+  fs.writeFileSync(m.runnerJs, "// v2");
+  expect(await m.start()).toBe("started");
+  await m.hold(OTHER + 1);
+  // Starter B judged OTHER outdated before that, and only now gets to stop it.
+  expect(await stopRunner(m.claudeDir, { ...m.opts(), expect: old })).toBe(false);
+  expect(m.killed).toEqual([OTHER]);
+  expect(await lockHolder(m.lock)).toBe(OTHER + 1);
+});
+
+test("one runner: a crash loop's hold-off keeps it down, until a newer version is installed", async () => {
+  const m = await machine();
+  await m.hold(OTHER);
+  await holdOff(m.lock, OTHER, Date.now() + 3600000, { reason: "gave-up", code: await runnerCode(m.runnerJs) });
+  expect(await m.start(() => false)).toBe("held-off");
+  fs.writeFileSync(m.runnerJs, "// v2, with the crash fixed");
+  expect(await m.start(() => false)).toBe("started");
+  expect(fs.existsSync(m.lock)).toBe(false);
+  // A server that didn't want the runner keeps it held off, whatever the version.
+  await m.hold(OTHER);
+  await holdOff(m.lock, OTHER, Date.now() + 3600000, { reason: "not-wanted", code: "old" });
+  expect(await m.start(() => false)).toBe("held-off");
+});
+
+test("runner: --claude-dir wins over an inherited CLAUDE_CONFIG_DIR", () => {
+  const home = path.resolve("/home/ada");
+  const env: Record<string, string | undefined> = { CLAUDE_CONFIG_DIR: "/elsewhere" };
+  applyClaudeDir(["node", "runner.mjs", "--claude-dir", path.join(home, ".claude")], env, home);
+  expect(env).toEqual({});
+  applyClaudeDir(["node", "runner.mjs", "--claude-dir", "/custom/claude", "--worker"], env, home);
+  expect(env).toEqual({ CLAUDE_CONFIG_DIR: "/custom/claude" });
+  applyClaudeDir(["node", "runner.mjs", "--worker"], env, home);
+  expect(env).toEqual({ CLAUDE_CONFIG_DIR: "/custom/claude" });
 });

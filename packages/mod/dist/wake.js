@@ -32,6 +32,10 @@ async function readLock(file) {
 	const r = await readText(file);
 	return r && parseLock(r.text, r.mtimeMs);
 }
+/** The pid the lock names, or null when there is none or it can't be read. */
+async function lockHolder(file) {
+	return (await readLock(file))?.pid ?? null;
+}
 const held = (lock, now, { isAlive = alive, freshMs }) => !!lock && (lock.until !== null && lock.until > now || lock.pid !== null && isAlive(lock.pid) && (freshMs === void 0 || now - lock.mtimeMs < freshMs));
 /** Whether the lock is held: by a live pid (kept fresh, under `freshMs`), or by a hold-off that hasn't ended. */
 async function isHeld(file, now = Date.now(), isAlive = alive, rule = {}) {
@@ -39,6 +43,10 @@ async function isHeld(file, now = Date.now(), isAlive = alive, rule = {}) {
 		...rule,
 		isAlive
 	});
+}
+/** Removes the lock if it still names `pid`. */
+async function releaseLock(file, pid) {
+	if (await lockHolder(file) === pid) await fs.rm(file, { force: true });
 }
 function alive(pid) {
 	try {
@@ -95,44 +103,58 @@ async function liveRunner(claudeDir, now, isAlive) {
 	return null;
 }
 /**
-* True when a runner was started. Nothing recorded, or a recorded runner that is gone, starts none;
-* a live one running the recorded code is left alone, and one running older code is replaced.
+* Starts the recorded runner unless a live one runs the recorded code. One on older code is
+* replaced. A hold-off keeps it from starting, except a crash loop's hold-off on older code: a new
+* version may have fixed what crashed.
 */
 async function startRunner({ claudeDir, spawn, isAlive = alive, kill = (pid) => process.kill(pid), now = Date.now }) {
 	let runner;
 	try {
 		runner = JSON.parse(await fs.readFile(wakeRecordPath(claudeDir), "utf8")).runner;
 	} catch {
-		return false;
+		return "not-installed";
 	}
-	if (typeof runner !== "string") return false;
+	if (typeof runner !== "string") return "not-installed";
 	const code = await runnerCode(runner);
-	if (!code) return false;
+	if (!code) return "not-installed";
+	const lockFile = runnerLockPath(claudeDir);
 	const live = await liveRunner(claudeDir, now(), isAlive);
-	if (live && (live.isHoldOff || live.extra.code === code)) return false;
-	if (live) await stopRunner(claudeDir, {
-		isAlive,
-		kill,
-		now
-	});
+	if (live?.isHoldOff) {
+		if (live.extra.reason !== "gave-up" || live.extra.code === code) return "held-off";
+		if ((await readLock(lockFile))?.until === live.until) await fs.rm(lockFile, { force: true });
+	} else if (live) {
+		if (live.extra.code === code) return "running";
+		await stopRunner(claudeDir, {
+			isAlive,
+			kill,
+			now,
+			expect: {
+				pid: live.pid,
+				code: live.extra.code
+			}
+		});
+	}
 	spawn([
 		runner,
 		"--claude-dir",
 		claudeDir
 	], claudeDir);
-	return true;
+	return "started";
 }
 /**
 * Ends the running runner, for uninstall and updates: its worker and forks follow once its
-* supervisor has gone. True when one was running. A stale lock's pid is never killed.
+* supervisor has gone. True when one was running. A stale lock's pid is never killed. With
+* `expect`, only the runner judged outdated is: if the lock names another pid or code by now
+* (another starter replaced it already), it is left.
 */
-async function stopRunner(claudeDir, { isAlive = alive, kill = (pid) => process.kill(pid), now = Date.now } = {}) {
+async function stopRunner(claudeDir, { isAlive = alive, kill = (pid) => process.kill(pid), now = Date.now, expect } = {}) {
 	const live = await liveRunner(claudeDir, now(), isAlive);
 	if (!live || live.isHoldOff || live.pid === null) return false;
+	if (expect && (live.pid !== expect.pid || live.extra.code !== expect.code)) return false;
 	try {
 		kill(live.pid);
 	} catch {}
-	await fs.rm(runnerLockPath(claudeDir), { force: true });
+	await releaseLock(runnerLockPath(claudeDir), live.pid);
 	return true;
 }
 //#endregion

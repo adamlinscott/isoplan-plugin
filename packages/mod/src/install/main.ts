@@ -41,7 +41,15 @@ try {
   if (uninstall && (await stopRunner(claudeDir))) console.log("Stopped the runner, which answered for this machine's rooms.");
   if (!uninstall) {
     if (!(await fs.stat(claudeBinaryPath(claudeDir)).catch(() => null))) console.log("Couldn't find the claude binary, so the runner can't answer for this machine's rooms; set its path in " + claudeBinaryPath(claudeDir) + ' as { "path": "..." }.');
-    console.log((await startRunner({ claudeDir, spawn: start })) ? "Started the runner, which answers for this machine's rooms." : "The runner is already running.");
+    const runner = await startRunner({ claudeDir, spawn: start });
+    console.log(
+      {
+        started: "Started the runner, which answers for this machine's rooms.",
+        running: "The runner is already running.",
+        "held-off": `The runner is holding off for now (the office server didn't want it, or it kept crashing); see ${path.join(claudeDir, "isoplan", "logs", "runner.log")}.`,
+        "not-installed": "The runner wasn't started: its copy isn't in place.",
+      }[runner],
+    );
     const io = nodeIo();
     const config = await loadConfig(io, path.join(here, "..", "config.json"), path.join(claudeDir, "isoplan", "config.json"));
     const found = await recentSessions(io, path.join(claudeDir, "projects"), Date.now() - config.lightsOffHours * 3600000);

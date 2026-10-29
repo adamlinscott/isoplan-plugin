@@ -676,7 +676,7 @@ test("lead: the runner finds a session by name and reads its folder, open turn, 
   const p = session(home, "s", [line.user(main, "go", 60), line.reply(main, "m1", u(1000), 50)], { slug: "somewhere" });
   const source = createClaudeCode({ ...nodeIo({ run: null }), claudeDir: path.join(home, ".claude") });
   const config = { tailBytes: 1048576, stalledMinutes: 5 };
-  expect(await source.lead("s", NOW, config)).toEqual({ cwd: main, working: false, compacted: false, context: 1001 });
+  expect(await source.lead("s", NOW, config)).toEqual({ cwd: main, working: false, compacted: false, context: 1001, lastActive: NOW - 10000 });
   expect(await source.lead("missing", NOW, config)).toBe(null);
 
   // A new prompt opens its turn; a compaction stays seen.

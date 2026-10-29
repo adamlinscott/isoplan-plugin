@@ -13,6 +13,8 @@ export interface Lead {
   compacted: boolean;
   /** Its context in tokens, which a fork reads in full; 0 when unknown. */
   context: number;
+  /** When it was last at work, in ms since the epoch. */
+  lastActive: number;
 }
 
 /** Tokens one fork used, with cache reads and writes apart since they are priced apart. */

@@ -6134,8 +6134,10 @@ async function isHeld(file, now = Date.now(), isAlive = alive, rule = {}) {
 *
 * A new lock is created exclusively, so of two takers at once only one gets it. A stale one is
 * moved aside by rename, which only one taker can do to the same file, and the taker checks that
-* what it moved is the lock it judged stale: one that moved another taker's new lock instead puts
-* it back and loses.
+* what it moved is the lock it judged stale, by its text and its write time, so a lock its holder
+* refreshed meanwhile isn't taken: one that moved another's lock instead puts it back and loses.
+* With `force` a lock that can't be moved (on Windows a scanner may have it open) is tried again
+* after a short wait, then overwritten, so the plugin's data layer always gets it.
 */
 async function takeLock(file, pid, isAlive = alive, force = false, now = Date.now(), { freshMs, extra = {} } = {}) {
 	await fs.mkdir(path.dirname(file), { recursive: true });
@@ -6144,6 +6146,7 @@ async function takeLock(file, pid, isAlive = alive, force = false, now = Date.no
 		...extra
 	});
 	for (let tries = 0; tries < 5; tries++) {
+		if (tries && force) await new Promise((r) => setTimeout(r, 20 * tries));
 		try {
 			await fs.writeFile(file, body, { flag: "wx" });
 			return true;
@@ -6169,7 +6172,9 @@ async function takeLock(file, pid, isAlive = alive, force = false, now = Date.no
 			].includes(err.code ?? "")) continue;
 			throw err;
 		}
-		if (await fs.readFile(aside, "utf8").catch(() => null) !== seen.text) {
+		const moved = await fs.readFile(aside, "utf8").catch(() => null);
+		const movedAt = (await fs.stat(aside).catch(() => null))?.mtimeMs;
+		if (moved !== seen.text || movedAt !== seen.mtimeMs) {
 			await fs.link(aside, file).catch(() => {});
 			await fs.rm(aside, { force: true });
 			if (!force) return false;
@@ -6177,17 +6182,20 @@ async function takeLock(file, pid, isAlive = alive, force = false, now = Date.no
 		}
 		await fs.rm(aside, { force: true });
 	}
-	return false;
+	if (!force) return false;
+	await fs.writeFile(file, body);
+	return true;
 }
 /** Removes the lock if it still names `pid`. */
 async function releaseLock(file, pid) {
 	if (await lockHolder(file) === pid) await fs.rm(file, { force: true });
 }
-/** Turns the lock `pid` holds into a hold-off until `until`; one another has taken is left. */
-async function holdOff(file, pid, until) {
+/** Turns the lock `pid` holds into a hold-off until `until`, with `extra` beside it; one another has taken is left. */
+async function holdOff(file, pid, until, extra = {}) {
 	if (await lockHolder(file) === pid) await fs.writeFile(file, JSON.stringify({
 		pid: 0,
-		until
+		until,
+		...extra
 	}));
 }
 function alive(pid) {
@@ -6368,44 +6376,58 @@ async function liveRunner(claudeDir, now, isAlive) {
 	return null;
 }
 /**
-* True when a runner was started. Nothing recorded, or a recorded runner that is gone, starts none;
-* a live one running the recorded code is left alone, and one running older code is replaced.
+* Starts the recorded runner unless a live one runs the recorded code. One on older code is
+* replaced. A hold-off keeps it from starting, except a crash loop's hold-off on older code: a new
+* version may have fixed what crashed.
 */
 async function startRunner({ claudeDir, spawn, isAlive = alive, kill = (pid) => process.kill(pid), now = Date.now }) {
 	let runner;
 	try {
 		runner = JSON.parse(await fs.readFile(wakeRecordPath(claudeDir), "utf8")).runner;
 	} catch {
-		return false;
+		return "not-installed";
 	}
-	if (typeof runner !== "string") return false;
+	if (typeof runner !== "string") return "not-installed";
 	const code = await runnerCode(runner);
-	if (!code) return false;
+	if (!code) return "not-installed";
+	const lockFile = runnerLockPath(claudeDir);
 	const live = await liveRunner(claudeDir, now(), isAlive);
-	if (live && (live.isHoldOff || live.extra.code === code)) return false;
-	if (live) await stopRunner(claudeDir, {
-		isAlive,
-		kill,
-		now
-	});
+	if (live?.isHoldOff) {
+		if (live.extra.reason !== "gave-up" || live.extra.code === code) return "held-off";
+		if ((await readLock(lockFile))?.until === live.until) await fs.rm(lockFile, { force: true });
+	} else if (live) {
+		if (live.extra.code === code) return "running";
+		await stopRunner(claudeDir, {
+			isAlive,
+			kill,
+			now,
+			expect: {
+				pid: live.pid,
+				code: live.extra.code
+			}
+		});
+	}
 	spawn([
 		runner,
 		"--claude-dir",
 		claudeDir
 	], claudeDir);
-	return true;
+	return "started";
 }
 /**
 * Ends the running runner, for uninstall and updates: its worker and forks follow once its
-* supervisor has gone. True when one was running. A stale lock's pid is never killed.
+* supervisor has gone. True when one was running. A stale lock's pid is never killed. With
+* `expect`, only the runner judged outdated is: if the lock names another pid or code by now
+* (another starter replaced it already), it is left.
 */
-async function stopRunner(claudeDir, { isAlive = alive, kill = (pid) => process.kill(pid), now = Date.now } = {}) {
+async function stopRunner(claudeDir, { isAlive = alive, kill = (pid) => process.kill(pid), now = Date.now, expect } = {}) {
 	const live = await liveRunner(claudeDir, now(), isAlive);
 	if (!live || live.isHoldOff || live.pid === null) return false;
+	if (expect && (live.pid !== expect.pid || live.extra.code !== expect.code)) return false;
 	try {
 		kill(live.pid);
 	} catch {}
-	await fs.rm(runnerLockPath(claudeDir), { force: true });
+	await releaseLock(runnerLockPath(claudeDir), live.pid);
 	return true;
 }
 //#endregion
@@ -7172,7 +7194,8 @@ function createClaudeCode(io) {
 			cwd: t.cwd,
 			working: t.turnOpen && now - st.mtimeMs <= config.stalledMinutes * 6e4,
 			compacted: t.compacted,
-			context: t.usage?.context ?? 0
+			context: t.usage?.context ?? 0,
+			lastActive: st.mtimeMs
 		};
 	}
 	async function locate(sessionId, cwd, now) {

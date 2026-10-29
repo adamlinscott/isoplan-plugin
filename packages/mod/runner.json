@@ -9,5 +9,6 @@
   "outputTokenWeight": 5,
   "estimatedOutputTokens": 2000,
   "answerTimeoutSeconds": 120,
-  "briefTimeoutSeconds": 240
+  "briefTimeoutSeconds": 240,
+  "maxForks": 2
 }

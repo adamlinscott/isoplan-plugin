@@ -8,7 +8,7 @@
 // the budget with an estimate made from the lead's context before it runs (#44: turn 1 may write
 // the whole context to cache, then each turn reads it). The estimate is reserved in the ledger as
 // the request passes, so requests in other rooms running at the same time count it, and is settled
-// to what the fork actually used once it is done. The ledger is kept in a file, so a restarted
+// to what the fork actually used once it is done, or taken back when no fork ran at all. The ledger is kept in a file, so a restarted
 // runner doesn't start the day over.
 
 import fs from "node:fs/promises";
@@ -60,14 +60,20 @@ export function overCap(entries: Entry[], room: string, expected: Usage, now: nu
   return null;
 }
 
+export interface Reservation {
+  settle(usage: Usage): Promise<void>;
+  cancel(): Promise<void>;
+}
+
 export interface Ledger {
   /** The entries of the last day, reserved ones among them. */
   entries(now: number): Entry[];
   /**
-   * Counts `entry` at once, and returns what settles it to the usage it turned out to have. Call
-   * it straight after checking `overCap`, with no await between, so no other request slips in.
+   * Counts `entry` at once. `settle` sets it to the usage it turned out to have; `cancel` takes it
+   * out again, answer and tokens both. Call it straight after checking `overCap`, with no await
+   * between, so no other request slips in.
    */
-  reserve(entry: Entry): (usage: Usage) => Promise<void>;
+  reserve(entry: Entry): Reservation;
 }
 
 /** The ledger in `file`; one that is missing or doesn't parse starts empty. */
@@ -97,9 +103,15 @@ export async function openLedger(file: string): Promise<Ledger> {
       const held = { ...entry };
       entries = [...recent(entry.at), held];
       void save().catch(() => {});
-      return (usage) => {
-        held.usage = usage;
-        return save();
+      return {
+        settle(usage) {
+          held.usage = usage;
+          return save();
+        },
+        cancel() {
+          entries = entries.filter((e) => e !== held);
+          return save();
+        },
       };
     },
   };

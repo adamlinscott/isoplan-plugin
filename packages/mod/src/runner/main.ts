@@ -35,15 +35,15 @@ import { loadConfig, loadSettings } from "../data-layer/config.js";
 import { accountOf, claudePaths } from "../data-layer/identity.js";
 import { nodeIo } from "../data-layer/io.js";
 import { createLink } from "../data-layer/link.js";
-import { HOLD_OFF_MS, alive, holdOff, refreshLock, releaseLock, takeLock } from "../wake/lock.js";
+import { HOLD_OFF_MS, alive, holdOff, lockPath, readLock, refreshLock, releaseLock, takeLock } from "../wake/lock.js";
 import { openLedger } from "./caps.js";
-import { createClaudeAnswerer } from "./claude.js";
+import { createClaudeAnswerer, forkableId } from "./claude.js";
 import { claudeBinary } from "./claude-binary.js";
 import { anyRoomSince, askableMs, NOT_WANTED_CODE, supervise } from "./lifecycle.js";
 import { loadPrompts } from "./prompts.js";
 import { createRunner, type RunnerSettings } from "./runner.js";
 import { loadPatterns, scan } from "./scan.js";
-import { LOCK_REFRESH_MS, RUNNER_FRESH_MS, runnerCode, runnerLockPath } from "./start.js";
+import { applyClaudeDir, LOCK_REFRESH_MS, RUNNER_FRESH_MS, runnerCode, runnerLockPath } from "./start.js";
 
 // The runner's log starts over once it is this big.
 const LOG_CAP_BYTES = 256 * 1024;
@@ -53,8 +53,7 @@ const CHECK_MS = 60000;
 const self = fileURLToPath(import.meta.url);
 const here = path.dirname(self);
 const appDir = path.join(here, "..");
-const dirFlag = process.argv.indexOf("--claude-dir");
-if (dirFlag >= 0 && process.argv[dirFlag + 1] && path.resolve(process.argv[dirFlag + 1]!) !== path.resolve(os.homedir(), ".claude")) process.env.CLAUDE_CONFIG_DIR = process.argv[dirFlag + 1];
+applyClaudeDir(process.argv, process.env, os.homedir());
 const { dir: claudeDir, json: claudeJson } = claudePaths(process.env, os.homedir());
 const isoplanDir = path.join(claudeDir, "isoplan");
 const logFile = path.join(isoplanDir, "logs", "runner.log");
@@ -102,12 +101,14 @@ async function supervisor(): Promise<number> {
       }),
   });
   clearInterval(refresh);
-  if (stopped === "not-wanted") {
-    log(`runner ${process.pid} stopped: the office server doesn't want this machine's runner; it won't start again for ${HOLD_OFF_MS / 60000} minutes`);
-    await holdOff(lock, process.pid, Date.now() + HOLD_OFF_MS).catch(() => {});
-  } else {
-    if (stopped === "done") log(`runner ${process.pid} stopped: no room on this machine is lit`);
+  if (stopped === "done") {
+    log(`runner ${process.pid} stopped: no room on this machine is lit`);
     await releaseLock(lock, process.pid).catch(() => {});
+  } else {
+    // Neither goes away by starting again: it holds off, which a newer version ends for a crash loop.
+    const why = stopped === "not-wanted" ? "the office server doesn't want this machine's runner" : "its worker kept crashing as it started";
+    log(`runner ${process.pid} stopped: ${why}; it won't start again for ${HOLD_OFF_MS / 60000} minutes`);
+    await holdOff(lock, process.pid, Date.now() + HOLD_OFF_MS, { reason: stopped, code }).catch(() => {});
   }
   return 0;
 }
@@ -137,6 +138,15 @@ async function worker(): Promise<number> {
     send: (message) => send(message),
     log,
     isDir: (p) => fs.stat(p).then((s) => s.isDirectory(), () => false),
+    // Only the rooms the data layer would report: inside the askable window, and not held off,
+    // which a detached data layer leaves when the server doesn't want the session's project (or git
+    // can't place its folder). That hold-off in isoplan/live/<id>.json is the only record of it.
+    isReported: async (session, lead) => {
+      const id = forkableId(session);
+      const lock = id ? await readLock(lockPath(claudeDir, id)) : null;
+      if (!id || (lock && lock.pid === null && lock.until !== null && lock.until > Date.now())) return false;
+      return Date.now() - lead.lastActive <= askableMs(await config().catch(() => first));
+    },
   });
 
   let notWanted = false;

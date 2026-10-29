@@ -81,13 +81,16 @@ export async function isHeld(file: string, now = Date.now(), isAlive = alive, ru
  *
  * A new lock is created exclusively, so of two takers at once only one gets it. A stale one is
  * moved aside by rename, which only one taker can do to the same file, and the taker checks that
- * what it moved is the lock it judged stale: one that moved another taker's new lock instead puts
- * it back and loses.
+ * what it moved is the lock it judged stale, by its text and its write time, so a lock its holder
+ * refreshed meanwhile isn't taken: one that moved another's lock instead puts it back and loses.
+ * With `force` a lock that can't be moved (on Windows a scanner may have it open) is tried again
+ * after a short wait, then overwritten, so the plugin's data layer always gets it.
  */
 export async function takeLock(file: string, pid: number, isAlive = alive, force = false, now = Date.now(), { freshMs, extra = {} }: { freshMs?: number; extra?: Record<string, unknown> } = {}): Promise<boolean> {
   await fs.mkdir(path.dirname(file), { recursive: true });
   const body = JSON.stringify({ pid, ...extra });
   for (let tries = 0; tries < 5; tries++) {
+    if (tries && force) await new Promise((r) => setTimeout(r, 20 * tries));
     try {
       await fs.writeFile(file, body, { flag: "wx" });
       return true;
@@ -107,7 +110,8 @@ export async function takeLock(file: string, pid: number, isAlive = alive, force
       throw err;
     }
     const moved = await fs.readFile(aside, "utf8").catch(() => null);
-    if (moved !== seen.text) {
+    const movedAt = (await fs.stat(aside).catch(() => null))?.mtimeMs;
+    if (moved !== seen.text || movedAt !== seen.mtimeMs) {
       // That was another taker's new lock: it goes back, unless a newer one is there already.
       await fs.link(aside, file).catch(() => {});
       await fs.rm(aside, { force: true });
@@ -116,12 +120,22 @@ export async function takeLock(file: string, pid: number, isAlive = alive, force
     }
     await fs.rm(aside, { force: true });
   }
-  return false;
+  if (!force) return false;
+  await fs.writeFile(file, body);
+  return true;
 }
 
-/** Marks the lock `pid` holds as fresh; false when another has taken it. */
-export async function refreshLock(file: string, pid: number, now = Date.now()): Promise<boolean> {
-  if ((await lockHolder(file)) !== pid) return false;
+/**
+ * Marks the lock `pid` holds as fresh; false when another has taken it. A lock briefly missing (a
+ * taker moved it aside to look, and is putting it back) is looked at again once, after `retryMs`.
+ */
+export async function refreshLock(file: string, pid: number, now = Date.now(), retryMs = 250): Promise<boolean> {
+  let holder = await lockHolder(file);
+  if (holder === null) {
+    await new Promise((r) => setTimeout(r, retryMs));
+    holder = await lockHolder(file);
+  }
+  if (holder !== pid) return false;
   const t = new Date(now);
   await fs.utimes(file, t, t);
   return true;
@@ -132,9 +146,9 @@ export async function releaseLock(file: string, pid: number): Promise<void> {
   if ((await lockHolder(file)) === pid) await fs.rm(file, { force: true });
 }
 
-/** Turns the lock `pid` holds into a hold-off until `until`; one another has taken is left. */
-export async function holdOff(file: string, pid: number, until: number): Promise<void> {
-  if ((await lockHolder(file)) === pid) await fs.writeFile(file, JSON.stringify({ pid: 0, until }));
+/** Turns the lock `pid` holds into a hold-off until `until`, with `extra` beside it; one another has taken is left. */
+export async function holdOff(file: string, pid: number, until: number, extra: Record<string, unknown> = {}): Promise<void> {
+  if ((await lockHolder(file)) === pid) await fs.writeFile(file, JSON.stringify({ pid: 0, until, ...extra }));
 }
 
 // Signal 0 tests for a process without touching it: ESRCH means it is gone, EPERM that it exists.
