@@ -32,7 +32,7 @@
 // and the hooks stay while a session wrote its files again during the wait, so a later prompt
 // tries once more.
 
-import { execFile } from "node:child_process";
+import { execFile, spawnSync } from "node:child_process";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -42,7 +42,7 @@ import { claudeBinaryPath } from "../runner/claude-binary.js";
 import { RUNNER_FRESH_MS, runnerLockPath } from "../runner/start.js";
 import { alive, holdOff, isHeld, readLock, releaseLock, takeLock } from "../wake/lock.js";
 import { wakeRecordPath, type WakeRecord } from "../wake/wake.js";
-import { pluginState, type Place, type PluginState } from "./state.js";
+import { normalPath, pluginState, type Place, type PluginState } from "./state.js";
 
 export const WAKE_EVENTS = ["UserPromptSubmit", "Stop"] as const;
 // Seconds Claude Code waits for the hook; it is done long before.
@@ -81,13 +81,21 @@ export const wakeCommand = (script: string) => `node "${script.replace(/\\/g, "/
 
 type Json = Record<string, unknown>;
 
-// A path or command as compared: forward slashes, and on Windows without regard to case.
-const comparable = (text: string) => (process.platform === "win32" ? text.replace(/\\/g, "/").toLowerCase() : text.replace(/\\/g, "/"));
+/** The script a hook command runs with node, as `node "<script>"` or `node <script>`; null for any other command. */
+export function nodeScriptOf(command: string): string | null {
+  const m = /^\s*node(?:\.exe)?\s+(?:"([^"]+)"|'([^']+)'|(\S+))\s*$/i.exec(command);
+  return m ? (m[1] ?? m[2] ?? m[3])! : null;
+}
 
-// Whether a settings hook runs this config folder's wake.mjs; another folder's is left alone.
+// Whether a settings hook runs this config folder's wake.mjs, whatever its spelling (quotes,
+// slashes, letter case where the file system ignores it); another folder's is left alone.
 const isWakeFor = (claudeDir: string) => {
-  const script = comparable(wakeScriptPath(claudeDir));
-  return (hook: unknown) => typeof (hook as Json | null)?.command === "string" && comparable((hook as Json).command as string).includes(script);
+  const script = normalPath(wakeScriptPath(claudeDir));
+  return (hook: unknown) => {
+    const command = (hook as Json | null)?.command;
+    const runs = typeof command === "string" ? nodeScriptOf(command) : null;
+    return runs !== null && normalPath(runs) === script;
+  };
 };
 
 /** The data layer wake.json records; null when there is none. */
@@ -110,18 +118,28 @@ export async function recordedState(paths: Paths, cwd?: string): Promise<PluginS
  * Copies `wakeSource` (dist/wake.js) into place, records `dataLayer`, and adds or updates the hooks.
  * With `runnerFrom` (the plugin's folder) it copies the runner too, and records the copy.
  * Returns what it changed, [] when it was all there. Throws when settings.json can't be merged.
- * With `auto` (the plugin's data layer) it does nothing once the hook has been uninstalled, or
- * once Claude Code lists the plugin `dataLayer` belongs to as uninstalled: a session that loaded
- * it before then still runs it.
+ * With `auto` (the plugin's data layer) it does nothing once the hook has been uninstalled, but
+ * finish what that uninstall left (a wake.mjs no hook names), or once Claude Code lists the plugin
+ * `dataLayer` belongs to as uninstalled: a session that loaded it before then still runs it.
+ *
+ * A background uninstall that is running is waited for, up to `waitMs`; one still running then
+ * leaves the plugin's data layer doing nothing (its next start tries again), and the install
+ * script failing. An uninstall that failed, or whose process has gone, leaves its lock and log,
+ * which go now, since the plugin is wanted after all.
  */
 export async function installWake(
   paths: Paths,
   dataLayer: string,
   wakeSource: string,
-  { auto = false, runnerFrom, findClaude }: { auto?: boolean; runnerFrom?: string; findClaude?: () => Promise<string | null> } = {},
+  { auto = false, runnerFrom, findClaude, waitMs = INSTALL_WAIT_MS }: { auto?: boolean; runnerFrom?: string; findClaude?: () => Promise<string | null>; waitMs?: number } = {},
 ): Promise<string[]> {
   const { claudeDir, settings } = paths;
-  if (auto && ((await isOptedOut(claudeDir)) || (await pluginState(paths, dataLayer)) === "uninstalled")) return [];
+  if (auto && (await isOptedOut(claudeDir))) return finishOptOut(paths);
+  if (auto && (await pluginState(paths, dataLayer)) === "uninstalled") return [];
+  if (!(await waitForUninstall(claudeDir, waitMs))) {
+    if (auto) return [];
+    throw new Error(`an uninstall is running (${uninstallLockPath(claudeDir)}); try again once it is done`);
+  }
   const isWake = isWakeFor(claudeDir);
   const current = await readSettings(settings);
   const script = wakeScriptPath(claudeDir);
@@ -171,10 +189,43 @@ export async function installWake(
   if (await writeIfChanged(script, await fs.readFile(wakeSource, "utf8"))) changes.push(`copied the wake hook to ${script}`);
   if (await writeIfChanged(wakeRecordPath(claudeDir), JSON.stringify(record, null, 2) + "\n")) changes.push(`recorded the data layer at ${dataLayer}${runner ? ` and the runner at ${runner}` : ""}`);
   // The runner's fork needs the claude binary; a hook's PATH may not name it, so it is found now.
-  const claude = findClaude && !(await isHandSet(claudeBinaryPath(claudeDir))) ? await findClaude() : null;
-  if (claude && (await writeIfChanged(claudeBinaryPath(claudeDir), JSON.stringify({ path: claude, auto: true }, null, 2) + "\n"))) changes.push(`recorded the claude binary at ${claude}`);
+  const binary = claudeBinaryPath(claudeDir);
+  const kind = await binaryRecord(binary);
+  if (kind === "broken") changes.push(`kept ${binary}, which doesn't parse: it may have been edited by hand`);
+  const claude = findClaude && (kind === "none" || kind === "auto") ? await findClaude() : null;
+  if (claude && (await writeIfChanged(binary, JSON.stringify({ path: claude, auto: true }, null, 2) + "\n"))) changes.push(`recorded the claude binary at ${claude}`);
+  for (const file of [uninstallLogPath(claudeDir), uninstallLockPath(claudeDir)]) {
+    if (await fs.rm(file).then(() => true, () => false)) changes.push(`removed ${file}, left by an uninstall that didn't finish`);
+  }
   if (done.length) await writeSettings(settings, current);
   return [...changes, ...done];
+}
+
+/** How long an install waits for a running background uninstall. */
+export const INSTALL_WAIT_MS = 15000;
+
+// True once no background uninstall is running, waiting up to `waitMs`. A failed one's hold-off
+// doesn't count: it isn't running.
+async function waitForUninstall(claudeDir: string, waitMs: number): Promise<boolean> {
+  const file = uninstallLockPath(claudeDir);
+  for (const until = Date.now() + waitMs; ; await new Promise((r) => setTimeout(r, 250))) {
+    const pid = (await readLock(file))?.pid;
+    if (!pid || !alive(pid)) return true;
+    if (Date.now() >= until) return false;
+  }
+}
+
+// After an uninstall that leaves the opt-out, what it left: a wake.mjs no hook names, and its lock and log.
+async function finishOptOut({ claudeDir, settings }: Paths): Promise<string[]> {
+  const isWake = isWakeFor(claudeDir);
+  const hooks = await readSettings(settings).then((current) => current.hooks, () => undefined);
+  const named = !!hooks && typeof hooks === "object" && Object.values(hooks as Json).some((groups) => Array.isArray(groups) && groups.some((g) => Array.isArray((g as Json | null)?.hooks) && ((g as Json).hooks as unknown[]).some(isWake)));
+  const changes: string[] = [];
+  if (named || !(await waitForUninstall(claudeDir, 0))) return changes;
+  for (const file of [wakeScriptPath(claudeDir), uninstallLogPath(claudeDir), uninstallLockPath(claudeDir)]) {
+    if (await fs.rm(file).then(() => true, () => false)) changes.push(`removed ${file}, left by an uninstall`);
+  }
+  return changes;
 }
 
 // The runner's state, the machine's pairing credential (pairing.json), and the sessions' traces:
@@ -234,20 +285,23 @@ export async function uninstall(paths: Paths, { optOut = false, settleMs = 0, co
     await remove(path.join(dir, name));
   }
   const binary = claudeBinaryPath(paths.claudeDir);
-  if (!(await isHandSet(binary))) await remove(binary);
+  const kind = await binaryRecord(binary);
+  if (kind === "auto") await remove(binary);
+  if (kind === "broken") changes.push(`kept ${binary}, which doesn't parse: it may have been edited by hand`);
   if (confirm && (await Promise.all(SESSION_TRACES.map((name) => exists(path.join(dir, name))))).includes(true)) {
     return stopped("stopped: a session still running the plugin wrote its files again; the hook stays, to try again on a later prompt");
   }
   if (!(await isStillGone())) return stopped(reinstalled);
-  changes.push(...(await uninstallHooks(paths)));
-  await remove(wakeScriptPath(paths.claudeDir));
+  // The opt-out goes in first, so a stop after the hooks have gone still keeps the plugin from
+  // putting them back; its data layer then finishes what is left (installWake).
   const record = wakeRecordPath(paths.claudeDir);
   if (optOut) {
     const disabled: WakeRecord = { disabled: true };
     if (await writeIfChanged(record, JSON.stringify(disabled, null, 2) + "\n")) changes.push(`marked the wake hook as uninstalled in ${record}, so the plugin won't put it back`);
-  } else {
-    await remove(record);
   }
+  changes.push(...(await uninstallHooks(paths)));
+  await remove(wakeScriptPath(paths.claudeDir));
+  if (!optOut) await remove(record);
   await remove(uninstallLogPath(paths.claudeDir));
   await remove(uninstallLockPath(paths.claudeDir));
   if (await fs.rmdir(dir).then(() => true, () => false)) changes.push(`removed ${dir}`);
@@ -311,14 +365,15 @@ export interface StopOptions {
  * when its pid is alive and its command line runs this folder's copy of the runner, since after a
  * reboot the pid may name another process. True when one was ended.
  */
-export async function stopOurRunner(claudeDir: string, { isAlive = alive, kill = (pid) => process.kill(pid), now = Date.now, commandOf, waitMs = 0 }: StopOptions = {}): Promise<boolean> {
+export async function stopOurRunner(claudeDir: string, { isAlive = alive, kill = killTree, now = Date.now, commandOf, waitMs = 0 }: StopOptions = {}): Promise<boolean> {
   const file = runnerLockPath(claudeDir);
   const lock = await readLock(file);
   const pid = lock?.pid;
   if (!lock || !pid || !isAlive(pid)) return false;
   if (now() - lock.mtimeMs >= RUNNER_FRESH_MS) {
     const command = commandOf ? await commandOf(pid) : null;
-    if (!command || !comparable(command).includes(comparable(path.join(runnerAppDir(claudeDir), copiedAs("dist/runner.js"))))) return false;
+    const runner = normalPath(path.join(runnerAppDir(claudeDir), copiedAs("dist/runner.js")));
+    if (!command || !command.replace(/\\/g, "/").toLowerCase().includes(runner.toLowerCase())) return false;
   }
   try {
     kill(pid);
@@ -328,6 +383,16 @@ export async function stopOurRunner(claudeDir: string, { isAlive = alive, kill =
   for (const until = now() + waitMs; isAlive(pid) && now() < until; ) await new Promise((r) => setTimeout(r, 100));
   await releaseLock(file, pid);
   return true;
+}
+
+/**
+ * Ends `pid` and what it started. On Windows a child outlives its parent, so the whole tree goes
+ * at once (taskkill /T, hidden), and no fork keeps the runner's files open; elsewhere the
+ * supervisor's worker follows it, as its stdin closes, and ends its forks.
+ */
+export function killTree(pid: number): void {
+  if (process.platform === "win32") spawnSync("taskkill", ["/pid", String(pid), "/T", "/F"], { windowsHide: true, stdio: "ignore" });
+  else process.kill(pid);
 }
 
 /** The command line of process `pid`; null when it can't be read. */
@@ -375,13 +440,21 @@ async function uninstallHooks({ claudeDir, settings }: Paths): Promise<string[]>
 
 const exists = (file: string) => fs.stat(file).then(() => true, () => false);
 
-// Whether the claude-binary.json record names a path someone set by hand: one without `auto`.
-async function isHandSet(file: string): Promise<boolean> {
+// What claude-binary.json is: missing, an install's own (`auto`), set by hand, or one that
+// doesn't parse, which may be a hand edit gone wrong and is left alone.
+async function binaryRecord(file: string): Promise<"none" | "auto" | "hand" | "broken"> {
+  let text: string;
   try {
-    const record = JSON.parse(await fs.readFile(file, "utf8")) as { path?: unknown; auto?: unknown };
-    return typeof record.path === "string" && record.path !== "" && record.auto !== true;
+    text = await fs.readFile(file, "utf8");
   } catch {
-    return false;
+    return "none";
+  }
+  try {
+    const record = JSON.parse(text) as { path?: unknown; auto?: unknown } | null;
+    if (record?.auto === true) return "auto";
+    return typeof record?.path === "string" && record.path !== "" ? "hand" : "broken";
+  } catch {
+    return "broken";
   }
 }
 

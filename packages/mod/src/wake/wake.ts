@@ -11,6 +11,8 @@ export interface WakeOptions {
   /** Starts `node <args>` in `cwd`, detached, and doesn't wait for it. */
   spawn(args: string[], cwd: string): void;
   isAlive?: (pid: number) => boolean;
+  /** The session's project folder ($CLAUDE_PROJECT_DIR), passed on to the data layer for its settings. */
+  project?: string;
 }
 
 /** The record install writes beside wake.mjs: where the current data layer and runner are, or that it was uninstalled. */
@@ -22,7 +24,7 @@ export const wakeRecordPath = (claudeDir: string) => path.join(claudeDir, "isopl
  * `input` is the hook's stdin JSON (`session_id`, `cwd`, ...). True when a data layer was started.
  * Anything missing or unreadable means nothing to do.
  */
-export async function wake(input: string, { claudeDir, spawn, isAlive = alive }: WakeOptions): Promise<boolean> {
+export async function wake(input: string, { claudeDir, spawn, isAlive = alive, project }: WakeOptions): Promise<boolean> {
   const { session_id: sessionId, cwd } = JSON.parse(input) as { session_id?: unknown; cwd?: unknown };
   // The id names a file in the live folder, so it must be a plain name.
   if (typeof sessionId !== "string" || !/^[\w-]+$/.test(sessionId) || typeof cwd !== "string" || !cwd) return false;
@@ -31,6 +33,6 @@ export async function wake(input: string, { claudeDir, spawn, isAlive = alive }:
   // A data layer that has gone (the plugin was removed), or an uninstalled hook, leaves it doing nothing.
   const { dataLayer } = JSON.parse(await fs.readFile(wakeRecordPath(claudeDir), "utf8")) as { dataLayer?: unknown };
   if (typeof dataLayer !== "string" || !(await fs.stat(dataLayer).then((s) => s.isFile(), () => false))) return false;
-  spawn([dataLayer, "--session", sessionId, "--cwd", cwd, "--detached"], cwd);
+  spawn([dataLayer, "--session", sessionId, "--cwd", cwd, ...(project ? ["--project", project] : []), "--detached"], cwd);
   return true;
 }

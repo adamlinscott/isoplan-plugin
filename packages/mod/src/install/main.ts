@@ -24,11 +24,11 @@ import { startRunner } from "../runner/start.js";
 import { recentSessions } from "../sweep/find.js";
 import { backfill } from "../wake/backfill.js";
 import { installWake, processCommand, settleMs, uninstall as uninstallAll } from "./install.js";
-import { managedDir, pluginsDir } from "./state.js";
+import { managedDir, pluginDirsOf, pluginsDir } from "./state.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const claudeDir = claudePaths(process.env, os.homedir()).dir;
-const paths = { claudeDir, settings: path.join(claudeDir, "settings.json"), plugins: pluginsDir(claudeDir, process.env), managed: managedDir(process.platform) };
+const paths = { claudeDir, settings: path.join(claudeDir, "settings.json"), plugins: pluginsDir(claudeDir, process.env), managed: managedDir(process.platform), pluginDirs: pluginDirsOf(process.env) };
 // How long uninstall waits for the runner to exit before it removes its files.
 const RUNNER_EXIT_MS = 10000;
 const uninstall = process.argv.includes("--uninstall");

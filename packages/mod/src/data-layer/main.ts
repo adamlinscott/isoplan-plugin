@@ -35,7 +35,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { PROTOCOL_VERSION, type Facts } from "@isoplan/protocol";
 import { installWake } from "../install/install.js";
-import { managedDir, pluginState, pluginsDir, type Place } from "../install/state.js";
+import { managedDir, pluginDirsOf, pluginState, pluginsDir, type Place } from "../install/state.js";
 import type { DataLayerLine, TitleReply } from "../lines.js";
 import { findClaude } from "../runner/claude-binary.js";
 import { loadPatterns } from "../runner/scan.js";
@@ -114,9 +114,11 @@ async function main(argv: string[]): Promise<number> {
   // Claude Code runs nothing of a plugin's when it is uninstalled or disabled, so this looks itself
   // (src/install/state.ts), before it takes the session's lock and on every pass: a data layer whose
   // plugin is uninstalled or disabled for this session reports nothing and exits.
-  const place: Place = { claudeDir, plugins: pluginsDir(claudeDir, process.env), managed: managedDir(process.platform) };
+  const place: Place = { claudeDir, plugins: pluginsDir(claudeDir, process.env), managed: managedDir(process.platform), pluginDirs: pluginDirsOf(process.env) };
+  // The project folder the wake hook passes on ($CLAUDE_PROJECT_DIR); the session's folder without it.
+  const project = value(argv, "--project") ?? cwd;
   const self = path.join(here, "data-layer.js");
-  const isOff = async () => (await pluginState(place, self, cwd).catch(() => "enabled")) !== "enabled";
+  const isOff = async () => (await pluginState(place, self, project).catch(() => "enabled")) !== "enabled";
   if (await isOff()) {
     emit({ type: "log", text: "Claude Code lists the Isoplan plugin as uninstalled or disabled here, so this session isn't reported" });
     return 0;

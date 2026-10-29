@@ -19,11 +19,11 @@ The plugin needs Node.js on `PATH`. When it first starts it puts a small hook in
 
 ## Disable or uninstall
 
-Claude Code runs nothing of a plugin's when you disable or uninstall it, so the hook in your settings looks for itself, each time a session takes a prompt, at what Claude Code records: `installed_plugins.json`, and `enabledPlugins` in your settings, the project's settings and a `managed-settings.json` file (not managed settings from MDM or the claude.ai console, which it can't read).
+Claude Code runs nothing of a plugin's when you disable or uninstall it, so the hook in your settings looks for itself, each time a session takes a prompt, at what Claude Code records: `installed_plugins.json`, and `enabledPlugins` in your settings, the project's settings and a `managed-settings.json` file (not managed settings from MDM or the claude.ai console, which it can't read). The project is the session's `CLAUDE_PROJECT_DIR`, or its folder. An install at project or local scope counts only for that project's sessions.
 
 **Disable** it (`/plugin disable isoplan@isoplan`, the plugin manager, or `claude plugin disable`) and reporting stops: the hook stops the runner and starts nothing, and the sessions' data layers stop. Every file stays, the pairing credential too. Disabled in one project only, that project's sessions aren't reported. Enable it again and the next prompt starts them again.
 
-**Uninstall** it (`/plugin uninstall isoplan@isoplan`, the plugin manager, or `claude plugin uninstall isoplan@isoplan`) and, the next time a session takes a prompt, the hook takes everything out in the background:
+**Uninstall** it (`/plugin uninstall isoplan@isoplan`, the plugin manager, or `claude plugin uninstall isoplan@isoplan`) and, the next time a session takes a prompt, the hook takes everything out in the background. That happens only once Claude Code lists no install of `isoplan` at all, from any marketplace and at any scope, and no folder in `CLAUDE_CODE_PLUGIN_DIRS` holds it, so moving to another marketplace isn't an uninstall. A copy you load with `--plugin-dir` leaves nothing it can find, so remove the marketplace install only once you no longer want it. What it takes out:
 
 - the runner, which it stops;
 - what the plugin wrote in `~/.claude/isoplan/`: the runner's copy and its records (`runner/`: the app, `environment.json`, the ledger, the lock), the machine's pairing credential (`pairing.json`), the session locks (`live/`), the logs (`logs/`), the title files (`titles/`), the hashes of reports you released (`released/`), and `claude-binary.json` unless you set it by hand;
@@ -31,9 +31,14 @@ Claude Code runs nothing of a plugin's when you disable or uninstall it, so the 
 
 The files you write are kept: `config.json`, `runner.json`, `secret-patterns.json`, and a `claude-binary.json` you set by hand, so a reinstall picks them up again. Delete `~/.claude/isoplan/` yourself to take those too; once nothing is left in it, uninstall removes the folder.
 
-It asks Claude Code before each step whether the plugin is still uninstalled, and stops if you installed it again. A session that already had the plugin loaded stops reporting, but Claude Code keeps the plugin loaded there until the session ends or you run `/reload-plugins`; if it wrote its files again meanwhile, the hook stays and the next prompt finishes the job. If it can't finish, for example because `settings.json` doesn't parse, it says why in `~/.claude/isoplan/uninstall.log` and tries again a day later; delete `~/.claude/isoplan/uninstall.json` to have the next prompt try at once.
+It asks Claude Code before each step whether the plugin is still uninstalled, and stops if you installed it again. A session that already had the plugin loaded stops reporting, but Claude Code keeps the plugin loaded there until the session ends or you run `/reload-plugins`; if it wrote its files again meanwhile, the hook stays and the next prompt finishes the job. If it can't finish while the hook is still in place, for example because `settings.json` doesn't parse, it says why in `~/.claude/isoplan/uninstall.log` and the hook tries again a day later; delete `~/.claude/isoplan/uninstall.json` to have the next prompt try at once. If a step fails after the hook has gone, nothing is left to try again: what remains of `~/.claude/isoplan/` stays until you delete it, or until you install the plugin again, which clears it.
 
-From a checkout, `pnpm isoplan-uninstall` takes out the same things at once, and leaves `~/.claude/isoplan/wake.json` as `{ "disabled": true }`, so the plugin, if it is still installed, doesn't put the hook back when it next starts; `pnpm isoplan-install` takes that away.
+Two things it can't help:
+
+- It writes `settings.json` whole, as Claude Code does, and there is no lock to share with Claude Code, so a change Claude Code writes to that file at the same moment can be lost. Check the file if you changed a setting right then.
+- A session that was open when the hook went may still run it until that session restarts, and shows Claude Code's non-blocking hook error each turn, since `wake.mjs` has gone.
+
+From a checkout, `pnpm isoplan-uninstall` takes out the same things at once, and leaves `~/.claude/isoplan/wake.json` as `{ "disabled": true }` (written before the hook comes out), so the plugin, if it is still installed, doesn't put the hook back when it next starts, and finishes anything the uninstall left; `pnpm isoplan-install` takes that away. An install waits for an uninstall that is still running.
 
 ## The runner
 

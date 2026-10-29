@@ -13,6 +13,7 @@ import {
   stopOurRunner,
   uninstall,
   uninstallInBackground,
+  uninstallLockPath,
   uninstallLogPath,
   wakeCommand,
   wakeScriptPath,
@@ -65,14 +66,19 @@ test("install: other hooks and settings are kept as they were", async () => {
 
 test("install: this folder's wake hook in an old form is updated in place, a duplicate goes, and another folder's stays", async () => {
   const s = setup();
-  const old = { type: "command", command: `node ${wakeScriptPath(s.claudeDir)}` };
+  const script = wakeScriptPath(s.claudeDir);
+  // Unquoted with the platform's separators, or in another letter case where the file system ignores case.
+  const old = { type: "command", command: `node ${script}` };
+  const spelled = { type: "command", command: `node "${process.platform === "linux" ? script : script.toUpperCase().replace(/\\/g, "/")}"` };
   const another = { type: "command", command: 'node "C:/Other/.claude/isoplan/wake.mjs"' };
+  // A path that only contains this one's is someone else's too.
+  const longer = { type: "command", command: `node "${script}.old"` };
   fs.mkdirSync(s.claudeDir, { recursive: true });
-  fs.writeFileSync(s.paths.settings, JSON.stringify({ hooks: { Stop: [{ hooks: [{ type: "command", command: "echo mine" }, old] }, { hooks: [old, another] }] } }));
+  fs.writeFileSync(s.paths.settings, JSON.stringify({ hooks: { Stop: [{ hooks: [{ type: "command", command: "echo mine" }, old] }, { hooks: [spelled, another, longer] }] } }));
   expect(await s.install()).toContain(`updated the wake hook in ${s.paths.settings} on Stop`);
-  expect(s.read().hooks.Stop).toEqual([{ hooks: [{ type: "command", command: "echo mine" }, s.wake] }, { hooks: [another] }]);
+  expect(s.read().hooks.Stop).toEqual([{ hooks: [{ type: "command", command: "echo mine" }, s.wake] }, { hooks: [another, longer] }]);
   await uninstall(s.paths);
-  expect(s.read().hooks.Stop).toEqual([{ hooks: [{ type: "command", command: "echo mine" }] }, { hooks: [another] }]);
+  expect(s.read().hooks.Stop).toEqual([{ hooks: [{ type: "command", command: "echo mine" }] }, { hooks: [another, longer] }]);
 });
 
 test("install: a moved data layer is recorded again", async () => {
@@ -302,4 +308,44 @@ test("install: records the claude binary it finds, and keeps one set by hand", a
   fs.writeFileSync(record, JSON.stringify({ path: "D:/tools/claude.exe" }));
   expect(await install(claude)).toEqual([]);
   expect(JSON.parse(fs.readFileSync(record, "utf8"))).toEqual({ path: "D:/tools/claude.exe" });
+});
+
+test("install: waits for a running uninstall, and clears a failed one's hold-off and log", async () => {
+  const s = setup();
+  const dir = path.join(s.claudeDir, "isoplan");
+  fs.mkdirSync(dir, { recursive: true });
+  // An uninstall running in this very process, so its pid is alive.
+  fs.writeFileSync(uninstallLockPath(s.claudeDir), JSON.stringify({ pid: process.pid }));
+  const dataLayer = path.join(s.dist, "data-layer.js");
+  expect(await installWake(s.paths, dataLayer, path.join(s.dist, "wake.js"), { auto: true, waitMs: 300 })).toEqual([]);
+  expect(fs.existsSync(s.paths.settings)).toBe(false);
+  await expect(installWake(s.paths, dataLayer, path.join(s.dist, "wake.js"), { waitMs: 300 })).rejects.toThrow("an uninstall is running");
+
+  fs.writeFileSync(uninstallLockPath(s.claudeDir), JSON.stringify({ pid: 0, until: Date.now() + 3600000 }));
+  fs.writeFileSync(uninstallLogPath(s.claudeDir), "it failed\n");
+  const changes = await installWake(s.paths, dataLayer, path.join(s.dist, "wake.js"), { auto: true, waitMs: 300 });
+  expect(changes).toContain(`removed ${uninstallLockPath(s.claudeDir)}, left by an uninstall that didn't finish`);
+  expect(fs.existsSync(uninstallLogPath(s.claudeDir))).toBe(false);
+  expect(s.read().hooks.Stop).toEqual([{ hooks: [s.wake] }]);
+});
+
+test("install: once the hook was uninstalled, the plugin's data layer finishes what that uninstall left", async () => {
+  const s = setup();
+  await s.install();
+  // An uninstall that stopped after taking the hooks out: the opt-out and wake.mjs are still there.
+  fs.writeFileSync(path.join(s.claudeDir, "isoplan", "wake.json"), JSON.stringify({ disabled: true }));
+  fs.writeFileSync(s.paths.settings, "{}");
+  expect(await installWake(s.paths, path.join(s.dist, "data-layer.js"), path.join(s.dist, "wake.js"), { auto: true })).toEqual([`removed ${wakeScriptPath(s.claudeDir)}, left by an uninstall`]);
+  expect(fs.readdirSync(path.join(s.claudeDir, "isoplan"))).toEqual(["wake.json"]);
+});
+
+test("claude-binary.json that doesn't parse is kept, by install and uninstall alike, and said so", async () => {
+  const s = setup();
+  const record = path.join(s.claudeDir, "isoplan", "claude-binary.json");
+  fs.mkdirSync(path.dirname(record), { recursive: true });
+  fs.writeFileSync(record, '{ "path": "D:/tools/claude.exe" ');
+  const changes = await installWake(s.paths, path.join(s.dist, "data-layer.js"), path.join(s.dist, "wake.js"), { findClaude: async () => "/bin/claude" });
+  expect(changes).toContain(`kept ${record}, which doesn't parse: it may have been edited by hand`);
+  expect((await uninstall(s.paths)).changes).toContain(`kept ${record}, which doesn't parse: it may have been edited by hand`);
+  expect(fs.readFileSync(record, "utf8")).toBe('{ "path": "D:/tools/claude.exe" ');
 });

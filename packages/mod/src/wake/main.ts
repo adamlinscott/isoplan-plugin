@@ -31,7 +31,7 @@ import { spawn } from "node:child_process";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { isUninstalling, processCommand, recordedState, runnerAppDir, settleMs, stopOurRunner, uninstallInBackground } from "../install/install.js";
-import { managedDir, pluginsDir } from "../install/state.js";
+import { managedDir, pluginDirsOf, pluginsDir } from "../install/state.js";
 import { startRunner } from "../runner/start.js";
 import { wake } from "./wake.js";
 
@@ -65,7 +65,7 @@ function cwdOf(input: string): string | undefined {
 
 const self = fileURLToPath(import.meta.url);
 const claudeDir = path.dirname(path.dirname(self));
-const paths = { claudeDir, settings: path.join(claudeDir, "settings.json"), plugins: pluginsDir(claudeDir, process.env), managed: managedDir(process.platform) };
+const paths = { claudeDir, settings: path.join(claudeDir, "settings.json"), plugins: pluginsDir(claudeDir, process.env), managed: managedDir(process.platform), pluginDirs: pluginDirsOf(process.env) };
 const start = (args: string[], cwd: string, env?: Record<string, string>) => spawn(process.execPath, args, { cwd, env, detached: true, stdio: "ignore", windowsHide: true }).on("error", () => {}).unref();
 if (process.argv.includes("--uninstall")) {
   const settle = await settleMs(claudeDir, path.join(runnerAppDir(claudeDir), "config.json"));
@@ -74,17 +74,19 @@ if (process.argv.includes("--uninstall")) {
 }
 const input = await readStdin();
 const cwd = cwdOf(input);
-const session = await recordedState(paths, cwd).catch(() => "enabled" as const);
+// Claude Code gives a hook the session's project folder; the session's own folder stands in without it.
+const project = process.env.CLAUDE_PROJECT_DIR || cwd;
+const session = await recordedState(paths, project).catch(() => "enabled" as const);
 if (session === "uninstalled") {
   // Started in the config folder, never inside the isoplan folder it removes.
   if (!(await isUninstalling(claudeDir))) start([self, "--uninstall"], claudeDir);
   process.exit(0);
 }
-const machine = cwd ? await recordedState(paths).catch(() => "enabled" as const) : session;
+const machine = project ? await recordedState(paths).catch(() => "enabled" as const) : session;
 if (machine === "disabled") await stopOurRunner(claudeDir).catch(() => {});
 if (session === "enabled") {
   try {
-    await wake(input, { claudeDir, spawn: start });
+    await wake(input, { claudeDir, spawn: start, project });
   } catch {
     // Nothing to do: a session is never failed for this.
   }

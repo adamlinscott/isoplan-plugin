@@ -7,17 +7,22 @@
 // layer anywhere else (a checkout, a --plugin-dir) has no id, and counts as enabled.
 //
 // Uninstalled means only this: installed_plugins.json reads, is the shape known (version 2, a
-// `plugins` object of install lists), and doesn't list the id. A missing file, one that can't be
-// read or parsed, or any other shape is unknown, and unknown never counts as uninstalled, since an
-// uninstall removes everything.
+// `plugins` object of install lists), and lists no install of a plugin of that name, from any
+// marketplace and at any scope, so moving from one marketplace to another is never an uninstall;
+// and no folder in $CLAUDE_CODE_PLUGIN_DIRS holds it. A missing file, one that can't be read or
+// parsed, or any other shape is unknown, and unknown never counts as uninstalled, since an
+// uninstall removes everything. A copy loaded with --plugin-dir leaves no record to find, so it
+// can't count. An install at project or local scope counts only for that project's sessions; one
+// whose record names no project counts everywhere.
 //
 // Disabled follows `enabledPlugins` as Claude Code merges it, highest first: the managed settings
 // files (managed-settings.json and managed-settings.d/*.json in the system folder; a managed `false`
-// anywhere wins), the project's local settings (at the git root, or beside the project's own off a
-// repository and on Windows), the project's settings in the session's folder, then the user's
-// settings.json. The first that names the id decides; none means enabled. A file that can't be read
-// or parsed is passed over, as Claude Code passes over it. Managed settings from MDM, the registry
-// or the claude.ai console can't be read here.
+// anywhere wins), the project's local settings (at its git root, then in the project's folder),
+// the project's settings, then the user's settings.json. The first that names an installed copy
+// decides for it, and the plugin is enabled if any copy is; none named means enabled. A file that
+// can't be read or parsed is passed over, as Claude Code passes over it. Managed settings from MDM,
+// the registry or the claude.ai console can't be read here. The project is the session's
+// $CLAUDE_PROJECT_DIR when the caller has it, else its folder.
 //
 // Kept free of zod and the protocol so the wake hook starts fast.
 
@@ -31,18 +36,36 @@ export interface Place {
   plugins: string;
   /** The system folder managed settings files are in (`managedDir`). */
   managed: string;
+  /** The folders $CLAUDE_CODE_PLUGIN_DIRS loads plugins from (`pluginDirsOf`). */
+  pluginDirs?: string[];
 }
 
 export type PluginState = "enabled" | "disabled" | "uninstalled";
 
+/** One install, as installed_plugins.json records it. */
+export interface Install {
+  id: string;
+  scope: string | null;
+  projectPath: string | null;
+}
+
 /** Claude Code's plugins folder: $CLAUDE_CODE_PLUGIN_CACHE_DIR when it is set, else <claude dir>/plugins. */
 export const pluginsDir = (claudeDir: string, env: Record<string, string | undefined>) => env.CLAUDE_CODE_PLUGIN_CACHE_DIR || path.join(claudeDir, "plugins");
+
+/** The folders $CLAUDE_CODE_PLUGIN_DIRS names. */
+export const pluginDirsOf = (env: Record<string, string | undefined>) => (env.CLAUDE_CODE_PLUGIN_DIRS ?? "").split(path.delimiter).filter(Boolean);
 
 /** The system folder Claude Code reads managed-settings.json from. */
 export function managedDir(platform: NodeJS.Platform): string {
   if (platform === "win32") return "C:\\Program Files\\ClaudeCode";
   if (platform === "darwin") return "/Library/Application Support/ClaudeCode";
   return "/etc/claude-code";
+}
+
+/** A path as compared: resolved, with forward slashes, and on Windows and macOS without regard to case. */
+export function normalPath(p: string, platform: NodeJS.Platform = process.platform): string {
+  const resolved = path.resolve(p).replace(/\\/g, "/");
+  return platform === "win32" || platform === "darwin" ? resolved.toLowerCase() : resolved;
 }
 
 /** The id, `<plugin>@<marketplace>`, of the marketplace install `file` is part of; null for a file outside the plugin cache. */
@@ -53,12 +76,25 @@ export function pluginIdOf(plugins: string, file: string): string | null {
   return parts.length >= 4 && parts[0] !== ".." ? `${parts[1]}@${parts[0]}` : null;
 }
 
-/** The ids installed_plugins.json lists; null when it is missing, can't be read, or isn't the shape known. */
-export async function installedPlugins(plugins: string): Promise<string[] | null> {
+const nameOf = (id: string) => id.slice(0, id.lastIndexOf("@"));
+
+/** Every install installed_plugins.json records; null when it is missing, can't be read, or isn't the shape known. */
+export async function installs(plugins: string): Promise<Install[] | null> {
   const record = await readJson(path.join(plugins, "installed_plugins.json"));
   const list = record?.plugins;
   if (record?.version !== 2 || !isObject(list) || !Object.values(list).every(Array.isArray)) return null;
-  return Object.keys(list);
+  return Object.entries(list).flatMap(([id, entries]) =>
+    (entries as unknown[]).map((entry) => {
+      const e = isObject(entry) ? entry : {};
+      return { id, scope: typeof e.scope === "string" ? e.scope : null, projectPath: typeof e.projectPath === "string" ? e.projectPath : null };
+    }),
+  );
+}
+
+/** The ids installed_plugins.json lists; null when it is unknown (`installs`). */
+export async function installedPlugins(plugins: string): Promise<string[] | null> {
+  const list = await installs(plugins);
+  return list && [...new Set(list.map((i) => i.id))];
 }
 
 /** Whether `enabledPlugins` names the plugin `id` enabled, disabled, or not at all (null). */
@@ -68,22 +104,44 @@ export async function enabledIn(file: string, id: string): Promise<boolean | nul
 }
 
 /**
- * What Claude Code says of the plugin `dataLayer` belongs to. With `cwd` (a session's folder) the
- * project's settings count too; without, only the machine's: the managed files and the user's.
+ * What Claude Code says of the plugin `dataLayer` belongs to. With `project` (a session's project
+ * folder) the project's settings and installs count too; without, only the machine's: the
+ * managed files, the user's settings, and every install.
  */
-export async function pluginState(place: Place, dataLayer: string, cwd?: string): Promise<PluginState> {
+export async function pluginState(place: Place, dataLayer: string, project?: string): Promise<PluginState> {
   const id = pluginIdOf(place.plugins, dataLayer);
   if (!id) return "enabled";
-  const installed = await installedPlugins(place.plugins);
-  if (installed && !installed.includes(id)) return "uninstalled";
-  const managed = await Promise.all((await managedFiles(place.managed)).map((file) => enabledIn(file, id)));
-  if (managed.includes(false)) return "disabled";
-  if (managed.includes(true)) return "enabled";
-  for (const file of await ownFiles(place, cwd)) {
-    const enabled = await enabledIn(file, id);
-    if (enabled !== null) return enabled ? "enabled" : "disabled";
+  const name = nameOf(id);
+  const all = await installs(place.plugins);
+  let ids = [id];
+  if (all) {
+    const mine = all.filter((i) => nameOf(i.id) === name);
+    if (!mine.length) return (await isInPluginDirs(place.pluginDirs ?? [], name)) ? "enabled" : "uninstalled";
+    const here = project ? mine.filter((i) => !(i.scope === "project" || i.scope === "local") || !i.projectPath || normalPath(i.projectPath) === normalPath(project)) : mine;
+    // Installed only for other projects: nothing to report for this one.
+    if (!here.length) return "disabled";
+    ids = [...new Set(here.map((i) => i.id))];
   }
-  return "enabled";
+  const states = await Promise.all(ids.map((one) => enabledFor(place, one, project)));
+  return states.includes(true) ? "enabled" : "disabled";
+}
+
+// Whether the plugin `id` is enabled, by the settings files that name it.
+async function enabledFor(place: Place, id: string, project?: string): Promise<boolean> {
+  const managed = await Promise.all((await managedFiles(place.managed)).map((file) => enabledIn(file, id)));
+  if (managed.includes(false)) return false;
+  if (managed.includes(true)) return true;
+  for (const file of await ownFiles(place, project)) {
+    const enabled = await enabledIn(file, id);
+    if (enabled !== null) return enabled;
+  }
+  return true;
+}
+
+// Whether a folder $CLAUDE_CODE_PLUGIN_DIRS names holds a plugin called `name`.
+async function isInPluginDirs(dirs: string[], name: string): Promise<boolean> {
+  for (const dir of dirs) if ((await readJson(path.join(dir, ".claude-plugin", "plugin.json")))?.name === name) return true;
+  return false;
 }
 
 // managed-settings.json and the drop-ins beside it.
@@ -96,12 +154,12 @@ async function managedFiles(managed: string): Promise<string[]> {
 }
 
 // The person's own settings files that can name the plugin, highest first.
-async function ownFiles({ claudeDir }: Place, cwd?: string): Promise<string[]> {
+async function ownFiles({ claudeDir }: Place, project?: string): Promise<string[]> {
   const files: string[] = [];
-  if (cwd) {
-    const root = process.platform === "win32" ? null : await gitRoot(cwd);
-    if (root) files.push(path.join(root, ".claude", "settings.local.json"));
-    files.push(path.join(cwd, ".claude", "settings.local.json"), path.join(cwd, ".claude", "settings.json"));
+  if (project) {
+    const root = await gitRoot(project);
+    if (root && normalPath(root) !== normalPath(project)) files.push(path.join(root, ".claude", "settings.local.json"));
+    files.push(path.join(project, ".claude", "settings.local.json"), path.join(project, ".claude", "settings.json"));
   }
   files.push(path.join(claudeDir, "settings.json"));
   return files;

@@ -38,7 +38,8 @@ test("installed plugins: only a readable record of the shape known counts; anyth
   s.write(file, { version: 2, plugins: { [ID]: { scope: "user" } } });
   expect(await installedPlugins(s.place.plugins)).toBeNull();
   s.installed({ [ID]: [{ scope: "user" }], "other@market": [] });
-  expect(await installedPlugins(s.place.plugins)).toEqual([ID, "other@market"]);
+  // An empty list of installs is no install.
+  expect(await installedPlugins(s.place.plugins)).toEqual([ID]);
 });
 
 test("uninstalled: only when the record reads and doesn't list the plugin; unknown never is", async () => {
@@ -82,4 +83,33 @@ test("disabled: enabledPlugins as Claude Code merges it, managed first, then loc
   fs.rmSync(s.place.managed, { recursive: true });
   s.write(user, "{ broken");
   expect(await pluginState(s.place, s.dataLayer)).toBe("enabled");
+});
+
+test("uninstalled: moving to another marketplace isn't, and its settings decide whether it is enabled", async () => {
+  const s = setup();
+  // wake.json still records marketplace A's copy; Claude Code now lists only B's.
+  s.installed({ "isoplan@other-market": [{ scope: "user" }] });
+  expect(await pluginState(s.place, s.dataLayer)).toBe("enabled");
+  s.write(path.join(s.place.claudeDir, "settings.json"), { enabledPlugins: { "isoplan@other-market": false, [ID]: true } });
+  expect(await pluginState(s.place, s.dataLayer)).toBe("disabled");
+});
+
+test("uninstalled: not while a folder in CLAUDE_CODE_PLUGIN_DIRS holds the plugin", async () => {
+  const s = setup();
+  s.installed({});
+  expect(await pluginState(s.place, s.dataLayer)).toBe("uninstalled");
+  const dir = path.join(s.root, "dev-copy");
+  s.write(path.join(dir, ".claude-plugin", "plugin.json"), { name: "isoplan" });
+  expect(await pluginState({ ...s.place, pluginDirs: [path.join(s.root, "nothing"), dir] }, s.dataLayer)).toBe("enabled");
+});
+
+test("project scope: an install counts only for its project's sessions, or everywhere when its record names none", async () => {
+  const s = setup();
+  const other = path.join(s.root, "elsewhere");
+  s.installed({ [ID]: [{ scope: "project", projectPath: s.project }] });
+  expect(await pluginState(s.place, s.dataLayer, s.project)).toBe("enabled");
+  expect(await pluginState(s.place, s.dataLayer, other)).toBe("disabled");
+  expect(await pluginState(s.place, s.dataLayer)).toBe("enabled"); // the machine still has it: nothing is uninstalled
+  s.installed({ [ID]: [{ scope: "local" }] });
+  expect(await pluginState(s.place, s.dataLayer, other)).toBe("enabled");
 });
