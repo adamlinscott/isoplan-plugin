@@ -5735,7 +5735,9 @@ const ReportFactSchema = object({
 /**
 * A question an agent asked its owner, open until it is answered, so the floor can show it and the
 * owner can answer it there. One of the named cases of session-derived text leaving a machine: the
-* server keeps it only for the retention period. `id` is the tool call's own id.
+* server keeps it only for the retention period. `id` is the tool call's own id. `answerable`: the
+* session's own plugin is waiting for it, so an answer from the floor reaches it; without it the
+* session is seen only through the wake hook, and the floor shows the question read-only.
 */
 const QuestionFactSchema = object({
 	id: string().min(1),
@@ -5750,6 +5752,7 @@ const QuestionFactSchema = object({
 		})),
 		multiSelect: boolean()
 	})).min(1),
+	answerable: literal(true).optional(),
 	extra: Extra
 });
 const FactsSchema = object({
@@ -7621,6 +7624,7 @@ const DOING = {
 	Agent: "talk",
 	SendMessage: "talk"
 };
+const ASK_TOOL = "AskUserQuestion";
 const READ_TOOLS = ["Read"];
 const STOPPED = /* @__PURE__ */ new Set(["killed", "stopped"]);
 const encoder = new TextEncoder();
@@ -7789,7 +7793,8 @@ function createClaudeCode(io) {
 			edits: [],
 			reads: [],
 			waits: [],
-			reports: []
+			reports: [],
+			questions: []
 		};
 		const leadWorking = main.turnOpen && now - c.ownMtime <= config.stalledMinutes * 6e4;
 		facts.agents.push({
@@ -7807,6 +7812,7 @@ function createClaudeCode(io) {
 		});
 		main.touches = await addFiles(facts.edits, lead, main.touches, [...config.touchedTools, ...config.shellTools], now, config, resolve);
 		main.reads = await addFiles(facts.reads, lead, main.reads, [...READ_TOOLS, ...config.shellTools], now, config, resolve);
+		if (main.turnOpen) addQuestions(facts.questions, lead, main, results, c.ownMtime);
 		for (const a of agentFiles) {
 			const id = agentId(a.id);
 			const type = typeof a.meta.agentType === "string" && a.meta.agentType ? a.meta.agentType : null;
@@ -7845,6 +7851,7 @@ function createClaudeCode(io) {
 				on: id,
 				since: iso(spawn ? spawn.at : a.t.firstAt, a.mtimeMs)
 			});
+			if (live) addQuestions(facts.questions, id, a.t, results, a.mtimeMs);
 			if ((s.status === "done" || s.status === "failed") && a.t.lastText !== null) facts.reports.push({
 				agent: id,
 				at: iso(a.t.lastTextAt, a.mtimeMs),
@@ -7916,6 +7923,33 @@ function createClaudeCode(io) {
 	};
 }
 const agentId = (id) => `${SOURCE}:${id}`;
+function addQuestions(list, agent, t, results, mtimeMs) {
+	for (const [id, ask] of t.asks) {
+		if (results.has(id)) continue;
+		const asked = ask.input?.questions;
+		if (!Array.isArray(asked)) continue;
+		const questions = [];
+		for (const q of asked) {
+			if (!q || typeof q.question !== "string" || !q.question) continue;
+			const options = Array.isArray(q.options) ? q.options.filter((o) => o && typeof o.label === "string" && o.label) : [];
+			questions.push({
+				question: q.question,
+				header: typeof q.header === "string" ? q.header : "",
+				options: options.map((o) => ({
+					label: o.label,
+					description: typeof o.description === "string" ? o.description : ""
+				})),
+				multiSelect: q.multiSelect === true
+			});
+		}
+		if (questions.length) list.push({
+			id,
+			agent,
+			at: iso(ask.at, mtimeMs),
+			questions
+		});
+	}
+}
 const message = (err) => String(err && err.message || err);
 function iso(ms, fallback) {
 	return new Date(Number.isFinite(ms) ? ms : fallback).toISOString();
@@ -7977,7 +8011,8 @@ function newTranscriptState() {
 		prompts: 0,
 		tools: 0,
 		firstPrompt: null,
-		compacted: false
+		compacted: false,
+		asks: /* @__PURE__ */ new Map()
 	};
 }
 const MESSAGE_TYPES = /* @__PURE__ */ new Set([
@@ -8023,6 +8058,10 @@ function foldLine(st, line) {
 			st.tools++;
 			st.waiting = true;
 			if (c.name === "Agent" && typeof c.id === "string") st.spawns.set(c.id, at);
+			if (c.name === ASK_TOOL && typeof c.id === "string") st.asks.set(c.id, {
+				at,
+				input: c.input
+			});
 			const input = c.input || {};
 			const cwd = ev.cwd || st.cwd;
 			const shell = typeof input.command === "string" ? shellFiles(input.command, cwd, { powershell: c.name === "PowerShell" }) : {
@@ -8081,6 +8120,7 @@ function foldLine(st, line) {
 		if (turn !== null) setTurn(st, turn, at);
 		if (turn === true && !toolResults) {
 			st.lastTool = null;
+			st.asks.clear();
 			st.prompts++;
 			if (st.firstPrompt === null) st.firstPrompt = promptText(content).slice(0, PROMPT_CHARS);
 		}
@@ -8268,6 +8308,9 @@ function diffFacts(before, after) {
 	const reports = diff(before.reports, after.reports, (r) => r.agent);
 	if (reports.upsert.length) upsert.reports = reports.upsert;
 	if (reports.remove.length) remove.reports = reports.remove.map((r) => r.agent);
+	const questions = diff(before.questions ?? [], after.questions ?? [], (q) => q.id);
+	if (questions.upsert.length) upsert.questions = questions.upsert;
+	if (questions.remove.length) remove.questions = questions.remove.map((q) => q.id);
 	return Object.keys(upsert).length || Object.keys(remove).length ? {
 		upsert,
 		remove
@@ -8539,6 +8582,46 @@ function createLink({ url, hello, emit, minIntervalMs = 1e3, retryBaseMs = 1e3, 
 		}
 	};
 }
+//#endregion
+//#region src/data-layer/owner-answers.ts
+const TAKEN_WAIT_MS = 1e4;
+const POLL_MS = 100;
+/** What to send back for the request: a reply once the answer ended the question's call, or a refusal saying why not. */
+async function relayOwnerAnswer(request, { detached, facts, file, emit, take, sleep = wait, waitMs = TAKEN_WAIT_MS }) {
+	const refuse = (detail) => ({
+		type: "refusal",
+		v: 1,
+		id: request.id,
+		reason: "unavailable",
+		detail
+	});
+	if (detached) return refuse("This session is seen only through Isoplan's wake hook, so its question can only be answered in its terminal.");
+	if (!facts?.questions?.some((q) => q.id === request.question)) return refuse("The question isn't waiting for an answer any more: it was answered in the terminal, or the agent moved on.");
+	emit({
+		type: "owner-answer",
+		question: request.question,
+		answers: request.answers,
+		file
+	});
+	for (let waited = 0; waited < waitMs; waited += POLL_MS) {
+		await sleep(POLL_MS);
+		const text = await take(file);
+		if (text === null) continue;
+		let taken = {};
+		try {
+			taken = JSON.parse(text);
+		} catch {}
+		if (taken.taken === true) return {
+			type: "reply",
+			v: 1,
+			id: request.id,
+			kind: "owner-answer"
+		};
+		return refuse("The question was answered in the terminal first.");
+	}
+	return refuse("Claude Code didn't take the answer in time: answer it in the terminal.");
+}
+const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 //#endregion
 //#region src/data-layer/pairing.ts
 /** Renewed this long before it runs out. */
@@ -9034,6 +9117,8 @@ async function main(argv) {
 	const userConfigPath = path.join(claudeDir, "isoplan", "config.json");
 	const titlesDir = path.join(claudeDir, "isoplan", "titles");
 	const titleFile = path.join(titlesDir, `${sessionId}.json`);
+	const answersDir = path.join(claudeDir, "isoplan", "answers");
+	let answerFiles = 0;
 	const modPatterns = path.join(here, "..", "secret-patterns.json");
 	const ownerPatterns = path.join(claudeDir, "isoplan", "secret-patterns.json");
 	const machine = os.hostname();
@@ -9247,13 +9332,20 @@ async function main(argv) {
 				file: titleFile
 			});
 		}
-		const facts = read.facts.session.titleFrom === "branch" && title?.title ? {
+		const titled = read.facts.session.titleFrom === "branch" && title?.title ? {
 			...read.facts,
 			session: {
 				...read.facts.session,
 				title: title.title
 			}
 		} : read.facts;
+		const facts = detached || !titled.questions?.length ? titled : {
+			...titled,
+			questions: titled.questions.map((q) => ({
+				...q,
+				answerable: true
+			}))
+		};
 		if (!link) {
 			const where = await resolve(cwd);
 			const readText = (p) => fs.readFile(p, "utf8").catch(() => null);
@@ -9280,6 +9372,20 @@ async function main(argv) {
 				}),
 				onNotWanted: () => isUnwanted = detached,
 				onMessage: (message) => {
+					if (message.type === "request" && message.kind === "owner-answer") {
+						const file = path.join(answersDir, `${sessionId}-${++answerFiles}.json`);
+						fs.mkdir(answersDir, { recursive: true }).then(() => relayOwnerAnswer(message, {
+							detached,
+							facts: shown?.[0] ?? null,
+							file,
+							emit,
+							take: takeFile
+						})).then((answer) => link?.send(answer)).catch((err) => emit({
+							type: "log",
+							text: `couldn't pass the owner's answer on: ${String(err?.message ?? err)}`
+						}));
+						return;
+					}
 					if (message.type !== "release") return emit({
 						type: "log",
 						text: `the office server sent a ${message.type} message, which this data layer doesn't handle yet`
@@ -9332,6 +9438,16 @@ async function writeLog(file, text) {
 	await fs.mkdir(path.dirname(file), { recursive: true });
 	if (size > LOG_CAP_BYTES) await fs.writeFile(file, text);
 	else await fs.appendFile(file, text);
+}
+async function takeFile(file) {
+	const text = await fs.readFile(file, "utf8").catch(() => null);
+	try {
+		JSON.parse(text ?? "");
+	} catch {
+		return null;
+	}
+	await fs.rm(file, { force: true }).catch(() => {});
+	return text;
 }
 async function takeReply(file) {
 	let value;

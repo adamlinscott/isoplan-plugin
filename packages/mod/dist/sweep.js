@@ -5871,7 +5871,9 @@ const ReportFactSchema = object({
 /**
 * A question an agent asked its owner, open until it is answered, so the floor can show it and the
 * owner can answer it there. One of the named cases of session-derived text leaving a machine: the
-* server keeps it only for the retention period. `id` is the tool call's own id.
+* server keeps it only for the retention period. `id` is the tool call's own id. `answerable`: the
+* session's own plugin is waiting for it, so an answer from the floor reaches it; without it the
+* session is seen only through the wake hook, and the floor shows the question read-only.
 */
 const QuestionFactSchema = object({
 	id: string().min(1),
@@ -5886,6 +5888,7 @@ const QuestionFactSchema = object({
 		})),
 		multiSelect: boolean()
 	})).min(1),
+	answerable: literal(true).optional(),
 	extra: Extra
 });
 const FactsSchema = object({

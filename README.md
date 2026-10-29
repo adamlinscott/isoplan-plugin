@@ -105,9 +105,13 @@ Once you have taken a handoff, your session's agent gets the plugin's `ask_room`
 
 Your agent is never held up for long: when their machine is off, their runner is away, a cap is reached or the answer is held, it checks `askPolls` times, `askPollSeconds` apart, then is told to carry on. The question stays queued and is asked again when their runner is back; an answer that comes later reaches your agent as a note on one of its next tool results. When the office signs people in, the tool asks with this machine's pairing, as the data layer reports; on a machine that isn't paired, or whose pairing has ended, your agent is told so and carries on.
 
+## Answering from the floor
+
+When an agent asks you something (`AskUserQuestion`), the question shows in the terminal and on the floor at once, and the first answer wins: answer it in the agent's details on the floor and the terminal's dialog closes, with your answers passed to the agent. Only you can answer your own sessions' questions there. A session the plugin doesn't run in, seen only through the wake hook, shows its question on the floor read-only: answer it in its terminal. A report the secret check held is released from the same place.
+
 ## What leaves your machine
 
-By default only facts: which sessions and agents are running and what kind of work each is doing, in which repository and branch, which files they touched, and when they wait. Session-derived text leaves only in named cases, each kept by the server for a set period and then deleted: an agent's final report, questions an agent asks its owner, and the questions, answers and briefs in a room that was handed over. A report is checked for secrets on your machine before it is sent, as answers and briefs are. One that matches stays a placeholder, a note saying it is held, until you release it; releasing it from the floor arrives with adamlinscott/isoplan#50. A pattern you add after a report went out can't recall it.
+By default only facts: which sessions and agents are running and what kind of work each is doing, in which repository and branch, which files they touched, and when they wait. Session-derived text leaves only in named cases, each kept by the server for a set period and then deleted: an agent's final report, questions an agent asks its owner, and the questions, answers and briefs in a room that was handed over. A report is checked for secrets on your machine before it is sent, as answers and briefs are. One that matches stays a placeholder, a note saying it is held, until you release it from the floor. A pattern you add after a report went out can't recall it.
 
 ## What is here
 

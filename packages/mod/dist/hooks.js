@@ -20,6 +20,7 @@ const RUNNING = /* @__PURE__ */ new Set([
 	"running",
 	"waiting"
 ]);
+const ASK_TOOL = "AskUserQuestion";
 let running = null;
 let lead = null;
 let stop = null;
@@ -35,6 +36,7 @@ let asking = false;
 let lastError = null;
 let pairing = null;
 let pairSaid = false;
+const floorWaits = /* @__PURE__ */ new Map();
 function register(on) {
 	on("session.start", async ($, e, next) => {
 		const result = await next(e);
@@ -52,7 +54,7 @@ function register(on) {
 	});
 	on("tool.call", async ($, e, next) => {
 		if (toolName !== null && e.tool === toolName) return askRoom($, e);
-		const r = await next(e);
+		const r = await (e.tool === ASK_TOOL ? askBoth(e, next) : next(e));
 		try {
 			checkSession($);
 			if (!lead || r.deny || r.isError) return r;
@@ -78,6 +80,36 @@ function register(on) {
 			return r;
 		}
 	}).catch(($, e, next) => next(e));
+}
+async function askBoth(e, next) {
+	const ran = next(e);
+	ran.catch(() => {});
+	let answer;
+	const floor = new Promise((resolve) => answer = resolve);
+	floorWaits.set(e.tool_use_id, answer);
+	try {
+		const first = await Promise.race([ran.then((r) => ({ r })), floor.then((reason) => ({ reason }))]);
+		return "r" in first ? first.r : { deny: first.reason };
+	} finally {
+		floorWaits.delete(e.tool_use_id);
+	}
+}
+/** What the agent reads when its owner answered on the floor. */
+function answerReason(answers) {
+	return [
+		"Your owner answered on the Isoplan office floor, so the question was closed in the terminal. Their answers:",
+		...Object.entries(answers).map(([question, answer]) => `"${question}" = "${answer}"`),
+		"Go on with these answers."
+	].join("\n");
+}
+function ownerAnswer($, line) {
+	const answer = floorWaits.get(line.question);
+	answer?.(answerReason(line.answers));
+	const taken = {
+		question: line.question,
+		taken: !!answer
+	};
+	$.fs.write(line.file, JSON.stringify(taken)).catch((err) => $.ui.log("isoplan: could not say whether the floor's answer was taken: " + message(err), { to: "debug" }));
 }
 async function checkSession($) {
 	const id = await $.session.id().catch(() => null);
@@ -193,6 +225,9 @@ function handle($, text) {
 		case "ask-rights":
 			mayAsk = line.granted;
 			if (line.granted) addTool($);
+			break;
+		case "owner-answer":
+			ownerAnswer($, line);
 			break;
 		case "error": {
 			const said = `Isoplan: the office server says: ${line.message} (${line.code})`;
@@ -325,4 +360,4 @@ function writeTitle($, ask) {
 }
 const message = (err) => String(err && err.message || err);
 //#endregion
-export { register };
+export { answerReason, register };

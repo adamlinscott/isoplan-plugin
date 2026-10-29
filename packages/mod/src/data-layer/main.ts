@@ -13,6 +13,8 @@
 // until its owner releases it (src/data-layer/reports.ts). An office server that signs people in
 // wants the machine paired first: the link pairs it, keeping the credential in
 // <claude dir>/isoplan/pairing.json, under the machine's Claude account (src/data-layer/pairing.ts).
+// An agent's open question to its owner is reported too, answerable from the floor while this data
+// layer's hooks module waits for it (src/data-layer/owner-answers.ts); a detached one's are read-only.
 //
 //   node dist/data-layer.js --session <session id> --cwd <the session's folder> --detached
 //
@@ -52,6 +54,7 @@ import { createGit } from "./git.js";
 import { accountOf, claudePaths, projectOf } from "./identity.js";
 import { nodeIo } from "./io.js";
 import { createLink, type Link } from "./link.js";
+import { relayOwnerAnswer } from "./owner-answers.js";
 import { createPairing, pairingLockPath, pairingPath, pairingWriteLockPath } from "./pairing.js";
 import { openReportHold } from "./reports.js";
 import { cleanTitle, nextTitle, TITLE_SYSTEM, type TitleCache } from "./titles.js";
@@ -82,6 +85,9 @@ async function main(argv: string[]): Promise<number> {
   // The person's own folder, not the machine's shared temp folder.
   const titlesDir = path.join(claudeDir, "isoplan", "titles");
   const titleFile = path.join(titlesDir, `${sessionId}.json`);
+  // Where the hooks module says whether it took an owner's answer, one file per answer.
+  const answersDir = path.join(claudeDir, "isoplan", "answers");
+  let answerFiles = 0;
   const modPatterns = path.join(here, "..", "secret-patterns.json");
   const ownerPatterns = path.join(claudeDir, "isoplan", "secret-patterns.json");
   const machine = os.hostname();
@@ -236,7 +242,9 @@ async function main(argv: string[]): Promise<number> {
       asked = ask.key;
       emit({ type: "title-ask", model: "haiku", system: TITLE_SYSTEM, prompt: ask.prompt, maxTokens: 40, key: ask.key, file: titleFile });
     }
-    const facts: Facts = read.facts.session.titleFrom === "branch" && title?.title ? { ...read.facts, session: { ...read.facts.session, title: title.title } } : read.facts;
+    const titled: Facts = read.facts.session.titleFrom === "branch" && title?.title ? { ...read.facts, session: { ...read.facts.session, title: title.title } } : read.facts;
+    // The hooks module that started this data layer waits for each open question; a detached one has none.
+    const facts: Facts = detached || !titled.questions?.length ? titled : { ...titled, questions: titled.questions.map((q) => ({ ...q, answerable: true as const })) };
 
     if (!link) {
       const where = await resolve(cwd);
@@ -259,7 +267,17 @@ async function main(argv: string[]): Promise<number> {
         }),
         onNotWanted: () => (isUnwanted = detached),
         // The owner released a withheld report: it goes to the link now, not on the next pass.
+        // The owner answered a question from the floor: it goes to the hooks module.
         onMessage: (message) => {
+          if (message.type === "request" && message.kind === "owner-answer") {
+            const file = path.join(answersDir, `${sessionId}-${++answerFiles}.json`);
+            void fs
+              .mkdir(answersDir, { recursive: true })
+              .then(() => relayOwnerAnswer(message, { detached, facts: shown?.[0] ?? null, file, emit, take: takeFile }))
+              .then((answer) => link?.send(answer))
+              .catch((err: unknown) => emit({ type: "log", text: `couldn't pass the owner's answer on: ${String((err as Error)?.message ?? err)}` }));
+            return;
+          }
           if (message.type !== "release") return emit({ type: "log", text: `the office server sent a ${message.type} message, which this data layer doesn't handle yet` });
           void hold.release(message.id).then((released) => {
             if (released && shown) link?.update(hold.apply(...shown));
@@ -306,6 +324,19 @@ async function writeLog(file: string, text: string): Promise<void> {
   await fs.mkdir(path.dirname(file), { recursive: true });
   if (size > LOG_CAP_BYTES) await fs.writeFile(file, text);
   else await fs.appendFile(file, text);
+}
+
+// A JSON file the hooks module wrote, which goes once it is read; null while it isn't there, or
+// doesn't parse yet (it may still be being written).
+async function takeFile(file: string): Promise<string | null> {
+  const text = await fs.readFile(file, "utf8").catch(() => null);
+  try {
+    JSON.parse(text ?? "");
+  } catch {
+    return null;
+  }
+  await fs.rm(file, { force: true }).catch(() => {});
+  return text;
 }
 
 // The title reply, if the hooks module has written one; the file goes once it is read. One that

@@ -172,6 +172,30 @@ test("lead: never stalls — an open turn quiet past stalledMinutes is idle sinc
   expect([l.status, l.statusSince, l.doing]).toEqual(["idle", at(650), null]);
 });
 
+test("questions: an AskUserQuestion with no result is open while the turn is; its result, an interruption or a new prompt closes it", async () => {
+  const { home, main } = office();
+  const prompt = line.user(main, "fix the bug", 60);
+  const options = [{ label: "main", description: "Straight to main." }, { label: "A new branch" }];
+  const ask = (id: string, questions: unknown, age = 30) => ({ ...line.tool(main, "AskUserQuestion", { questions }, age), message: { role: "assistant", content: [{ type: "tool_use", id, name: "AskUserQuestion", input: { questions } }] } });
+  const asked = ask("toolu_1", [{ question: "Which branch?", header: "Branch", options, multiSelect: false }, { question: "" }]);
+  const questions = async () => (await factsOf(home, "s")).questions;
+
+  session(home, "s", [prompt, asked]);
+  expect(await questions()).toEqual([
+    { id: "toolu_1", agent: cc("s:lead"), at: at(30), questions: [{ question: "Which branch?", header: "Branch", options: [options[0], { label: "A new branch", description: "" }], multiSelect: false }] },
+  ]);
+  // An input the model wrote in another shape is no question.
+  session(home, "s", [prompt, ask("toolu_2", "Which branch?")]);
+  expect(await questions()).toEqual([]);
+
+  session(home, "s", [prompt, asked, line.result(main, "toolu_1", null, 20, true)]);
+  expect(await questions()).toEqual([]);
+  session(home, "s", [prompt, asked, line.user(main, [{ type: "text", text: "[Request interrupted by user for tool use]" }], 20)]);
+  expect(await questions()).toEqual([]);
+  session(home, "s", [prompt, asked, line.user(main, "never mind, do it on main", 20)]);
+  expect(await questions()).toEqual([]);
+});
+
 test("foreground agent: working until the parent's tool_result says completed, then done with a report", async () => {
   const { home, main } = office();
   const lines = [line.spawn(main, "tu-fg1", { subagent_type: "researcher" }, 100)];
