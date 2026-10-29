@@ -34,7 +34,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { PROTOCOL_VERSION, type Facts } from "@isoplan/protocol";
-import { installWake } from "../install/install.js";
+import { installWake, pluginsDir } from "../install/install.js";
 import type { DataLayerLine, TitleReply } from "../lines.js";
 import { findClaude } from "../runner/claude-binary.js";
 import { loadPatterns } from "../runner/scan.js";
@@ -120,7 +120,7 @@ async function main(argv: string[]): Promise<number> {
     emit({ type: "log", text: `couldn't take the session lock, so going on without it: ${String((err as Error)?.message ?? err)}` });
   }
 
-  const paths = { claudeDir, settings: path.join(claudeDir, "settings.json") };
+  const paths = { claudeDir, settings: path.join(claudeDir, "settings.json"), plugins: pluginsDir(claudeDir, process.env) };
   const start = (args: string[], dir: string, env?: Record<string, string>) => spawn(process.execPath, args, { cwd: dir, env, detached: true, stdio: "ignore", windowsHide: true }).on("error", () => {}).unref();
   const installing = detached
     ? Promise.resolve([])

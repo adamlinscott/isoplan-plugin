@@ -1,0 +1,37 @@
+# Deploy only: when a release is published, publishes @isoplan/protocol to npm, unless the version
+# in packages/protocol/package.json is there already. It uses npm trusted publishing: npm trusts
+# this repository and this file (set on npmjs.com, in the package's settings), so there is no token
+# secret, and the package gets a provenance statement.
+name: Publish protocol
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      # The pnpm version comes from packageManager in package.json.
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+      # Trusted publishing needs npm 11.5.1 or later.
+      - run: npm install -g npm@^11.5.1
+      - run: pnpm install --frozen-lockfile
+      - name: Publish, unless this version is on npm already
+        working-directory: packages/protocol
+        run: |
+          version=$(node -p "require('./package.json').version")
+          if [ -n "$(npm view "@isoplan/protocol@$version" version 2>/dev/null)" ]; then
+            echo "@isoplan/protocol@$version is on npm already; nothing to publish."
+          else
+            npm publish --provenance --access public
+          fi

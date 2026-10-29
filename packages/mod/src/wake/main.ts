@@ -13,14 +13,25 @@
 //
 // It runs as a copy at <claude dir>/isoplan/wake.mjs, so its own folder's parent is the config
 // folder, whichever one Claude Code was started with.
+//
+// It is also how an uninstall through Claude Code (`/plugin uninstall`, the plugin manager, `claude
+// plugin uninstall`) takes everything out, since Claude Code runs nothing of a plugin's then: once
+// installed_plugins.json no longer lists the plugin whose data layer wake.json records, the hook
+// starts no data layer and no runner, and starts itself detached to uninstall it all instead
+// (src/install), hooks, runner and files, so the session isn't kept waiting while it does.
+//
+//   node <claude dir>/isoplan/wake.mjs --uninstall
 
 import { spawn } from "node:child_process";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { isRecordedUninstalled, pluginsDir, uninstall } from "../install/install.js";
 import { startRunner } from "../runner/start.js";
 import { wake } from "./wake.js";
 
 const STDIN_MS = 500;
+// Long enough for a detached data layer to see its lock has gone, at the default streamSeconds.
+const SETTLE_MS = 3000;
 
 process.on("uncaughtException", () => process.exit(0));
 
@@ -36,10 +47,22 @@ function readStdin(): Promise<string> {
   });
 }
 
-const claudeDir = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
+const self = fileURLToPath(import.meta.url);
+const claudeDir = path.dirname(path.dirname(self));
+const paths = { claudeDir, settings: path.join(claudeDir, "settings.json"), plugins: pluginsDir(claudeDir, process.env) };
 const start = (args: string[], cwd: string, env?: Record<string, string>) => spawn(process.execPath, args, { cwd, env, detached: true, stdio: "ignore", windowsHide: true }).on("error", () => {}).unref();
+if (process.argv.includes("--uninstall")) {
+  await uninstall(paths, { settleMs: SETTLE_MS }).catch(() => {});
+  process.exit(0);
+}
+const input = await readStdin();
+if (await isRecordedUninstalled(paths)) {
+  // Started in the config folder, never inside the isoplan folder it removes.
+  start([self, "--uninstall"], claudeDir);
+  process.exit(0);
+}
 try {
-  await wake(await readStdin(), { claudeDir, spawn: start });
+  await wake(input, { claudeDir, spawn: start });
 } catch {
   // Nothing to do: a session is never failed for this.
 }

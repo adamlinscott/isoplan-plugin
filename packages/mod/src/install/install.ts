@@ -17,12 +17,22 @@
 // byte order mark). A settings.json that doesn't parse is left alone. Each file is written whole
 // beside its target and moved over it, so neither Claude Code nor a running hook reads half of one.
 //
-// Uninstalling leaves wake.json as `{ "disabled": true }`, so the plugin's data layer doesn't put
-// the hook back when it next starts; only the install script takes that away.
+// Uninstalling takes out everything install and the plugin put in place: the hooks, the running
+// runner, and the plugin's files under <claude dir>/isoplan. The files a person writes there are
+// kept: config.json, runner.json, secret-patterns.json, and a claude-binary.json set by hand. The
+// install script's uninstall can leave wake.json as `{ "disabled": true }`, so a plugin that is
+// still installed doesn't put the hook back when its data layer next starts; only the install
+// script takes that away.
+//
+// Claude Code runs nothing of a plugin's when it is uninstalled, and leaves the version's folder in
+// its cache for days, so the wake hook is what notices (src/wake/main.ts): the data layer wake.json
+// records sits in that cache, at cache/<marketplace>/<plugin>/<version>/, and once Claude Code's
+// installed_plugins.json no longer lists that plugin, the wake hook uninstalls it all.
 
 import fs from "node:fs/promises";
 import path from "node:path";
 import { claudeBinaryPath } from "../runner/claude-binary.js";
+import { stopRunner, type StartOptions } from "../runner/start.js";
 import { wakeRecordPath, type WakeRecord } from "../wake/wake.js";
 
 export const WAKE_EVENTS = ["UserPromptSubmit", "Stop"] as const;
@@ -34,6 +44,62 @@ export interface Paths {
   claudeDir: string;
   /** The settings.json the hooks go in. */
   settings: string;
+  /** Claude Code's plugins folder (`pluginsDir`), for whether the plugin is still installed. */
+  plugins: string;
+}
+
+/** Claude Code's plugins folder: $CLAUDE_CODE_PLUGIN_CACHE_DIR when it is set, else <claude dir>/plugins. */
+export const pluginsDir = (claudeDir: string, env: Record<string, string | undefined>) => env.CLAUDE_CODE_PLUGIN_CACHE_DIR || path.join(claudeDir, "plugins");
+
+/**
+ * The id, `<plugin>@<marketplace>`, of the marketplace install `file` is part of, from its place in
+ * the plugins folder's cache/<marketplace>/<plugin>/<version>/. Null for a file outside it, such as
+ * a checkout's.
+ */
+export function pluginIdOf(plugins: string, file: string): string | null {
+  const relative = path.relative(path.join(plugins, "cache"), path.resolve(file));
+  if (path.isAbsolute(relative)) return null; // another drive
+  const parts = relative.split(path.sep);
+  return parts.length >= 4 && parts[0] !== ".." ? `${parts[1]}@${parts[0]}` : null;
+}
+
+/**
+ * The plugin ids Claude Code's installed_plugins.json lists, [] when there is no such file. Null
+ * when it can't be read or isn't the shape known (`{ plugins: { "<id>": [install, ...] } }`), so
+ * no one acts on it.
+ */
+export async function installedPlugins(plugins: string): Promise<string[] | null> {
+  let text: string;
+  try {
+    text = await fs.readFile(path.join(plugins, "installed_plugins.json"), "utf8");
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === "ENOENT" ? [] : null;
+  }
+  try {
+    const list = (JSON.parse(text) as { plugins?: unknown }).plugins;
+    if (!list || typeof list !== "object" || Array.isArray(list)) return null;
+    return Object.entries(list).filter(([, installs]) => Array.isArray(installs) && installs.length > 0).map(([id]) => id);
+  } catch {
+    return null;
+  }
+}
+
+/** Whether `dataLayer` is a marketplace install's that Claude Code no longer lists as installed. */
+export async function isUninstalled(plugins: string, dataLayer: string): Promise<boolean> {
+  const id = pluginIdOf(plugins, dataLayer);
+  if (!id) return false;
+  const installed = await installedPlugins(plugins);
+  return installed !== null && !installed.includes(id);
+}
+
+/** Whether the data layer wake.json records belongs to a plugin Claude Code has uninstalled. */
+export async function isRecordedUninstalled({ claudeDir, plugins }: Paths): Promise<boolean> {
+  try {
+    const { dataLayer } = JSON.parse(await fs.readFile(wakeRecordPath(claudeDir), "utf8")) as { dataLayer?: unknown };
+    return typeof dataLayer === "string" && (await isUninstalled(plugins, dataLayer));
+  } catch {
+    return false;
+  }
 }
 
 export const wakeScriptPath = (claudeDir: string) => path.join(claudeDir, "isoplan", "wake.mjs");
@@ -62,15 +128,17 @@ const isWake = (hook: unknown) => typeof (hook as Json | null)?.command === "str
  * Copies `wakeSource` (dist/wake.js) into place, records `dataLayer`, and adds or updates the hooks.
  * With `runnerFrom` (the plugin's folder) it copies the runner too, and records the copy.
  * Returns what it changed, [] when it was all there. Throws when settings.json can't be merged.
- * With `auto` (the plugin's data layer) it does nothing once the hook has been uninstalled.
+ * With `auto` (the plugin's data layer) it does nothing once the hook has been uninstalled, or
+ * once Claude Code has uninstalled the plugin `dataLayer` belongs to: a session that loaded it
+ * before then still runs it.
  */
 export async function installWake(
-  { claudeDir, settings }: Paths,
+  { claudeDir, settings, plugins }: Paths,
   dataLayer: string,
   wakeSource: string,
   { auto = false, runnerFrom, findClaude }: { auto?: boolean; runnerFrom?: string; findClaude?: () => Promise<string | null> } = {},
 ): Promise<string[]> {
-  if (auto && (await isOptedOut(claudeDir))) return [];
+  if (auto && ((await isOptedOut(claudeDir)) || (await isUninstalled(plugins, dataLayer)))) return [];
   const current = await readSettings(settings);
   const script = wakeScriptPath(claudeDir);
   const hooks = (current.hooks ??= {}) as Json;
@@ -125,11 +193,52 @@ export async function installWake(
   return [...changes, ...done];
 }
 
+/** What uninstall removes under <claude dir>/isoplan, besides an install's own claude-binary.json. */
+export const INSTALLED_FILES = ["wake.mjs", "wake.json", "runner", "live", "logs", "titles"];
+
+export interface UninstallOptions {
+  /** Leave wake.json as `{ "disabled": true }`, so a plugin still installed doesn't put the hook back. */
+  optOut?: boolean;
+  /** How long to wait, once the runner is stopped and the session locks are gone, for what they end to stop writing. */
+  settleMs?: number;
+  /** For stopping the runner (start.ts). */
+  runner?: Omit<StartOptions, "claudeDir" | "spawn">;
+}
+
 /**
- * Takes out the wake hooks and wake.mjs, and marks wake.json as uninstalled; nothing else. Returns
- * what it changed.
+ * Takes out everything install and the plugin put in place: the wake hooks in settings.json, the
+ * running runner, and under <claude dir>/isoplan the wake hook, its record, the runner's copy and
+ * its records (environment, ledger, lock), the session locks, the logs and the title files, and
+ * claude-binary.json unless it was set by hand. The session locks go before the wait, since a
+ * detached data layer stops once its lock isn't its own; the runner's worker stops with its
+ * supervisor. What else is in the folder, the files a person writes, is kept, and the folder goes
+ * once it is empty. Returns what it changed.
  */
-export async function uninstallWake({ claudeDir, settings }: Paths): Promise<string[]> {
+export async function uninstall(paths: Paths, { optOut = false, settleMs = 0, runner = {} }: UninstallOptions = {}): Promise<string[]> {
+  const changes = await uninstallHooks(paths);
+  const dir = path.dirname(wakeScriptPath(paths.claudeDir));
+  const remove = async (file: string) => {
+    if (!(await fs.stat(file).then(() => true, () => false))) return;
+    // Retried, for a file on Windows that a stopping process or a scanner still has open.
+    await fs.rm(file, { recursive: true, force: true, maxRetries: 5 });
+    if (!changes.includes(`removed ${file}`)) changes.push(`removed ${file}`);
+  };
+  if (await stopRunner(paths.claudeDir, runner)) changes.push("stopped the runner, which answered for this machine's rooms");
+  await remove(path.join(dir, "live"));
+  if (settleMs) await new Promise((r) => setTimeout(r, settleMs));
+  const record = wakeRecordPath(paths.claudeDir);
+  for (const file of INSTALLED_FILES.map((name) => path.join(dir, name))) if (!(optOut && file === record)) await remove(file);
+  const binary = claudeBinaryPath(paths.claudeDir);
+  if (!(await isHandSet(binary)) && (await fs.rm(binary).then(() => true, () => false))) changes.push(`removed ${binary}`);
+  if (optOut) {
+    const disabled: WakeRecord = { disabled: true };
+    if (await writeIfChanged(record, JSON.stringify(disabled, null, 2) + "\n")) changes.push(`marked the wake hook as uninstalled in ${record}, so the plugin won't put it back`);
+  } else if (await fs.rmdir(dir).then(() => true, () => false)) changes.push(`removed ${dir}`);
+  return changes;
+}
+
+// Takes the wake hooks out of settings.json, keeping every other hook and setting.
+async function uninstallHooks({ settings }: Paths): Promise<string[]> {
   const current = await readSettings(settings);
   const changes: string[] = [];
   const hooks = current.hooks as Json | undefined;
@@ -152,13 +261,6 @@ export async function uninstallWake({ claudeDir, settings }: Paths): Promise<str
     if (changes.length && !Object.keys(hooks).length) delete current.hooks;
   }
   if (changes.length) await writeSettings(settings, current);
-  const script = wakeScriptPath(claudeDir);
-  if (await fs.rm(script).then(() => true, () => false)) changes.push(`removed ${script}`);
-  const record: WakeRecord = { disabled: true };
-  await fs.mkdir(path.dirname(script), { recursive: true });
-  if (await writeIfChanged(wakeRecordPath(claudeDir), JSON.stringify(record, null, 2) + "\n")) {
-    changes.push(`marked the wake hook as uninstalled in ${wakeRecordPath(claudeDir)}, so the plugin won't put it back`);
-  }
   return changes;
 }
 

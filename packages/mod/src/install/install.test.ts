@@ -2,7 +2,8 @@ import fs from "node:fs";
 import path from "node:path";
 import { expect, test } from "vitest";
 import { tempRoot } from "../data-layer/fixture.js";
-import { copiedAs, installWake, RUNNER_FILES, runnerAppDir, uninstallWake, wakeCommand, wakeScriptPath } from "./install.js";
+import { runnerLockPath } from "../runner/start.js";
+import { copiedAs, installWake, isRecordedUninstalled, isUninstalled, pluginIdOf, RUNNER_FILES, runnerAppDir, uninstall, wakeCommand, wakeScriptPath } from "./install.js";
 
 const other = { matcher: "Bash", hooks: [{ type: "command", command: "echo other" }] };
 
@@ -14,7 +15,7 @@ function setup(settings?: unknown) {
   fs.mkdirSync(dist, { recursive: true });
   fs.writeFileSync(path.join(dist, "data-layer.js"), "");
   fs.writeFileSync(path.join(dist, "wake.js"), "// wake");
-  const paths = { claudeDir, settings: path.join(claudeDir, "settings.json") };
+  const paths = { claudeDir, settings: path.join(claudeDir, "settings.json"), plugins: path.join(claudeDir, "plugins") };
   if (settings !== undefined) {
     fs.mkdirSync(claudeDir, { recursive: true });
     fs.writeFileSync(paths.settings, typeof settings === "string" ? settings : JSON.stringify(settings));
@@ -83,22 +84,87 @@ test("install: a symlinked settings.json stays a link, and a leading byte order 
   expect(fs.readdirSync(path.dirname(real))).toEqual(["settings.json"]);
 });
 
-test("uninstall: removes only the wake hooks and wake.mjs, and marks wake.json so the plugin stays out", async () => {
+test("uninstall: takes out the hooks and everything the plugin wrote, and keeps the files a person writes", async () => {
   const s = setup({ model: "opus", hooks: { Stop: [other] } });
   await s.install();
-  fs.writeFileSync(path.join(s.claudeDir, "isoplan", "config.json"), "{}");
-  const changes = await uninstallWake(s.paths);
-  expect(changes).toHaveLength(4);
+  const dir = path.join(s.claudeDir, "isoplan");
+  for (const file of ["live/s1.json", "logs/runner.log", "titles/s1.json", "runner/ledger.json", "runner/environment.json", "config.json", "runner.json", "secret-patterns.json"]) {
+    fs.mkdirSync(path.dirname(path.join(dir, file)), { recursive: true });
+    fs.writeFileSync(path.join(dir, file), "{}");
+  }
+  fs.writeFileSync(path.join(dir, "claude-binary.json"), JSON.stringify({ path: "/bin/claude", auto: true }));
+  const changes = await uninstall(s.paths);
+  expect(changes).toContain(`removed the wake hook from ${s.paths.settings} on UserPromptSubmit`);
   expect(s.read()).toEqual({ model: "opus", hooks: { Stop: [other] } });
-  expect(fs.readdirSync(path.join(s.claudeDir, "isoplan")).sort()).toEqual(["config.json", "wake.json"]);
-  expect(JSON.parse(fs.readFileSync(path.join(s.claudeDir, "isoplan", "wake.json"), "utf8"))).toEqual({ disabled: true });
-  expect(await uninstallWake(s.paths)).toEqual([]);
+  expect(fs.readdirSync(dir).sort()).toEqual(["config.json", "runner.json", "secret-patterns.json"]);
+  expect(await uninstall(s.paths)).toEqual([]);
 
-  // The plugin's own install at start leaves it out; the install script puts it back.
+  // With nothing of the person's in it, the folder goes too; a claude binary set by hand stays.
+  fs.rmSync(dir, { recursive: true });
+  await s.install();
+  expect(await uninstall(s.paths)).toContain(`removed ${dir}`);
+  expect(fs.existsSync(dir)).toBe(false);
+  fs.mkdirSync(dir);
+  fs.writeFileSync(path.join(dir, "claude-binary.json"), JSON.stringify({ path: "D:/tools/claude.exe" }));
+  await uninstall(s.paths);
+  expect(fs.readdirSync(dir)).toEqual(["claude-binary.json"]);
+});
+
+test("uninstall: stops the running runner", async () => {
+  const s = setup();
+  await s.install();
+  fs.mkdirSync(path.dirname(runnerLockPath(s.claudeDir)), { recursive: true });
+  fs.writeFileSync(runnerLockPath(s.claudeDir), JSON.stringify({ pid: 4242, code: "1-1" }));
+  const killed: number[] = [];
+  expect(await uninstall(s.paths, { runner: { isAlive: () => true, kill: (pid) => void killed.push(pid) } })).toContain("stopped the runner, which answered for this machine's rooms");
+  expect(killed).toEqual([4242]);
+});
+
+test("uninstall with optOut: wake.json stays, marked, so the plugin's data layer leaves the hook out; the install script puts it back", async () => {
+  const s = setup();
+  await s.install();
+  expect(await uninstall(s.paths, { optOut: true })).toContain(`marked the wake hook as uninstalled in ${path.join(s.claudeDir, "isoplan", "wake.json")}, so the plugin won't put it back`);
+  expect(fs.readdirSync(path.join(s.claudeDir, "isoplan"))).toEqual(["wake.json"]);
+  expect(JSON.parse(fs.readFileSync(path.join(s.claudeDir, "isoplan", "wake.json"), "utf8"))).toEqual({ disabled: true });
+  expect(await uninstall(s.paths, { optOut: true })).toEqual([]);
+
   expect(await installWake(s.paths, path.join(s.dist, "data-layer.js"), path.join(s.dist, "wake.js"), { auto: true })).toEqual([]);
-  expect(s.read().hooks.UserPromptSubmit).toBeUndefined();
+  expect(s.read().hooks).toBeUndefined();
   await s.install();
   expect(s.read().hooks.UserPromptSubmit).toEqual([{ hooks: [s.wake] }]);
+});
+
+test("uninstalled: a data layer in Claude Code's plugin cache whose plugin installed_plugins.json no longer lists", async () => {
+  const s = setup();
+  const plugins = s.paths.plugins;
+  const dataLayer = path.join(plugins, "cache", "isoplan", "isoplan", "0.1.0", "dist", "data-layer.js");
+  const record = (ids: string[]) => {
+    fs.mkdirSync(plugins, { recursive: true });
+    fs.writeFileSync(path.join(plugins, "installed_plugins.json"), JSON.stringify({ version: 2, plugins: Object.fromEntries(ids.map((id) => [id, [{ scope: "user" }]])) }));
+  };
+  expect(pluginIdOf(plugins, dataLayer)).toBe("isoplan@isoplan");
+  expect(pluginIdOf(plugins, path.join(s.dist, "data-layer.js"))).toBeNull();
+  // No installed_plugins.json: nothing is installed.
+  expect(await isUninstalled(plugins, dataLayer)).toBe(true);
+  record(["isoplan@isoplan", "other@market"]);
+  expect(await isUninstalled(plugins, dataLayer)).toBe(false);
+  record(["other@market"]);
+  expect(await isUninstalled(plugins, dataLayer)).toBe(true);
+  // A checkout's data layer, or records that can't be read, never count as uninstalled.
+  expect(await isUninstalled(plugins, path.join(s.dist, "data-layer.js"))).toBe(false);
+  fs.writeFileSync(path.join(plugins, "installed_plugins.json"), "{ broken");
+  expect(await isUninstalled(plugins, dataLayer)).toBe(false);
+
+  // The wake hook reads it off wake.json; the plugin's own data layer no longer puts the hook back.
+  record([]);
+  fs.mkdirSync(path.dirname(dataLayer), { recursive: true });
+  fs.writeFileSync(dataLayer, "");
+  expect(await isRecordedUninstalled(s.paths)).toBe(false);
+  await installWake(s.paths, dataLayer, path.join(s.dist, "wake.js"));
+  expect(await isRecordedUninstalled(s.paths)).toBe(true);
+  await uninstall(s.paths);
+  expect(await installWake(s.paths, dataLayer, path.join(s.dist, "wake.js"), { auto: true })).toEqual([]);
+  expect(fs.existsSync(s.paths.settings) && s.read().hooks).toBeFalsy();
 });
 
 test("install: copies the runner and its defaults out of the plugin's folder, and records the copy", async () => {

@@ -6217,9 +6217,142 @@ function alive(pid) {
 //#region src/wake/wake.ts
 const wakeRecordPath = (claudeDir) => path.join(claudeDir, "isoplan", "wake.json");
 //#endregion
+//#region src/runner/environment.ts
+const runnerEnvPath = (claudeDir) => path.join(claudeDir, "isoplan", "runner", "environment.json");
+/** The recorded environment, or null when there is none, or it doesn't parse, so the starter's is used. */
+async function recordedEnv(claudeDir) {
+	try {
+		const { env } = JSON.parse(await fs.readFile(runnerEnvPath(claudeDir), "utf8"));
+		if (!env || typeof env !== "object" || Array.isArray(env)) return null;
+		return Object.fromEntries(Object.entries(env).filter((e) => typeof e[1] === "string"));
+	} catch {
+		return null;
+	}
+}
+//#endregion
+//#region src/runner/start.ts
+/** The runner's lock: `{ pid, code }` of the supervisor that holds it. */
+const runnerLockPath = (claudeDir) => path.join(claudeDir, "isoplan", "runner", "lock.json");
+/** What names a runner.js's code: its size and write time. Null when it is gone. */
+async function runnerCode(file) {
+	const st = await fs.stat(file).catch(() => null);
+	return st && st.isFile() ? `${st.size}-${Math.round(st.mtimeMs)}` : null;
+}
+/** The live runner's lock: a hold-off that hasn't ended, or a live pid that keeps it fresh. */
+async function liveRunner(claudeDir, now, isAlive) {
+	const lock = await readLock(runnerLockPath(claudeDir));
+	if (!lock) return null;
+	if (lock.until !== null && lock.until > now) return {
+		...lock,
+		isHoldOff: true
+	};
+	if (lock.pid !== null && isAlive(lock.pid) && now - lock.mtimeMs < 9e4) return {
+		...lock,
+		isHoldOff: false
+	};
+	return null;
+}
+/**
+* Starts the recorded runner unless a live one runs the recorded code. One on older code is
+* replaced. A hold-off keeps it from starting, except a crash loop's hold-off on older code: a new
+* version may have fixed what crashed.
+*/
+async function startRunner({ claudeDir, spawn, isAlive = alive, kill = (pid) => process.kill(pid), now = Date.now }) {
+	let runner;
+	try {
+		runner = JSON.parse(await fs.readFile(wakeRecordPath(claudeDir), "utf8")).runner;
+	} catch {
+		return "not-installed";
+	}
+	if (typeof runner !== "string") return "not-installed";
+	const code = await runnerCode(runner);
+	if (!code) return "not-installed";
+	const lockFile = runnerLockPath(claudeDir);
+	const live = await liveRunner(claudeDir, now(), isAlive);
+	if (live?.isHoldOff) {
+		if (live.extra.reason !== "gave-up" || live.extra.code === code) return "held-off";
+		if ((await readLock(lockFile))?.until === live.until) await fs.rm(lockFile, { force: true });
+	} else if (live) {
+		if (live.extra.code === code) return "running";
+		await stopRunner(claudeDir, {
+			isAlive,
+			kill,
+			now,
+			expect: {
+				pid: live.pid,
+				code: live.extra.code
+			}
+		});
+	}
+	const env = await recordedEnv(claudeDir);
+	spawn([
+		runner,
+		"--claude-dir",
+		claudeDir,
+		...env ? [] : ["--inherited-env"]
+	], claudeDir, env ?? void 0);
+	return "started";
+}
+/**
+* Ends the running runner, for uninstall and updates: its worker and forks follow once its
+* supervisor has gone. True when one was running. A stale lock's pid is never killed. With
+* `expect`, only the runner judged outdated is: if the lock names another pid or code by now
+* (another starter replaced it already), it is left.
+*/
+async function stopRunner(claudeDir, { isAlive = alive, kill = (pid) => process.kill(pid), now = Date.now, expect } = {}) {
+	const live = await liveRunner(claudeDir, now(), isAlive);
+	if (!live || live.isHoldOff || live.pid === null) return false;
+	if (expect && (live.pid !== expect.pid || live.extra.code !== expect.code)) return false;
+	try {
+		kill(live.pid);
+	} catch {}
+	await releaseLock(runnerLockPath(claudeDir), live.pid);
+	return true;
+}
+//#endregion
 //#region src/install/install.ts
 const WAKE_EVENTS = ["UserPromptSubmit", "Stop"];
 const TIMEOUT_SECONDS = 10;
+/** Claude Code's plugins folder: $CLAUDE_CODE_PLUGIN_CACHE_DIR when it is set, else <claude dir>/plugins. */
+const pluginsDir = (claudeDir, env) => env.CLAUDE_CODE_PLUGIN_CACHE_DIR || path.join(claudeDir, "plugins");
+/**
+* The id, `<plugin>@<marketplace>`, of the marketplace install `file` is part of, from its place in
+* the plugins folder's cache/<marketplace>/<plugin>/<version>/. Null for a file outside it, such as
+* a checkout's.
+*/
+function pluginIdOf(plugins, file) {
+	const relative = path.relative(path.join(plugins, "cache"), path.resolve(file));
+	if (path.isAbsolute(relative)) return null;
+	const parts = relative.split(path.sep);
+	return parts.length >= 4 && parts[0] !== ".." ? `${parts[1]}@${parts[0]}` : null;
+}
+/**
+* The plugin ids Claude Code's installed_plugins.json lists, [] when there is no such file. Null
+* when it can't be read or isn't the shape known (`{ plugins: { "<id>": [install, ...] } }`), so
+* no one acts on it.
+*/
+async function installedPlugins(plugins) {
+	let text;
+	try {
+		text = await fs.readFile(path.join(plugins, "installed_plugins.json"), "utf8");
+	} catch (err) {
+		return err.code === "ENOENT" ? [] : null;
+	}
+	try {
+		const list = JSON.parse(text).plugins;
+		if (!list || typeof list !== "object" || Array.isArray(list)) return null;
+		return Object.entries(list).filter(([, installs]) => Array.isArray(installs) && installs.length > 0).map(([id]) => id);
+	} catch {
+		return null;
+	}
+}
+/** Whether `dataLayer` is a marketplace install's that Claude Code no longer lists as installed. */
+async function isUninstalled(plugins, dataLayer) {
+	const id = pluginIdOf(plugins, dataLayer);
+	if (!id) return false;
+	const installed = await installedPlugins(plugins);
+	return installed !== null && !installed.includes(id);
+}
 const wakeScriptPath = (claudeDir) => path.join(claudeDir, "isoplan", "wake.mjs");
 /** Where install copies the runner and the defaults it reads, under the plugin's own layout. */
 const runnerAppDir = (claudeDir) => path.join(claudeDir, "isoplan", "runner", "app");
@@ -6244,10 +6377,12 @@ const isWake = (hook) => typeof hook?.command === "string" && /isoplan[\\/]+wake
 * Copies `wakeSource` (dist/wake.js) into place, records `dataLayer`, and adds or updates the hooks.
 * With `runnerFrom` (the plugin's folder) it copies the runner too, and records the copy.
 * Returns what it changed, [] when it was all there. Throws when settings.json can't be merged.
-* With `auto` (the plugin's data layer) it does nothing once the hook has been uninstalled.
+* With `auto` (the plugin's data layer) it does nothing once the hook has been uninstalled, or
+* once Claude Code has uninstalled the plugin `dataLayer` belongs to: a session that loaded it
+* before then still runs it.
 */
-async function installWake({ claudeDir, settings }, dataLayer, wakeSource, { auto = false, runnerFrom, findClaude } = {}) {
-	if (auto && await isOptedOut(claudeDir)) return [];
+async function installWake({ claudeDir, settings, plugins }, dataLayer, wakeSource, { auto = false, runnerFrom, findClaude } = {}) {
+	if (auto && (await isOptedOut(claudeDir) || await isUninstalled(plugins, dataLayer))) return [];
 	const current = await readSettings(settings);
 	const script = wakeScriptPath(claudeDir);
 	const hooks = current.hooks ??= {};
@@ -6407,99 +6542,6 @@ async function loadPatterns(modFile, ownerFile, log) {
 function scan(text, patterns) {
 	if (!patterns) return UNREADABLE;
 	return patterns.find((p) => p.regex.test(text))?.name ?? null;
-}
-//#endregion
-//#region src/runner/environment.ts
-const runnerEnvPath = (claudeDir) => path.join(claudeDir, "isoplan", "runner", "environment.json");
-/** The recorded environment, or null when there is none, or it doesn't parse, so the starter's is used. */
-async function recordedEnv(claudeDir) {
-	try {
-		const { env } = JSON.parse(await fs.readFile(runnerEnvPath(claudeDir), "utf8"));
-		if (!env || typeof env !== "object" || Array.isArray(env)) return null;
-		return Object.fromEntries(Object.entries(env).filter((e) => typeof e[1] === "string"));
-	} catch {
-		return null;
-	}
-}
-//#endregion
-//#region src/runner/start.ts
-/** The runner's lock: `{ pid, code }` of the supervisor that holds it. */
-const runnerLockPath = (claudeDir) => path.join(claudeDir, "isoplan", "runner", "lock.json");
-/** What names a runner.js's code: its size and write time. Null when it is gone. */
-async function runnerCode(file) {
-	const st = await fs.stat(file).catch(() => null);
-	return st && st.isFile() ? `${st.size}-${Math.round(st.mtimeMs)}` : null;
-}
-/** The live runner's lock: a hold-off that hasn't ended, or a live pid that keeps it fresh. */
-async function liveRunner(claudeDir, now, isAlive) {
-	const lock = await readLock(runnerLockPath(claudeDir));
-	if (!lock) return null;
-	if (lock.until !== null && lock.until > now) return {
-		...lock,
-		isHoldOff: true
-	};
-	if (lock.pid !== null && isAlive(lock.pid) && now - lock.mtimeMs < 9e4) return {
-		...lock,
-		isHoldOff: false
-	};
-	return null;
-}
-/**
-* Starts the recorded runner unless a live one runs the recorded code. One on older code is
-* replaced. A hold-off keeps it from starting, except a crash loop's hold-off on older code: a new
-* version may have fixed what crashed.
-*/
-async function startRunner({ claudeDir, spawn, isAlive = alive, kill = (pid) => process.kill(pid), now = Date.now }) {
-	let runner;
-	try {
-		runner = JSON.parse(await fs.readFile(wakeRecordPath(claudeDir), "utf8")).runner;
-	} catch {
-		return "not-installed";
-	}
-	if (typeof runner !== "string") return "not-installed";
-	const code = await runnerCode(runner);
-	if (!code) return "not-installed";
-	const lockFile = runnerLockPath(claudeDir);
-	const live = await liveRunner(claudeDir, now(), isAlive);
-	if (live?.isHoldOff) {
-		if (live.extra.reason !== "gave-up" || live.extra.code === code) return "held-off";
-		if ((await readLock(lockFile))?.until === live.until) await fs.rm(lockFile, { force: true });
-	} else if (live) {
-		if (live.extra.code === code) return "running";
-		await stopRunner(claudeDir, {
-			isAlive,
-			kill,
-			now,
-			expect: {
-				pid: live.pid,
-				code: live.extra.code
-			}
-		});
-	}
-	const env = await recordedEnv(claudeDir);
-	spawn([
-		runner,
-		"--claude-dir",
-		claudeDir,
-		...env ? [] : ["--inherited-env"]
-	], claudeDir, env ?? void 0);
-	return "started";
-}
-/**
-* Ends the running runner, for uninstall and updates: its worker and forks follow once its
-* supervisor has gone. True when one was running. A stale lock's pid is never killed. With
-* `expect`, only the runner judged outdated is: if the lock names another pid or code by now
-* (another starter replaced it already), it is left.
-*/
-async function stopRunner(claudeDir, { isAlive = alive, kill = (pid) => process.kill(pid), now = Date.now, expect } = {}) {
-	const live = await liveRunner(claudeDir, now(), isAlive);
-	if (!live || live.isHoldOff || live.pid === null) return false;
-	if (expect && (live.pid !== expect.pid || live.extra.code !== expect.code)) return false;
-	try {
-		kill(live.pid);
-	} catch {}
-	await releaseLock(runnerLockPath(claudeDir), live.pid);
-	return true;
 }
 //#endregion
 //#region src/data-layer/git.ts
@@ -8336,7 +8378,8 @@ async function main(argv) {
 	}
 	const paths = {
 		claudeDir,
-		settings: path.join(claudeDir, "settings.json")
+		settings: path.join(claudeDir, "settings.json"),
+		plugins: pluginsDir(claudeDir, process.env)
 	};
 	const start = (args, dir, env) => spawn(process.execPath, args, {
 		cwd: dir,
