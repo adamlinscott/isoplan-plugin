@@ -8,7 +8,8 @@
 // Claude Code ends it with the session; as a backstop it also stops when stdout breaks or its
 // parent process has gone. When it starts it also installs the wake hook (src/install), so
 // sessions without the plugin are seen too, and the first time, reports the machine's other recent
-// sessions at once (src/wake/backfill.ts).
+// sessions at once (src/wake/backfill.ts), and starts the machine's runner (src/runner) if none is
+// running.
 //
 //   node dist/data-layer.js --session <session id> --cwd <the session's folder> --detached
 //
@@ -34,6 +35,8 @@ import { fileURLToPath } from "node:url";
 import { PROTOCOL_VERSION, type Facts } from "@isoplan/protocol";
 import { installWake } from "../install/install.js";
 import type { DataLayerLine, TitleReply } from "../lines.js";
+import { findClaude } from "../runner/claude-binary.js";
+import { startRunner } from "../runner/start.js";
 import { recentSessions } from "../sweep/find.js";
 import { backfill } from "../wake/backfill.js";
 import { alive, HOLD_OFF_MS, holdOff, lockHolder, lockPath, releaseLock, takeLock } from "../wake/lock.js";
@@ -113,12 +116,19 @@ async function main(argv: string[]): Promise<number> {
   }
 
   const paths = { claudeDir, settings: path.join(claudeDir, "settings.json") };
+  const start = (args: string[], dir: string) => spawn(process.execPath, args, { cwd: dir, detached: true, stdio: "ignore", windowsHide: true }).on("error", () => {}).unref();
   const installing = detached
     ? Promise.resolve([])
-    : installWake(paths, path.join(here, "data-layer.js"), path.join(here, "wake.js"), { auto: true }).then(
+    : installWake(paths, path.join(here, "data-layer.js"), path.join(here, "wake.js"), {
+        auto: true,
+        runner: path.join(here, "runner.js"),
+        findClaude: () => findClaude(process.env, process.platform, os.homedir()),
+      }).then(
         (changes) => (changes.forEach((text) => emit({ type: "log", text })), changes),
         (err: unknown) => (emit({ type: "log", text: `couldn't install the wake hook: ${String((err as Error)?.message ?? err)}` }), []),
       );
+  // The machine's runner answers for its rooms; it is started here as well as by the wake hook.
+  if (!detached) void installing.then(() => startRunner({ claudeDir, spawn: start })).catch(() => {});
 
   let config: Config = await loadConfig(io, defaultsPath, userConfigPath);
   // A hook just installed sees other sessions only on their next turn: they are reported now.
@@ -126,11 +136,7 @@ async function main(argv: string[]): Promise<number> {
     .then(async (changes) => {
       if (!changes.length) return;
       const found = await recentSessions(io, path.join(claudeDir, "projects"), Date.now() - config.lightsOffHours * 3600000);
-      const started = await backfill(found, {
-        claudeDir,
-        dataLayer: path.join(here, "data-layer.js"),
-        spawn: (args, dir) => spawn(process.execPath, args, { cwd: dir, detached: true, stdio: "ignore", windowsHide: true }).on("error", () => {}).unref(),
-      });
+      const started = await backfill(found, { claudeDir, dataLayer: path.join(here, "data-layer.js"), spawn: start });
       emit({ type: "log", text: `reported ${started} other session(s) from the last ${config.lightsOffHours} hours` });
     })
     .catch((err: unknown) => emit({ type: "log", text: `couldn't report the other sessions: ${String((err as Error)?.message ?? err)}` }));

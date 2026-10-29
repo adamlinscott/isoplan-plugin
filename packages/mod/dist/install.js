@@ -1,8 +1,8 @@
 import { execFile, spawn } from "node:child_process";
+import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import fs from "node:fs/promises";
 //#region src/data-layer/git.ts
 function isAbsolute(p) {
 	return /^[A-Za-z]:[\\/]/.test(p) || p.startsWith("/") || p.startsWith("\\");
@@ -55,6 +55,10 @@ function claudePaths(env, home) {
 //#endregion
 //#region src/data-layer/config.ts
 async function loadConfig(io, defaultsPath, userPath) {
+	return loadSettings(io, defaultsPath, userPath);
+}
+/** The same per-key override for any settings file of the mod's, such as the runner's runner.json. */
+async function loadSettings(io, defaultsPath, userPath) {
 	const defaults = await readJson(io, defaultsPath);
 	const user = await readJson(io, userPath, true);
 	const config = {};
@@ -148,6 +152,92 @@ function runCommand([cmd, ...args], { cwd }) {
 			});
 		});
 	});
+}
+//#endregion
+//#region src/runner/claude-binary.ts
+const claudeBinaryPath = (claudeDir) => path.join(claudeDir, "isoplan", "claude-binary.json");
+const isFile = (p) => fs.stat(p).then((s) => s.isFile(), () => false);
+/**
+* The `claude` binary's path: PATH first, then where Claude Code's installers put it. On Windows
+* an npm install leaves only a claude.cmd shim, which can't be run without a shell, so its cli.js
+* is used instead (run with node). Null when none is found.
+*/
+async function findClaude(env, platform, home, exists = isFile) {
+	const windows = platform === "win32";
+	const join = windows ? path.win32.join : path.posix.join;
+	const dirs = (Object.entries(env).find(([key]) => key.toUpperCase() === "PATH")?.[1] ?? "").split(windows ? ";" : ":").filter(Boolean);
+	const candidates = windows ? [...dirs.map((d) => join(d, "claude.exe")), join(home, ".local", "bin", "claude.exe")] : [
+		...dirs.map((d) => join(d, "claude")),
+		join(home, ".local", "bin", "claude"),
+		join(home, ".claude", "local", "claude"),
+		"/opt/homebrew/bin/claude",
+		"/usr/local/bin/claude"
+	];
+	for (const candidate of candidates) if (await exists(candidate)) return candidate;
+	if (windows) for (const d of dirs) {
+		const cli = join(d, "node_modules", "@anthropic-ai", "claude-code", "cli.js");
+		if (await exists(join(d, "claude.cmd")) && await exists(cli)) return cli;
+	}
+	return null;
+}
+//#endregion
+//#region src/wake/lock.ts
+const lockPath = (claudeDir, sessionId) => path.join(claudeDir, "isoplan", "live", `${sessionId}.json`);
+async function readLock(file) {
+	try {
+		const { pid, until } = JSON.parse(await fs.readFile(file, "utf8"));
+		return {
+			pid: Number.isSafeInteger(pid) && pid > 0 ? pid : null,
+			until: typeof until === "number" ? until : null
+		};
+	} catch {
+		return null;
+	}
+}
+/** The pid the lock names, or null when there is none or it can't be read. */
+async function lockHolder(file) {
+	return (await readLock(file))?.pid ?? null;
+}
+/** Whether the session is held: by a live pid, or by a hold-off that hasn't ended. */
+async function isHeld(file, now = Date.now(), isAlive = alive) {
+	const lock = await readLock(file);
+	return !!lock && (lock.until !== null && lock.until > now || lock.pid !== null && isAlive(lock.pid));
+}
+function alive(pid) {
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch (err) {
+		return err.code === "EPERM";
+	}
+}
+//#endregion
+//#region src/wake/wake.ts
+const wakeRecordPath = (claudeDir) => path.join(claudeDir, "isoplan", "wake.json");
+//#endregion
+//#region src/runner/start.ts
+/** The runner's lock: `{ pid }` of the supervisor that holds it. */
+const runnerLockPath = (claudeDir) => path.join(claudeDir, "isoplan", "runner", "lock.json");
+/** True when a runner was started. Nothing recorded, or a recorded runner that is gone, starts none. */
+async function startRunner({ claudeDir, spawn, isAlive = alive }) {
+	if (await isHeld(runnerLockPath(claudeDir), Date.now(), isAlive)) return false;
+	let runner;
+	try {
+		runner = JSON.parse(await fs.readFile(wakeRecordPath(claudeDir), "utf8")).runner;
+	} catch {
+		return false;
+	}
+	if (typeof runner !== "string" || !await fs.stat(runner).then((s) => s.isFile(), () => false)) return false;
+	spawn([runner], claudeDir);
+	return true;
+}
+/** Ends the running runner, for uninstall: its worker follows once its supervisor has gone. True when one was running. */
+async function stopRunner(claudeDir, kill = (pid) => process.kill(pid)) {
+	const pid = await lockHolder(runnerLockPath(claudeDir));
+	if (pid === null || !alive(pid)) return false;
+	kill(pid);
+	await fs.rm(runnerLockPath(claudeDir), { force: true });
+	return true;
 }
 //#endregion
 //#region ../../node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/core/util.js
@@ -6120,33 +6210,6 @@ async function recentSessions(io, projectsDir, since) {
 	}
 	return out;
 }
-//#endregion
-//#region src/wake/lock.ts
-const lockPath = (claudeDir, sessionId) => path.join(claudeDir, "isoplan", "live", `${sessionId}.json`);
-async function readLock(file) {
-	try {
-		const { pid, until } = JSON.parse(await fs.readFile(file, "utf8"));
-		return {
-			pid: Number.isSafeInteger(pid) && pid > 0 ? pid : null,
-			until: typeof until === "number" ? until : null
-		};
-	} catch {
-		return null;
-	}
-}
-/** Whether the session is held: by a live pid, or by a hold-off that hasn't ended. */
-async function isHeld(file, now = Date.now(), isAlive = alive) {
-	const lock = await readLock(file);
-	return !!lock && (lock.until !== null && lock.until > now || lock.pid !== null && isAlive(lock.pid));
-}
-function alive(pid) {
-	try {
-		process.kill(pid, 0);
-		return true;
-	} catch (err) {
-		return err.code === "EPERM";
-	}
-}
 /** Starts a data layer for each session no one reports whose folder is still there; returns how many. */
 async function backfill(found, { claudeDir, dataLayer, spawn, isAlive = alive, pause = (ms) => new Promise((r) => setTimeout(r, ms)) }) {
 	let started = 0;
@@ -6166,9 +6229,6 @@ async function backfill(found, { claudeDir, dataLayer, spawn, isAlive = alive, p
 	return started;
 }
 //#endregion
-//#region src/wake/wake.ts
-const wakeRecordPath = (claudeDir) => path.join(claudeDir, "isoplan", "wake.json");
-//#endregion
 //#region src/install/install.ts
 const WAKE_EVENTS = ["UserPromptSubmit", "Stop"];
 const TIMEOUT_SECONDS = 10;
@@ -6184,7 +6244,7 @@ const isWake = (hook) => typeof hook?.command === "string" && /isoplan[\\/]+wake
 * Returns what it changed, [] when it was all there. Throws when settings.json can't be merged.
 * With `auto` (the plugin's data layer) it does nothing once the hook has been uninstalled.
 */
-async function installWake({ claudeDir, settings }, dataLayer, wakeSource, { auto = false } = {}) {
+async function installWake({ claudeDir, settings }, dataLayer, wakeSource, { auto = false, runner, findClaude } = {}) {
 	if (auto && await isOptedOut(claudeDir)) return [];
 	const current = await readSettings(settings);
 	const script = wakeScriptPath(claudeDir);
@@ -6221,11 +6281,16 @@ async function installWake({ claudeDir, settings }, dataLayer, wakeSource, { aut
 		if (!found) done.push(`added the wake hook to ${settings} on ${event}`);
 		else if (changed) done.push(`updated the wake hook in ${settings} on ${event}`);
 	}
-	const record = { dataLayer };
+	const record = runner ? {
+		dataLayer,
+		runner
+	} : { dataLayer };
 	const changes = [];
 	await fs.mkdir(path.dirname(script), { recursive: true });
 	if (await writeIfChanged(script, await fs.readFile(wakeSource, "utf8"))) changes.push(`copied the wake hook to ${script}`);
-	if (await writeIfChanged(wakeRecordPath(claudeDir), JSON.stringify(record, null, 2) + "\n")) changes.push(`recorded the data layer at ${dataLayer}`);
+	if (await writeIfChanged(wakeRecordPath(claudeDir), JSON.stringify(record, null, 2) + "\n")) changes.push(`recorded the data layer at ${dataLayer}${runner ? ` and the runner at ${runner}` : ""}`);
+	const claude = findClaude ? await findClaude() : null;
+	if (claude && await writeIfChanged(claudeBinaryPath(claudeDir), JSON.stringify({ path: claude }, null, 2) + "\n")) changes.push(`recorded the claude binary at ${claude}`);
 	if (done.length) await writeSettings(settings, current);
 	return [...changes, ...done];
 }
@@ -6316,23 +6381,33 @@ const paths = {
 	settings: path.join(claudeDir, "settings.json")
 };
 const uninstall = process.argv.includes("--uninstall");
+const start = (args, cwd) => spawn(process.execPath, args, {
+	cwd,
+	detached: true,
+	stdio: "ignore",
+	windowsHide: true
+}).on("error", () => {}).unref();
 try {
-	const changes = uninstall ? await uninstallWake(paths) : await installWake(paths, path.join(here, "data-layer.js"), path.join(here, "wake.js"));
+	const changes = uninstall ? await uninstallWake(paths) : await installWake(paths, path.join(here, "data-layer.js"), path.join(here, "wake.js"), {
+		runner: path.join(here, "runner.js"),
+		findClaude: () => findClaude(process.env, process.platform, os.homedir())
+	});
 	for (const change of changes) console.log(change);
 	if (!changes.length) console.log(uninstall ? "The wake hook wasn't installed; nothing to remove." : "The wake hook is already installed; nothing changed.");
+	if (uninstall && await stopRunner(claudeDir)) console.log("Stopped the runner, which answered for this machine's rooms.");
 	if (!uninstall) {
+		if (!await fs.stat(claudeBinaryPath(claudeDir)).catch(() => null)) console.log("Couldn't find the claude binary, so the runner can't answer for this machine's rooms; set its path in " + claudeBinaryPath(claudeDir) + " as { \"path\": \"...\" }.");
+		console.log(await startRunner({
+			claudeDir,
+			spawn: start
+		}) ? "Started the runner, which answers for this machine's rooms." : "The runner is already running.");
 		const io = nodeIo();
 		const config = await loadConfig(io, path.join(here, "..", "config.json"), path.join(claudeDir, "isoplan", "config.json"));
 		const found = await recentSessions(io, path.join(claudeDir, "projects"), Date.now() - config.lightsOffHours * 36e5);
 		const started = await backfill(found, {
 			claudeDir,
 			dataLayer: path.join(here, "data-layer.js"),
-			spawn: (args, cwd) => spawn(process.execPath, args, {
-				cwd,
-				detached: true,
-				stdio: "ignore",
-				windowsHide: true
-			}).on("error", () => {}).unref()
+			spawn: start
 		});
 		console.log(`Reported ${started} session(s) from the last ${config.lightsOffHours} hours to ${config.server}; ${found.length - started} were already reported or their folder is gone.`);
 	}

@@ -13,8 +13,8 @@ export interface WakeOptions {
   isAlive?: (pid: number) => boolean;
 }
 
-/** The record install writes beside wake.mjs: where the current data layer is, or that it was uninstalled. */
-export type WakeRecord = { dataLayer: string } | { disabled: true };
+/** The record install writes beside wake.mjs: where the current data layer and runner are, or that it was uninstalled. */
+export type WakeRecord = { dataLayer: string; runner?: string } | { disabled: true };
 
 export const wakeRecordPath = (claudeDir: string) => path.join(claudeDir, "isoplan", "wake.json");
 

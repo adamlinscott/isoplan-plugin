@@ -1,9 +1,9 @@
 import type { AddressInfo } from "node:net";
-import { PROTOCOL_VERSION, type Facts, type HelloMessage } from "@isoplan/protocol";
+import { PROTOCOL_VERSION, type Facts, type HelloMessage, type RunnerHelloMessage } from "@isoplan/protocol";
 import { afterEach, expect, test } from "vitest";
 import { WebSocketServer, type WebSocket as ServerSocket } from "ws";
 import type { DataLayerLine } from "../lines.js";
-import { createLink, type Link, type LinkOptions } from "./link.js";
+import { createLink, type Link, type LinkOptions, type ServerAsk } from "./link.js";
 
 const at = "2026-10-20T09:00:00.000Z";
 const hello: HelloMessage = {
@@ -186,4 +186,25 @@ test("link: a conflict note for an agent outside this session is not passed on",
   s.sockets[0]!.send(JSON.stringify({ type: "conflict", v: PROTOCOL_VERSION, agent: "claude-code:someone-else", file: "a.md", text: "Not yours." }));
   await until(() => lines.length >= 3);
   expect(lines[2]).toEqual({ type: "log", text: expect.stringContaining("not an agent of this session") });
+});
+
+test("link: a runner's link passes the server's requests on, and a reply sent while down goes after the next hello", async () => {
+  const s = await server();
+  const runnerHello: RunnerHelloMessage = { type: "runner", v: PROTOCOL_VERSION, account: hello.account, machine: hello.machine };
+  const asks: ServerAsk[] = [];
+  const { link: l, lines } = link(s.url, { hello: runnerHello, onMessage: (m) => asks.push(m) });
+  await until(() => s.got.length === 1);
+  expect(s.got[0]).toMatchObject(runnerHello);
+  const request = { type: "request", v: PROTOCOL_VERSION, id: "q1", kind: "answer-question", session: "claude-code:s", room: "r", from: { id: "claude:bob", name: "Bob" }, question: "Why?" };
+  s.sockets[0]!.send(JSON.stringify(request));
+  s.sockets[0]!.send(JSON.stringify({ type: "release", v: PROTOCOL_VERSION, id: "q0" }));
+  await until(() => asks.length === 2);
+  expect(asks).toEqual([request, { type: "release", v: PROTOCOL_VERSION, id: "q0" }]);
+
+  s.sockets[0]!.terminate();
+  await until(() => lines.some((x) => x.type === "status" && x.state === "disconnected"));
+  l.send({ type: "reply", v: PROTOCOL_VERSION, id: "q1", kind: "answer-question", answer: "Because." });
+  await until(() => s.got.length === 3);
+  expect(types(s.got)).toEqual(["runner", "runner", "reply"]);
+  expect(s.got[2]).toMatchObject({ id: "q1", answer: "Because." });
 });

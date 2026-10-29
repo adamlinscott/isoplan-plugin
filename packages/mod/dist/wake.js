@@ -52,6 +52,23 @@ async function wake(input, { claudeDir, spawn, isAlive = alive }) {
 	return true;
 }
 //#endregion
+//#region src/runner/start.ts
+/** The runner's lock: `{ pid }` of the supervisor that holds it. */
+const runnerLockPath = (claudeDir) => path.join(claudeDir, "isoplan", "runner", "lock.json");
+/** True when a runner was started. Nothing recorded, or a recorded runner that is gone, starts none. */
+async function startRunner({ claudeDir, spawn, isAlive = alive }) {
+	if (await isHeld(runnerLockPath(claudeDir), Date.now(), isAlive)) return false;
+	let runner;
+	try {
+		runner = JSON.parse(await fs.readFile(wakeRecordPath(claudeDir), "utf8")).runner;
+	} catch {
+		return false;
+	}
+	if (typeof runner !== "string" || !await fs.stat(runner).then((s) => s.isFile(), () => false)) return false;
+	spawn([runner], claudeDir);
+	return true;
+}
+//#endregion
 //#region src/wake/main.ts
 const STDIN_MS = 500;
 process.on("uncaughtException", () => process.exit(0));
@@ -66,17 +83,23 @@ function readStdin() {
 		process.stdin.setEncoding("utf8").on("data", (piece) => text += piece).on("end", done).on("error", done);
 	});
 }
+const claudeDir = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
+const start = (args, cwd) => spawn(process.execPath, args, {
+	cwd,
+	detached: true,
+	stdio: "ignore",
+	windowsHide: true
+}).on("error", () => {}).unref();
 try {
 	await wake(await readStdin(), {
-		claudeDir: path.dirname(path.dirname(fileURLToPath(import.meta.url))),
-		spawn: (args, cwd) => spawn(process.execPath, args, {
-			cwd,
-			detached: true,
-			stdio: "ignore",
-			windowsHide: true
-		}).on("error", () => {}).unref()
+		claudeDir,
+		spawn: start
 	});
 } catch {}
+await startRunner({
+	claudeDir,
+	spawn: start
+}).catch(() => {});
 process.exit(0);
 //#endregion
 export {};

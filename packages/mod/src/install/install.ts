@@ -3,9 +3,10 @@
 //
 // The hook script is copied to <claude dir>/isoplan/wake.mjs, a path that outlives plugin updates
 // and their versioned cache folders, and wake.json beside it records where the current data layer
-// is. settings.json gets one command hook on UserPromptSubmit and one on Stop. They are found again
-// by the wake.mjs path in their command, not by a field of their own, which Claude Code's settings
-// check might refuse; so an install updates them in place and never adds a second, and every other
+// and the machine's runner (src/runner) are; claude-binary.json records the `claude` binary the
+// runner's fork runs. settings.json gets one command hook on UserPromptSubmit and one on Stop.
+// They are found again by the wake.mjs path in their command, not by a field of their own, which
+// Claude Code's settings check might refuse; so an install updates them in place and never adds a second, and every other
 // hook and setting is kept, though the file's formatting comes back normalised (two-space JSON, no
 // byte order mark). A settings.json that doesn't parse is left alone. Each file is written whole
 // beside its target and moved over it, so neither Claude Code nor a running hook reads half of one.
@@ -15,6 +16,7 @@
 
 import fs from "node:fs/promises";
 import path from "node:path";
+import { claudeBinaryPath } from "../runner/claude-binary.js";
 import { wakeRecordPath, type WakeRecord } from "../wake/wake.js";
 
 export const WAKE_EVENTS = ["UserPromptSubmit", "Stop"] as const;
@@ -45,7 +47,12 @@ const isWake = (hook: unknown) => typeof (hook as Json | null)?.command === "str
  * Returns what it changed, [] when it was all there. Throws when settings.json can't be merged.
  * With `auto` (the plugin's data layer) it does nothing once the hook has been uninstalled.
  */
-export async function installWake({ claudeDir, settings }: Paths, dataLayer: string, wakeSource: string, { auto = false } = {}): Promise<string[]> {
+export async function installWake(
+  { claudeDir, settings }: Paths,
+  dataLayer: string,
+  wakeSource: string,
+  { auto = false, runner, findClaude }: { auto?: boolean; runner?: string; findClaude?: () => Promise<string | null> } = {},
+): Promise<string[]> {
   if (auto && (await isOptedOut(claudeDir))) return [];
   const current = await readSettings(settings);
   const script = wakeScriptPath(claudeDir);
@@ -81,11 +88,14 @@ export async function installWake({ claudeDir, settings }: Paths, dataLayer: str
   }
 
   // The script and its record go first, so the hooks never name a script that isn't there.
-  const record: WakeRecord = { dataLayer };
+  const record: WakeRecord = runner ? { dataLayer, runner } : { dataLayer };
   const changes: string[] = [];
   await fs.mkdir(path.dirname(script), { recursive: true });
   if (await writeIfChanged(script, await fs.readFile(wakeSource, "utf8"))) changes.push(`copied the wake hook to ${script}`);
-  if (await writeIfChanged(wakeRecordPath(claudeDir), JSON.stringify(record, null, 2) + "\n")) changes.push(`recorded the data layer at ${dataLayer}`);
+  if (await writeIfChanged(wakeRecordPath(claudeDir), JSON.stringify(record, null, 2) + "\n")) changes.push(`recorded the data layer at ${dataLayer}${runner ? ` and the runner at ${runner}` : ""}`);
+  // The runner's fork needs the claude binary; a hook's PATH may not name it, so it is found now.
+  const claude = findClaude ? await findClaude() : null;
+  if (claude && (await writeIfChanged(claudeBinaryPath(claudeDir), JSON.stringify({ path: claude }, null, 2) + "\n"))) changes.push(`recorded the claude binary at ${claude}`);
   if (done.length) await writeSettings(settings, current);
   return [...changes, ...done];
 }

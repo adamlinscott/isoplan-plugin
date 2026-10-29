@@ -100,3 +100,17 @@ test("uninstall: removes only the wake hooks and wake.mjs, and marks wake.json s
   await s.install();
   expect(s.read().hooks.UserPromptSubmit).toEqual([{ hooks: [s.wake] }]);
 });
+
+test("install: records the runner beside the data layer, and the claude binary it finds", async () => {
+  const s = setup();
+  const runner = path.join(s.dist, "runner.js");
+  const claude = path.join(s.root, "bin", "claude.exe");
+  const changes = await installWake(s.paths, path.join(s.dist, "data-layer.js"), path.join(s.dist, "wake.js"), { runner, findClaude: async () => claude });
+  expect(changes).toContain(`recorded the data layer at ${path.join(s.dist, "data-layer.js")} and the runner at ${runner}`);
+  expect(changes).toContain(`recorded the claude binary at ${claude}`);
+  expect(JSON.parse(fs.readFileSync(path.join(s.claudeDir, "isoplan", "wake.json"), "utf8"))).toEqual({ dataLayer: path.join(s.dist, "data-layer.js"), runner });
+  expect(JSON.parse(fs.readFileSync(path.join(s.claudeDir, "isoplan", "claude-binary.json"), "utf8"))).toEqual({ path: claude });
+  // Found again unchanged, nothing is written; not found, the old record stays.
+  expect(await installWake(s.paths, path.join(s.dist, "data-layer.js"), path.join(s.dist, "wake.js"), { runner, findClaude: async () => claude })).toEqual([]);
+  expect(await installWake(s.paths, path.join(s.dist, "data-layer.js"), path.join(s.dist, "wake.js"), { runner, findClaude: async () => null })).toEqual([]);
+});

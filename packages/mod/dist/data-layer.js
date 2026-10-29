@@ -6057,6 +6057,33 @@ function splitRemote(remote) {
 	} : null;
 }
 //#endregion
+//#region src/runner/claude-binary.ts
+const claudeBinaryPath = (claudeDir) => path.join(claudeDir, "isoplan", "claude-binary.json");
+const isFile = (p) => fs.stat(p).then((s) => s.isFile(), () => false);
+/**
+* The `claude` binary's path: PATH first, then where Claude Code's installers put it. On Windows
+* an npm install leaves only a claude.cmd shim, which can't be run without a shell, so its cli.js
+* is used instead (run with node). Null when none is found.
+*/
+async function findClaude(env, platform, home, exists = isFile) {
+	const windows = platform === "win32";
+	const join = windows ? path.win32.join : path.posix.join;
+	const dirs = (Object.entries(env).find(([key]) => key.toUpperCase() === "PATH")?.[1] ?? "").split(windows ? ";" : ":").filter(Boolean);
+	const candidates = windows ? [...dirs.map((d) => join(d, "claude.exe")), join(home, ".local", "bin", "claude.exe")] : [
+		...dirs.map((d) => join(d, "claude")),
+		join(home, ".local", "bin", "claude"),
+		join(home, ".claude", "local", "claude"),
+		"/opt/homebrew/bin/claude",
+		"/usr/local/bin/claude"
+	];
+	for (const candidate of candidates) if (await exists(candidate)) return candidate;
+	if (windows) for (const d of dirs) {
+		const cli = join(d, "node_modules", "@anthropic-ai", "claude-code", "cli.js");
+		if (await exists(join(d, "claude.cmd")) && await exists(cli)) return cli;
+	}
+	return null;
+}
+//#endregion
 //#region src/wake/lock.ts
 const lockPath = (claudeDir, sessionId) => path.join(claudeDir, "isoplan", "live", `${sessionId}.json`);
 const HOLD_OFF_MS = 36e5;
@@ -6135,7 +6162,7 @@ const isWake = (hook) => typeof hook?.command === "string" && /isoplan[\\/]+wake
 * Returns what it changed, [] when it was all there. Throws when settings.json can't be merged.
 * With `auto` (the plugin's data layer) it does nothing once the hook has been uninstalled.
 */
-async function installWake({ claudeDir, settings }, dataLayer, wakeSource, { auto = false } = {}) {
+async function installWake({ claudeDir, settings }, dataLayer, wakeSource, { auto = false, runner, findClaude } = {}) {
 	if (auto && await isOptedOut(claudeDir)) return [];
 	const current = await readSettings(settings);
 	const script = wakeScriptPath(claudeDir);
@@ -6172,11 +6199,16 @@ async function installWake({ claudeDir, settings }, dataLayer, wakeSource, { aut
 		if (!found) done.push(`added the wake hook to ${settings} on ${event}`);
 		else if (changed) done.push(`updated the wake hook in ${settings} on ${event}`);
 	}
-	const record = { dataLayer };
+	const record = runner ? {
+		dataLayer,
+		runner
+	} : { dataLayer };
 	const changes = [];
 	await fs.mkdir(path.dirname(script), { recursive: true });
 	if (await writeIfChanged(script, await fs.readFile(wakeSource, "utf8"))) changes.push(`copied the wake hook to ${script}`);
-	if (await writeIfChanged(wakeRecordPath(claudeDir), JSON.stringify(record, null, 2) + "\n")) changes.push(`recorded the data layer at ${dataLayer}`);
+	if (await writeIfChanged(wakeRecordPath(claudeDir), JSON.stringify(record, null, 2) + "\n")) changes.push(`recorded the data layer at ${dataLayer}${runner ? ` and the runner at ${runner}` : ""}`);
+	const claude = findClaude ? await findClaude() : null;
+	if (claude && await writeIfChanged(claudeBinaryPath(claudeDir), JSON.stringify({ path: claude }, null, 2) + "\n")) changes.push(`recorded the claude binary at ${claude}`);
 	if (done.length) await writeSettings(settings, current);
 	return [...changes, ...done];
 }
@@ -6223,6 +6255,23 @@ async function writeWhole(file, text) {
 		await fs.rm(temp, { force: true }).catch(() => {});
 		throw err;
 	}
+}
+//#endregion
+//#region src/runner/start.ts
+/** The runner's lock: `{ pid }` of the supervisor that holds it. */
+const runnerLockPath = (claudeDir) => path.join(claudeDir, "isoplan", "runner", "lock.json");
+/** True when a runner was started. Nothing recorded, or a recorded runner that is gone, starts none. */
+async function startRunner({ claudeDir, spawn, isAlive = alive }) {
+	if (await isHeld(runnerLockPath(claudeDir), Date.now(), isAlive)) return false;
+	let runner;
+	try {
+		runner = JSON.parse(await fs.readFile(wakeRecordPath(claudeDir), "utf8")).runner;
+	} catch {
+		return false;
+	}
+	if (typeof runner !== "string" || !await fs.stat(runner).then((s) => s.isFile(), () => false)) return false;
+	spawn([runner], claudeDir);
+	return true;
 }
 //#endregion
 //#region src/data-layer/git.ts
@@ -6978,6 +7027,19 @@ function createClaudeCode(io) {
 			for (const cache of [transcripts, metas]) for (const key of cache.keys()) if (!used.has(key)) cache.delete(key);
 		}
 	}
+	async function lead(sessionId, now, config) {
+		const path = await locate(sessionId, "", now);
+		const st = path && await io.stat(path);
+		if (!path || !st) return null;
+		const t = await readTranscript(path, st.size, config.tailBytes);
+		if (!t.cwd) return null;
+		return {
+			cwd: t.cwd,
+			working: t.turnOpen && now - st.mtimeMs <= config.stalledMinutes * 6e4,
+			compacted: t.compacted,
+			context: t.usage?.context ?? 0
+		};
+	}
 	async function locate(sessionId, cwd, now) {
 		const known = found.get(sessionId);
 		if (known && await io.stat(known)) return known;
@@ -7202,7 +7264,8 @@ function createClaudeCode(io) {
 	}
 	return {
 		id: SOURCE,
-		read
+		read,
+		lead
 	};
 }
 const agentId = (id) => `${SOURCE}:${id}`;
@@ -7266,7 +7329,8 @@ function newTranscriptState() {
 		fromStart: true,
 		prompts: 0,
 		tools: 0,
-		firstPrompt: null
+		firstPrompt: null,
+		compacted: false
 	};
 }
 const MESSAGE_TYPES = /* @__PURE__ */ new Set([
@@ -7296,6 +7360,7 @@ function foldLine(st, line) {
 	if (typeof ev.gitBranch === "string" && ev.gitBranch) st.branch = ev.gitBranch;
 	if (ev.type === "ai-title" && typeof ev.aiTitle === "string" && ev.aiTitle) st.title = ev.aiTitle;
 	if (ev.type === "queue-operation" && typeof ev.content === "string") readNotifications(st, ev.content, at);
+	if (isCompaction(ev)) st.compacted = true;
 	const content = ev.message && ev.message.content;
 	if (ev.type === "assistant" && Array.isArray(content)) {
 		st.lastRole = "assistant";
@@ -7406,15 +7471,17 @@ function readUsage(st, message, at) {
 	};
 }
 function foldUsage(st, line) {
-	if (!line.includes("\"usage\"")) return;
+	if (!line.includes("\"usage\"") && !line.includes("compact")) return;
 	let ev;
 	try {
 		ev = JSON.parse(line);
 	} catch {
 		return;
 	}
+	if (isCompaction(ev)) st.compacted = true;
 	if (ev && ev.type === "assistant" && ev.message && typeof ev.message === "object") readUsage(st, ev.message, Date.parse(ev.timestamp));
 }
+const isCompaction = (ev) => !!ev && typeof ev === "object" && (ev.type === "system" && ev.subtype === "compact_boundary" || ev.isCompactSummary === true);
 function usageOf(st, fallbackMs) {
 	return st.usage && {
 		model: st.usage.model,
@@ -7518,6 +7585,10 @@ async function doingOf(st, resolve, fallbackMs, config) {
 //#endregion
 //#region src/data-layer/config.ts
 async function loadConfig(io, defaultsPath, userPath) {
+	return loadSettings(io, defaultsPath, userPath);
+}
+/** The same per-key override for any settings file of the mod's, such as the runner's runner.json. */
+async function loadSettings(io, defaultsPath, userPath) {
 	const defaults = await readJson(io, defaultsPath);
 	const user = await readJson(io, userPath, true);
 	const config = {};
@@ -7668,7 +7739,8 @@ const key = (...parts) => JSON.stringify(parts);
 const same = (a, b) => a !== void 0 && JSON.stringify(a) === JSON.stringify(b);
 //#endregion
 //#region src/data-layer/link.ts
-function createLink({ url, hello, emit, minIntervalMs = 1e3, retryBaseMs = 1e3, retryCapMs = 3e4, notWantedRetryMs = 36e5, onNotWanted, random = Math.random }) {
+function createLink({ url, hello, emit, minIntervalMs = 1e3, retryBaseMs = 1e3, retryCapMs = 3e4, notWantedRetryMs = 36e5, onNotWanted, onMessage, random = Math.random }) {
+	const outbox = [];
 	let latest = null;
 	let socket = null;
 	let isOpen = false;
@@ -7695,6 +7767,7 @@ function createLink({ url, hello, emit, minIntervalMs = 1e3, retryBaseMs = 1e3, 
 			isOpen = true;
 			seq = 0;
 			send(hello);
+			for (const message of outbox.splice(0)) send(message);
 			sendFull();
 			emit({
 				type: "status",
@@ -7811,7 +7884,8 @@ function createLink({ url, hello, emit, minIntervalMs = 1e3, retryBaseMs = 1e3, 
 				isUnwanted = true;
 				onNotWanted?.();
 			}
-		} else emit({
+		} else if (onMessage && (message.type === "request" || message.type === "release" || message.type === "handoff")) onMessage(message);
+		else emit({
 			type: "log",
 			text: `the office server sent a ${message.type} message, which this data layer doesn't handle yet`
 		});
@@ -7822,6 +7896,10 @@ function createLink({ url, hello, emit, minIntervalMs = 1e3, retryBaseMs = 1e3, 
 			latest = facts;
 			if (isOpen && !sent) sendFull();
 			else if (!pacing) flush();
+		},
+		send(message) {
+			if (isOpen && socket.readyState === WebSocket.OPEN) send(message);
+			else outbox.push(message);
 		},
 		close() {
 			isClosed = true;
@@ -7955,25 +8033,34 @@ async function main(argv) {
 		claudeDir,
 		settings: path.join(claudeDir, "settings.json")
 	};
-	const installing = detached ? Promise.resolve([]) : installWake(paths, path.join(here, "data-layer.js"), path.join(here, "wake.js"), { auto: true }).then((changes) => (changes.forEach((text) => emit({
+	const start = (args, dir) => spawn(process.execPath, args, {
+		cwd: dir,
+		detached: true,
+		stdio: "ignore",
+		windowsHide: true
+	}).on("error", () => {}).unref();
+	const installing = detached ? Promise.resolve([]) : installWake(paths, path.join(here, "data-layer.js"), path.join(here, "wake.js"), {
+		auto: true,
+		runner: path.join(here, "runner.js"),
+		findClaude: () => findClaude(process.env, process.platform, os.homedir())
+	}).then((changes) => (changes.forEach((text) => emit({
 		type: "log",
 		text
 	})), changes), (err) => (emit({
 		type: "log",
 		text: `couldn't install the wake hook: ${String(err?.message ?? err)}`
 	}), []));
+	if (!detached) installing.then(() => startRunner({
+		claudeDir,
+		spawn: start
+	})).catch(() => {});
 	let config = await loadConfig(io, defaultsPath, userConfigPath);
 	installing.then(async (changes) => {
 		if (!changes.length) return;
 		const started = await backfill(await recentSessions(io, path.join(claudeDir, "projects"), Date.now() - config.lightsOffHours * 36e5), {
 			claudeDir,
 			dataLayer: path.join(here, "data-layer.js"),
-			spawn: (args, dir) => spawn(process.execPath, args, {
-				cwd: dir,
-				detached: true,
-				stdio: "ignore",
-				windowsHide: true
-			}).on("error", () => {}).unref()
+			spawn: start
 		});
 		emit({
 			type: "log",
