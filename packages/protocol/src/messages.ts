@@ -27,10 +27,18 @@ const HandoffId = z
   .max(64)
   .regex(/^[a-z0-9][a-z0-9-]*$/, "lowercase letters, digits and dashes");
 
+// A path segment Windows reads as `.git`: its trailing dots and spaces dropped, in any case, or
+// the 8.3 short name of a folder that starts with `.git`.
+const isGitFolder = (segment: string) => {
+  const name = segment.replace(/[. ]+$/, "").toLowerCase();
+  return name === ".git" || /^git~\d+$/.test(name);
+};
+
 /**
  * One repo a handoff pushed: its path in the session's folder (`.` for the folder itself), remote,
  * branch and commit. A handoff drives git on the receiver's machine, so the path stays inside the
- * folder and the remote can't name a transport helper such as `ext::`, which runs a command.
+ * folder, out of any `.git` folder (in any spelling Windows reads as one: `.GIT.`, `.git `, `GIT~1`),
+ * and the remote can't name a transport helper such as `ext::`, which runs a command.
  */
 export const HandoffRepoSchema = z.object({
   path: z
@@ -38,7 +46,8 @@ export const HandoffRepoSchema = z.object({
     .min(1)
     .refine((path) => !/^([\\/]|[A-Za-z]:)/.test(path), "a path relative to the session's folder")
     .refine((path) => !path.split(/[\\/]/).includes(".."), "a path inside the session's folder, with no `..`")
-    .refine((path) => !path.startsWith("-"), "a path that doesn't start with `-`, which git would read as an option"),
+    .refine((path) => !path.startsWith("-"), "a path that doesn't start with `-`, which git would read as an option")
+    .refine((path) => !path.split(/[\\/]/).some(isGitFolder), "a path that isn't in a `.git` folder"),
   remote: z
     .string()
     .min(1)
@@ -48,7 +57,11 @@ export const HandoffRepoSchema = z.object({
   commit: z.string().regex(/^([0-9a-f]{40}|[0-9a-f]{64})$/, "a full commit hash"),
 });
 
-/** What the receiver gets: the brief, and every repo pushed for it, each on the handoff's own branch. */
+/**
+ * What the receiver gets: the brief, and every repo pushed for it, each on the handoff's own branch,
+ * `isoplan/handoff/<id>`. Repos that push to the same remote can't share one, so each after the
+ * first has `isoplan/handoff/<id>--<its path, as lowercase letters, digits and dashes>`.
+ */
 export const HandoffSchema = z
   .object({
     id: HandoffId,
@@ -57,8 +70,9 @@ export const HandoffSchema = z
   })
   .superRefine((handoff, context) => {
     handoff.repos.forEach((repo, i) => {
-      if (repo.branch !== `isoplan/handoff/${handoff.id}`) {
-        context.addIssue({ code: "custom", path: ["repos", i, "branch"], message: `the handoff's branch, isoplan/handoff/${handoff.id}` });
+      const own = `isoplan/handoff/${handoff.id}`;
+      if (repo.branch !== own && !(repo.branch.startsWith(`${own}--`) && /^[a-z0-9]+(-[a-z0-9]+)*$/.test(repo.branch.slice(own.length + 2)))) {
+        context.addIssue({ code: "custom", path: ["repos", i, "branch"], message: `the handoff's branch, isoplan/handoff/${handoff.id} or isoplan/handoff/${handoff.id}--<slug>` });
       }
     });
   });
@@ -136,7 +150,8 @@ export const RefusalMessageSchema = z.discriminatedUnion("reason", [
     cap: z.enum(["room-hour", "owner-day", "owner-tokens"]),
   }),
   // `file`: what was withheld is the handoff's commit, whose added lines in that file matched (the
-  // pattern itself stays on the machine); without it, the brief or answer.
+  // pattern itself stays on the machine); without it, the brief or answer. With several matches, or
+  // several repos (#56), it names every such file by its path in the session's folder, joined by ", ".
   // `unchecked`: files the commit adds that the scan can't read (binary), named so the owner knows.
   z.object({
     type: z.literal("refusal"),
