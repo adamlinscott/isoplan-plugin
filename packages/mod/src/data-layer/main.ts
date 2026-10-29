@@ -217,7 +217,7 @@ async function main(argv: string[]): Promise<number> {
         url: server,
         emit,
         onNotWanted: () => (isUnwanted = detached),
-        // The owner released a withheld report from the floor: it goes out at once.
+        // The owner released a withheld report: it goes to the link now, not on the next pass.
         onMessage: (message) => {
           if (message.type !== "release") return emit({ type: "log", text: `the office server sent a ${message.type} message, which this data layer doesn't handle yet` });
           void hold.release(message.id).then((released) => {

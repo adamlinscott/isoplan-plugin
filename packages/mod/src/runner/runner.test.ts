@@ -9,7 +9,7 @@ import type { Answered, Answerer, Ask, Lead } from "./answerer.js";
 import { openLedger, type Entry } from "./caps.js";
 import { loadPrompts } from "./prompts.js";
 import { COMPACTED_NOTE, createRunner, MAX_HELD, type RunnerOptions, type RunnerSettings } from "./runner.js";
-import { loadPatterns, scan } from "./scan.js";
+import { loadPatterns, scan, UNREADABLE } from "./scan.js";
 
 const NOW = Date.parse("2026-10-29T12:00:00Z");
 const defaults = JSON.parse(fs.readFileSync(path.join(modDir, "runner.json"), "utf8")) as RunnerSettings;
@@ -361,13 +361,46 @@ test("runner.json: the labelled defaults load, and the owner's file overrides th
   expect(s).toEqual({ ...defaults, claudeModel: "sonnet", answersPerRoomPerHour: 3 });
 });
 
-test("secret patterns: the owner's file adds patterns, and one that doesn't compile is skipped with a log line", async () => {
+test("secret patterns: the owner's file adds patterns", async () => {
   const owner = path.join(tempRoot(), "secret-patterns.json");
-  fs.writeFileSync(owner, JSON.stringify({ patterns: [{ name: "internal host", regex: "corp\\.internal" }, { name: "broken", regex: "(" }, { name: "global", regex: "x", flags: "g" }] }));
+  fs.writeFileSync(owner, JSON.stringify({ patterns: [{ name: "internal host", regex: "corp\.internal" }] }));
   const logs: string[] = [];
   const patterns = await loadPatterns(path.join(modDir, "secret-patterns.json"), owner, (t) => logs.push(t));
   expect(scan("db at build.corp.internal", patterns)).toBe("internal host");
   expect(scan("-----BEGIN OPENSSH PRIVATE KEY-----", patterns)).toBe("private key");
   expect(scan("Coverage was 79.16% against an 80% floor, on handover-polish.", patterns)).toBe(null);
-  expect(logs).toEqual([expect.stringContaining('"broken" is skipped'), expect.stringContaining('"global" is skipped')]);
+  expect(logs).toEqual([]);
+});
+
+test("secret patterns: an owner's file that can't be used makes them unreadable, so everything is held, with the reason logged", async () => {
+  const dir = tempRoot();
+  const cases: [string, string | null, string][] = [
+    ["broken.json", JSON.stringify({ patterns: [{ name: "internal host", regex: "corp" }, { name: "broken", regex: "(" }] }), `"broken" doesn't compile`],
+    ["global.json", JSON.stringify({ patterns: [{ name: "global", regex: "x", flags: "g" }] }), 'flags "g"'],
+    ["not-json.json", "{ patterns: ", "JSON"],
+    ["no-list.json", JSON.stringify({ pattern: [] }), 'no "patterns" list'],
+    // A folder where the file should be: a read error other than a missing file, as a locked or unreadable file is.
+    ["folder.json", null, "EISDIR"],
+  ];
+  for (const [name, text, reason] of cases) {
+    const file = path.join(dir, name);
+    if (text === null) fs.mkdirSync(file);
+    else fs.writeFileSync(file, text);
+    const logs: string[] = [];
+    const patterns = await loadPatterns(path.join(modDir, "secret-patterns.json"), file, (t) => logs.push(t));
+    expect(patterns, name).toBe(null);
+    expect(scan("Coverage was 79.16%.", patterns), name).toBe(UNREADABLE);
+    expect(logs, name).toHaveLength(1);
+    expect(logs[0], name).toContain("can't be used, so every answer, brief and report is held: ");
+    expect(logs[0], name).toContain(reason);
+  }
+});
+
+test("runner: with the secret patterns unreadable, an answer is refused withheld", async () => {
+  const t = await setup({ scan: async (text) => scan(text, null) });
+  t.runner.take(question("q1"));
+  await t.asked(1);
+  t.asks[0]!.settle(ok("Coverage is 81%."));
+  await t.runner.settled();
+  expect(t.sent).toEqual([{ type: "refusal", v: PROTOCOL_VERSION, id: "q1", reason: "withheld" }]);
 });

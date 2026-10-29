@@ -24,7 +24,7 @@ The runner reads these files. Each file in `~/.claude/isoplan/` is optional:
 | File | What |
 |---|---|
 | `packages/mod/runner.json`, overridden per key by `~/.claude/isoplan/runner.json` | The fork's model (`claudeModel`, Opus by default); the caps on answers per room per hour and per machine per day; the machine's daily token budget, and the weight of each kind of token in it (a cache write costs more than plain input, a cache read far less); and the timeouts. |
-| `packages/mod/secret-patterns.json`, plus `~/.claude/isoplan/secret-patterns.json` | The secret scan's patterns, as `{ "patterns": [{ "name", "regex", "flags"? }] }`. Your file adds patterns; it can't remove the plugin's. |
+| `packages/mod/secret-patterns.json`, plus `~/.claude/isoplan/secret-patterns.json` | The secret scan's patterns, as `{ "patterns": [{ "name", "regex", "flags"? }] }`. Your file adds patterns; it can't remove the plugin's. While your file can't be read, or has a pattern that doesn't compile, every answer, brief and report is held. |
 | `packages/mod/prompts/` | What the fork is told: `instructions.md` first, the same every time so the lead's context is reused from cache, then `question.md` or `brief.md`. |
 | `~/.claude/isoplan/claude-binary.json` | The `claude` binary the fork runs, `{ "path": "..." }`, which install finds and records. Set it by hand if install can't find it; a path set by hand, without `"auto": true`, is kept by later installs. |
 
@@ -38,7 +38,7 @@ Its log is `~/.claude/isoplan/logs/runner.log`, and its count of answers and tok
 
 ## What leaves your machine
 
-By default only facts: which sessions and agents are running and what kind of work each is doing, in which repository and branch, which files they touched, and when they wait. Session-derived text leaves only in named cases, each kept by the server for a set period and then deleted: an agent's final report, questions an agent asks its owner, and the questions, answers and briefs in a room that was handed over. A report is checked for secrets on your machine before it is sent, as answers and briefs are, and one that matches is held, with only a note saying so sent in its place, until you release it from the floor.
+By default only facts: which sessions and agents are running and what kind of work each is doing, in which repository and branch, which files they touched, and when they wait. Session-derived text leaves only in named cases, each kept by the server for a set period and then deleted: an agent's final report, questions an agent asks its owner, and the questions, answers and briefs in a room that was handed over. A report is checked for secrets on your machine before it is sent, as answers and briefs are. One that matches stays a placeholder, a note saying it is held, until you release it; releasing it from the floor arrives with adamlinscott/isoplan#50. A pattern you add after a report went out can't recall it.
 
 ## What is here
 

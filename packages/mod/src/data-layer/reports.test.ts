@@ -42,6 +42,7 @@ test("reports: a released report is sent, and stays released after a restart; a 
   const { id } = hold.apply(factsWith([report]), patterns).reports[0]!.withheld!;
   expect(await hold.release(id)).toBe(true);
   expect(hold.apply(factsWith([report]), patterns).reports).toEqual([report]);
+  expect(hold.apply(factsWith([report]), null).reports).toEqual([report]);
   expect(fs.readFileSync(file, "utf8")).not.toContain("AKIA");
 
   const again = (await open(file)).hold;
@@ -62,6 +63,17 @@ test("reports: a release lets out only the report it names; a newer report of th
   expect(hold.apply(factsWith([newer]), patterns).reports[0]).toEqual(sent);
   expect(await hold.release("claude-code:a1")).toBe(false);
   expect(fs.existsSync(file)).toBe(false);
+});
+
+test("reports: two agents with the same text are held apart, and a release lets out only the one it names", async () => {
+  const { hold, file } = await open();
+  const one = { agent: "claude-code:a1", at: at(5), text: `Set it up: ${KEY}` };
+  const two = { ...one, agent: "claude-code:a2" };
+  const [held1, held2] = hold.apply(factsWith([one, two]), patterns).reports;
+  expect(held1!.withheld!.id).not.toBe(held2!.withheld!.id);
+  expect(await hold.release(held1!.withheld!.id)).toBe(true);
+  expect(hold.apply(factsWith([one, two]), patterns).reports).toEqual([one, held2]);
+  expect((await open(file)).hold.apply(factsWith([one, two]), patterns).reports[1]).toMatchObject({ agent: "claude-code:a2", text: WITHHELD_TEXT });
 });
 
 test("reports: with no patterns to read, every report is held", async () => {

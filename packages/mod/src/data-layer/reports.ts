@@ -1,14 +1,16 @@
 // The secret scan for reports (#59): an agent's final report is checked on the owner's machine,
 // with the runner's scan (src/runner/scan.ts), before the session's facts go to the office server.
-// A report that matches goes out as a placeholder, `withheld`, until its owner releases it from the
-// floor: the server sends `release` on the session's link with the placeholder's hold id, a random
-// id for that one text, so a release lets out only the report it names and a newer report of the
-// same agent stays held. A hold id lasts while its report is held and the data layer runs; after a
-// restart the placeholder carries a new one. Patterns that can't be read withhold every report.
+// A report that matches goes out as a placeholder, `withheld`, until its owner releases it: the
+// server sends `release` on the session's link with the placeholder's hold id, a random id for that
+// one agent and text, so a release lets out only the report it names, and a newer report of the
+// same agent, or the same text from another agent, stays held. A hold id lasts while its report is
+// held and the data layer runs; after a restart the placeholder carries a new one. While the
+// patterns can't be read, every report not already released is held. A report already sent isn't
+// recalled by a pattern added later.
 //
-// A release is kept as the sha256 of the released text in <claude dir>/isoplan/released/
-// <session>.json, so the report stays released when the data layer starts again, and a later,
-// different report of the same agent is scanned afresh. The hashes never leave the machine.
+// A release is kept as the sha256 of the agent and the released text in <claude dir>/isoplan/
+// released/<session>.json, so the report stays released when the data layer starts again. The
+// hashes never leave the machine.
 
 import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
@@ -26,12 +28,14 @@ export interface ReportHold {
   release(id: string): Promise<boolean>;
 }
 
-const hash = (text: string) => createHash("sha256").update(text).digest("hex");
+// One report: its agent and its text.
+const hash = (agent: string, text: string) => createHash("sha256").update(`${agent}
+${text}`).digest("hex");
 
 export async function openReportHold(file: string, log: (text: string) => void): Promise<ReportHold> {
   const released = new Set(await readReleased(file));
   let held = new Map<string, { agent: string; hash: string }>(); // hold id → the report held under it
-  let ids = new Map<string, string>(); // the hash of a held text → its hold id, kept while it is held
+  let ids = new Map<string, string>(); // the hash of a held report → its hold id, kept while it is held
   const told = new Set<string>(); // the hashes of held reports already logged
 
   return {
@@ -39,7 +43,7 @@ export async function openReportHold(file: string, log: (text: string) => void):
       held = new Map();
       const kept = new Map<string, string>();
       const reports = facts.reports.map((report) => {
-        const h = hash(report.text);
+        const h = hash(report.agent, report.text);
         if (released.has(h)) return report;
         const matched = patterns ? scan(report.text, patterns) : null;
         if (patterns && !matched) return report;

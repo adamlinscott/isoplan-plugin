@@ -8190,22 +8190,25 @@ function createRunner({ answerer, ledger, settings, prompts, scan, send, log, is
 }
 //#endregion
 //#region src/runner/scan.ts
-/** The patterns in `file`; [] when an optional file is missing. */
+/** What `scan` names as the match when the patterns couldn't be read. */
+const UNREADABLE = "unreadable patterns: everything is held";
+/** The patterns in `file`: [] when the owner's is missing, and null, logged, when it can't be used. */
 async function readPatterns(file, optional, log) {
+	const unusable = (why) => {
+		if (!optional) throw new Error(`${file}: ${why}`);
+		log(`${file} can't be used, so every answer, brief and report is held: ${why}`);
+		return null;
+	};
 	let value;
 	try {
 		value = JSON.parse(await fs.readFile(file, "utf8"));
 	} catch (err) {
+		if (optional && err.code === "ENOENT") return [];
 		if (!optional) throw err;
-		if (err.code !== "ENOENT") log(`${file} isn't valid JSON, so its secret patterns aren't used`);
-		return [];
+		return unusable(err.message);
 	}
 	const list = value?.patterns;
-	if (!Array.isArray(list)) {
-		if (!optional) throw new Error(`${file} has no "patterns" list`);
-		log(`${file} has no "patterns" list, so it adds none`);
-		return [];
-	}
+	if (!Array.isArray(list)) return unusable("it has no \"patterns\" list");
 	const out = [];
 	for (const p of list) {
 		const name = typeof p?.name === "string" && p.name ? p.name : String(p?.regex);
@@ -8218,18 +8221,20 @@ async function readPatterns(file, optional, log) {
 				regex: new RegExp(p.regex, flags)
 			});
 		} catch (err) {
-			if (!optional) throw new Error(`${file}: the secret pattern "${name}" doesn't compile: ${err.message}`);
-			log(`${file}: the secret pattern "${name}" is skipped: ${err.message}`);
+			return unusable(`the secret pattern "${name}" doesn't compile: ${err.message}`);
 		}
 	}
 	return out;
 }
-/** The mod's patterns and the owner's. */
+/** The mod's patterns and the owner's, or null when the owner's can't be used. */
 async function loadPatterns(modFile, ownerFile, log) {
-	return [...await readPatterns(modFile, false, log), ...await readPatterns(ownerFile, true, log)];
+	const mod = await readPatterns(modFile, false, log);
+	const owner = await readPatterns(ownerFile, true, log);
+	return owner && [...mod, ...owner];
 }
-/** The name of the first pattern `text` matches, or null when it matches none. */
+/** The name of the first pattern `text` matches, or null when it matches none; UNREADABLE when `patterns` is null. */
 function scan(text, patterns) {
+	if (!patterns) return UNREADABLE;
 	return patterns.find((p) => p.regex.test(text))?.name ?? null;
 }
 //#endregion
