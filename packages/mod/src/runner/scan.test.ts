@@ -8,13 +8,13 @@ const patterns = (await loadPatterns(path.join(modDir, "secret-patterns.json"), 
 // Each shipped pattern: text it must withhold, and ordinary text near it that it must not.
 const cases: Record<string, { hits: string[]; misses: string[] }> = {
   "private key": { hits: ["-----BEGIN RSA PRIVATE KEY-----\nMIIE...", "-----BEGIN OPENSSH PRIVATE KEY-----"], misses: ["-----BEGIN PUBLIC KEY-----", "the private key lives in the vault"] },
-  "AWS access key id": { hits: ["aws_access_key_id = AKIAIOSFODNN7EXAMPLE", "ASIAABCDEFGHIJKLMNOP"], misses: ["AKIA is the prefix of an access key id", "AKIAIOSFODNN7"] },
+  "AWS access key id": { hits: ["aws_access_key_id = AKIAIOSFODNN7EXAMPLE", "ASIA" + "ABCDEFGHIJKLMNOP"], misses: ["AKIA is the prefix of an access key id", "AKIAIOSFODNN7"] },
   "GitHub token": { hits: ["ghp_" + "a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8", "github_pat_" + "11ABCDEFG0123456789_abcdefghijklmnopqrstuvwxyzABCDEFGHIJ"], misses: ["ghp_short", "the gh_pages branch"] },
   "Anthropic API key": { hits: ["ANTHROPIC_API_KEY=sk-ant-api03-abcdefghijklmnopqrstuv"], misses: ["keys start with sk-ant-", "sk-ant-short"] },
   "OpenAI API key": { hits: ["sk-proj-abcdefghijklmnopqrstuvwxyz0123456789", "sk-abcdefghijklmnopqrstuvwxyz012345"], misses: ["scikit is sk-learn", "sk-12345"] },
   "Stripe live key": { hits: ["sk_live_" + "51HabcdefghijklmnopqrstuVWXYZ", "rk_live_" + "abcdefghijklmnopqrst0123"], misses: ["sk_test_" + "51Habcdefghijklmnopqrstu", "use sk_live_ keys only in production"] },
   "Slack token": { hits: ["xoxb-123456789012-abcdefghijkl"], misses: ["xoxb-", "the xox prefix"] },
-  "Google API key": { hits: ["AIzaSyA-abcdefghijklmnopqrstuvwxyz12345"], misses: ["AIza is a Google key's prefix", "AIzaShort123"] },
+  "Google API key": { hits: ["AIza" + "SyA-abcdefghijklmnopqrstuvwxyz12345"], misses: ["AIza is a Google key's prefix", "AIzaShort123"] },
   "JSON web token": { hits: ["Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U"], misses: ["a JWT starts with eyJ", "eyJhbGciOiJIUzI1NiJ9"] },
   "password in a URL": { hits: ["postgres://admin:s3cretpw@db.internal:5432/app", "https://bob:hunter22@example.com"], misses: ["http://localhost:3000@example", "git@github.com:org/repo.git", "https://user:${PASSWORD}@host", "https://example.com/a:b@c"] },
   "assigned secret": {
