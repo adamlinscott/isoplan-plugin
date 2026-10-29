@@ -1,6 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
-import { PROTOCOL_VERSION, type HandoffRepo, type RefusalMessage, type ReplyMessage, type RequestMessage } from "@isoplan/protocol";
+import { PROTOCOL_VERSION, type HandoffMessage, type HandoffRepo, type RefusalMessage, type ReplyMessage, type RequestMessage, type TakenMessage } from "@isoplan/protocol";
 import { expect, test } from "vitest";
 import { modDir, tempRoot } from "../data-layer/fixture.js";
 import { loadSettings } from "../data-layer/config.js";
@@ -8,7 +8,7 @@ import { nodeIo } from "../data-layer/io.js";
 import type { Answered, Answerer, Ask, Lead } from "./answerer.js";
 import { openLedger, type Entry } from "./caps.js";
 import { loadPrompts } from "./prompts.js";
-import { COMPACTED_NOTE, createRunner, MAX_HELD, type RunnerOptions, type RunnerSettings } from "./runner.js";
+import { COMPACTED_NOTE, createRunner, MAX_HELD, PushFailed, type RunnerOptions, type RunnerSettings } from "./runner.js";
 import { loadPatterns, scan, UNREADABLE } from "./scan.js";
 
 const NOW = Date.parse("2026-10-29T12:00:00Z");
@@ -47,7 +47,7 @@ async function setup({ lead, settings, entries, ...opts }: Partial<Omit<RunnerOp
   const ledgerFile = path.join(dir, "ledger.json");
   if (entries) fs.writeFileSync(ledgerFile, JSON.stringify(entries));
   const ledger = await openLedger(ledgerFile);
-  const sent: (ReplyMessage | RefusalMessage)[] = [];
+  const sent: (ReplyMessage | RefusalMessage | TakenMessage)[] = [];
   const logs: string[] = [];
   const patterns = await loadPatterns(path.join(modDir, "secret-patterns.json"), path.join(dir, "none.json"), (t) => logs.push(t));
   const runner = createRunner({
@@ -95,7 +95,7 @@ test("runner: answers one at a time per room; other rooms don't wait", async () 
   await t.asked(3);
   t.askFor("q2")!.settle(ok("two"));
   await t.runner.settled();
-  expect(t.sent.map((m) => [m.id, m.type === "reply" && m.kind === "answer-question" ? m.answer : m.type])).toEqual([
+  expect(t.sent.map((m) => ["id" in m && m.id, m.type === "reply" && m.kind === "answer-question" ? m.answer : m.type])).toEqual([
     ["q1", "one"],
     ["q3", "three"],
     ["q2", "two"],
@@ -150,6 +150,63 @@ test("runner: a brief is scanned too, and carries the repos the handoff pushed",
   t.runner.take({ type: "release", v: PROTOCOL_VERSION, id: "b1" });
   await t.sentN(2);
   expect(t.sent[1]).toEqual({ type: "reply", v: PROTOCOL_VERSION, id: "b1", kind: "write-brief", handoff: { id: "h-1", brief: 'Goal: ship. Set password: "hunter2hunter2" first.', repos } });
+});
+
+test("runner: a brief is asked for with the untracked files named, ends with the note, and is pushed only once it clears the scan", async () => {
+  const repos: HandoffRepo[] = [{ path: ".", remote: "origin", branch: "isoplan/handoff/h-1", commit: "a".repeat(40) }];
+  const pushed: string[] = [];
+  const t = await setup({ prepareBrief: async () => ({ files: [".env.local"], note: "Handed over by Isoplan on isoplan/handoff/h-1." }), push: async (_s, _l, h) => (pushed.push(h), repos) });
+  t.runner.take(brief("b1"));
+  await t.asked(1);
+  expect(t.asks[0]!.ask.request).toContain("The untracked files are: `.env.local`. Say what each is for.");
+  expect(pushed).toEqual([]);
+  t.asks[0]!.settle(ok("Goal: ship. `.env.local` points the app at a local API."));
+  await t.runner.settled();
+  expect(t.sent).toEqual([{ type: "reply", v: PROTOCOL_VERSION, id: "b1", kind: "write-brief", handoff: { id: "h-1", brief: "Goal: ship. `.env.local` points the app at a local API.\n\nHanded over by Isoplan on isoplan/handoff/h-1.", repos } }]);
+  expect(pushed).toEqual(["h-1"]);
+});
+
+test("runner: a brief the fork can't write still goes, marked fallback, with the note; a push that fails is refused with its reason", async () => {
+  const repos: HandoffRepo[] = [{ path: ".", remote: "origin", branch: "isoplan/handoff/h-1", commit: "a".repeat(40) }];
+  const t = await setup({ prepareBrief: async () => ({ files: [], note: "The note." }), push: async () => repos });
+  t.runner.take(brief("b1"));
+  await t.asked(1);
+  t.asks[0]!.settle({ ok: false, kind: "timed-out", detail: "no answer within 240 s", usage: null });
+  await t.runner.settled();
+  expect(t.sent).toEqual([{ type: "reply", v: PROTOCOL_VERSION, id: "b1", kind: "write-brief", fallback: true, handoff: { id: "h-1", brief: "No brief was written by the session: the fork took too long to answer.\n\nThe note.", repos } }]);
+
+  const over = await setup({ settings: { answersPerMachinePerDay: 1 }, entries: [{ at: NOW - 1000, room: "a", usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } }], prepareBrief: async () => ({ files: [], note: "The note." }), push: async () => repos });
+  over.runner.take(brief("b2"));
+  await over.runner.settled();
+  expect(over.asks).toEqual([]);
+  expect(over.sent[0]).toMatchObject({ kind: "write-brief", fallback: true });
+
+  const rejected = await setup({ push: async () => Promise.reject(new PushFailed("the remote rejected the handoff's branch")) });
+  rejected.runner.take(brief("b3"));
+  await rejected.asked(1);
+  rejected.asks[0]!.settle(ok("Goal: ship."));
+  await rejected.runner.settled();
+  expect(rejected.sent).toEqual([{ type: "refusal", v: PROTOCOL_VERSION, id: "b3", reason: "unavailable", detail: "the remote rejected the handoff's branch" }]);
+});
+
+test("runner: a handoff to take goes to take once at a time, and what it did goes back as taken", async () => {
+  let finish: () => void = () => {};
+  const taken: string[] = [];
+  const t = await setup({
+    take: async (h) => {
+      taken.push(h.id);
+      await new Promise<void>((r) => (finish = r));
+      return { type: "taken", v: PROTOCOL_VERSION, handoff: h.id, session: "claude-code:new", failures: [] };
+    },
+  });
+  const handoff: HandoffMessage = { type: "handoff", v: PROTOCOL_VERSION, handoff: { id: "h-1", brief: "b", repos: [{ path: ".", remote: "origin", branch: "isoplan/handoff/h-1", commit: "a".repeat(40) }] } };
+  t.runner.take(handoff);
+  t.runner.take(handoff);
+  expect(taken).toEqual(["h-1"]);
+  expect(t.runner.idle()).toBe(false);
+  finish();
+  await t.sentN(1);
+  expect(t.sent).toEqual([{ type: "taken", v: PROTOCOL_VERSION, handoff: "h-1", session: "claude-code:new", failures: [] }]);
 });
 
 test("runner: without the handoff's push, a brief is refused before the fork runs", async () => {

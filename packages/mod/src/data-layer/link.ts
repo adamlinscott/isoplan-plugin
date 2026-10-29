@@ -28,6 +28,7 @@ import {
   type ReplyMessage,
   type RequestMessage,
   type RunnerHelloMessage,
+  type TakenMessage,
 } from "@isoplan/protocol";
 import type { DataLayerLine } from "../lines.js";
 import { diffFacts } from "./changes.js";
@@ -54,14 +55,17 @@ export interface LinkOptions {
   random?: () => number;
 }
 
+/** What a runner sends back: a reply, a refusal, or what it did with a handoff it took. */
+type Outgoing = ReplyMessage | RefusalMessage | TakenMessage;
+
 /** What the server asks of a machine, rather than of a session's facts. */
 export type ServerAsk = RequestMessage | ReleaseMessage | HandoffMessage;
 
 export interface Link {
   /** The session's facts now; what differs from what the server has goes out when the pace allows. */
   update(facts: Facts): void;
-  /** A reply or refusal. One sent while the link is down goes out after the next hello. */
-  send(message: ReplyMessage | RefusalMessage): void;
+  /** A reply, refusal or taken. One sent while the link is down goes out after the next hello. */
+  send(message: Outgoing): void;
   close(): void;
 }
 
@@ -77,7 +81,7 @@ export function createLink({
   onMessage,
   random = Math.random,
 }: LinkOptions): Link {
-  const outbox: { message: ReplyMessage | RefusalMessage; at: number }[] = [];
+  const outbox: { message: Outgoing; at: number }[] = [];
   let latest: Facts | null = null;
   let socket: WebSocket | null = null;
   let isOpen = false;

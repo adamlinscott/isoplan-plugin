@@ -6008,7 +6008,8 @@ discriminatedUnion("type", [
 			v: Version,
 			id: RequestId,
 			kind: literal("write-brief"),
-			handoff: HandoffSchema
+			handoff: HandoffSchema,
+			fallback: literal(true).optional()
 		}),
 		object({
 			type: literal("reply"),
@@ -6058,6 +6059,7 @@ discriminatedUnion("type", [
 		type: literal("taken"),
 		v: Version,
 		handoff: HandoffId,
+		session: string().min(1).optional(),
 		failures: array(object({
 			step: _enum([
 				"worktree",
@@ -6129,6 +6131,12 @@ discriminatedUnion("type", [
 		type: literal("handoff"),
 		v: Version,
 		handoff: HandoffSchema
+	}),
+	object({
+		type: literal("handed-over"),
+		v: Version,
+		handoff: HandoffId,
+		to: Account
 	})
 ]);
 //#endregion

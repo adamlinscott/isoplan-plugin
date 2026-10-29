@@ -41,7 +41,9 @@ import { createClaudeAnswerer, forkableId } from "./claude.js";
 import { claudeBinary } from "./claude-binary.js";
 import { anyRoomSince, askableMs, NOT_WANTED_CODE, supervise } from "./lifecycle.js";
 import { loadPrompts } from "./prompts.js";
-import { createRunner, type RunnerSettings } from "./runner.js";
+import { createRunGit, GIT_FAILED, handoffBranch, handoffNote, HandoffGitError, prepare, pushHandoff } from "../handoff/git.js";
+import { takeHandoff, type TakeSettings } from "../handoff/take.js";
+import { createRunner, PushFailed, type RunnerSettings } from "./runner.js";
 import { loadPatterns, scan } from "./scan.js";
 import { runnerEnvPath } from "./environment.js";
 import { applyClaudeDir, LOCK_REFRESH_MS, RUNNER_FRESH_MS, runnerCode, runnerLockPath } from "./start.js";
@@ -118,7 +120,7 @@ async function supervisor(): Promise<number> {
 async function worker(): Promise<number> {
   const io = nodeIo();
   const config = () => loadConfig(io, path.join(appDir, "config.json"), path.join(isoplanDir, "config.json"));
-  const settings = () => loadSettings<RunnerSettings & { claudeModel: string }>(io, path.join(appDir, "runner.json"), path.join(isoplanDir, "runner.json"));
+  const settings = () => loadSettings<RunnerSettings & TakeSettings & { claudeModel: string }>(io, path.join(appDir, "runner.json"), path.join(isoplanDir, "runner.json"));
   const first = await config();
   await settings(); // a broken runner.json of the plugin's is a crash to see at once
 
@@ -130,13 +132,22 @@ async function worker(): Promise<number> {
   });
   // However the worker ends, its forks end with it.
   process.on("exit", () => answerer.close());
+  const git = createRunGit();
+  const gitMs = async () => (await settings()).gitTimeoutSeconds * 1000;
+  // A git failure is told by its kind; git's own words stay in the log.
+  const told = (err: unknown) => {
+    if (!(err instanceof HandoffGitError)) throw err;
+    log(`handoff git: ${err.detail}`);
+    return new PushFailed(GIT_FAILED[err.kind]);
+  };
+  const scanText = async (text: string) => scan(text, await loadPatterns(path.join(appDir, "secret-patterns.json"), path.join(isoplanDir, "secret-patterns.json"), log));
   let send: Parameters<typeof createRunner>[0]["send"] = () => {};
   const runner = createRunner({
     answerer,
     ledger: await openLedger(path.join(isoplanDir, "runner", "ledger.json")),
     settings,
     prompts: () => loadPrompts(path.join(appDir, "prompts")),
-    scan: async (text) => scan(text, await loadPatterns(path.join(appDir, "secret-patterns.json"), path.join(isoplanDir, "secret-patterns.json"), log)),
+    scan: scanText,
     send: (message) => send(message),
     log,
     isDir: (p) => fs.stat(p).then((s) => s.isDirectory(), () => false),
@@ -149,6 +160,26 @@ async function worker(): Promise<number> {
       if (!id || (lock && lock.pid === null && lock.until !== null && lock.until > Date.now())) return false;
       return Date.now() - lead.lastActive <= askableMs(await config().catch(() => first));
     },
+    // The handoff (#48): the brief names the untracked files, then the branch is pushed, both from
+    // the lead's folder, in the background, with no prompts and under gitTimeoutSeconds.
+    prepareBrief: async (lead, handoff) => {
+      const { from, files } = await prepare(git, lead.cwd, await gitMs()).catch((err) => Promise.reject(told(err)));
+      return { files, note: handoffNote({ branch: handoffBranch(handoff), from, files }) };
+    },
+    push: async (_session, lead, handoff) => [await pushHandoff(git, lead.cwd, handoff, await gitMs()).catch((err) => Promise.reject(told(err)))],
+    take: (handoff) =>
+      takeHandoff(handoff, {
+        run: git,
+        io,
+        claudeDir,
+        machine: os.hostname(),
+        platform: process.platform,
+        env: process.env,
+        settings,
+        claude: () => claudeBinary(claudeDir, process.env, process.platform, os.homedir()),
+        scan: scanText,
+        log,
+      }),
   });
 
   let notWanted = false;

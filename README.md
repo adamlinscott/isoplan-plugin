@@ -48,7 +48,7 @@ The runner reads these files. Each file in `~/.claude/isoplan/` is optional:
 
 | File | What |
 |---|---|
-| `packages/mod/runner.json`, overridden per key by `~/.claude/isoplan/runner.json` | The fork's model (`claudeModel`, Opus by default); the caps on answers per room per hour and per machine per day; the machine's daily token budget, and the weight of each kind of token in it (a cache write costs more than plain input, a cache read far less); and the timeouts. |
+| `packages/mod/runner.json`, overridden per key by `~/.claude/isoplan/runner.json` | The fork's model (`claudeModel`, Opus by default); the caps on answers per room per hour and per machine per day; the machine's daily token budget, and the weight of each kind of token in it (a cache write costs more than plain input, a cache read far less); the timeouts, including git's for a handoff (`gitTimeoutSeconds`) and a worktree setup script's default (`setupTimeoutMinutes`); and how far back the runner looks for your clone of a repo (`cloneSearchDays`). |
 | `packages/mod/secret-patterns.json`, plus `~/.claude/isoplan/secret-patterns.json` | The secret scan's patterns, as `{ "patterns": [{ "name", "regex", "flags"? }] }`. Your file adds patterns; it can't remove the plugin's. While your file can't be read, or has a pattern that doesn't compile, every answer, brief and report is held. |
 | `packages/mod/prompts/` | What the fork is told: `instructions.md` first, the same every time so the lead's context is reused from cache, then `question.md` or `brief.md`. |
 | `~/.claude/isoplan/claude-binary.json` | The `claude` binary the fork runs, `{ "path": "..." }`, which install finds and records. Set it by hand if install can't find it; a path set by hand, without `"auto": true`, is kept by later installs. |
@@ -61,6 +61,26 @@ The fork reads no settings files, so a login or proxy that comes from `settings.
 
 Its log is `~/.claude/isoplan/logs/runner.log`, and its count of answers and tokens for the last day is in `~/.claude/isoplan/runner/ledger.json`.
 
+## Handoffs
+
+A room is handed over from the floor (the room panel's Hand over) or, in the session, with `/isoplan:handover <their name>`. Either way the tracked changes go in a work-in-progress commit on a new branch, `isoplan/handoff/<id>`, made from your current branch without touching your work tree or index, and only that branch is pushed: never your current branch, never the default one. Untracked files stay behind and the brief names them; files `.gitignore` matches are never committed or mentioned. From the floor your runner's fork writes the brief and git runs in the background, with no prompts and under `gitTimeoutSeconds`; with the command, your session's own agent writes it. Either way the brief is scanned for secrets before it leaves.
+
+The receiver takes it with the room panel's Take handoff, or with `/isoplan:take <code>` in a session of their own. Take handoff has their runner find their clone (a folder one of their Claude Code sessions ran in, whose remote is the handoff's), add a worktree beside it, `<clone>-handoff-<id>`, on the handoff's branch, run the repo's setup script, then open a terminal (on Windows through `start`, which opens a Windows Terminal tab where that is the default; on a Mac, Terminal) running Claude Code there, told to read the brief, which is kept in `~/.claude/isoplan/handoffs/<id>/`. A step that fails is shown in the room, with the end of its output, and the session still opens. `/isoplan:take` checks the branch out in that session's folder and loads the brief; no setup script runs, since your own harness does that.
+
+The setup script is set once per repo, in `isoplan.json` at its top, committed:
+
+```json
+{
+  "worktreeSetup": {
+    "about": "Runs in each new worktree Isoplan makes when someone takes a handoff from the floor.",
+    "command": "pnpm install",
+    "timeoutMinutes": 15
+  }
+}
+```
+
+`command` is one command, or `{ "windows": "...", "mac": "..." }`. It runs with the system shell (cmd.exe on Windows, /bin/sh on a Mac) in the new worktree, with `ISOPLAN_HANDOFF_ID` and `ISOPLAN_HANDOFF_BRANCH` set, and is read from your own copy of the default branch, never from the handoff's branch.
+
 ## What leaves your machine
 
 By default only facts: which sessions and agents are running and what kind of work each is doing, in which repository and branch, which files they touched, and when they wait. Session-derived text leaves only in named cases, each kept by the server for a set period and then deleted: an agent's final report, questions an agent asks its owner, and the questions, answers and briefs in a room that was handed over. A report is checked for secrets on your machine before it is sent, as answers and briefs are. One that matches stays a placeholder, a note saying it is held, until you release it; releasing it from the floor arrives with adamlinscott/isoplan#50. A pattern you add after a report went out can't recall it.
@@ -69,6 +89,7 @@ By default only facts: which sessions and agents are running and what kind of wo
 
 | Path | What |
 |---|---|
+| `packages/mod/commands/` | The plugin's commands, `/isoplan:handover` and `/isoplan:take`, which run `dist/handoff.js`. |
 | `packages/mod/` | The Claude Code plugin. Its bundle in `dist/` is committed, so the plugin runs from a checkout with no install step; rebuild it with every change to `src/`. |
 | `packages/protocol/` | The wire protocol, published to npm as [`@isoplan/protocol`](https://www.npmjs.com/package/@isoplan/protocol). |
 | `.claude-plugin/marketplace.json` | The marketplace listing. |
