@@ -118,8 +118,10 @@ const valid = {
   "reply owner-answer": { type: "reply", v, id: "r3", kind: "owner-answer" },
   "refusal over-cap": { type: "refusal", v, id: "r1", reason: "over-cap", cap: "owner-tokens" },
   "refusal withheld": { type: "refusal", v, id: "r1", reason: "withheld" },
+  "refusal withheld commit": { type: "refusal", v, id: "r2", reason: "withheld", file: "config/dev.ts" },
   "refusal unavailable": { type: "refusal", v, id: "r2", reason: "unavailable", detail: "The session's folder is gone." },
   "hand-over": { type: "hand-over", v, to: "sam@example.com", handoff },
+  "hand-over-check": { type: "hand-over-check", v, to: "Sam", handoff: "h7k2" },
   take: { type: "take", v, code: "K4P9-2QX" },
   taken: { type: "taken", v, handoff: "h7k2", failures: [{ step: "setup", output: "pnpm: command not found" }, { step: "checkout", repo: "libs/core", output: "" }] },
   "taken by a runner": { type: "taken", v, handoff: "h7k2", session: "claude-code:0b5c", failures: [] },
@@ -149,6 +151,8 @@ const valid = {
   release: { type: "release", v, id: "r1" },
   handoff: { type: "handoff", v, handoff },
   "handed-over": { type: "handed-over", v, handoff: "h7k2", to: sam },
+  "hand-over-ready": { type: "hand-over-ready", v, handoff: "h7k2", to: sam },
+  "handoff to a runner": { type: "handoff", v, handoff, mode: "headless", session: "0b5c4d3e-0000-4000-8000-000000000001" },
 };
 
 const parsers = {
@@ -162,8 +166,10 @@ const parsers = {
   "reply owner-answer": parseDataLayerMessage,
   "refusal over-cap": parseDataLayerMessage,
   "refusal withheld": parseDataLayerMessage,
+  "refusal withheld commit": parseDataLayerMessage,
   "refusal unavailable": parseDataLayerMessage,
   "hand-over": parseDataLayerMessage,
+  "hand-over-check": parseDataLayerMessage,
   take: parseDataLayerMessage,
   taken: parseDataLayerMessage,
   "taken by a runner": parseDataLayerMessage,
@@ -176,6 +182,8 @@ const parsers = {
   release: parseOfficeServerMessage,
   handoff: parseOfficeServerMessage,
   "handed-over": parseOfficeServerMessage,
+  "hand-over-ready": parseOfficeServerMessage,
+  "handoff to a runner": parseOfficeServerMessage,
 } satisfies Record<keyof typeof valid, (value: unknown) => ParseResult<unknown>>;
 
 // Each message with one field made wrong, and the path the error should name.
@@ -190,8 +198,10 @@ const broken: Record<keyof typeof valid, [unknown, string]> = {
   "reply owner-answer": [{ ...valid["reply owner-answer"], id: "" }, "id"],
   "refusal over-cap": [{ ...valid["refusal over-cap"], cap: "per-week" }, "cap"],
   "refusal withheld": [{ ...valid["refusal withheld"], reason: "secret" }, "reason"],
+  "refusal withheld commit": [{ ...valid["refusal withheld commit"], file: "" }, "file"],
   "refusal unavailable": [{ ...valid["refusal unavailable"], detail: undefined }, "detail"],
   "hand-over": [{ ...valid["hand-over"], handoff: { ...handoff, id: "H 7" } }, "handoff.id"],
+  "hand-over-check": [{ ...valid["hand-over-check"], handoff: "H 7" }, "handoff"],
   take: [{ ...valid.take, code: "" }, "code"],
   taken: [{ ...valid.taken, failures: [{ step: "push", output: "" }] }, "failures[0].step"],
   "taken by a runner": [{ ...valid["taken by a runner"], session: "" }, "session"],
@@ -204,6 +214,8 @@ const broken: Record<keyof typeof valid, [unknown, string]> = {
   release: [{ ...valid.release, id: 3 }, "id"],
   handoff: [{ ...valid.handoff, handoff: { ...handoff, repos: [{ ...handoff.repos[0], commit: "0123abc" }] } }, "handoff.repos[0].commit"],
   "handed-over": [{ ...valid["handed-over"], to: { id: "", name: "Sam" } }, "to.id"],
+  "hand-over-ready": [{ ...valid["hand-over-ready"], to: { name: "Sam" } }, "to.id"],
+  "handoff to a runner": [{ ...valid["handoff to a runner"], mode: "window" }, "mode"],
 };
 
 describe.each(Object.keys(valid) as (keyof typeof valid)[])("%s", (type) => {
