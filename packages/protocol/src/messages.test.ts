@@ -248,10 +248,11 @@ test("facts from a data layer that doesn't report questions still parse", () => 
   expect(parseDataLayerMessage({ ...valid.full, facts: older })).toEqual({ ok: true, message: { ...valid.full, facts: older } });
 });
 
-test("a withheld report parses, and withheld can only be true", () => {
-  const report = { agent: worker.id, at, text: "Held for its owner to check.", withheld: true };
+test("a withheld report parses with its hold id, and not without one", () => {
+  const report = { agent: worker.id, at, text: "Held for its owner to check.", withheld: { id: "h-1" } };
   expect(parseDataLayerMessage({ ...valid.full, facts: { ...facts, reports: [report] } })).toMatchObject({ ok: true });
-  expect(parseDataLayerMessage({ ...valid.full, facts: { ...facts, reports: [{ ...report, withheld: false }] } })).toMatchObject({ ok: false, kind: "invalid" });
+  expect(parseDataLayerMessage({ ...valid.full, facts: { ...facts, reports: [{ ...report, withheld: true }] } })).toMatchObject({ ok: false, kind: "invalid" });
+  expect(parseDataLayerMessage({ ...valid.full, facts: { ...facts, reports: [{ ...report, withheld: { id: "" } }] } })).toMatchObject({ ok: false, kind: "invalid" });
 });
 
 describe("handoff", () => {

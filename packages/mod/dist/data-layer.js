@@ -3,7 +3,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 //#region ../../node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/core/util.js
 function getEnumValues(entries) {
 	const numericValues = Object.values(entries).filter((v) => typeof v === "number");
@@ -5721,13 +5721,14 @@ const WaitFactSchema = object({
 });
 /**
 * An agent's final report. One the secret scan matched, and its owner hasn't released, is
-* `withheld`: its `text` then only says so, and the report follows once the owner releases it.
+* `withheld`: its `text` then only says so, and the report follows once the owner releases it by
+* `withheld.id`, a random id for this one text. A newer report of the same agent gets a new id.
 */
 const ReportFactSchema = object({
 	agent: string().min(1),
 	at: Time,
 	text: string(),
-	withheld: literal(true).optional(),
+	withheld: object({ id: string().min(1) }).optional(),
 	extra: Extra
 });
 /**
@@ -8148,16 +8149,23 @@ const hash = (text) => createHash("sha256").update(text).digest("hex");
 async function openReportHold(file, log) {
 	const released = new Set(await readReleased(file));
 	let held = /* @__PURE__ */ new Map();
+	let ids = /* @__PURE__ */ new Map();
 	const told = /* @__PURE__ */ new Set();
 	return {
 		apply(facts, patterns) {
 			held = /* @__PURE__ */ new Map();
+			const kept = /* @__PURE__ */ new Map();
 			const reports = facts.reports.map((report) => {
 				const h = hash(report.text);
 				if (released.has(h)) return report;
 				const matched = patterns ? scan(report.text, patterns) : null;
 				if (patterns && !matched) return report;
-				held.set(report.agent, report.text);
+				const id = ids.get(h) ?? kept.get(h) ?? randomUUID();
+				kept.set(h, id);
+				held.set(id, {
+					agent: report.agent,
+					hash: h
+				});
 				if (!told.has(h)) {
 					told.add(h);
 					log(`withheld the report of ${report.agent}: ${matched ? `it matches the secret pattern "${matched}"` : "the secret patterns couldn't be read"}; its owner can release it from the floor`);
@@ -8166,22 +8174,24 @@ async function openReportHold(file, log) {
 					agent: report.agent,
 					at: report.at,
 					text: WITHHELD_TEXT,
-					withheld: true
+					withheld: { id }
 				};
 			});
+			ids = kept;
 			return held.size ? {
 				...facts,
 				reports
 			} : facts;
 		},
-		async release(agent) {
-			const text = held.get(agent);
-			if (text === void 0) {
-				log(`the office server released the report of ${agent}, but no report of it is withheld here`);
+		async release(id) {
+			const report = held.get(id);
+			if (!report) {
+				log(`the office server released the report held as ${id}, but none is held under that id here; it may have been replaced by a newer report, or the data layer restarted`);
 				return false;
 			}
-			held.delete(agent);
-			released.add(hash(text));
+			const { agent } = report;
+			held.delete(id);
+			released.add(report.hash);
 			log(`the report of ${agent} was released, so it is sent`);
 			await fs.mkdir(path.dirname(file), { recursive: true }).then(() => fs.writeFile(file, JSON.stringify({ released: [...released] }) + "\n")).catch((err) => log(`couldn't save the release of ${agent}'s report, so it is withheld again after a restart: ${err.message}`));
 			return true;

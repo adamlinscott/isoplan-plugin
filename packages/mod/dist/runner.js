@@ -5720,13 +5720,14 @@ const WaitFactSchema = object({
 });
 /**
 * An agent's final report. One the secret scan matched, and its owner hasn't released, is
-* `withheld`: its `text` then only says so, and the report follows once the owner releases it.
+* `withheld`: its `text` then only says so, and the report follows once the owner releases it by
+* `withheld.id`, a random id for this one text. A newer report of the same agent gets a new id.
 */
 const ReportFactSchema = object({
 	agent: string().min(1),
 	at: Time,
 	text: string(),
-	withheld: literal(true).optional(),
+	withheld: object({ id: string().min(1) }).optional(),
 	extra: Extra
 });
 /**
