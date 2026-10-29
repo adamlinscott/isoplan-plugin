@@ -153,8 +153,11 @@ test("a re-take never drops the receiver's work: a worktree with commits or chan
   fs.writeFileSync(path.join(dir, "app.js"), "dirty\n");
   expect((await takeHandoff({ handoff: { ...t.handoff, repos: [repo] } }, t.options)).failures[0]!.output).toContain("uncommitted changes");
   git(dir, "checkout", "--", "app.js");
+  // An untracked file, a setup script's say, doesn't hold it back, and stays.
+  fs.writeFileSync(path.join(dir, "setup-ran.txt"), "yes\n");
   expect((await takeHandoff({ handoff: { ...t.handoff, repos: [repo] } }, t.options)).failures).toEqual([]);
   expect(fs.readFileSync(path.join(dir, "app.js"), "utf8")).toBe("console.log('again');\n");
+  expect(fs.existsSync(path.join(dir, "setup-ran.txt"))).toBe(true);
 });
 
 test("with no clone of the repo on the machine, no session opens and the failure says what to do", async () => {

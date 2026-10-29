@@ -443,7 +443,8 @@ async function worktreeFor(run: RunGit, clone: string, remote: string, branch: s
     if (exists) {
       const head = await run(["rev-parse", "--abbrev-ref", "HEAD"], { cwd: dir, timeoutMs });
       if (head.code !== 0 || head.stdout.trim() !== branch) continue;
-      const dirty = (await run(["status", "--porcelain"], { cwd: dir, timeoutMs })).stdout.trim() !== "";
+      // Untracked files (a setup script's own, say) are kept by the reset, so only tracked changes count.
+      const dirty = (await run(["status", "--porcelain", "--untracked-files=no"], { cwd: dir, timeoutMs })).stdout.trim() !== "";
       const extra = await ahead(run, dir, tip, before, "HEAD", timeoutMs);
       if (dirty || extra !== 0) {
         return { error: `${dir}, this handoff's worktree from before, has work that isn't in the handoff as handed over now (${dirty ? "uncommitted changes" : `${extra ?? "some"} commit(s)`}), so it was left as it is. Commit and push it, or move it aside, then take the handoff again.` };

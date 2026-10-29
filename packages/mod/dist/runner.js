@@ -8879,7 +8879,11 @@ async function worktreeFor(run, clone, remote, branch, id, before, timeoutMs) {
 				timeoutMs
 			});
 			if (head.code !== 0 || head.stdout.trim() !== branch) continue;
-			const dirty = (await run(["status", "--porcelain"], {
+			const dirty = (await run([
+				"status",
+				"--porcelain",
+				"--untracked-files=no"
+			], {
 				cwd: dir,
 				timeoutMs
 			})).stdout.trim() !== "";
