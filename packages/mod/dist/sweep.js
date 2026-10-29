@@ -6108,6 +6108,16 @@ discriminatedUnion("type", [
 			repo: string().min(1).optional(),
 			output: string()
 		}))
+	}),
+	object({
+		type: literal("ask-room"),
+		v: Version,
+		question: string().trim().min(1).max(4e3)
+	}),
+	object({
+		type: literal("ask-check"),
+		v: Version,
+		question: RequestId
 	})
 ]);
 /** Asks the data layer to send its facts in full. */
@@ -6218,7 +6228,22 @@ discriminatedUnion("type", [
 		to: Account
 	}),
 	HandOverReadyMessageSchema,
-	DropMessageSchema
+	DropMessageSchema,
+	object({
+		type: literal("asked"),
+		v: Version,
+		question: RequestId,
+		text: string().min(1),
+		state: _enum([
+			"queued",
+			"asking",
+			"withheld",
+			"answered",
+			"dropped"
+		]),
+		answer: string().min(1).optional(),
+		note: string().min(1).optional()
+	})
 ]);
 //#endregion
 //#region ../protocol/dist/project-id.js

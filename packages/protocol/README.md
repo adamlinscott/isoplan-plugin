@@ -11,7 +11,7 @@ ES module only, with TypeScript types. Depends on zod 4.
 ## What is in it
 
 - **Facts** (`FactsSchema` and its parts: `SessionFactSchema`, `AgentFactSchema`, `FileFactSchema`, `WaitFactSchema`, `ReportFactSchema`, `QuestionFactSchema`): what one session reports, the shape a data layer sends and a server stores.
-- **Messages**: `DataLayerMessageSchema` for what a data layer or runner sends (hellos, full facts, changes, replies, refusals, and the hand-over, take and taken steps of a handoff), and `OfficeServerMessageSchema` for what a server sends back (repair, conflict, error, request, release and handoff). Each message type has its own schema and type as well, such as `HelloMessage` or `RequestMessage`.
+- **Messages**: `DataLayerMessageSchema` for what a data layer or runner sends (hellos, full facts, changes, replies, refusals, and the hand-over, take and taken steps of a handoff, and ask-room and ask-check for asking a handed-over room a question), and `OfficeServerMessageSchema` for what a server sends back (repair, conflict, error, request, release, handoff, and asked, where a question stands). Each message type has its own schema and type as well, such as `HelloMessage` or `RequestMessage`.
 - **`PROTOCOL_VERSION`**: the version both sides speak. A message's `v` must match it.
 - **`projectId(remoteUrl, { machine, root })`**: a repository's project id, `host/owner/repo` from its git remote whatever form the remote is written in, or `local:<machine>/<root>` without one.
 

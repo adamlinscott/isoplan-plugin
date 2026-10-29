@@ -5,14 +5,20 @@
 // server wants the machine paired, a "Pair this machine" link is in the status line while it waits,
 // and in the transcript once per session start, so nobody types a command or is nagged.
 //
+// It also gives the session's agent the ask_room tool (#49): in a room that was handed to this
+// session's person, it asks the room's lead a question through the office server (dist/ask.js),
+// with no one typing anything. The script waits only as long as runner.json says, then tells the
+// agent to carry on; an answer that comes after that arrives as an `asked` line and goes on the
+// lead's next tool result, as a conflict note does.
+//
 // The data layer talks back as JSON lines on stdout (src/lines.ts). Claude Code closes the child's
 // stdin at launch, so what goes the other way, a title, goes through a file the line names. A data
 // layer that ends is started again, backing off while it keeps failing; one running for a session
 // id the process has left (a /clear, a resume) is started again for the new id.
 
-import type { ConflictMessage } from "@isoplan/protocol";
+import type { AskedMessage, ConflictMessage } from "@isoplan/protocol";
 import type { DataLayerLine, PairLine, StatusLine, TitleAskLine } from "../lines.js";
-import type { Host, On } from "./host.js";
+import type { Host, On, ToolCallInput, ToolCallResult } from "./host.js";
 
 const RETRY_CAP_MS = 30000;
 // A run that stayed up this long was healthy: the next failure starts the backoff over.
@@ -20,8 +26,13 @@ const STABLE_MS = 60000;
 // After a session ends, the process may go on under a new id (a /clear, a resume) with no
 // session.start; the id is looked at again this long after.
 const SWITCH_CHECK_MS = 1000;
-// The most of a server's note that reaches the model.
+// The most of a server's note that reaches the model, and of a late answer from the room.
 const NOTE_MAX = 1000;
+const ANSWER_MAX = 8000;
+/** The ask_room tool, as the model calls it. */
+export const ASK_TOOL = "mcp__isoplan__ask_room";
+// Longer than the script ever waits (runner.json's polls), which ends it first.
+const ASK_TIMEOUT_MS = 10 * 60 * 1000;
 
 let running: string | null = null; // the session id the data layer runs for
 let lead: string | null = null; // that session's lead, as the facts name it
@@ -36,6 +47,14 @@ let pairSaid = false; // a link was put in the transcript since the session star
 
 export function register(on: On): void {
   on("session.start", async ($, e, next) => {
+    await $.tool
+      .register({
+        name: "ask_room",
+        description:
+          "Ask the lead of the room that was handed to you through Isoplan a question about its work, such as why something was done or what was left unfinished. It answers from the original session's own context, on its owner's machine. Use it only in a session that took an Isoplan handoff; anywhere else it is refused. If no answer comes soon, carry on: a later answer arrives as a note.",
+        inputSchema: { type: "object", properties: { question: { type: "string", description: "The question, on its own: the lead hasn't seen this conversation." } }, required: ["question"] },
+      })
+      .catch((err) => $.ui.log("isoplan: the ask_room tool couldn't be added: " + message(err), { to: "debug" }));
     const result = await next(e);
     pairSaid = false;
     if (!started) {
@@ -56,6 +75,7 @@ export function register(on: On): void {
   // handler answers only when `next` itself rejected; there `next(e)` replays what that call
   // settled to (the mod API's documented guard pattern), and the tool never runs twice.
   on("tool.call", async ($, e, next) => {
+    if (e.tool === ASK_TOOL) return askRoom($, e);
     const r = await next(e);
     try {
       void checkSession($);
@@ -173,6 +193,9 @@ function handle($: Host, text: string): void {
     case "conflict":
       addNote(line);
       break;
+    case "asked":
+      addAnswer(line);
+      break;
     case "error": {
       // Shown once in the transcript (never to the model), not on every reconnect.
       const said = `Isoplan: the office server says: ${line.message} (${line.code})`;
@@ -211,6 +234,33 @@ function addNote(line: ConflictMessage): void {
   const waiting = notes.get(line.agent) ?? [];
   waiting.push(line.text.length > NOTE_MAX ? line.text.slice(0, NOTE_MAX - 1) + "…" : line.text);
   notes.set(line.agent, waiting);
+}
+
+// A late answer from the room goes to the lead, which asked; the rest of a question's news reached it while it waited.
+function addAnswer(line: AskedMessage): void {
+  if (line.state !== "answered" || !line.answer || !lead) return;
+  const answer = line.answer.length > ANSWER_MAX ? line.answer.slice(0, ANSWER_MAX - 1) + "…" : line.answer;
+  const waiting = notes.get(lead) ?? [];
+  waiting.push(`Isoplan: the room you asked has answered your question (${line.question}), "${line.text}", from its lead's own session:\n\n${answer}`);
+  notes.set(lead, waiting);
+}
+
+// The ask_room tool: the script asks as this session and prints what the agent is told.
+async function askRoom($: Host, e: ToolCallInput): Promise<ToolCallResult> {
+  const question = typeof e.question === "string" ? e.question.trim() : "";
+  if (!question) return { result: "Give the question to ask the room as `question`." };
+  try {
+    const script = $.plugin.root.replace(/\\/g, "/") + "/dist/ask.js";
+    const session = await $.session.id();
+    const cwd = await $.session.cwd();
+    const r = await $.process.run(["node", script, "--session", session, "--cwd", cwd], { cwd, stdin: question, timeoutMs: ASK_TIMEOUT_MS });
+    if (r.stdout.trim()) return { result: r.stdout.trim() };
+    $.ui.log("isoplan: ask_room: " + (r.stderr.trim() || `node exited with code ${r.exitCode}`), { to: "debug" });
+    return { result: "The room couldn't be asked here. Carry on without the answer." };
+  } catch (err) {
+    $.ui.log("isoplan: ask_room couldn't run: " + message(err), { to: "debug" });
+    return { result: "The room couldn't be asked here (Node.js is needed on PATH). Carry on without the answer." };
+  }
 }
 
 // The data layer decides when a title is due and keeps it; this only makes the call it can't.

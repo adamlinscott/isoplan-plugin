@@ -156,6 +156,10 @@ const valid = {
   "hand-over-ready": { type: "hand-over-ready", v, handoff: "h7k2", to: sam },
   drop: { type: "drop", v, id: "r2" },
   "handoff to a runner": { type: "handoff", v, handoff, mode: "headless", session: "0b5c4d3e-0000-4000-8000-000000000001" },
+  "ask-room": { type: "ask-room", v, question: "Why does the CRLF check exist?" },
+  "ask-check": { type: "ask-check", v, question: "q-4f9c" },
+  asked: { type: "asked", v, question: "q-4f9c", text: "Why does the CRLF check exist?", state: "answered", answer: "Windows checkouts." },
+  "asked queued": { type: "asked", v, question: "q-4f9c", text: "Why does the CRLF check exist?", state: "queued", note: "Adam's machine isn't reachable." },
 };
 
 const parsers = {
@@ -190,6 +194,10 @@ const parsers = {
   "hand-over-ready": parseOfficeServerMessage,
   drop: parseOfficeServerMessage,
   "handoff to a runner": parseOfficeServerMessage,
+  "ask-room": parseDataLayerMessage,
+  "ask-check": parseDataLayerMessage,
+  asked: parseOfficeServerMessage,
+  "asked queued": parseOfficeServerMessage,
 } satisfies Record<keyof typeof valid, (value: unknown) => ParseResult<unknown>>;
 
 // Each message with one field made wrong, and the path the error should name.
@@ -225,6 +233,10 @@ const broken: Record<keyof typeof valid, [unknown, string]> = {
   "hand-over-ready": [{ ...valid["hand-over-ready"], to: { name: "Sam" } }, "to.id"],
   drop: [{ ...valid.drop, id: "" }, "id"],
   "handoff to a runner": [{ ...valid["handoff to a runner"], mode: "window" }, "mode"],
+  "ask-room": [{ ...valid["ask-room"], question: "x".repeat(4001) }, "question"],
+  "ask-check": [{ ...valid["ask-check"], question: "" }, "question"],
+  asked: [{ ...valid.asked, state: "lost" }, "state"],
+  "asked queued": [{ ...valid["asked queued"], note: "" }, "note"],
 };
 
 describe.each(Object.keys(valid) as (keyof typeof valid)[])("%s", (type) => {

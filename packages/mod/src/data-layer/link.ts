@@ -4,8 +4,8 @@
 // exponential backoff and jitter, and starts over with hello and full. Nothing is kept while the
 // link is down: it is a live view, not a log.
 //
-// The server's conflict notes and errors, and the link's own state, go out through `emit` as
-// stdout lines for the hooks module.
+// The server's conflict notes and errors, a late answer to a question the session asked the room
+// (#49), and the link's own state, go out through `emit` as stdout lines for the hooks module.
 //
 // A server that answers `not-wanted` holds this project in no office: the link calls `onNotWanted`
 // and waits, asking again once an hour rather than backing off fast. Only the plugin's data layer
@@ -285,7 +285,7 @@ export function createLink({
     } else if (message.type === "error" && message.code === "forged-hello") {
       isTaken = true;
       emit(message);
-    } else if (message.type === "conflict" || message.type === "error") {
+    } else if (message.type === "conflict" || message.type === "error" || message.type === "asked") {
       emit(message);
       if (message.type === "error" && message.code === "not-wanted") {
         isUnwanted = true;

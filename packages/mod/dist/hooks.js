@@ -3,6 +3,10 @@ const RETRY_CAP_MS = 3e4;
 const STABLE_MS = 6e4;
 const SWITCH_CHECK_MS = 1e3;
 const NOTE_MAX = 1e3;
+const ANSWER_MAX = 8e3;
+/** The ask_room tool, as the model calls it. */
+const ASK_TOOL = "mcp__isoplan__ask_room";
+const ASK_TIMEOUT_MS = 6e5;
 let running = null;
 let lead = null;
 let stop = null;
@@ -14,6 +18,18 @@ let pairing = null;
 let pairSaid = false;
 function register(on) {
 	on("session.start", async ($, e, next) => {
+		await $.tool.register({
+			name: "ask_room",
+			description: "Ask the lead of the room that was handed to you through Isoplan a question about its work, such as why something was done or what was left unfinished. It answers from the original session's own context, on its owner's machine. Use it only in a session that took an Isoplan handoff; anywhere else it is refused. If no answer comes soon, carry on: a later answer arrives as a note.",
+			inputSchema: {
+				type: "object",
+				properties: { question: {
+					type: "string",
+					description: "The question, on its own: the lead hasn't seen this conversation."
+				} },
+				required: ["question"]
+			}
+		}).catch((err) => $.ui.log("isoplan: the ask_room tool couldn't be added: " + message(err), { to: "debug" }));
 		const result = await next(e);
 		pairSaid = false;
 		if (!started) {
@@ -28,6 +44,7 @@ function register(on) {
 		return result;
 	});
 	on("tool.call", async ($, e, next) => {
+		if (e.tool === "mcp__isoplan__ask_room") return askRoom($, e);
 		const r = await next(e);
 		try {
 			checkSession($);
@@ -148,6 +165,9 @@ function handle($, text) {
 		case "conflict":
 			addNote(line);
 			break;
+		case "asked":
+			addAnswer(line);
+			break;
 		case "error": {
 			const said = `Isoplan: the office server says: ${line.message} (${line.code})`;
 			if (said !== lastError) $.ui.log(said);
@@ -176,6 +196,40 @@ function addNote(line) {
 	waiting.push(line.text.length > NOTE_MAX ? line.text.slice(0, 999) + "…" : line.text);
 	notes.set(line.agent, waiting);
 }
+function addAnswer(line) {
+	if (line.state !== "answered" || !line.answer || !lead) return;
+	const answer = line.answer.length > ANSWER_MAX ? line.answer.slice(0, 7999) + "…" : line.answer;
+	const waiting = notes.get(lead) ?? [];
+	waiting.push(`Isoplan: the room you asked has answered your question (${line.question}), "${line.text}", from its lead's own session:\n\n${answer}`);
+	notes.set(lead, waiting);
+}
+async function askRoom($, e) {
+	const question = typeof e.question === "string" ? e.question.trim() : "";
+	if (!question) return { result: "Give the question to ask the room as `question`." };
+	try {
+		const script = $.plugin.root.replace(/\\/g, "/") + "/dist/ask.js";
+		const session = await $.session.id();
+		const cwd = await $.session.cwd();
+		const r = await $.process.run([
+			"node",
+			script,
+			"--session",
+			session,
+			"--cwd",
+			cwd
+		], {
+			cwd,
+			stdin: question,
+			timeoutMs: ASK_TIMEOUT_MS
+		});
+		if (r.stdout.trim()) return { result: r.stdout.trim() };
+		$.ui.log("isoplan: ask_room: " + (r.stderr.trim() || `node exited with code ${r.exitCode}`), { to: "debug" });
+		return { result: "The room couldn't be asked here. Carry on without the answer." };
+	} catch (err) {
+		$.ui.log("isoplan: ask_room couldn't run: " + message(err), { to: "debug" });
+		return { result: "The room couldn't be asked here (Node.js is needed on PATH). Carry on without the answer." };
+	}
+}
 function writeTitle($, ask) {
 	if (asking) return;
 	asking = true;
@@ -196,4 +250,4 @@ function writeTitle($, ask) {
 }
 const message = (err) => String(err && err.message || err);
 //#endregion
-export { register };
+export { ASK_TOOL, register };

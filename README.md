@@ -62,7 +62,7 @@ The runner reads these files. Each file in `~/.claude/isoplan/` is optional:
 
 | File | What |
 |---|---|
-| `packages/mod/runner.json`, overridden per key by `~/.claude/isoplan/runner.json` | The fork's model (`claudeModel`, Opus by default); the caps on answers per room per hour and per machine per day; the machine's daily token budget, and the weight of each kind of token in it (a cache write costs more than plain input, a cache read far less); the timeouts, including git's for a handoff (`gitTimeoutSeconds`) and a worktree setup script's default (`setupTimeoutMinutes`); how far back the runner looks for your clone of a repo (`cloneSearchDays`); and how many folders down from a session's folder a handoff looks for repos (`repoSearchDepth`, 3). |
+| `packages/mod/runner.json`, overridden per key by `~/.claude/isoplan/runner.json` | The fork's model (`claudeModel`, Opus by default); the caps on answers per room per hour and per machine per day; the machine's daily token budget, and the weight of each kind of token in it (a cache write costs more than plain input, a cache read far less); the timeouts, including git's for a handoff (`gitTimeoutSeconds`) and a worktree setup script's default (`setupTimeoutMinutes`); how far back the runner looks for your clone of a repo (`cloneSearchDays`); how many folders down from a session's folder a handoff looks for repos (`repoSearchDepth`, 3); and how long an agent waits when it asks a room that was handed to it: `askPolls` checks, `askPollSeconds` apart, before it is told to carry on. |
 | `packages/mod/secret-patterns.json`, plus `~/.claude/isoplan/secret-patterns.json` | The secret scan's patterns, as `{ "patterns": [{ "name", "regex", "flags"? }] }`. Your file adds patterns; it can't remove the plugin's. While your file can't be read, or has a pattern that doesn't compile, every answer, brief and report is held. |
 | `packages/mod/prompts/` | What the fork is told: `instructions.md` first, the same every time so the lead's context is reused from cache, then `question.md` or `brief.md`. |
 | `~/.claude/isoplan/claude-binary.json` | The `claude` binary the fork runs, `{ "path": "..." }`, which install finds and records. Set it by hand if install can't find it; a path set by hand, without `"auto": true`, is kept by later installs. |
@@ -98,6 +98,12 @@ The setup script is set once per repo, in `isoplan.json` at its top, committed:
 ```
 
 `command` is one command, or `{ "windows": "...", "mac": "..." }`. It runs with the system shell (cmd.exe on Windows, /bin/sh on a Mac), hidden, in the new worktree, with `ISOPLAN_HANDOFF_ID` and `ISOPLAN_HANDOFF_BRANCH` set. It is read only from the remote's default branch, as your clone fetches it, never from the handoff's branch or whatever your clone has checked out; when the default branch can't be told, setup is skipped and the room says why.
+
+## Asking the room
+
+Once you have taken a handoff, your session's agent can ask the room's lead a question with the plugin's `ask_room` tool, without you typing anything. Only a taken handoff gives that right, only for that room, and the person who handed it over can turn it off on the floor. The question goes through the office server to their runner, whose fork of the lead answers from the session's own context, within the caps in their `runner.json`, and the answer is checked for secrets on their machine before it leaves. Every question and answer shows in the handoff's meeting on the floor, and the server keeps them for its retention period.
+
+Your agent is never held up for long: when their machine is off, their runner is away, a cap is reached or the answer is held, it checks `askPolls` times, `askPollSeconds` apart, then is told to carry on. The question stays queued and is asked again when their runner is back; an answer that comes later reaches your agent as a note on one of its next tool results. When the office signs people in, the tool asks with this machine's pairing, as the data layer reports; on a machine that isn't paired, or whose pairing has ended, your agent is told so and carries on.
 
 ## What leaves your machine
 

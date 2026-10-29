@@ -5973,6 +5973,16 @@ discriminatedUnion("type", [
 			repo: string().min(1).optional(),
 			output: string()
 		}))
+	}),
+	object({
+		type: literal("ask-room"),
+		v: Version,
+		question: string().trim().min(1).max(4e3)
+	}),
+	object({
+		type: literal("ask-check"),
+		v: Version,
+		question: RequestId
 	})
 ]);
 /** Asks the data layer to send its facts in full. */
@@ -6083,7 +6093,22 @@ const OfficeServerMessageSchema = discriminatedUnion("type", [
 		to: Account
 	}),
 	HandOverReadyMessageSchema,
-	DropMessageSchema
+	DropMessageSchema,
+	object({
+		type: literal("asked"),
+		v: Version,
+		question: RequestId,
+		text: string().min(1),
+		state: _enum([
+			"queued",
+			"asking",
+			"withheld",
+			"answered",
+			"dropped"
+		]),
+		answer: string().min(1).optional(),
+		note: string().min(1).optional()
+	})
 ]);
 /** Validates a message a data layer received from an office server. */
 function parseOfficeServerMessage(value) {
@@ -7935,6 +7960,7 @@ async function takeCommand(argv) {
 			`You have taken Isoplan handoff ${handoff.id}, and this session is in its room now.`,
 			checkout,
 			...setupNote,
+			"To ask the session it came from a question, use the Isoplan ask_room tool.",
 			"",
 			"The brief:",
 			"",

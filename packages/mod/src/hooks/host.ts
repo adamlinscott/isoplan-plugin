@@ -7,6 +7,8 @@ export interface ToolCallInput {
   tool_use_id: string;
   /** The subagent's id; absent on the main loop. */
   agentId?: string;
+  /** The tool's own arguments, beside these. */
+  [argument: string]: unknown;
 }
 
 /** `{ deny }`, or the tool's result, possibly an error, with notes the model reads after it. */
@@ -35,6 +37,12 @@ export interface Host {
   process: {
     /** Streams a child's output; the loop is the child's life: `return()` or the module's unload ends it. */
     spawn(request: { argv: readonly string[]; cwd?: string }): AsyncGenerator<{ stream: "stdout" | "stderr"; text: string }, { code: number | null; signal: string | null }>;
+    /** Runs a command by argv (no shell) and resolves once it exits; the timeout is 30 s unless given, ten minutes at most. */
+    run(argv: readonly string[], init?: { cwd?: string; stdin?: string; timeoutMs?: number }): Promise<{ exitCode: number; stdout: string; stderr: string }>;
+  };
+  tool: {
+    /** Declares a tool the model can call, as `mcp__<plugin>__<name>`, served by a `tool.call` hook on that name. */
+    register(tool: { name: string; description: string; inputSchema?: Record<string, unknown>; isDeferred?: boolean }): Promise<{ tool: string }>;
   };
   model: {
     complete(request: { model: string; prompt: string; system?: string; maxTokens?: number }): Promise<ModelCompleteResult>;

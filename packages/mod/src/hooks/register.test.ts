@@ -24,6 +24,8 @@ function host(lines: DataLayerLine[], { wakes = 0, runMs = 0, stays = false, noN
   const spawnedIn: (string | undefined)[] = [];
   const slept: number[] = [];
   const logged: string[] = []; // what reached the transcript
+  const ran: { argv: readonly string[]; stdin?: string }[] = [];
+  const tools: string[] = [];
   const session = { id: "s1" };
   let now = 0;
   const $: Host = {
@@ -44,7 +46,12 @@ function host(lines: DataLayerLine[], { wakes = 0, runMs = 0, stays = false, noN
           return { code: 0, signal: null };
         })();
       },
+      run: async (argv, init) => {
+        ran.push({ argv, stdin: init?.stdin });
+        return { exitCode: 0, stdout: "The room answered your question (q-1), from its lead's own session:\n\nBecause.\n", stderr: "" };
+      },
     },
+    tool: { register: async (tool) => (tools.push(tool.name), { tool: `mcp__isoplan__${tool.name}` }) },
     model: { complete: async () => ({ isAnswered: true, text: "Fixing the wizard" }) },
     fs: { write: async (p, text) => void written.push([p, text]) },
     ui: { status: (text) => void status.push(text), log: (text, options) => void (options?.to !== "debug" && logged.push(text)) },
@@ -54,7 +61,7 @@ function host(lines: DataLayerLine[], { wakes = 0, runMs = 0, stays = false, noN
       after: (_ms, fn) => (fn(), { cancel: () => {} }),
     },
   };
-  return { $, status, written, spawned, spawnedIn, slept, session, logged };
+  return { $, status, written, spawned, spawnedIn, slept, session, logged, ran, tools };
 }
 
 let hooks: Hooks;
@@ -182,4 +189,26 @@ test("hooks: a pairing link is in the status line while it waits, and in the tra
   expect(h.status[4]).toBe("Isoplan: connected to ws://127.0.0.1:4747/data-layer");
   // A new link ten minutes on goes to the status line, not the transcript again.
   expect(h.logged).toEqual(["Isoplan: to report to wss://office.team.example/data-layer, pair this machine: click https://office.team.example/#pair=r1 on this computer and approve it in the office."]);
+});
+
+test("hooks: the ask_room tool is added at the start, and runs the ask script as this session, with the question on stdin, without the tool beneath", async () => {
+  const h = await start([connected], { stays: true });
+  expect(h.tools).toEqual(["ask_room"]);
+  const next = vi.fn(async () => ({ result: "not this" }));
+  const r = await hooks["tool.call"]!(h.$, { tool: "mcp__isoplan__ask_room", tool_use_id: "t", question: "  Why skip archived rows? " }, next);
+  expect(next).not.toHaveBeenCalled();
+  expect(r).toEqual({ result: "The room answered your question (q-1), from its lead's own session:\n\nBecause." });
+  expect(h.ran).toEqual([{ argv: ["node", "C:/plugins/isoplan/dist/ask.js", "--session", "s1", "--cwd", "C:/w/repo"], stdin: "Why skip archived rows?" }]);
+  expect(await hooks["tool.call"]!(h.$, { tool: "mcp__isoplan__ask_room", tool_use_id: "t" }, next)).toEqual({ result: "Give the question to ask the room as `question`." });
+});
+
+test("hooks: a late answer from the room goes on the lead's next tool result, once; other news of a question doesn't", async () => {
+  const h = await start([
+    { type: "asked", v: PROTOCOL_VERSION, question: "q-1", text: "Which branch?", state: "queued", note: "Queued." },
+    { type: "asked", v: PROTOCOL_VERSION, question: "q-1", text: "Which branch?", state: "answered", answer: "feat/migrate-v2." },
+  ]);
+  await stopped(h);
+  expect(await call(h, { agentId: "w1" })).toEqual({ result: "ok" });
+  expect(await call(h, {})).toEqual({ result: "ok", context: ['Isoplan: the room you asked has answered your question (q-1), "Which branch?", from its lead\'s own session:\n\nfeat/migrate-v2.'] });
+  expect(await call(h, {})).toEqual({ result: "ok" });
 });

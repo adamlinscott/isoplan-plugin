@@ -218,6 +218,27 @@ export const TakenMessageSchema = z.object({
   ),
 });
 
+/** The longest question a session may ask the room. */
+export const MAX_QUESTION_LENGTH = 4000;
+
+/**
+ * The receiver's session asks the room it was handed a question (#49), on its own short link with
+ * the session's hello: the room's lead, on its owner's machine, answers it. The server answers
+ * `asked`, or an error (`ask-refused`) when the session may not ask.
+ */
+export const AskRoomMessageSchema = z.object({
+  type: z.literal("ask-room"),
+  v: Version,
+  question: z.string().trim().min(1).max(MAX_QUESTION_LENGTH),
+});
+
+/** The asking session polls a question it asked: the server answers `asked`. */
+export const AskCheckMessageSchema = z.object({
+  type: z.literal("ask-check"),
+  v: Version,
+  question: RequestId,
+});
+
 export const DataLayerMessageSchema = z.discriminatedUnion("type", [
   HelloMessageSchema,
   RunnerHelloMessageSchema,
@@ -229,6 +250,8 @@ export const DataLayerMessageSchema = z.discriminatedUnion("type", [
   HandOverCheckMessageSchema,
   TakeMessageSchema,
   TakenMessageSchema,
+  AskRoomMessageSchema,
+  AskCheckMessageSchema,
 ]);
 
 // Office server → data layer.
@@ -349,6 +372,25 @@ export const HandedOverMessageSchema = z.object({
   to: Account,
 });
 
+/**
+ * Where a question asked of the room stands (#49), sent in answer to ask-room and ask-check, and
+ * down the asking session's own link when an answer arrives after it stopped polling. `queued`: the
+ * owner's machine can't answer now (it is off, its runner is away, a cap is reached, or the fork
+ * couldn't answer), and it is asked again later; `note` says why. `asking`: the owner's runner is
+ * answering. `withheld`: the answer matched a secret pattern on the owner's machine, which keeps it
+ * until they release it. `answered`, with `answer`. `dropped`: it won't be answered (the owner
+ * revoked the asker's rights); `note` says why. `text` is the question as it was asked.
+ */
+export const AskedMessageSchema = z.object({
+  type: z.literal("asked"),
+  v: Version,
+  question: RequestId,
+  text: z.string().min(1),
+  state: z.enum(["queued", "asking", "withheld", "answered", "dropped"]),
+  answer: z.string().min(1).optional(),
+  note: z.string().min(1).optional(),
+});
+
 export const OfficeServerMessageSchema = z.discriminatedUnion("type", [
   RepairMessageSchema,
   ConflictMessageSchema,
@@ -359,6 +401,7 @@ export const OfficeServerMessageSchema = z.discriminatedUnion("type", [
   HandedOverMessageSchema,
   HandOverReadyMessageSchema,
   DropMessageSchema,
+  AskedMessageSchema,
 ]);
 
 export type Project = z.infer<typeof ProjectSchema>;
@@ -385,6 +428,9 @@ export type HandedOverMessage = z.infer<typeof HandedOverMessageSchema>;
 export type HandOverCheckMessage = z.infer<typeof HandOverCheckMessageSchema>;
 export type HandOverReadyMessage = z.infer<typeof HandOverReadyMessageSchema>;
 export type DropMessage = z.infer<typeof DropMessageSchema>;
+export type AskRoomMessage = z.infer<typeof AskRoomMessageSchema>;
+export type AskCheckMessage = z.infer<typeof AskCheckMessageSchema>;
+export type AskedMessage = z.infer<typeof AskedMessageSchema>;
 export type OfficeServerMessage = z.infer<typeof OfficeServerMessageSchema>;
 
 /**
