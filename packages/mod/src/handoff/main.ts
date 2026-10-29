@@ -2,7 +2,7 @@
 // the session (commands/):
 //
 //   node dist/handoff.js prepare --to <name>                                     a new handoff id, where to write the brief and what to write
-//   node dist/handoff.js hand-over --id <id> --to <name> --brief <file> [--push-anyway <commit>]   commits, pushes and hands the room over
+//   node dist/handoff.js hand-over --id <id> --to <name> --brief <file> [--push-anyway [<repo>=]<commit>]...   commits, pushes and hands the room over
 //   node dist/handoff.js take <code>                                             checks out the handoff here and prints its brief
 //
 // The session is $CLAUDE_CODE_SESSION_ID and its folder $CLAUDE_PROJECT_DIR (else this process's
@@ -15,7 +15,9 @@
 // the server whether it would take the hand-over, does the git work (git.ts) and sends it. A brief
 // that matches a secret pattern isn't sent: the agent is told which pattern, so it can take it out.
 // A commit whose added lines match isn't pushed: the agent is told the file and the commit, and only
-// --push-anyway with that commit, on the person's say, pushes it, exactly as it was. The brief's
+// --push-anyway with that commit, on the person's say, pushes it, exactly as it was. With several
+// repos in the session's folder (#56) the file is named by its path there, and the flag is
+// `--push-anyway <repo>=<commit>` for a repo under the folder, one per held repo. The brief's
 // folder (isoplan/handoffs/out/<id>) goes once it is sent, and any left by a prepare that wasn't
 // followed up goes after a day.
 
@@ -31,7 +33,7 @@ import { nodeIo } from "../data-layer/io.js";
 import { fill, loadPrompts } from "../runner/prompts.js";
 import { loadPatterns, scan } from "../runner/scan.js";
 import { openSideLink } from "./connection.js";
-import { createRunGit, GIT_FAILED, handoffBranch, handoffNote, HandoffGitError, newHandoffId, prepare, pushHandoff, untrackedLine } from "./git.js";
+import { createRunGit, gitFailed, handoffBranch, handoffNote, HandoffGitError, newHandoffId, prepare, pushHandoff, untrackedLine } from "./git.js";
 import { checkoutHere, handoffDir, setupCommand, type TakeSettings } from "./take.js";
 
 const ANSWER_MS = 20000;
@@ -110,28 +112,43 @@ async function prepareCommand(argv: string[]): Promise<string> {
   const to = nameOf(argv);
   const s = await settings();
   await tidyOut();
-  const prepared = await prepare(run, sessionDir(), s.gitTimeoutSeconds * 1000).catch((err: unknown) => stop(err instanceof HandoffGitError ? `Can't hand over from here: ${GIT_FAILED[err.kind]}.` : String(err)));
+  const prepared = await prepare(run, sessionDir(), s.gitTimeoutSeconds * 1000, s.repoSearchDepth).catch((err: unknown) => stop(err instanceof HandoffGitError ? `Can't hand over from here: ${gitFailed(err)}.` : String(err)));
   const id = newHandoffId();
   const folder = outDir(id);
   await fs.mkdir(folder, { recursive: true });
   const brief = fill((await loadPrompts(path.join(modDir, "prompts"))).brief, { to, untracked: untrackedLine(prepared.files) });
-  return [`Handoff id: ${id}`, `Brief file: ${path.join(folder, "brief.md")}`, `Branch: ${handoffBranch(id)}${prepared.from ? `, made from ${prepared.from}` : ""}`, "", brief].join("\n");
+  const subs = prepared.repos.filter((r) => r.path !== ".");
+  const repos = subs.length ? [`Repos, by path in this folder: ${prepared.repos.map((r) => `${r.path}${r.from ? ` (from ${r.from})` : ""}`).join(", ")}`] : [];
+  return [`Handoff id: ${id}`, `Brief file: ${path.join(folder, "brief.md")}`, `Branch: ${handoffBranch(id)}${prepared.from ? `, made from ${prepared.from}` : ""}`, ...repos, "", brief].join("\n");
+}
+
+// --push-anyway <commit> for the session folder's own repo, or <repo>=<commit> for one under it, as often as there are held repos.
+function pushAnywayOf(argv: string[]): Record<string, string> {
+  const out: Record<string, string> = {};
+  argv.forEach((arg, i) => {
+    if (arg !== "--push-anyway") return;
+    const value = argv[i + 1] ?? "";
+    const at = value.lastIndexOf("=");
+    const [repo, commit] = at >= 0 ? [value.slice(0, at), value.slice(at + 1)] : [".", value];
+    if (!repo || !/^[0-9a-f]{40}([0-9a-f]{24})?$/.test(commit)) stop("--push-anyway takes the held commit's full hash, with its repo's path and = before it for a repo under the folder, as hand-over printed it.");
+    out[repo] = commit;
+  });
+  return out;
 }
 
 async function handOverCommand(argv: string[]): Promise<string> {
   const id = flag(argv, "--id") || stop("Missing --id: run prepare first.");
   if (!/^[a-z0-9][a-z0-9-]{0,63}$/.test(id)) stop(`"${id}" isn't a handoff id.`);
   const to = nameOf(argv);
-  const pushAnyway = flag(argv, "--push-anyway");
-  if (pushAnyway !== null && !/^[0-9a-f]{40}([0-9a-f]{24})?$/.test(pushAnyway)) stop("--push-anyway takes the held commit's full hash, as hand-over printed it.");
+  const pushAnyway = pushAnywayOf(argv);
   const file = flag(argv, "--brief") || stop("Missing --brief <file>.");
   const written = (await fs.readFile(file, "utf8").catch(() => stop(`There is no brief at ${file}: write it there first.`))).trim();
   if (!written) stop(`The brief at ${file} is empty.`);
   const cwd = sessionDir();
   const s = await settings();
   const timeoutMs = s.gitTimeoutSeconds * 1000;
-  const { from, files } = await prepare(run, cwd, timeoutMs).catch((err: unknown) => stop(err instanceof HandoffGitError ? `Can't hand over from here: ${GIT_FAILED[err.kind]}.` : String(err)));
-  const brief = `${written}\n\n${handoffNote({ branch: handoffBranch(id), from, files, at: new Date() })}`;
+  const { from, files, repos, left } = await prepare(run, cwd, timeoutMs, s.repoSearchDepth).catch((err: unknown) => stop(err instanceof HandoffGitError ? `Can't hand over from here: ${gitFailed(err)}.` : String(err)));
+  const brief = `${written}\n\n${handoffNote({ branch: handoffBranch(id), from, files, at: new Date(), repos, left })}`;
   const patterns = await loadPatterns(path.join(modDir, "secret-patterns.json"), path.join(isoplanDir, "secret-patterns.json"), () => {});
   const matched = scan(brief, patterns);
   if (matched) stop(`The brief wasn't sent: it matches the secret pattern "${matched}". Take that out of ${file} and run hand-over again.`);
@@ -142,20 +159,25 @@ async function handOverCommand(argv: string[]): Promise<string> {
     link.send({ type: "hand-over-check", v: PROTOCOL_VERSION, to, handoff: id });
     const ready = await link.next((m): m is HandOverReadyMessage => m.type === "hand-over-ready" && m.handoff === id, ANSWER_MS);
     if (ready.type === "error") stop(`Nothing was pushed. ${said(ready)}`);
-    const pushed = await pushHandoff(run, cwd, id, timeoutMs, { scan: async (text) => scan(text, patterns), ...(pushAnyway ? { pushAnyway } : {}) }).catch((err: unknown) =>
-      stop(err instanceof HandoffGitError ? `The handoff wasn't sent: ${GIT_FAILED[err.kind]}.\n${err.detail}` : String(err)),
+    const pushed = await pushHandoff(run, cwd, id, timeoutMs, { scan: async (text) => scan(text, patterns), pushAnyway, depth: s.repoSearchDepth }).catch((err: unknown) =>
+      stop(err instanceof HandoffGitError ? `The handoff wasn't sent: ${gitFailed(err)}.\n${err.detail}` : String(err)),
     );
     if ("held" in pushed) {
       const unchecked = pushed.unchecked.length ? ` These files couldn't be checked (binary): ${pushed.unchecked.join(", ")}.` : "";
-      stop(`Nothing was pushed: the lines the push would send to ${pushed.held} match a secret pattern.${unchecked} Take the secret out, or, if it isn't one, run hand-over again with --push-anyway ${pushed.commit} to push that exact commit.`);
+      const where = pushed.repo === "." ? "" : ` (in the repo ${pushed.repo})`;
+      const again = pushed.repo === "." ? pushed.commit : `${pushed.repo}=${pushed.commit}`;
+      const kept = Object.keys(pushAnyway).length ? ", keeping the --push-anyway you gave already" : "";
+      stop(`Nothing was pushed: the lines the push would send to ${pushed.held}${where} match a secret pattern.${unchecked} Take the secret out, or, if it isn't one, run hand-over again with --push-anyway ${again}${kept}, to push that exact commit.`);
     }
-    const { repo } = pushed as { repo: HandoffRepo };
-    link.send({ type: "hand-over", v: PROTOCOL_VERSION, to, handoff: { id, brief, repos: [repo] } });
+    const { repos: sent } = pushed as { repos: HandoffRepo[] };
+    const branch = handoffBranch(id);
+    link.send({ type: "hand-over", v: PROTOCOL_VERSION, to, handoff: { id, brief, repos: sent } });
     const answer = await link.next((m): m is HandedOverMessage => m.type === "handed-over" && m.handoff === id, ANSWER_MS);
-    if (answer.type === "error") stop(`${said(answer)}\nThe branch ${repo.branch} is pushed; run hand-over again with the same id once that is fixed.`);
+    if (answer.type === "error") stop(`${said(answer)}\nThe branch ${branch} is pushed; run hand-over again with the same id once that is fixed.`);
     const name = (answer as HandedOverMessage).to.name || (answer as HandedOverMessage).to.id;
     if (path.resolve(path.dirname(file)) === path.resolve(outDir(id))) await fs.rm(outDir(id), { recursive: true, force: true }).catch(() => {});
-    return `Handed over to ${name}, on ${repo.branch}. They will see a Take handoff button in the room on the floor.`;
+    const inRepos = sent.some((r) => r.path !== ".") ? ` in ${sent.map((r) => r.path).join(", ")}` : "";
+    return `Handed over to ${name}, on ${branch}${inRepos}. They will see a Take handoff button in the room on the floor.`;
   } finally {
     await link.close();
   }
@@ -178,9 +200,19 @@ async function takeCommand(argv: string[]): Promise<string> {
     // Git's output leaves this machine only after the scan.
     const sent = failures.map((f) => (scan(f.output, patterns) ? { ...f, output: "The end of its output is withheld here: it matches a secret pattern." } : f));
     link.send({ type: "taken", v: PROTOCOL_VERSION, handoff: handoff.id, failures: sent });
-    const checkout = failures.length
-      ? `The checkout of ${handoffBranch(handoff.id)} failed, so this folder is as it was:\n${failures[0]!.output}`
-      : `This folder is now on ${handoffBranch(handoff.id)}.`;
+    const branch = handoffBranch(handoff.id);
+    const own = failures.find((f) => !f.repo);
+    const subs = handoff.repos.filter((r) => r.path !== ".").map((r) => r.path);
+    const done = subs.filter((p) => !failures.some((f) => f.repo === p));
+    const checkout = own
+      ? `The checkout of ${branch} failed, so this folder is as it was:\n${own.output}`
+      : [
+          handoff.repos.some((r) => r.path === ".") ? `This folder is now on ${branch}.` : "",
+          done.length ? `These repos in it are now on ${branch}: ${done.join(", ")}.` : "",
+          ...failures.map((f) => `The checkout of ${branch} in ${f.repo} failed, so that repo is as it was:\n${f.output}`),
+        ]
+          .filter(Boolean)
+          .join("\n");
     // No setup runs on this path; the agent is told when the repo has one, in case it matters here.
     const setup = remote ? await setupCommand(run, { dir: cwd, remote }, process.platform, timeoutMs) : null;
     const setupNote = setup ? [`The repo's worktree setup script has NOT been run here: \`${setup}\` (from isoplan.json). Run it only if this folder isn't set up yet.`] : [];

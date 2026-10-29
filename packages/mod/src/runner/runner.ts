@@ -70,9 +70,10 @@ export interface RunnerOptions {
   /** Pushes the handoff's work and returns its repos (#48); without it, briefs are refused. */
   /**
    * Pushes the handoff's work and returns its repos (#48), or the file whose added lines matched a
-   * secret pattern, with nothing pushed, unless `pushAnyway`. Without it, briefs are refused.
+   * secret pattern and its repo (#56), with nothing pushed, unless `pushAnyway` names that repo's
+   * held commit. Without it, briefs are refused.
    */
-  push?: (session: string, lead: Lead, handoff: string, pushAnyway: string | null) => Promise<HandoffRepo[] | { held: string; commit: string; unchecked: string[] }>;
+  push?: (session: string, lead: Lead, handoff: string, pushAnyway: Record<string, string> | null) => Promise<HandoffRepo[] | { held: string; repo: string; commit: string; unchecked: string[] }>;
   /** The untracked files the brief names (null when unknown), and the note it ends with (#48). Throws PushFailed when there is no repo to push. */
   prepareBrief?: (lead: Lead, handoff: string) => Promise<{ files: string[] | null; note: string }>;
   /** Takes a handoff on this machine (#48); without it, handoffs are logged as not handled. */
@@ -206,9 +207,9 @@ export function createRunner({ answerer, ledger, settings, prompts, scan, send, 
     }
 
     // The brief's push, held in turn when its commit adds a possible secret; released, it pushes anyway.
-    const pushAndReply = async (pushAnyway: string | null): Promise<Outgoing> => {
+    const pushAndReply = async (pushAnyway: Record<string, string> | null): Promise<Outgoing> => {
       if (dropping.has(id)) return unavailable(id, "the handoff was cancelled, so nothing was pushed");
-      let pushed: HandoffRepo[] | { held: string; commit: string; unchecked: string[] };
+      let pushed: HandoffRepo[] | { held: string; repo: string; commit: string; unchecked: string[] };
       try {
         pushed = await push!(session, lead, (request as Extract<Ask, { kind: "write-brief" }>).handoff, pushAnyway);
       } catch (err) {
@@ -216,9 +217,10 @@ export function createRunner({ answerer, ledger, settings, prompts, scan, send, 
         return unavailable(id, err instanceof PushFailed ? err.message : "the handoff's branch couldn't be pushed");
       }
       if (!Array.isArray(pushed)) {
-        const { held: file, commit, unchecked } = pushed;
+        const { held: file, repo, commit, unchecked } = pushed;
         log(`withheld the handoff's commit ${commit} for ${id} in ${room}: the lines it adds to ${file} match a secret pattern`);
-        hold(id, () => pushAndReply(commit));
+        // Released, this repo's held commit goes as it was, with any released before it (#56).
+        hold(id, () => pushAndReply({ ...pushAnyway, [repo]: commit }));
         return { type: "refusal", v: PROTOCOL_VERSION, id, reason: "withheld", file, ...(unchecked.length ? { unchecked } : {}) };
       }
       return { type: "reply", v: PROTOCOL_VERSION, id, kind: "write-brief", handoff: { id: (request as Extract<Ask, { kind: "write-brief" }>).handoff, brief: body, repos: pushed }, ...(isFallback ? { fallback: true as const } : {}) };

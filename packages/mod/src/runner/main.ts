@@ -45,7 +45,7 @@ import { createClaudeAnswerer, forkableId } from "./claude.js";
 import { claudeBinary } from "./claude-binary.js";
 import { anyRoomSince, askableMs, NOT_WANTED_CODE, supervise, UNPAIRED_CODE } from "./lifecycle.js";
 import { loadPrompts } from "./prompts.js";
-import { createRunGit, GIT_FAILED, handoffBranch, handoffNote, HandoffGitError, prepare, pushHandoff } from "../handoff/git.js";
+import { createRunGit, gitFailed, handoffBranch, handoffNote, HandoffGitError, prepare, pushHandoff } from "../handoff/git.js";
 import { takeHandoff, type TakeSettings } from "../handoff/take.js";
 import { createRunner, PushFailed, type RunnerSettings } from "./runner.js";
 import { loadPatterns, scan } from "./scan.js";
@@ -149,7 +149,7 @@ async function worker(): Promise<number> {
   const told = (err: unknown) => {
     if (!(err instanceof HandoffGitError)) throw err;
     log(`handoff git: ${err.detail}`);
-    return new PushFailed(GIT_FAILED[err.kind]);
+    return new PushFailed(gitFailed(err));
   };
   const scanText = async (text: string) => scan(text, await loadPatterns(path.join(appDir, "secret-patterns.json"), path.join(isoplanDir, "secret-patterns.json"), log));
   let send: Parameters<typeof createRunner>[0]["send"] = () => {};
@@ -174,12 +174,12 @@ async function worker(): Promise<number> {
     // The handoff (#48): the brief names the untracked files, then the branch is pushed, both from
     // the lead's folder, in the background, with no prompts and under gitTimeoutSeconds.
     prepareBrief: async (lead, handoff) => {
-      const { from, files } = await prepare(git, lead.cwd, await gitMs()).catch((err) => Promise.reject(told(err)));
-      return { files, note: handoffNote({ branch: handoffBranch(handoff), from, files, at: new Date() }) };
+      const { from, files, repos, left } = await prepare(git, lead.cwd, await gitMs(), (await settings()).repoSearchDepth).catch((err) => Promise.reject(told(err)));
+      return { files, note: handoffNote({ branch: handoffBranch(handoff), from, files, at: new Date(), repos, left }) };
     },
     push: async (_session, lead, handoff, pushAnyway) => {
-      const pushed = await pushHandoff(git, lead.cwd, handoff, await gitMs(), { scan: scanText, ...(pushAnyway ? { pushAnyway } : {}) }).catch((err) => Promise.reject(told(err)));
-      return "held" in pushed ? pushed : [pushed.repo];
+      const pushed = await pushHandoff(git, lead.cwd, handoff, await gitMs(), { scan: scanText, depth: (await settings()).repoSearchDepth, ...(pushAnyway ? { pushAnyway } : {}) }).catch((err) => Promise.reject(told(err)));
+      return "held" in pushed ? pushed : pushed.repos;
     },
     take: (message) =>
       takeHandoff(message, {
