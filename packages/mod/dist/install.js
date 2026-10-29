@@ -6193,6 +6193,12 @@ const HandoffSchema = object({
 		});
 	});
 });
+/**
+* The machine's access token from pairing, which an office server that signs people in requires
+* (it refuses a hello without one as `not-paired`, an expired one as `token-expired`, and one whose
+* account isn't the paired account as `forged-hello`). A server that signs nobody in ignores it.
+*/
+const Token = string().min(1).max(200).optional();
 discriminatedUnion("type", [
 	object({
 		type: literal("hello"),
@@ -6201,13 +6207,15 @@ discriminatedUnion("type", [
 		account: Account,
 		machine: Machine,
 		session: string().min(1),
-		project: ProjectSchema
+		project: ProjectSchema,
+		token: Token
 	}),
 	object({
 		type: literal("runner"),
 		v: Version,
 		account: Account,
-		machine: Machine
+		machine: Machine,
+		token: Token
 	}),
 	object({
 		type: literal("full"),

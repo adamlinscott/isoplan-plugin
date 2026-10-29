@@ -15,7 +15,9 @@
 // takes <claude dir>/isoplan/runner/lock.json, so a second one exits at once, writes the code it
 // runs into it and keeps it fresh, and runs the worker, starting it again after a crash
 // (lifecycle.ts). After MAX_FAST_FAILURES quick crashes in a row it gives up and lets the lock go.
-// The worker holds one link to the office server, opened with a runner hello, and stays up while
+// The worker holds one link to the office server, opened with a runner hello carrying the machine's
+// pairing token when the server signs people in (src/data-layer/pairing.ts; a code to approve goes
+// to the log, and the data layers show the same one in Claude Code), and stays up while
 // any session on the machine is inside its lights-off window. A server that doesn't want this
 // machine's runner ends it, and it holds off starting again for HOLD_OFF_MS. The worker exits when
 // its supervisor has gone too, since its stdin closes then, and ends its forks as it goes.
@@ -35,6 +37,7 @@ import { loadConfig, loadSettings } from "../data-layer/config.js";
 import { accountOf, claudePaths } from "../data-layer/identity.js";
 import { nodeIo } from "../data-layer/io.js";
 import { createLink } from "../data-layer/link.js";
+import { createPairing, pairingPath } from "../data-layer/pairing.js";
 import { HOLD_OFF_MS, alive, holdOff, lockPath, readLock, refreshLock, releaseLock, takeLock } from "../wake/lock.js";
 import { openLedger } from "./caps.js";
 import { createClaudeAnswerer, forkableId } from "./claude.js";
@@ -188,12 +191,16 @@ async function worker(): Promise<number> {
 
   let notWanted = false;
   let wake: () => void = () => {};
+  const account = await accountOf({ readText: (p) => fs.readFile(p, "utf8").catch(() => null), run: io.run }, claudeJson, os.homedir());
+  const emit: Parameters<typeof createLink>[0]["emit"] = (line) => {
+    if (line.type === "log") log(line.text);
+    else if (line.type === "error") log(`the office server says: ${line.message} (${line.code})`);
+    else if (line.type === "pair") log(`to answer for this machine's rooms through ${line.server}, pair it: open ${line.url} and approve code ${line.code} (it works until ${line.expires})`);
+  };
   const link = createLink({
     url: first.server,
-    emit: (line) => {
-      if (line.type === "log") log(line.text);
-      else if (line.type === "error") log(`the office server says: ${line.message} (${line.code})`);
-    },
+    emit,
+    pairing: createPairing({ file: pairingPath(claudeDir), server: first.server, account, machine: os.hostname(), emit }),
     onMessage: (message) => runner.take(message),
     onNotWanted: () => {
       notWanted = true;
@@ -202,7 +209,7 @@ async function worker(): Promise<number> {
     hello: {
       type: "runner",
       v: PROTOCOL_VERSION,
-      account: await accountOf({ readText: (p) => fs.readFile(p, "utf8").catch(() => null), run: io.run }, claudeJson, os.homedir()),
+      account,
       machine: { name: os.hostname() },
     },
   });

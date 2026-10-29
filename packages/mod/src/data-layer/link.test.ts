@@ -221,3 +221,33 @@ test("link: replies kept while down are bounded, the oldest dropped first", asyn
   await new Promise((r) => setTimeout(r, 50));
   expect(s.got.slice(2).map((m) => m.id)).toEqual(Array.from({ length: 100 }, (_, i) => `q${i + 1}`));
 });
+
+test("link: a hello refused for its token is told to pairing, which pairs or renews, and the link tries again at once", async () => {
+  const s = await server();
+  // The server takes only the fresh token: no token is not-paired, an old one has expired.
+  s.wss.on("connection", (ws) => {
+    ws.once("message", (data) => {
+      const { token } = JSON.parse(String(data)) as { token?: string };
+      if (token === "fresh") return;
+      const code = token ? "token-expired" : "not-paired";
+      ws.send(JSON.stringify({ type: "error", v: PROTOCOL_VERSION, code, message: code === "not-paired" ? "Pair this machine first." : "expired" }));
+      ws.close(1008, code);
+    });
+  });
+  const refused: [string, string | undefined][] = [];
+  const answers: (string | null | undefined)[] = [undefined, null, "old", "fresh"];
+  const pairing = {
+    token: async () => answers.shift(),
+    refused: async (code: "not-paired" | "token-expired", sent: string | undefined) => void refused.push([code, sent]),
+  };
+  // Backoff is long, so trying again "at once" shows: only a refused token skips it.
+  const { link: l, lines } = link(s.url, { pairing, pairPollMs: 20, retryBaseMs: 40, retryCapMs: 40 });
+  l.update(facts("active"));
+  await until(() => s.got.at(-1)?.type === "full" && s.got.at(-2)?.token === "fresh");
+  expect(refused).toEqual([["not-paired", undefined], ["token-expired", "old"]]);
+  expect(s.got.filter((m) => m.type === "hello").map((m) => m.token)).toEqual([undefined, "old", "fresh"]);
+  expect(lines.some((x) => x.type === "status" && x.state === "pairing")).toBe(true);
+  // The server's words on how to pair are shown; the renewal only logged.
+  expect(lines).toContainEqual({ type: "error", v: PROTOCOL_VERSION, code: "not-paired", message: "Pair this machine first." });
+  expect(lines.some((x) => x.type === "error" && x.code === "token-expired")).toBe(false);
+});

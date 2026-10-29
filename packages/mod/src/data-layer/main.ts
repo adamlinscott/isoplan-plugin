@@ -10,7 +10,9 @@
 // sessions without the plugin are seen too, and the first time, reports the machine's other recent
 // sessions at once (src/wake/backfill.ts), and starts the machine's runner (src/runner) if none is
 // running. Each agent's report is secret-checked before it is sent, and one that matches is held
-// until its owner releases it (src/data-layer/reports.ts).
+// until its owner releases it (src/data-layer/reports.ts). An office server that signs people in
+// wants the machine paired first: the link pairs it, keeping the credential in
+// <claude dir>/isoplan/pairing.json (src/data-layer/pairing.ts).
 //
 //   node dist/data-layer.js --session <session id> --cwd <the session's folder> --detached
 //
@@ -50,6 +52,7 @@ import { createGit } from "./git.js";
 import { accountOf, claudePaths, projectOf } from "./identity.js";
 import { nodeIo } from "./io.js";
 import { createLink, type Link } from "./link.js";
+import { createPairing, pairingPath } from "./pairing.js";
 import { openReportHold } from "./reports.js";
 import { cleanTitle, nextTitle, TITLE_SYSTEM, type TitleCache } from "./titles.js";
 
@@ -100,8 +103,9 @@ async function main(argv: string[]): Promise<number> {
   const emit = (line: DataLayerLine) => {
     if (line.type === "status") downSince = line.state === "connected" ? null : (downSince ?? Date.now());
     if (isOut) process.stdout.write(JSON.stringify(line) + "\n");
-    else if (detached && (line.type === "log" || line.type === "error")) {
-      const text = `${new Date().toISOString()} ${line.type === "log" ? line.text : `the office server says: ${line.message} (${line.code})`}\n`;
+    else if (detached && (line.type === "log" || line.type === "error" || line.type === "pair")) {
+      const said = line.type === "log" ? line.text : line.type === "pair" ? pairNote(line) : `the office server says: ${line.message} (${line.code})`;
+      const text = `${new Date().toISOString()} ${said}\n`;
       logging = logging.then(() => writeLog(logFile, text)).catch(() => {});
     }
   };
@@ -228,9 +232,11 @@ async function main(argv: string[]): Promise<number> {
 
     if (!link) {
       const where = await resolve(cwd);
+      const account = await accountOf({ readText: (p) => fs.readFile(p, "utf8").catch(() => null), run: io.run }, claudeJson, cwd);
       link = createLink({
         url: server,
         emit,
+        pairing: createPairing({ file: pairingPath(claudeDir), server, account, machine, emit }),
         onNotWanted: () => (isUnwanted = detached),
         // The owner released a withheld report: it goes to the link now, not on the next pass.
         onMessage: (message) => {
@@ -243,7 +249,7 @@ async function main(argv: string[]): Promise<number> {
           type: "hello",
           v: PROTOCOL_VERSION,
           source: "claude-code",
-          account: await accountOf({ readText: (p) => fs.readFile(p, "utf8").catch(() => null), run: io.run }, claudeJson, cwd),
+          account,
           machine: { name: machine },
           session: facts.session.id,
           project: await projectOf(io.run, where, cwd, machine),
@@ -269,6 +275,10 @@ async function main(argv: string[]): Promise<number> {
   await logging;
   return 0;
 }
+
+/** A pair line as the log says it. */
+const pairNote = (line: { server: string; code: string; url: string; expires: string }) =>
+  `to report to ${line.server}, pair this machine: open ${line.url} and approve code ${line.code} (it works until ${line.expires})`;
 
 // Appends to a detached data layer's log, starting it over once it passes LOG_CAP_BYTES.
 async function writeLog(file: string, text: string): Promise<void> {

@@ -17,6 +17,12 @@ Then point it at your office server: set `server` in `~/.claude/isoplan/config.j
 
 The plugin needs Node.js on `PATH`. When it first starts it puts a small hook in your `~/.claude/settings.json` (on `UserPromptSubmit` and `Stop`), so sessions that don't load the plugin are seen too, and copies the runner (below) into `~/.claude/isoplan/`.
 
+### Pairing this machine
+
+An office server that signs people in reports a machine only once someone has paired it. The first time a session reports, Claude Code's status line and transcript show a code and a link, such as `https://your-office.example/#pair=ABCD-2345`. Open the link while signed in to the office (or choose **Pair a machine** on the floor and type the code), check the Claude account and machine it names, and approve it. Within a few seconds the session reports as you; nothing needs typing in a terminal. A session the plugin doesn't run in, and the runner, write the same code to their logs.
+
+The machine's credential, and its access token, are kept in `~/.claude/isoplan/pairing.json` (in `$CLAUDE_CONFIG_DIR/isoplan/` when that is set), readable by you only (on Windows it takes the folder's permissions). It is for one office server and one Claude account: pointing `server` elsewhere, or signing in to Claude as someone else, pairs again. The token lasts about an hour and is renewed on its own. If the pairing is revoked on the floor, or lapses after 30 days without the machine connecting, the next session shows a new code. Deleting the file unpairs the machine on this side; revoke it on the floor too.
+
 ## Disable or uninstall
 
 Claude Code runs nothing of a plugin's when you disable or uninstall it, so the hook in your settings looks for itself, each time a session takes a prompt, at what Claude Code records: `installed_plugins.json`, and `enabledPlugins` in your settings, the project's settings and a `managed-settings.json` file (not managed settings from MDM or the claude.ai console, which it can't read). The project is the session's `CLAUDE_PROJECT_DIR`, or its folder. An install at project or local scope counts only for that project's sessions.

@@ -23,6 +23,7 @@ function host(lines: DataLayerLine[], { wakes = 0, runMs = 0, stays = false, noN
   const spawned: (readonly string[])[] = [];
   const spawnedIn: (string | undefined)[] = [];
   const slept: number[] = [];
+  const logged: string[] = []; // what reached the transcript
   const session = { id: "s1" };
   let now = 0;
   const $: Host = {
@@ -46,14 +47,14 @@ function host(lines: DataLayerLine[], { wakes = 0, runMs = 0, stays = false, noN
     },
     model: { complete: async () => ({ isAnswered: true, text: "Fixing the wizard" }) },
     fs: { write: async (p, text) => void written.push([p, text]) },
-    ui: { status: (text) => void status.push(text), log: () => {} },
+    ui: { status: (text) => void status.push(text), log: (text, options) => void (options?.to !== "debug" && logged.push(text)) },
     clock: {
       now: async () => now,
       sleep: (ms) => (slept.push(ms), slept.length <= wakes ? Promise.resolve() : new Promise(() => {})),
       after: (_ms, fn) => (fn(), { cancel: () => {} }),
     },
   };
-  return { $, status, written, spawned, spawnedIn, slept, session };
+  return { $, status, written, spawned, spawnedIn, slept, session, logged };
 }
 
 let hooks: Hooks;
@@ -164,4 +165,15 @@ test("hooks: a title ask is answered by the model and written where the line say
   const file = "C:/Users/ada/.claude/isoplan/titles/s1.json";
   const h = await start([{ type: "title-ask", model: "haiku", system: "Name it.", prompt: "Branch: fix/wizard", maxTokens: 40, key: "k1", file }]);
   await vi.waitFor(() => expect(h.written).toEqual([[file, JSON.stringify({ key: "k1", text: "Fixing the wizard" })]]));
+});
+
+test("hooks: a pairing code is in the status line while it waits, and in the transcript once", async () => {
+  const pair: DataLayerLine = { type: "pair", server: "wss://office.team.example/data-layer", code: "ABCD-2345", url: "https://office.team.example/#pair=ABCD-2345", expires: "2026-10-20T09:10:00.000Z" };
+  const pairing: DataLayerLine = { type: "status", server: pair.server, state: "pairing" };
+  const h = await start([pair, pairing, pair, pairing, connected]);
+  await stopped(h);
+  expect(h.status.slice(0, 4)).toEqual(Array(4).fill("Isoplan: pair this machine: open https://office.team.example/#pair=ABCD-2345 (code ABCD-2345)"));
+  expect(h.status[4]).toBe("Isoplan: connected to ws://127.0.0.1:4747/data-layer");
+  expect(h.logged).toHaveLength(1);
+  expect(h.logged[0]).toMatch(/^Isoplan: to report to wss:\/\/office\.team\.example\/data-layer, pair this machine: open https:\/\/office\.team\.example\/#pair=ABCD-2345 and approve code ABCD-2345/);
 });
