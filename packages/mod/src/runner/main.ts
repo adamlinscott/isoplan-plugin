@@ -164,11 +164,14 @@ async function worker(): Promise<number> {
     // the lead's folder, in the background, with no prompts and under gitTimeoutSeconds.
     prepareBrief: async (lead, handoff) => {
       const { from, files } = await prepare(git, lead.cwd, await gitMs()).catch((err) => Promise.reject(told(err)));
-      return { files, note: handoffNote({ branch: handoffBranch(handoff), from, files }) };
+      return { files, note: handoffNote({ branch: handoffBranch(handoff), from, files, at: new Date() }) };
     },
-    push: async (_session, lead, handoff) => [await pushHandoff(git, lead.cwd, handoff, await gitMs()).catch((err) => Promise.reject(told(err)))],
-    take: (handoff) =>
-      takeHandoff(handoff, {
+    push: async (_session, lead, handoff, pushAnyway) => {
+      const pushed = await pushHandoff(git, lead.cwd, handoff, await gitMs(), { scan: scanText, pushAnyway }).catch((err) => Promise.reject(told(err)));
+      return "held" in pushed ? pushed : [pushed.repo];
+    },
+    take: (message) =>
+      takeHandoff(message, {
         run: git,
         io,
         claudeDir,

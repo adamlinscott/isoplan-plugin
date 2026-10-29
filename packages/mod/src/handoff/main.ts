@@ -2,7 +2,7 @@
 // the session (commands/), in the session's folder:
 //
 //   node dist/handoff.js prepare --to <name>                          a new handoff id, where to write the brief and what to write
-//   node dist/handoff.js hand-over --id <id> --to <name> --brief <file>   commits, pushes and hands the room over
+//   node dist/handoff.js hand-over --id <id> --to <name> --brief <file> [--push-anyway]   commits, pushes and hands the room over
 //   node dist/handoff.js take <code>                                  checks out the handoff here and prints its brief
 //
 // The session is $CLAUDE_CODE_SESSION_ID, which Claude Code sets for the commands it runs. Each talks
@@ -10,14 +10,16 @@
 //
 // On the command path the live agent writes the brief, in its own turn, then runs hand-over, which
 // adds the runner's note (the branch and the untracked files), scans the brief for secrets, does
-// the git work (git.ts) and sends it. A brief that matches a secret pattern isn't sent: the agent is
-// told which pattern, so it can take it out.
+// asks the server whether it would take it, does the git work (git.ts) and sends it. A brief that
+// matches a secret pattern isn't sent: the agent is told which pattern, so it can take it out. A
+// commit whose added lines match isn't pushed; the agent is told the file, and only
+// --push-anyway, on the person's say, pushes it.
 
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { PROTOCOL_VERSION, type HandedOverMessage, type HandoffMessage, type HelloMessage, type OfficeServerMessage } from "@isoplan/protocol";
+import { PROTOCOL_VERSION, type HandedOverMessage, type HandOverReadyMessage, type HandoffMessage, type HandoffRepo, type HelloMessage, type OfficeServerMessage } from "@isoplan/protocol";
 import { loadConfig, loadSettings } from "../data-layer/config.js";
 import { createGit } from "../data-layer/git.js";
 import { accountOf, claudePaths, projectOf } from "../data-layer/identity.js";
@@ -26,7 +28,7 @@ import { fill, loadPrompts } from "../runner/prompts.js";
 import { loadPatterns, scan } from "../runner/scan.js";
 import { openSideLink } from "./connection.js";
 import { createRunGit, GIT_FAILED, handoffBranch, handoffNote, HandoffGitError, newHandoffId, prepare, pushHandoff, untrackedLine } from "./git.js";
-import { checkoutHere, handoffDir, type TakeSettings } from "./take.js";
+import { checkoutHere, handoffDir, setupCommand, type TakeSettings } from "./take.js";
 
 const ANSWER_MS = 20000;
 
@@ -73,8 +75,18 @@ async function server(): Promise<string> {
 
 const said = (m: Extract<OfficeServerMessage, { type: "error" }>) => `The office server says: ${m.message}`;
 
+// What the commands accept: a take code is the floor's fixed alphabet; a name is letters, digits,
+// spaces and . _ @ -, so nothing typed after a command can reach a shell as more than that.
+const CODE = /^[A-HJ-NP-Z2-9]{4}-?[A-HJ-NP-Z2-9]{4}$/i;
+const NAME = /^[\p{L}\p{N}][\p{L}\p{N} ._@-]{0,79}$/u;
+const nameOf = (argv: string[]) => {
+  const to = (flag(argv, "--to") ?? "").trim();
+  if (!NAME.test(to)) stop(`"${to}" isn't a name to hand over to: use their name or account id, in letters, digits, spaces and . _ @ - only.`);
+  return to;
+};
+
 async function prepareCommand(argv: string[]): Promise<string> {
-  const to = flag(argv, "--to") || stop("Say who to hand over to: --to <their name>.");
+  const to = nameOf(argv);
   const s = await settings();
   const prepared = await prepare(run, process.cwd(), s.gitTimeoutSeconds * 1000).catch((err: unknown) => stop(err instanceof HandoffGitError ? `Can't hand over from here: ${GIT_FAILED[err.kind]}.` : String(err)));
   const id = newHandoffId();
@@ -87,7 +99,8 @@ async function prepareCommand(argv: string[]): Promise<string> {
 async function handOverCommand(argv: string[]): Promise<string> {
   const id = flag(argv, "--id") || stop("Missing --id: run prepare first.");
   if (!/^[a-z0-9][a-z0-9-]{0,63}$/.test(id)) stop(`"${id}" isn't a handoff id.`);
-  const to = flag(argv, "--to") || stop("Missing --to <their name>.");
+  const to = nameOf(argv);
+  const pushAnyway = argv.includes("--push-anyway");
   const file = flag(argv, "--brief") || stop("Missing --brief <file>.");
   const written = (await fs.readFile(file, "utf8").catch(() => stop(`There is no brief at ${file}: write it there first.`))).trim();
   if (!written) stop(`The brief at ${file} is empty.`);
@@ -95,19 +108,29 @@ async function handOverCommand(argv: string[]): Promise<string> {
   const s = await settings();
   const timeoutMs = s.gitTimeoutSeconds * 1000;
   const { from, files } = await prepare(run, cwd, timeoutMs).catch((err: unknown) => stop(err instanceof HandoffGitError ? `Can't hand over from here: ${GIT_FAILED[err.kind]}.` : String(err)));
-  const brief = `${written}\n\n${handoffNote({ branch: handoffBranch(id), from, files })}`;
+  const brief = `${written}\n\n${handoffNote({ branch: handoffBranch(id), from, files, at: new Date() })}`;
   const patterns = await loadPatterns(path.join(modDir, "secret-patterns.json"), path.join(isoplanDir, "secret-patterns.json"), () => {});
   const matched = scan(brief, patterns);
   if (matched) stop(`The brief wasn't sent: it matches the secret pattern "${matched}". Take that out of ${file} and run hand-over again.`);
-  const repo = await pushHandoff(run, cwd, id, timeoutMs).catch((err: unknown) => stop(err instanceof HandoffGitError ? `The handoff wasn't sent: ${GIT_FAILED[err.kind]}.\n${err.detail}` : String(err)));
 
   const link = await openSideLink(await server(), await hello(cwd), ANSWER_MS);
   try {
+    // The server says whether it would take this hand-over before anything is pushed.
+    link.send({ type: "hand-over-check", v: PROTOCOL_VERSION, to, handoff: id });
+    const ready = await link.next((m): m is HandOverReadyMessage => m.type === "hand-over-ready" && m.handoff === id, ANSWER_MS);
+    if (ready.type === "error") stop(`Nothing was pushed. ${said(ready)}`);
+    const pushed = await pushHandoff(run, cwd, id, timeoutMs, { scan: async (text) => scan(text, patterns), pushAnyway }).catch((err: unknown) =>
+      stop(err instanceof HandoffGitError ? `The handoff wasn't sent: ${GIT_FAILED[err.kind]}.\n${err.detail}` : String(err)),
+    );
+    if ("held" in pushed) {
+      stop(`Nothing was pushed: the lines the handoff's commit adds to ${pushed.held} match a secret pattern. Take the secret out of that file, or, if it isn't one, run hand-over again with --push-anyway.`);
+    }
+    const { repo } = pushed as { repo: HandoffRepo };
     link.send({ type: "hand-over", v: PROTOCOL_VERSION, to, handoff: { id, brief, repos: [repo] } });
     const answer = await link.next((m): m is HandedOverMessage => m.type === "handed-over" && m.handoff === id, ANSWER_MS);
     if (answer.type === "error") stop(`${said(answer)}\nThe branch ${repo.branch} is pushed; run hand-over again with the same id once that is fixed.`);
     const name = (answer as HandedOverMessage).to.name || (answer as HandedOverMessage).to.id;
-    return `Handed over to ${name}, on ${repo.branch}. They will see a Take handoff button in the room on the floor, with /isoplan:take and a code beside it.`;
+    return `Handed over to ${name}, on ${repo.branch}. They will see a Take handoff button in the room on the floor.`;
   } finally {
     await link.close();
   }
@@ -115,21 +138,28 @@ async function handOverCommand(argv: string[]): Promise<string> {
 
 async function takeCommand(argv: string[]): Promise<string> {
   const code = (argv[0] ?? "").trim();
-  if (!code) stop("Give the take code from the floor: /isoplan:take <code>.");
+  if (!CODE.test(code)) stop("That isn't a take code: it is the eight letters and digits the floor shows, like ABCD-EFGH.");
   const cwd = process.cwd();
   const s = await settings();
+  const timeoutMs = s.gitTimeoutSeconds * 1000;
+  const patterns = await loadPatterns(path.join(modDir, "secret-patterns.json"), path.join(isoplanDir, "secret-patterns.json"), () => {});
   const link = await openSideLink(await server(), await hello(cwd), ANSWER_MS);
   try {
     link.send({ type: "take", v: PROTOCOL_VERSION, code });
     const answer = await link.next((m): m is HandoffMessage => m.type === "handoff", ANSWER_MS);
     if (answer.type === "error") stop(said(answer));
     const { handoff } = answer as HandoffMessage;
-    const failures = await checkoutHere(run, cwd, handoff, s.gitTimeoutSeconds * 1000);
-    link.send({ type: "taken", v: PROTOCOL_VERSION, handoff: handoff.id, failures });
+    const { failures, remote } = await checkoutHere(run, cwd, handoff, timeoutMs);
+    // Git's output leaves this machine only after the scan.
+    const sent = failures.map((f) => (scan(f.output, patterns) ? { ...f, output: "The end of its output is withheld here: it matches a secret pattern." } : f));
+    link.send({ type: "taken", v: PROTOCOL_VERSION, handoff: handoff.id, failures: sent });
     const checkout = failures.length
       ? `The checkout of ${handoffBranch(handoff.id)} failed, so this folder is as it was:\n${failures[0]!.output}`
       : `This folder is now on ${handoffBranch(handoff.id)}.`;
-    return [`You have taken Isoplan handoff ${handoff.id}, and this session is in its room now.`, checkout, "", "The brief:", "", handoff.brief].join("\n");
+    // No setup runs on this path; the agent is told when the repo has one, in case it matters here.
+    const setup = remote ? await setupCommand(run, { dir: cwd, remote }, process.platform, timeoutMs) : null;
+    const setupNote = setup ? [`The repo's worktree setup script has NOT been run here: \`${setup}\` (from isoplan.json). Run it only if this folder isn't set up yet.`] : [];
+    return [`You have taken Isoplan handoff ${handoff.id}, and this session is in its room now.`, checkout, ...setupNote, "", "The brief:", "", handoff.brief].join("\n");
   } finally {
     await link.close();
   }

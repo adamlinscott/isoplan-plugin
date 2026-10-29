@@ -33,7 +33,7 @@ export async function openSideLink(url: string, hello: HelloMessage, timeoutMs: 
     wake();
   };
   await new Promise<void>((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error(`couldn't reach the office server at ${url}`)), timeoutMs);
+    const timer = setTimeout(() => (ws.close(), reject(new Error(`couldn't reach the office server at ${url}`))), timeoutMs);
     ws.onopen = () => (clearTimeout(timer), resolve());
     ws.onerror = () => (clearTimeout(timer), reject(new Error(`couldn't reach the office server at ${url}`)));
   });
@@ -50,16 +50,18 @@ export async function openSideLink(url: string, hello: HelloMessage, timeoutMs: 
         const left = end - Date.now();
         if (left <= 0) throw new Error("the office server didn't answer in time");
         await new Promise<void>((resolve) => {
-          wake = resolve;
-          setTimeout(resolve, left);
+          const timer = setTimeout(resolve, left);
+          wake = () => (clearTimeout(timer), resolve());
         });
       }
     },
     async close() {
       if (closed) return;
+      let timer: ReturnType<typeof setTimeout> | undefined;
       const gone = new Promise<void>((resolve) => (ws.onclose = () => resolve()));
       ws.close();
-      await Promise.race([gone, new Promise((r) => setTimeout(r, 2000))]);
+      await Promise.race([gone, new Promise((r) => (timer = setTimeout(r, 2000)))]);
+      clearTimeout(timer);
     },
   };
 }
