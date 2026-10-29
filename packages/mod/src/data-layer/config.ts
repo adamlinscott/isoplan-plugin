@@ -27,11 +27,16 @@ export interface ConfigIo {
 }
 
 export async function loadConfig(io: ConfigIo, defaultsPath: string, userPath: string): Promise<Config> {
+  return loadSettings<Config>(io, defaultsPath, userPath);
+}
+
+/** The same per-key override for any settings file of the mod's, such as the runner's runner.json. */
+export async function loadSettings<T>(io: ConfigIo, defaultsPath: string, userPath: string): Promise<T> {
   const defaults = await readJson(io, defaultsPath);
   const user = await readJson(io, userPath, true);
   const config: Record<string, unknown> = {};
   for (const [key, fallback] of Object.entries(defaults)) config[key] = fits(key, user[key], fallback) ? user[key] : fallback;
-  return config as unknown as Config;
+  return config as unknown as T;
 }
 
 // Keys used as a byte count or a file offset, which must be whole numbers.

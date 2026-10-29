@@ -10,14 +10,36 @@
 // A server that answers `not-wanted` holds this project in no office: the link calls `onNotWanted`
 // and waits, asking again once an hour rather than backing off fast. Only the plugin's data layer
 // sees that hour out; a detached one exits on `onNotWanted` (main.ts).
+//
+// The runner (src/runner) uses the same link with its own hello and no facts. The server's
+// requests, releases and handoffs go to `onMessage`, and the runner's replies and refusals go out
+// through `send`. One sent while the link is down waits, and goes out after the next hello, within
+// OUTBOX_MAX and OUTBOX_MAX_AGE_MS.
 
-import { parseOfficeServerMessage, PROTOCOL_VERSION, type DataLayerMessage, type Facts, type HelloMessage } from "@isoplan/protocol";
+import {
+  parseOfficeServerMessage,
+  PROTOCOL_VERSION,
+  type DataLayerMessage,
+  type Facts,
+  type HandoffMessage,
+  type HelloMessage,
+  type RefusalMessage,
+  type ReleaseMessage,
+  type ReplyMessage,
+  type RequestMessage,
+  type RunnerHelloMessage,
+} from "@isoplan/protocol";
 import type { DataLayerLine } from "../lines.js";
 import { diffFacts } from "./changes.js";
 
+// Replies kept while the link is down: at most this many, the oldest dropped first, and none older
+// than this, which the server will have asked again for by then.
+const OUTBOX_MAX = 100;
+const OUTBOX_MAX_AGE_MS = 3600000;
+
 export interface LinkOptions {
   url: string;
-  hello: HelloMessage;
+  hello: HelloMessage | RunnerHelloMessage;
   emit: (line: DataLayerLine) => void;
   /** The least time between two messages of facts; a repair's full doesn't wait. */
   minIntervalMs?: number;
@@ -27,12 +49,19 @@ export interface LinkOptions {
   /** How long a link the server didn't want waits before asking again. */
   notWantedRetryMs?: number;
   onNotWanted?: () => void;
+  /** Takes the server's requests, releases and handoffs; without it they are logged as not handled. */
+  onMessage?: (message: ServerAsk) => void;
   random?: () => number;
 }
+
+/** What the server asks of a machine, rather than of a session's facts. */
+export type ServerAsk = RequestMessage | ReleaseMessage | HandoffMessage;
 
 export interface Link {
   /** The session's facts now; what differs from what the server has goes out when the pace allows. */
   update(facts: Facts): void;
+  /** A reply or refusal. One sent while the link is down goes out after the next hello. */
+  send(message: ReplyMessage | RefusalMessage): void;
   close(): void;
 }
 
@@ -45,8 +74,10 @@ export function createLink({
   retryCapMs = 30000,
   notWantedRetryMs = 3600000,
   onNotWanted,
+  onMessage,
   random = Math.random,
 }: LinkOptions): Link {
+  const outbox: { message: ReplyMessage | RefusalMessage; at: number }[] = [];
   let latest: Facts | null = null;
   let socket: WebSocket | null = null;
   let isOpen = false;
@@ -70,6 +101,7 @@ export function createLink({
       isOpen = true;
       seq = 0;
       send(hello);
+      for (const { message, at } of outbox.splice(0)) if (Date.now() - at < OUTBOX_MAX_AGE_MS) send(message);
       sendFull();
       emit({ type: "status", server: url, state: "connected" });
     };
@@ -167,6 +199,8 @@ export function createLink({
         isUnwanted = true;
         onNotWanted?.();
       }
+    } else if (onMessage && (message.type === "request" || message.type === "release" || message.type === "handoff")) {
+      onMessage(message);
     } else {
       emit({ type: "log", text: `the office server sent a ${message.type} message, which this data layer doesn't handle yet` });
     }
@@ -179,6 +213,13 @@ export function createLink({
       latest = facts;
       if (isOpen && !sent) sendFull();
       else if (!pacing) flush();
+    },
+    send(message) {
+      if (isOpen && socket!.readyState === WebSocket.OPEN) send(message);
+      else {
+        outbox.push({ message, at: Date.now() });
+        if (outbox.length > OUTBOX_MAX) outbox.shift();
+      }
     },
     close() {
       isClosed = true;

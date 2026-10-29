@@ -130,6 +130,23 @@ export function createClaudeCode(io: SourceIo) {
     }
   }
 
+  // What the runner needs of a session's lead before it forks it. The transcript is found by name
+  // in every project folder, since the runner doesn't know the session's folder.
+  async function lead(sessionId: string, now: number, config: Pick<Config, "tailBytes" | "stalledMinutes">): Promise<LeadState | null> {
+    const path = await locate(sessionId, "", now);
+    const st = path && (await io.stat(path));
+    if (!path || !st) return null;
+    const t = await readTranscript(path, st.size, config.tailBytes);
+    if (!t.cwd) return null;
+    return {
+      cwd: t.cwd,
+      working: t.turnOpen && now - st.mtimeMs <= config.stalledMinutes * 60000,
+      compacted: t.compacted,
+      context: t.usage?.context ?? 0,
+      lastActive: st.mtimeMs,
+    };
+  }
+
   // The session's transcript goes straight to <projects>/<cwd as a folder name>/<id>.jsonl. Claude
   // Code may name the folder otherwise (a session moved, a long path shortened), so a miss looks
   // for <id>.jsonl in each project folder, by name: no transcript is opened to find it. Before
@@ -374,7 +391,21 @@ export function createClaudeCode(io: SourceIo) {
     return rest;
   }
 
-  return { id: SOURCE, read };
+  return { id: SOURCE, read, lead };
+}
+
+/** A session's lead as the runner sees it before forking it. */
+export interface LeadState {
+  /** The folder its newest line ran in. */
+  cwd: string;
+  /** Its turn is open now: a fork would miss what it is doing. */
+  working: boolean;
+  /** It was compacted at least once, so earlier work survives only as a summary. */
+  compacted: boolean;
+  /** Its newest reply's prompt in tokens (input and both cache counts); 0 before any reply. */
+  context: number;
+  /** When its transcript was last written, in ms since the epoch. */
+  lastActive: number;
 }
 
 // The transcript's types: what the source reads off a file, before it becomes facts.
@@ -463,6 +494,7 @@ interface TranscriptState {
   prompts: number; // user lines that opened a turn, tool results and interruptions aside
   tools: number; // tool_use blocks
   firstPrompt: string | null; // the first prompt's opening, for leftOut only: it is never sent
+  compacted: boolean; // the session was compacted at least once
 }
 
 const agentId = (id: string) => `${SOURCE}:${id}`;
@@ -526,6 +558,7 @@ function newTranscriptState(): TranscriptState {
     prompts: 0,
     tools: 0,
     firstPrompt: null,
+    compacted: false,
   };
 }
 
@@ -559,6 +592,7 @@ function foldLine(st: TranscriptState, line: string): void {
   if (typeof ev.gitBranch === "string" && ev.gitBranch) st.branch = ev.gitBranch;
   if (ev.type === "ai-title" && typeof ev.aiTitle === "string" && ev.aiTitle) st.title = ev.aiTitle;
   if (ev.type === "queue-operation" && typeof ev.content === "string") readNotifications(st, ev.content, at);
+  if (isCompaction(ev)) st.compacted = true;
 
   const content = ev.message && ev.message.content;
   if (ev.type === "assistant" && Array.isArray(content)) {
@@ -656,16 +690,21 @@ function readUsage(st: TranscriptState, message: Line, at: number): void {
 }
 
 // A line from before the tail, read for its usage alone: a line that doesn't name usage isn't parsed.
+// A compaction there is read too, so a long session compacted early still counts as compacted.
 function foldUsage(st: TranscriptState, line: string): void {
-  if (!line.includes('"usage"')) return;
+  if (!line.includes('"usage"') && !line.includes("compact")) return;
   let ev: Line;
   try {
     ev = JSON.parse(line);
   } catch {
     return;
   }
+  if (isCompaction(ev)) st.compacted = true;
   if (ev && ev.type === "assistant" && ev.message && typeof ev.message === "object") readUsage(st, ev.message, Date.parse(ev.timestamp));
 }
+
+// Claude Code marks a compaction with a compact_boundary system line, then the summary as a user line.
+const isCompaction = (ev: Line): boolean => !!ev && typeof ev === "object" && ((ev.type === "system" && ev.subtype === "compact_boundary") || ev.isCompactSummary === true);
 
 // An agent's usage: null until a reply with usage has been read.
 function usageOf(st: TranscriptState, fallbackMs: number): AgentFact["usage"] {

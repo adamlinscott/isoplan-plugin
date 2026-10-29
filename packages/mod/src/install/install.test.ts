@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { expect, test } from "vitest";
 import { tempRoot } from "../data-layer/fixture.js";
-import { installWake, uninstallWake, wakeCommand, wakeScriptPath } from "./install.js";
+import { copiedAs, installWake, RUNNER_FILES, runnerAppDir, uninstallWake, wakeCommand, wakeScriptPath } from "./install.js";
 
 const other = { matcher: "Bash", hooks: [{ type: "command", command: "echo other" }] };
 
@@ -99,4 +99,44 @@ test("uninstall: removes only the wake hooks and wake.mjs, and marks wake.json s
   expect(s.read().hooks.UserPromptSubmit).toBeUndefined();
   await s.install();
   expect(s.read().hooks.UserPromptSubmit).toEqual([{ hooks: [s.wake] }]);
+});
+
+test("install: copies the runner and its defaults out of the plugin's folder, and records the copy", async () => {
+  const s = setup();
+  // A stand-in plugin folder holding the runner's files.
+  const plugin = path.join(s.root, "plugin-1.0.0");
+  for (const file of RUNNER_FILES) {
+    fs.mkdirSync(path.dirname(path.join(plugin, file)), { recursive: true });
+    fs.writeFileSync(path.join(plugin, file), `// ${file} v1`);
+  }
+  const install = () => installWake(s.paths, path.join(s.dist, "data-layer.js"), path.join(s.dist, "wake.js"), { runnerFrom: plugin });
+  const app = runnerAppDir(s.claudeDir);
+  const runner = path.join(app, "dist", "runner.mjs");
+  const changes = await install();
+  expect(changes).toContain(`copied the runner to ${app}`);
+  expect(changes).toContain(`recorded the data layer at ${path.join(s.dist, "data-layer.js")} and the runner at ${runner}`);
+  for (const file of RUNNER_FILES) expect(fs.readFileSync(path.join(app, copiedAs(file)), "utf8")).toBe(`// ${file} v1`);
+  expect(JSON.parse(fs.readFileSync(path.join(s.claudeDir, "isoplan", "wake.json"), "utf8"))).toEqual({ dataLayer: path.join(s.dist, "data-layer.js"), runner });
+  expect(await install()).toEqual([]);
+  // The plugin folder is replaced by an update; the copy is too, and the old folder can go.
+  fs.writeFileSync(path.join(plugin, "dist", "runner.js"), "// v2");
+  expect(await install()).toEqual([`copied the runner to ${app}`]);
+  expect(fs.readFileSync(runner, "utf8")).toBe("// v2");
+});
+
+test("install: records the claude binary it finds, and keeps one set by hand", async () => {
+  const s = setup();
+  const claude = path.join(s.root, "bin", "claude.exe");
+  const install = (found: string | null) => installWake(s.paths, path.join(s.dist, "data-layer.js"), path.join(s.dist, "wake.js"), { findClaude: async () => found });
+  const record = path.join(s.claudeDir, "isoplan", "claude-binary.json");
+  expect(await install(claude)).toContain(`recorded the claude binary at ${claude}`);
+  expect(JSON.parse(fs.readFileSync(record, "utf8"))).toEqual({ path: claude, auto: true });
+  // Found again unchanged, nothing is written; not found, the old record stays.
+  expect(await install(claude)).toEqual([]);
+  expect(await install(null)).toEqual([]);
+  // Found somewhere new, an install's own record moves; one set by hand stays.
+  expect(await install("/elsewhere/claude")).toEqual(["recorded the claude binary at /elsewhere/claude"]);
+  fs.writeFileSync(record, JSON.stringify({ path: "D:/tools/claude.exe" }));
+  expect(await install(claude)).toEqual([]);
+  expect(JSON.parse(fs.readFileSync(record, "utf8"))).toEqual({ path: "D:/tools/claude.exe" });
 });

@@ -1,6 +1,7 @@
 // The wake hook: a Claude Code command hook on UserPromptSubmit and Stop, once per turn, from the
 // user's settings.json (src/install). It starts a detached data layer for a session that has no
-// data layer reporting it, so every session is seen without the plugin loaded in it.
+// data layer reporting it, so every session is seen without the plugin loaded in it, and starts
+// the machine's runner (src/runner) when none is running.
 //
 //   node <claude dir>/isoplan/wake.mjs     (the hook's JSON on stdin)
 //
@@ -16,6 +17,7 @@
 import { spawn } from "node:child_process";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { startRunner } from "../runner/start.js";
 import { wake } from "./wake.js";
 
 const STDIN_MS = 500;
@@ -34,12 +36,13 @@ function readStdin(): Promise<string> {
   });
 }
 
+const claudeDir = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
+const start = (args: string[], cwd: string, env?: Record<string, string>) => spawn(process.execPath, args, { cwd, env, detached: true, stdio: "ignore", windowsHide: true }).on("error", () => {}).unref();
 try {
-  await wake(await readStdin(), {
-    claudeDir: path.dirname(path.dirname(fileURLToPath(import.meta.url))),
-    spawn: (args, cwd) => spawn(process.execPath, args, { cwd, detached: true, stdio: "ignore", windowsHide: true }).on("error", () => {}).unref(),
-  });
+  await wake(await readStdin(), { claudeDir, spawn: start });
 } catch {
   // Nothing to do: a session is never failed for this.
 }
+// The machine's runner, which answers for its rooms, is started again if it isn't running.
+await startRunner({ claudeDir, spawn: start }).catch(() => {});
 process.exit(0);

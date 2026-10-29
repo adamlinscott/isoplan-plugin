@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { expect, test } from "vitest";
+import { createClaudeCode } from "./claude-code.js";
 import { normalize, pathKey } from "./git.js";
 import { nodeIo } from "./io.js";
 import { NOW, tempRoot, gitRepo, gitWorktree, line, session, agent, sourceIn, factsOf, byId, cc, touch, at } from "./fixture.js";
@@ -667,4 +668,26 @@ test("cache pruning: a subagent transcript a pass didn't use is forgotten, and r
   expect((await read("s")).facts!.agents).toHaveLength(2);
   // Kept in the cache, the unchanged file would not have been read again.
   expect(reads).toEqual([0, 0]);
+});
+
+test("lead: the runner finds a session by name and reads its folder, open turn, compaction and context", async () => {
+  const { home, main } = office();
+  const u = (read: number) => ({ input_tokens: 1, cache_read_input_tokens: read, cache_creation_input_tokens: 0, output_tokens: 5 });
+  const p = session(home, "s", [line.user(main, "go", 60), line.reply(main, "m1", u(1000), 50)], { slug: "somewhere" });
+  const source = createClaudeCode({ ...nodeIo({ run: null }), claudeDir: path.join(home, ".claude") });
+  const config = { tailBytes: 1048576, stalledMinutes: 5 };
+  expect(await source.lead("s", NOW, config)).toEqual({ cwd: main, working: false, compacted: false, context: 1001, lastActive: NOW - 10000 });
+  expect(await source.lead("missing", NOW, config)).toBe(null);
+
+  // A new prompt opens its turn; a compaction stays seen.
+  fs.appendFileSync(p, [{ type: "system", subtype: "compact_boundary", content: "Conversation compacted", timestamp: at(8) }, line.user(main, "summary", 8, { isCompactSummary: true }), line.user(main, "next", 5)].map((l) => JSON.stringify(l)).join("\n") + "\n");
+  touch(p, 5);
+  expect(await source.lead("s", NOW, config)).toMatchObject({ working: true, compacted: true });
+  // An open turn quiet past stalledMinutes isn't mid-turn.
+  expect(await source.lead("s", NOW + 6 * 60000, config)).toMatchObject({ working: false });
+
+  // A compaction before a tail read is still seen.
+  const long = session(home, "long", [{ type: "system", subtype: "compact_boundary", timestamp: at(100) }, ...Array.from({ length: 50 }, (_, i) => line.text(main, "x".repeat(100), 90 - i))]);
+  expect(fs.statSync(long).size).toBeGreaterThan(2000);
+  expect(await source.lead("long", NOW, { ...config, tailBytes: 1000 })).toMatchObject({ compacted: true });
 });

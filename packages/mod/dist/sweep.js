@@ -5,6 +5,10 @@ import { fileURLToPath } from "node:url";
 import fs from "node:fs/promises";
 //#region src/data-layer/config.ts
 async function loadConfig(io, defaultsPath, userPath) {
+	return loadSettings(io, defaultsPath, userPath);
+}
+/** The same per-key override for any settings file of the mod's, such as the runner's runner.json. */
+async function loadSettings(io, defaultsPath, userPath) {
 	const defaults = await readJson(io, defaultsPath);
 	const user = await readJson(io, userPath, true);
 	const config = {};

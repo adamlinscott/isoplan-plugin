@@ -4,21 +4,49 @@ import { fileURLToPath } from "node:url";
 import fs from "node:fs/promises";
 //#region src/wake/lock.ts
 const lockPath = (claudeDir, sessionId) => path.join(claudeDir, "isoplan", "live", `${sessionId}.json`);
-async function readLock(file) {
+async function readText(file) {
 	try {
-		const { pid, until } = JSON.parse(await fs.readFile(file, "utf8"));
+		const [text, st] = await Promise.all([fs.readFile(file, "utf8"), fs.stat(file)]);
 		return {
-			pid: Number.isSafeInteger(pid) && pid > 0 ? pid : null,
-			until: typeof until === "number" ? until : null
+			text,
+			mtimeMs: st.mtimeMs
 		};
 	} catch {
 		return null;
 	}
 }
-/** Whether the session is held: by a live pid, or by a hold-off that hasn't ended. */
-async function isHeld(file, now = Date.now(), isAlive = alive) {
-	const lock = await readLock(file);
-	return !!lock && (lock.until !== null && lock.until > now || lock.pid !== null && isAlive(lock.pid));
+function parseLock(text, mtimeMs) {
+	try {
+		const { pid, until, ...extra } = JSON.parse(text);
+		return {
+			pid: Number.isSafeInteger(pid) && pid > 0 ? pid : null,
+			until: typeof until === "number" ? until : null,
+			mtimeMs,
+			extra
+		};
+	} catch {
+		return null;
+	}
+}
+async function readLock(file) {
+	const r = await readText(file);
+	return r && parseLock(r.text, r.mtimeMs);
+}
+/** The pid the lock names, or null when there is none or it can't be read. */
+async function lockHolder(file) {
+	return (await readLock(file))?.pid ?? null;
+}
+const held = (lock, now, { isAlive = alive, freshMs }) => !!lock && (lock.until !== null && lock.until > now || lock.pid !== null && isAlive(lock.pid) && (freshMs === void 0 || now - lock.mtimeMs < freshMs));
+/** Whether the lock is held: by a live pid (kept fresh, under `freshMs`), or by a hold-off that hasn't ended. */
+async function isHeld(file, now = Date.now(), isAlive = alive, rule = {}) {
+	return held(await readLock(file), now, {
+		...rule,
+		isAlive
+	});
+}
+/** Removes the lock if it still names `pid`. */
+async function releaseLock(file, pid) {
+	if (await lockHolder(file) === pid) await fs.rm(file, { force: true });
 }
 function alive(pid) {
 	try {
@@ -52,6 +80,99 @@ async function wake(input, { claudeDir, spawn, isAlive = alive }) {
 	return true;
 }
 //#endregion
+//#region src/runner/environment.ts
+const runnerEnvPath = (claudeDir) => path.join(claudeDir, "isoplan", "runner", "environment.json");
+/** The recorded environment, or null when there is none, or it doesn't parse, so the starter's is used. */
+async function recordedEnv(claudeDir) {
+	try {
+		const { env } = JSON.parse(await fs.readFile(runnerEnvPath(claudeDir), "utf8"));
+		if (!env || typeof env !== "object" || Array.isArray(env)) return null;
+		return Object.fromEntries(Object.entries(env).filter((e) => typeof e[1] === "string"));
+	} catch {
+		return null;
+	}
+}
+//#endregion
+//#region src/runner/start.ts
+/** The runner's lock: `{ pid, code }` of the supervisor that holds it. */
+const runnerLockPath = (claudeDir) => path.join(claudeDir, "isoplan", "runner", "lock.json");
+/** What names a runner.js's code: its size and write time. Null when it is gone. */
+async function runnerCode(file) {
+	const st = await fs.stat(file).catch(() => null);
+	return st && st.isFile() ? `${st.size}-${Math.round(st.mtimeMs)}` : null;
+}
+/** The live runner's lock: a hold-off that hasn't ended, or a live pid that keeps it fresh. */
+async function liveRunner(claudeDir, now, isAlive) {
+	const lock = await readLock(runnerLockPath(claudeDir));
+	if (!lock) return null;
+	if (lock.until !== null && lock.until > now) return {
+		...lock,
+		isHoldOff: true
+	};
+	if (lock.pid !== null && isAlive(lock.pid) && now - lock.mtimeMs < 9e4) return {
+		...lock,
+		isHoldOff: false
+	};
+	return null;
+}
+/**
+* Starts the recorded runner unless a live one runs the recorded code. One on older code is
+* replaced. A hold-off keeps it from starting, except a crash loop's hold-off on older code: a new
+* version may have fixed what crashed.
+*/
+async function startRunner({ claudeDir, spawn, isAlive = alive, kill = (pid) => process.kill(pid), now = Date.now }) {
+	let runner;
+	try {
+		runner = JSON.parse(await fs.readFile(wakeRecordPath(claudeDir), "utf8")).runner;
+	} catch {
+		return "not-installed";
+	}
+	if (typeof runner !== "string") return "not-installed";
+	const code = await runnerCode(runner);
+	if (!code) return "not-installed";
+	const lockFile = runnerLockPath(claudeDir);
+	const live = await liveRunner(claudeDir, now(), isAlive);
+	if (live?.isHoldOff) {
+		if (live.extra.reason !== "gave-up" || live.extra.code === code) return "held-off";
+		if ((await readLock(lockFile))?.until === live.until) await fs.rm(lockFile, { force: true });
+	} else if (live) {
+		if (live.extra.code === code) return "running";
+		await stopRunner(claudeDir, {
+			isAlive,
+			kill,
+			now,
+			expect: {
+				pid: live.pid,
+				code: live.extra.code
+			}
+		});
+	}
+	const env = await recordedEnv(claudeDir);
+	spawn([
+		runner,
+		"--claude-dir",
+		claudeDir,
+		...env ? [] : ["--inherited-env"]
+	], claudeDir, env ?? void 0);
+	return "started";
+}
+/**
+* Ends the running runner, for uninstall and updates: its worker and forks follow once its
+* supervisor has gone. True when one was running. A stale lock's pid is never killed. With
+* `expect`, only the runner judged outdated is: if the lock names another pid or code by now
+* (another starter replaced it already), it is left.
+*/
+async function stopRunner(claudeDir, { isAlive = alive, kill = (pid) => process.kill(pid), now = Date.now, expect } = {}) {
+	const live = await liveRunner(claudeDir, now(), isAlive);
+	if (!live || live.isHoldOff || live.pid === null) return false;
+	if (expect && (live.pid !== expect.pid || live.extra.code !== expect.code)) return false;
+	try {
+		kill(live.pid);
+	} catch {}
+	await releaseLock(runnerLockPath(claudeDir), live.pid);
+	return true;
+}
+//#endregion
 //#region src/wake/main.ts
 const STDIN_MS = 500;
 process.on("uncaughtException", () => process.exit(0));
@@ -66,17 +187,24 @@ function readStdin() {
 		process.stdin.setEncoding("utf8").on("data", (piece) => text += piece).on("end", done).on("error", done);
 	});
 }
+const claudeDir = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
+const start = (args, cwd, env) => spawn(process.execPath, args, {
+	cwd,
+	env,
+	detached: true,
+	stdio: "ignore",
+	windowsHide: true
+}).on("error", () => {}).unref();
 try {
 	await wake(await readStdin(), {
-		claudeDir: path.dirname(path.dirname(fileURLToPath(import.meta.url))),
-		spawn: (args, cwd) => spawn(process.execPath, args, {
-			cwd,
-			detached: true,
-			stdio: "ignore",
-			windowsHide: true
-		}).on("error", () => {}).unref()
+		claudeDir,
+		spawn: start
 	});
 } catch {}
+await startRunner({
+	claudeDir,
+	spawn: start
+}).catch(() => {});
 process.exit(0);
 //#endregion
 export {};
