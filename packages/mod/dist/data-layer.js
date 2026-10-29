@@ -3,6 +3,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { createHash, randomUUID } from "node:crypto";
 //#region ../../node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/core/util.js
 function getEnumValues(entries) {
 	const numericValues = Object.values(entries).filter((v) => typeof v === "number");
@@ -5718,10 +5719,16 @@ const WaitFactSchema = object({
 	since: Time,
 	extra: Extra
 });
+/**
+* An agent's final report. One the secret scan matched, and its owner hasn't released, is
+* `withheld`: its `text` then only says so, and the report follows once the owner releases it by
+* `withheld.id`, a random id for this one text. A newer report of the same agent gets a new id.
+*/
 const ReportFactSchema = object({
 	agent: string().min(1),
 	at: Time,
 	text: string(),
+	withheld: object({ id: string().min(1) }).optional(),
 	extra: Extra
 });
 /**
@@ -6351,6 +6358,55 @@ async function writeWhole(file, text) {
 		await fs.rm(temp, { force: true }).catch(() => {});
 		throw err;
 	}
+}
+//#endregion
+//#region src/runner/scan.ts
+/** What `scan` names as the match when the patterns couldn't be read. */
+const UNREADABLE = "unreadable patterns: everything is held";
+/** The patterns in `file`: [] when the owner's is missing, and null, logged, when it can't be used. */
+async function readPatterns(file, optional, log) {
+	const unusable = (why) => {
+		if (!optional) throw new Error(`${file}: ${why}`);
+		log(`${file} can't be used, so every answer, brief and report is held: ${why}`);
+		return null;
+	};
+	let value;
+	try {
+		value = JSON.parse(await fs.readFile(file, "utf8"));
+	} catch (err) {
+		if (optional && err.code === "ENOENT") return [];
+		if (!optional) throw err;
+		return unusable(err.message);
+	}
+	const list = value?.patterns;
+	if (!Array.isArray(list)) return unusable("it has no \"patterns\" list");
+	const out = [];
+	for (const p of list) {
+		const name = typeof p?.name === "string" && p.name ? p.name : String(p?.regex);
+		try {
+			if (typeof p?.regex !== "string" || !p.regex) throw new Error("no regex");
+			const flags = typeof p.flags === "string" ? p.flags : "";
+			if (!/^[imsu]*$/.test(flags)) throw new Error(`flags "${flags}" aren't any of i, m, s and u`);
+			out.push({
+				name,
+				regex: new RegExp(p.regex, flags)
+			});
+		} catch (err) {
+			return unusable(`the secret pattern "${name}" doesn't compile: ${err.message}`);
+		}
+	}
+	return out;
+}
+/** The mod's patterns and the owner's, or null when the owner's can't be used. */
+async function loadPatterns(modFile, ownerFile, log) {
+	const mod = await readPatterns(modFile, false, log);
+	const owner = await readPatterns(ownerFile, true, log);
+	return owner && [...mod, ...owner];
+}
+/** The name of the first pattern `text` matches, or null when it matches none; UNREADABLE when `patterns` is null. */
+function scan(text, patterns) {
+	if (!patterns) return UNREADABLE;
+	return patterns.find((p) => p.regex.test(text))?.name ?? null;
 }
 //#endregion
 //#region src/runner/environment.ts
@@ -8091,6 +8147,72 @@ function createLink({ url, hello, emit, minIntervalMs = 1e3, retryBaseMs = 1e3, 
 	};
 }
 //#endregion
+//#region src/data-layer/reports.ts
+/** What a withheld report says in place of its text. */
+const WITHHELD_TEXT = "Held for its owner to check: the secret check found what may be a secret in this report.";
+const hash = (agent, text) => createHash("sha256").update(`${agent}
+${text}`).digest("hex");
+async function openReportHold(file, log) {
+	const released = new Set(await readReleased(file));
+	let held = /* @__PURE__ */ new Map();
+	let ids = /* @__PURE__ */ new Map();
+	const told = /* @__PURE__ */ new Set();
+	return {
+		apply(facts, patterns) {
+			held = /* @__PURE__ */ new Map();
+			const kept = /* @__PURE__ */ new Map();
+			const reports = facts.reports.map((report) => {
+				const h = hash(report.agent, report.text);
+				if (released.has(h)) return report;
+				const matched = patterns ? scan(report.text, patterns) : null;
+				if (patterns && !matched) return report;
+				const id = ids.get(h) ?? kept.get(h) ?? randomUUID();
+				kept.set(h, id);
+				held.set(id, {
+					agent: report.agent,
+					hash: h
+				});
+				if (!told.has(h)) {
+					told.add(h);
+					log(`withheld the report of ${report.agent}: ${matched ? `it matches the secret pattern "${matched}"` : "the secret patterns couldn't be read"}; its owner can release it from the floor`);
+				}
+				return {
+					agent: report.agent,
+					at: report.at,
+					text: WITHHELD_TEXT,
+					withheld: { id }
+				};
+			});
+			ids = kept;
+			return held.size ? {
+				...facts,
+				reports
+			} : facts;
+		},
+		async release(id) {
+			const report = held.get(id);
+			if (!report) {
+				log(`the office server released the report held as ${id}, but none is held under that id here; it may have been replaced by a newer report, or the data layer restarted`);
+				return false;
+			}
+			const { agent } = report;
+			held.delete(id);
+			released.add(report.hash);
+			log(`the report of ${agent} was released, so it is sent`);
+			await fs.mkdir(path.dirname(file), { recursive: true }).then(() => fs.writeFile(file, JSON.stringify({ released: [...released] }) + "\n")).catch((err) => log(`couldn't save the release of ${agent}'s report, so it is withheld again after a restart: ${err.message}`));
+			return true;
+		}
+	};
+}
+async function readReleased(file) {
+	try {
+		const list = JSON.parse(await fs.readFile(file, "utf8")).released;
+		return Array.isArray(list) ? list.filter((h) => typeof h === "string") : [];
+	} catch {
+		return [];
+	}
+}
+//#endregion
 //#region src/data-layer/titles.ts
 const ASK_EVERY_MS = 6e5;
 const MAX_FILES = 15;
@@ -8171,6 +8293,8 @@ async function main(argv) {
 	const userConfigPath = path.join(claudeDir, "isoplan", "config.json");
 	const titlesDir = path.join(claudeDir, "isoplan", "titles");
 	const titleFile = path.join(titlesDir, `${sessionId}.json`);
+	const modPatterns = path.join(here, "..", "secret-patterns.json");
+	const ownerPatterns = path.join(claudeDir, "isoplan", "secret-patterns.json");
 	const machine = os.hostname();
 	const io = nodeIo();
 	const git = createGit(io);
@@ -8265,6 +8389,19 @@ async function main(argv) {
 	let isUnwanted = false;
 	let isPlaceless = false;
 	let passes = 0;
+	const hold = await openReportHold(path.join(claudeDir, "isoplan", "released", `${sessionId}.json`), (text) => emit({
+		type: "log",
+		text
+	}));
+	let shown = null;
+	const said = /* @__PURE__ */ new Set();
+	const patternLog = (text) => {
+		if (!said.has(text)) emit({
+			type: "log",
+			text
+		});
+		said.add(text);
+	};
 	do {
 		const now = Date.now();
 		const isFirstPass = passes++ === 0;
@@ -8351,6 +8488,15 @@ async function main(argv) {
 				url: server,
 				emit,
 				onNotWanted: () => isUnwanted = detached,
+				onMessage: (message) => {
+					if (message.type !== "release") return emit({
+						type: "log",
+						text: `the office server sent a ${message.type} message, which this data layer doesn't handle yet`
+					});
+					hold.release(message.id).then((released) => {
+						if (released && shown) link?.update(hold.apply(...shown));
+					});
+				},
 				hello: {
 					type: "hello",
 					v: 1,
@@ -8365,7 +8511,12 @@ async function main(argv) {
 				}
 			});
 		}
-		link.update(facts);
+		const patterns = await loadPatterns(modPatterns, ownerPatterns, patternLog).catch((err) => {
+			patternLog(`couldn't read the secret patterns, so every report is withheld: ${String(err?.message ?? err)}`);
+			return null;
+		});
+		shown = [facts, patterns];
+		link.update(hold.apply(facts, patterns));
 		const why = detached ? detachedStop({
 			now,
 			lastActive: facts.session.lastActive,

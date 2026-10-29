@@ -9,7 +9,8 @@
 // parent process has gone. When it starts it also installs the wake hook (src/install), so
 // sessions without the plugin are seen too, and the first time, reports the machine's other recent
 // sessions at once (src/wake/backfill.ts), and starts the machine's runner (src/runner) if none is
-// running.
+// running. Each agent's report is secret-checked before it is sent, and one that matches is held
+// until its owner releases it (src/data-layer/reports.ts).
 //
 //   node dist/data-layer.js --session <session id> --cwd <the session's folder> --detached
 //
@@ -36,6 +37,7 @@ import { PROTOCOL_VERSION, type Facts } from "@isoplan/protocol";
 import { installWake } from "../install/install.js";
 import type { DataLayerLine, TitleReply } from "../lines.js";
 import { findClaude } from "../runner/claude-binary.js";
+import { loadPatterns } from "../runner/scan.js";
 import { startRunner } from "../runner/start.js";
 import { recentSessions } from "../sweep/find.js";
 import { backfill } from "../wake/backfill.js";
@@ -47,6 +49,7 @@ import { createGit } from "./git.js";
 import { accountOf, claudePaths, projectOf } from "./identity.js";
 import { nodeIo } from "./io.js";
 import { createLink, type Link } from "./link.js";
+import { openReportHold } from "./reports.js";
 import { cleanTitle, nextTitle, TITLE_SYSTEM, type TitleCache } from "./titles.js";
 
 // A detached data layer's log starts over once it is this big.
@@ -75,6 +78,8 @@ async function main(argv: string[]): Promise<number> {
   // The person's own folder, not the machine's shared temp folder.
   const titlesDir = path.join(claudeDir, "isoplan", "titles");
   const titleFile = path.join(titlesDir, `${sessionId}.json`);
+  const modPatterns = path.join(here, "..", "secret-patterns.json");
+  const ownerPatterns = path.join(claudeDir, "isoplan", "secret-patterns.json");
   const machine = os.hostname();
 
   const io = nodeIo();
@@ -151,6 +156,13 @@ async function main(argv: string[]): Promise<number> {
   let isUnwanted = false; // detached, and the server said this project isn't wanted
   let isPlaceless = false; // detached, and git couldn't place the session's folder
   let passes = 0;
+  const hold = await openReportHold(path.join(claudeDir, "isoplan", "released", `${sessionId}.json`), (text) => emit({ type: "log", text }));
+  let shown: Parameters<typeof hold.apply> | null = null; // the last facts and patterns the hold was applied to
+  const said = new Set<string>(); // the pattern files' problems, logged once each, since they are read every pass
+  const patternLog = (text: string) => {
+    if (!said.has(text)) emit({ type: "log", text });
+    said.add(text);
+  };
 
   do {
     const now = Date.now();
@@ -205,6 +217,13 @@ async function main(argv: string[]): Promise<number> {
         url: server,
         emit,
         onNotWanted: () => (isUnwanted = detached),
+        // The owner released a withheld report: it goes to the link now, not on the next pass.
+        onMessage: (message) => {
+          if (message.type !== "release") return emit({ type: "log", text: `the office server sent a ${message.type} message, which this data layer doesn't handle yet` });
+          void hold.release(message.id).then((released) => {
+            if (released && shown) link?.update(hold.apply(...shown));
+          });
+        },
         hello: {
           type: "hello",
           v: PROTOCOL_VERSION,
@@ -216,7 +235,12 @@ async function main(argv: string[]): Promise<number> {
         },
       });
     }
-    link.update(facts);
+    const patterns = await loadPatterns(modPatterns, ownerPatterns, patternLog).catch((err: unknown) => {
+      patternLog(`couldn't read the secret patterns, so every report is withheld: ${String((err as Error)?.message ?? err)}`);
+      return null;
+    });
+    shown = [facts, patterns];
+    link.update(hold.apply(facts, patterns));
     const why = detached ? detachedStop({ now, lastActive: facts.session.lastActive, idleMinutes: config.idleMinutes, downSince }) : null;
     if (why) {
       emit({ type: "log", text: `stopping: ${why}` });

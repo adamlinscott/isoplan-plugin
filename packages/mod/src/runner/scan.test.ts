@@ -3,7 +3,7 @@ import { expect, test } from "vitest";
 import { modDir } from "../data-layer/fixture.js";
 import { loadPatterns, scan } from "./scan.js";
 
-const patterns = await loadPatterns(path.join(modDir, "secret-patterns.json"), path.join(modDir, "missing.json"), () => {});
+const patterns = (await loadPatterns(path.join(modDir, "secret-patterns.json"), path.join(modDir, "missing.json"), () => {}))!;
 
 // Each shipped pattern: text it must withhold, and ordinary text near it that it must not.
 const cases: Record<string, { hits: string[]; misses: string[] }> = {
