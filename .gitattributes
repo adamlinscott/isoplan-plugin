@@ -1,3 +1,6 @@
 # The mod's committed bundle is built with LF on every OS; keep checkouts the same, so a rebuilt
 # bundle compares like with like against the committed one.
 packages/mod/dist/** text eol=lf
+
+# The runner sends the prompts byte for byte, so the lead's cached context is reused: LF on every checkout.
+packages/mod/prompts/*.md text eol=lf
