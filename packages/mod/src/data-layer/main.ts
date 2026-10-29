@@ -34,7 +34,8 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { PROTOCOL_VERSION, type Facts } from "@isoplan/protocol";
-import { installWake, pluginsDir } from "../install/install.js";
+import { installWake } from "../install/install.js";
+import { managedDir, pluginState, pluginsDir, type Place } from "../install/state.js";
 import type { DataLayerLine, TitleReply } from "../lines.js";
 import { findClaude } from "../runner/claude-binary.js";
 import { loadPatterns } from "../runner/scan.js";
@@ -110,6 +111,17 @@ async function main(argv: string[]): Promise<number> {
     return Promise.race([timeUp, closed.then(() => false)]).finally(() => clearTimeout(timer));
   };
 
+  // Claude Code runs nothing of a plugin's when it is uninstalled or disabled, so this looks itself
+  // (src/install/state.ts), before it takes the session's lock and on every pass: a data layer whose
+  // plugin is uninstalled or disabled for this session reports nothing and exits.
+  const place: Place = { claudeDir, plugins: pluginsDir(claudeDir, process.env), managed: managedDir(process.platform) };
+  const self = path.join(here, "data-layer.js");
+  const isOff = async () => (await pluginState(place, self, cwd).catch(() => "enabled")) !== "enabled";
+  if (await isOff()) {
+    emit({ type: "log", text: "Claude Code lists the Isoplan plugin as uninstalled or disabled here, so this session isn't reported" });
+    return 0;
+  }
+
   try {
     if (!(await takeLock(lock, process.pid, alive, !detached))) {
       process.stderr.write(`another data layer already reports session ${sessionId}\n`);
@@ -120,7 +132,7 @@ async function main(argv: string[]): Promise<number> {
     emit({ type: "log", text: `couldn't take the session lock, so going on without it: ${String((err as Error)?.message ?? err)}` });
   }
 
-  const paths = { claudeDir, settings: path.join(claudeDir, "settings.json"), plugins: pluginsDir(claudeDir, process.env) };
+  const paths = { ...place, settings: path.join(claudeDir, "settings.json") };
   const start = (args: string[], dir: string, env?: Record<string, string>) => spawn(process.execPath, args, { cwd: dir, env, detached: true, stdio: "ignore", windowsHide: true }).on("error", () => {}).unref();
   const installing = detached
     ? Promise.resolve([])
@@ -133,7 +145,8 @@ async function main(argv: string[]): Promise<number> {
         (err: unknown) => (emit({ type: "log", text: `couldn't install the wake hook: ${String((err as Error)?.message ?? err)}` }), []),
       );
   // The machine's runner answers for its rooms; it is started here as well as by the wake hook.
-  if (!detached) void installing.then(() => startRunner({ claudeDir, spawn: start })).catch(() => {});
+  // Not while the plugin is disabled for the machine, though this session's project enables it.
+  if (!detached) void installing.then(async () => (await pluginState(place, self)) === "enabled" && startRunner({ claudeDir, spawn: start })).catch(() => {});
 
   let config: Config = await loadConfig(io, defaultsPath, userConfigPath);
   // A hook just installed sees other sessions only on their next turn: they are reported now.
@@ -246,7 +259,7 @@ async function main(argv: string[]): Promise<number> {
       emit({ type: "log", text: `stopping: ${why}` });
       break;
     }
-  } while ((await wait(config.streamSeconds * 1000)) && !isUnwanted && (!detached || (await lockHolder(lock)) === process.pid));
+  } while ((await wait(config.streamSeconds * 1000)) && !isUnwanted && (!detached || (await lockHolder(lock)) === process.pid) && !(await isOff()));
 
   link?.close();
   if (isUnwanted || isPlaceless) await holdOff(lock, process.pid, Date.now() + HOLD_OFF_MS).catch(() => {});

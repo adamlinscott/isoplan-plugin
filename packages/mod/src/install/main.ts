@@ -1,10 +1,10 @@
 // The install script: puts the wake hook in Claude Code's user settings without a session, as the
 // plugin's data layer does when it starts, or takes out everything install and the plugin put in
-// place (install.ts). An uninstall while Claude Code still lists the plugin as installed leaves
-// wake.json marking the hook as uninstalled, so the plugin's data layer doesn't put it back.
-// Installing also backfills: every session written inside the window is reported now rather than
-// on its next turn, so running it again fills the office back in. It also records the `claude` binary and starts the machine's
-// runner (src/runner), which answers for its rooms, with an environment recorded from this shell.
+// place (install.ts), leaving wake.json marking the hook as uninstalled, so the plugin's data layer
+// doesn't put it back. Installing also backfills: every session written inside the window is
+// reported now rather than on its next turn, so running it again fills the office back in. It also
+// records the `claude` binary and starts the machine's runner (src/runner), which answers for its
+// rooms, with an environment recorded from this shell.
 //
 //   node dist/install.js [--uninstall]
 //
@@ -23,23 +23,22 @@ import { recordEnv, runnerEnvPath } from "../runner/environment.js";
 import { startRunner } from "../runner/start.js";
 import { recentSessions } from "../sweep/find.js";
 import { backfill } from "../wake/backfill.js";
-import { installedPlugins, installWake, pluginsDir, uninstall as uninstallAll } from "./install.js";
+import { installWake, processCommand, settleMs, uninstall as uninstallAll } from "./install.js";
+import { managedDir, pluginsDir } from "./state.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const claudeDir = claudePaths(process.env, os.homedir()).dir;
-const paths = { claudeDir, settings: path.join(claudeDir, "settings.json"), plugins: pluginsDir(claudeDir, process.env) };
-// Long enough for a detached data layer to see its lock has gone, at the default streamSeconds.
-const SETTLE_MS = 3000;
+const paths = { claudeDir, settings: path.join(claudeDir, "settings.json"), plugins: pluginsDir(claudeDir, process.env), managed: managedDir(process.platform) };
+// How long uninstall waits for the runner to exit before it removes its files.
+const RUNNER_EXIT_MS = 10000;
 const uninstall = process.argv.includes("--uninstall");
 
 const start = (args: string[], cwd: string, env?: Record<string, string>) => spawn(process.execPath, args, { cwd, env, detached: true, stdio: "ignore", windowsHide: true }).on("error", () => {}).unref();
 
 try {
-  // The opt-out is kept while Claude Code lists a plugin named isoplan, from any marketplace, or
-  // while its records can't be read.
-  const isListed = async () => (await installedPlugins(paths.plugins))?.some((id) => id.startsWith("isoplan@")) ?? true;
+  const settle = () => settleMs(claudeDir, path.join(here, "..", "config.json"));
   const changes = uninstall
-    ? await uninstallAll(paths, { optOut: await isListed(), settleMs: SETTLE_MS })
+    ? (await uninstallAll(paths, { optOut: true, settleMs: await settle(), runner: { commandOf: processCommand, waitMs: RUNNER_EXIT_MS } })).changes
     : await installWake(paths, path.join(here, "data-layer.js"), path.join(here, "wake.js"), {
         runnerFrom: path.join(here, ".."),
         findClaude: () => findClaude(process.env, process.platform, os.homedir()),
