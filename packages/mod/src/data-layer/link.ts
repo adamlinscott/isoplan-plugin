@@ -15,8 +15,12 @@
 // a token from `pairing`, and sends it in the hello. A hello refused as `not-paired`,
 // `pairing-ended` or `token-expired` is told to `pairing`, which pairs or renews, and the link tries
 // again: after retryBaseMs the first time, then backing off, doubling up to retryCapMs, until a
-// link stays up STABLE_MS. While a link to pair waits to be clicked the link shows `pairing` and
-// looks again every `pairPollMs`.
+// link stays up STABLE_MS. A token that ran out on a link that stayed up (the server closes it then)
+// is renewed and the link opened again at once, with no `disconnected` in between. While a link to
+// pair waits to be clicked the link shows `pairing` and looks again every `pairPollMs`.
+//
+// `forged-hello` means the session belongs to someone else on the office: the link shows `taken`
+// and stops, asking again only after `takenRetryMs`, in case an admin has released it.
 //
 // The runner (src/runner) uses the same link with its own hello and no facts. The server's
 // requests, releases and handoffs go to `onMessage`, and the runner's replies and refusals go out
@@ -61,6 +65,8 @@ export interface LinkOptions {
   retryCapMs?: number;
   /** How long a link the server didn't want waits before asking again. */
   notWantedRetryMs?: number;
+  /** How long a link refused as forged-hello waits before asking again. */
+  takenRetryMs?: number;
   onNotWanted?: () => void;
   /** The server said this machine's pairing has ended, once `pairing` has dropped the credential. */
   onPairingEnded?: () => void;
@@ -95,6 +101,7 @@ export function createLink({
   retryBaseMs = 1000,
   retryCapMs = 30000,
   notWantedRetryMs = 3600000,
+  takenRetryMs = 3600000,
   onNotWanted,
   onPairingEnded,
   onMessage,
@@ -117,6 +124,8 @@ export function createLink({
   let sentToken: string | undefined; // the token this connection's hello carried
   let refusing: Promise<void> = Promise.resolve(); // telling `pairing` of a refused hello
   let isRefused = false; // the server refused this connection's hello for its token
+  let refusedFor: string | null = null; // why
+  let isTaken = false; // the server said the session belongs to someone else
   let refusals = 0; // hellos refused for their token, in a row
   let stable: ReturnType<typeof setTimeout> | null = null; // counts refusals from zero once the link has stayed up
 
@@ -184,9 +193,21 @@ export function createLink({
     if (stable) clearTimeout(stable);
     stable = null;
     if (isClosed) return;
+    if (isTaken) {
+      isTaken = false;
+      emit({ type: "status", server: url, state: "taken" });
+      retry = setTimeout(connect, takenRetryMs);
+      return;
+    }
     // Refusals back off on their own count: the socket opened each time, which resets `failures`.
     if (isRefused) {
       isRefused = false;
+      // A token that ran out on a link that had stayed up is renewed at once, unseen.
+      if (refusedFor === "token-expired" && refusals === 0) {
+        refusals++;
+        retry = setTimeout(connect, 0);
+        return;
+      }
       const delay = Math.min(retryCapMs, retryBaseMs * 2 ** refusals++);
       emit({ type: "status", server: url, state: "disconnected", retryInMs: delay });
       retry = setTimeout(connect, delay);
@@ -256,10 +277,14 @@ export function createLink({
       emit({ type: "log", text: `the office server sent a note for ${message.agent}, not an agent of this session` });
     } else if (pairing && message.type === "error" && (message.code === "not-paired" || message.code === "pairing-ended" || message.code === "token-expired")) {
       isRefused = true;
+      refusedFor = message.code;
       refusing = pairing.refused(message.code, sentToken).catch(() => {});
       if (message.code === "pairing-ended" && onPairingEnded) void refusing.then(onPairingEnded);
       // The server's own words on how to pair are passed on; a renewal is the link's own business.
       emit(message.code === "token-expired" ? { type: "log", text: "the office server says this machine's token has expired; renewing it" } : message);
+    } else if (message.type === "error" && message.code === "forged-hello") {
+      isTaken = true;
+      emit(message);
     } else if (message.type === "conflict" || message.type === "error") {
       emit(message);
       if (message.type === "error" && message.code === "not-wanted") {

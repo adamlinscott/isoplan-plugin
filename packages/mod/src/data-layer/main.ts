@@ -52,7 +52,7 @@ import { createGit } from "./git.js";
 import { accountOf, claudePaths, projectOf } from "./identity.js";
 import { nodeIo } from "./io.js";
 import { createLink, type Link } from "./link.js";
-import { createPairing, pairingLockPath, pairingPath } from "./pairing.js";
+import { createPairing, pairingLockPath, pairingPath, pairingWriteLockPath } from "./pairing.js";
 import { openReportHold } from "./reports.js";
 import { cleanTitle, nextTitle, TITLE_SYSTEM, type TitleCache } from "./titles.js";
 
@@ -166,6 +166,14 @@ async function main(argv: string[]): Promise<number> {
     .catch((err: unknown) => emit({ type: "log", text: `couldn't report the other sessions: ${String((err as Error)?.message ?? err)}` }));
   // The address is read once: a link that moved servers mid-session would leave a room behind.
   const server = config.server;
+  // Plain ws:// to another machine would send facts and the machine's credential unencrypted.
+  if (config.plainRefused) {
+    emit({ type: "status", server: config.plainRefused, state: "insecure" });
+    emit({ type: "log", text: `not reporting: ${config.plainRefused} is plain ws:// to another machine; use wss://, or set "allowPlainWs": true in config.json` });
+    if (!detached) await closed;
+    await logging;
+    return 0;
+  }
   emit({ type: "status", server, state: "waiting" });
 
   let link: Link | null = null;
@@ -239,7 +247,16 @@ async function main(argv: string[]): Promise<number> {
       link = createLink({
         url: server,
         emit,
-        pairing: createPairing({ file: pairingPath(claudeDir), lock: pairingLockPath(claudeDir), server, account: machineAccount, machine, emit }),
+        pairing: createPairing({
+          file: pairingPath(claudeDir),
+          lock: pairingLockPath(claudeDir),
+          writeLock: pairingWriteLockPath(claudeDir),
+          server,
+          account: machineAccount,
+          machine,
+          emit,
+          allowPlainWs: config.allowPlainWs,
+        }),
         onNotWanted: () => (isUnwanted = detached),
         // The owner released a withheld report: it goes to the link now, not on the next pass.
         onMessage: (message) => {

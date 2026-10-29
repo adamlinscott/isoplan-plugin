@@ -38,7 +38,7 @@ import { loadConfig, loadSettings } from "../data-layer/config.js";
 import { accountOf, claudePaths } from "../data-layer/identity.js";
 import { nodeIo } from "../data-layer/io.js";
 import { createLink } from "../data-layer/link.js";
-import { createPairing, pairingLockPath, pairingPath } from "../data-layer/pairing.js";
+import { createPairing, pairingLockPath, pairingPath, pairingWriteLockPath } from "../data-layer/pairing.js";
 import { HOLD_OFF_MS, alive, holdOff, lockPath, readLock, refreshLock, releaseLock, takeLock } from "../wake/lock.js";
 import { openLedger } from "./caps.js";
 import { createClaudeAnswerer, forkableId } from "./claude.js";
@@ -128,6 +128,11 @@ async function worker(): Promise<number> {
   const config = () => loadConfig(io, path.join(appDir, "config.json"), path.join(isoplanDir, "config.json"));
   const settings = () => loadSettings<RunnerSettings & TakeSettings & { claudeModel: string }>(io, path.join(appDir, "runner.json"), path.join(isoplanDir, "runner.json"));
   const first = await config();
+  // Plain ws:// to another machine would send the machine's credential unencrypted.
+  if (first.plainRefused) {
+    log(`the runner isn't starting: ${first.plainRefused} is plain ws:// to another machine; use wss://, or set "allowPlainWs": true in config.json`);
+    return 0;
+  }
   await settings(); // a broken runner.json of the plugin's is a crash to see at once
 
   const answerer = createClaudeAnswerer({
@@ -204,7 +209,16 @@ async function worker(): Promise<number> {
   const link = createLink({
     url: first.server,
     emit,
-    pairing: createPairing({ file: pairingPath(claudeDir), lock: pairingLockPath(claudeDir), server: first.server, account, machine: os.hostname(), emit }),
+    pairing: createPairing({
+      file: pairingPath(claudeDir),
+      lock: pairingLockPath(claudeDir),
+      writeLock: pairingWriteLockPath(claudeDir),
+      server: first.server,
+      account,
+      machine: os.hostname(),
+      emit,
+      allowPlainWs: first.allowPlainWs,
+    }),
     onMessage: (message) => runner.take(message),
     onNotWanted: () => {
       notWanted = true;

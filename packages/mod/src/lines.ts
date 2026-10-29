@@ -7,12 +7,14 @@ import type { ConflictMessage, ErrorMessage } from "@isoplan/protocol";
 /**
  * The link to the office server. `waiting`: nothing to report yet, so not connected.
  * `not-wanted`: the server holds this project in no office, so it isn't reported. `pairing`: the
- * machine's link to pair it (the last `pair` line) waits to be clicked.
+ * machine's link to pair it (the last `pair` line) waits to be clicked. `taken`: the session belongs to
+ * someone else on the office, so it isn't reported. `insecure`: the server is plain ws:// to another
+ * machine, so nothing is sent to it.
  */
 export interface StatusLine {
   type: "status";
   server: string;
-  state: "waiting" | "connecting" | "connected" | "disconnected" | "not-wanted" | "pairing";
+  state: "waiting" | "connecting" | "connected" | "disconnected" | "not-wanted" | "pairing" | "taken" | "insecure";
   /** With `disconnected`: when the next try is. */
   retryInMs?: number;
 }

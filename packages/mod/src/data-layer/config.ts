@@ -5,8 +5,12 @@
 import type { MaybePromise, Stat } from "./git.js";
 
 export interface Config {
-  /** The office server's data-layer address: wss://, or ws:// to this machine. */
+  /** The office server's data-layer address: wss://, or ws:// to this machine, or anywhere with allowPlainWs. */
   server: string;
+  /** Lets `server` be plain ws:// to another machine, which sends facts and credentials unencrypted. */
+  allowPlainWs: boolean;
+  /** A `server` set to plain ws:// to another machine without allowPlainWs: not used, and said why. */
+  plainRefused?: string;
   activeMinutes: number;
   idleMinutes: number;
   lightsOffHours: number;
@@ -27,7 +31,13 @@ export interface ConfigIo {
 }
 
 export async function loadConfig(io: ConfigIo, defaultsPath: string, userPath: string): Promise<Config> {
-  return loadSettings<Config>(io, defaultsPath, userPath);
+  const config = await loadSettings<Config>(io, defaultsPath, userPath);
+  const asked = (await readJson(io, userPath, true)).server;
+  if (typeof asked === "string" && URL.canParse(asked) && new URL(asked).protocol === "ws:" && !LOOPBACK.has(new URL(asked).hostname)) {
+    if (config.allowPlainWs) config.server = asked;
+    else config.plainRefused = asked;
+  }
+  return config;
 }
 
 /** The same per-key override for any settings file of the mod's, such as the runner's runner.json. */

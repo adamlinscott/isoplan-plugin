@@ -6135,7 +6135,13 @@ function splitRemote(remote) {
 //#endregion
 //#region src/data-layer/config.ts
 async function loadConfig(io, defaultsPath, userPath) {
-	return loadSettings(io, defaultsPath, userPath);
+	const config = await loadSettings(io, defaultsPath, userPath);
+	const asked = (await readJson$1(io, userPath, true)).server;
+	if (typeof asked === "string" && URL.canParse(asked) && new URL(asked).protocol === "ws:" && !LOOPBACK$1.has(new URL(asked).hostname)) {
+		if (config.allowPlainWs) config.server = asked;
+		else config.plainRefused = asked;
+	}
+	return config;
 }
 /** The same per-key override for any settings file of the mod's, such as the runner's runner.json. */
 async function loadSettings(io, defaultsPath, userPath) {
@@ -6158,7 +6164,7 @@ function fits(key, value, fallback) {
 	if (Array.isArray(fallback)) return Array.isArray(value);
 	return value != null && typeof value === typeof fallback;
 }
-const LOOPBACK = /* @__PURE__ */ new Set([
+const LOOPBACK$1 = /* @__PURE__ */ new Set([
 	"127.0.0.1",
 	"[::1]",
 	"localhost"
@@ -6166,7 +6172,7 @@ const LOOPBACK = /* @__PURE__ */ new Set([
 function isWebSocketUrl(value) {
 	if (!URL.canParse(value)) return false;
 	const url = new URL(value);
-	return url.protocol === "wss:" || url.protocol === "ws:" && LOOPBACK.has(url.hostname);
+	return url.protocol === "wss:" || url.protocol === "ws:" && LOOPBACK$1.has(url.hostname);
 }
 async function readJson$1(io, p, optional = false) {
 	if (optional && !await io.stat(p)) return {};
@@ -6361,6 +6367,21 @@ async function takeLock(file, pid, isAlive = alive, force = false, now = Date.no
 	}
 	if (!force) return false;
 	await fs.writeFile(file, body);
+	return true;
+}
+/**
+* Marks the lock `pid` holds as fresh; false when another has taken it. A lock briefly missing (a
+* taker moved it aside to look, and is putting it back) is looked at again once, after `retryMs`.
+*/
+async function refreshLock(file, pid, now = Date.now(), retryMs = 250) {
+	let holder = await lockHolder(file);
+	if (holder === null) {
+		await new Promise((r) => setTimeout(r, retryMs));
+		holder = await lockHolder(file);
+	}
+	if (holder !== pid) return false;
+	const t = new Date(now);
+	await fs.utimes(file, t, t);
 	return true;
 }
 /** Removes the lock if it still names `pid`. */
@@ -8211,7 +8232,7 @@ const same = (a, b) => a !== void 0 && JSON.stringify(a) === JSON.stringify(b);
 const STABLE_MS = 3e4;
 const OUTBOX_MAX = 100;
 const OUTBOX_MAX_AGE_MS = 36e5;
-function createLink({ url, hello, emit, minIntervalMs = 1e3, retryBaseMs = 1e3, retryCapMs = 3e4, notWantedRetryMs = 36e5, onNotWanted, onPairingEnded, onMessage, pairing, pairPollMs = 5e3, random = Math.random }) {
+function createLink({ url, hello, emit, minIntervalMs = 1e3, retryBaseMs = 1e3, retryCapMs = 3e4, notWantedRetryMs = 36e5, takenRetryMs = 36e5, onNotWanted, onPairingEnded, onMessage, pairing, pairPollMs = 5e3, random = Math.random }) {
 	const outbox = [];
 	let latest = null;
 	let socket = null;
@@ -8227,6 +8248,8 @@ function createLink({ url, hello, emit, minIntervalMs = 1e3, retryBaseMs = 1e3, 
 	let sentToken;
 	let refusing = Promise.resolve();
 	let isRefused = false;
+	let refusedFor = null;
+	let isTaken = false;
 	let refusals = 0;
 	let stable = null;
 	function connect() {
@@ -8300,8 +8323,23 @@ function createLink({ url, hello, emit, minIntervalMs = 1e3, retryBaseMs = 1e3, 
 		if (stable) clearTimeout(stable);
 		stable = null;
 		if (isClosed) return;
+		if (isTaken) {
+			isTaken = false;
+			emit({
+				type: "status",
+				server: url,
+				state: "taken"
+			});
+			retry = setTimeout(connect, takenRetryMs);
+			return;
+		}
 		if (isRefused) {
 			isRefused = false;
+			if (refusedFor === "token-expired" && refusals === 0) {
+				refusals++;
+				retry = setTimeout(connect, 0);
+				return;
+			}
 			const delay = Math.min(retryCapMs, retryBaseMs * 2 ** refusals++);
 			emit({
 				type: "status",
@@ -8396,12 +8434,16 @@ function createLink({ url, hello, emit, minIntervalMs = 1e3, retryBaseMs = 1e3, 
 		});
 		else if (pairing && message.type === "error" && (message.code === "not-paired" || message.code === "pairing-ended" || message.code === "token-expired")) {
 			isRefused = true;
+			refusedFor = message.code;
 			refusing = pairing.refused(message.code, sentToken).catch(() => {});
 			if (message.code === "pairing-ended" && onPairingEnded) refusing.then(onPairingEnded);
 			emit(message.code === "token-expired" ? {
 				type: "log",
 				text: "the office server says this machine's token has expired; renewing it"
 			} : message);
+		} else if (message.type === "error" && message.code === "forged-hello") {
+			isTaken = true;
+			emit(message);
 		} else if (message.type === "conflict" || message.type === "error") {
 			emit(message);
 			if (message.type === "error" && message.code === "not-wanted") {
@@ -8445,8 +8487,15 @@ function createLink({ url, hello, emit, minIntervalMs = 1e3, retryBaseMs = 1e3, 
 //#region src/data-layer/pairing.ts
 /** Renewed this long before it runs out. */
 const RENEW_EARLY_MS = 3e5;
+const PAIRING_REFRESH_MS = 2e4;
+/** pairing.write.lock: free once this old, and waited for at most WRITE_WAIT_MS. */
+const WRITE_FRESH_MS = 1e4;
+const WRITE_WAIT_MS = 1e4;
+/** How often the callback tries to write the credential it got before saying it couldn't. */
+const WRITE_TRIES = 4;
 const pairingPath = (claudeDir) => path.join(claudeDir, "isoplan", "pairing.json");
 const pairingLockPath = (claudeDir) => path.join(claudeDir, "isoplan", "pairing.lock");
+const pairingWriteLockPath = (claudeDir) => path.join(claudeDir, "isoplan", "pairing.write.lock");
 const postJson = async (url, body) => {
 	const response = await fetch(url, {
 		method: "POST",
@@ -8468,6 +8517,16 @@ function httpUrl(server, sub) {
 	url.search = "";
 	return url.toString();
 }
+const LOOPBACK = /* @__PURE__ */ new Set([
+	"127.0.0.1",
+	"[::1]",
+	"localhost"
+]);
+/** Whether `server` is plain ws:// to another machine, where a credential would cross the network unencrypted. */
+const isPlainRemote = (server) => {
+	const url = new URL(server);
+	return url.protocol === "ws:" && !LOOPBACK.has(url.hostname);
+};
 async function readPairing(file) {
 	try {
 		const value = JSON.parse(await fs.readFile(file, "utf8"));
@@ -8488,26 +8547,57 @@ async function writePairing(file, value) {
 		throw err;
 	}
 }
+const queues = /* @__PURE__ */ new Map();
+/** Runs `change` on pairing.json under both locks, and writes what it returns (or nothing, for null). */
+async function locked(file, writeLock, pid, isAlive, change) {
+	const run = async () => {
+		const until = Date.now() + WRITE_WAIT_MS;
+		while (!await takeLock(writeLock, pid, isAlive, false, Date.now(), { freshMs: WRITE_FRESH_MS })) {
+			if (Date.now() > until) throw new Error(`couldn't take ${writeLock} in ${WRITE_WAIT_MS / 1e3} s`);
+			await new Promise((r) => setTimeout(r, 25));
+		}
+		try {
+			const { write, result } = change(await readPairing(file));
+			if (write) await writePairing(file, write);
+			return result;
+		} finally {
+			await releaseLock(writeLock, pid).catch(() => {});
+		}
+	};
+	const next = (queues.get(file) ?? Promise.resolve()).then(run, run);
+	queues.set(file, next.catch(() => {}));
+	return next;
+}
+const page = (worked, text) => `<!doctype html><meta charset="utf-8"><title>Isoplan: ${worked ? "paired" : "not paired"}</title><p style="font:16px system-ui;margin:3em auto;max-width:30em">${text}</p>`;
 const HTML = {
 	"content-type": "text/html; charset=utf-8",
 	connection: "close"
 };
-const page = (text) => `<!doctype html><meta charset="utf-8"><title>Isoplan</title><p style="font:16px system-ui;margin:3em auto;max-width:30em">${text}</p>`;
-function createPairing({ file, lock, server, account, machine, emit, post = postJson, now = Date.now, pid = process.pid, isAlive = alive }) {
+function createPairing({ file, lock, writeLock, server, account, machine, emit, allowPlainWs = false, post = postJson, now = Date.now, pid = process.pid, isAlive = alive, retryMs = 200 }) {
 	let asked = false;
 	let shown = null;
 	let unreadable = false;
 	let callback = null;
-	const mine = async () => {
-		const entry = (await readPairing(file)).accounts[account.id];
-		return entry && entry.server === server ? entry : { server };
-	};
-	const update = async (change) => {
-		const all = await readPairing(file);
+	const empty = () => ({ server });
+	const entryOf = (all) => {
 		const kept = all.accounts[account.id];
-		all.accounts[account.id] = change(kept && kept.server === server ? kept : { server });
-		await writePairing(file, all);
+		return kept && kept.server === server ? kept : empty();
 	};
+	const withEntry = (all, entry) => ({
+		...all,
+		accounts: {
+			...all.accounts,
+			[account.id]: entry
+		}
+	});
+	const mine = async () => entryOf(await readPairing(file));
+	const update = (decide) => locked(file, writeLock, pid, isAlive, (all) => {
+		const { entry, result } = decide(entryOf(all));
+		return {
+			write: entry ? withEntry(all, entry) : null,
+			result
+		};
+	});
 	const drop = ({ credential: _, token: __, tokenExpires: ___, ...rest }) => rest;
 	const show = (waiting) => {
 		if (shown === waiting.url) return;
@@ -8519,90 +8609,148 @@ function createPairing({ file, lock, server, account, machine, emit, post = post
 			expires: new Date(waiting.expires).toISOString()
 		});
 	};
-	async function renew(entry) {
-		const answer = await post(httpUrl(server, "/token"), { credential: entry.credential });
+	const plainRefused = () => {
+		if (!allowPlainWs && isPlainRemote(server)) throw new Error(`${server} is plain ws:// to another machine, so this machine's credential isn't sent; use wss://, or set "allowPlainWs": true in config.json`);
+	};
+	async function renew(used) {
+		const answer = await post(httpUrl(server, "/token"), { credential: used });
 		if (answer.status === 200 && typeof answer.body.token === "string") {
 			const token = answer.body.token;
-			const tokenExpires = Date.parse(String(answer.body.expires));
-			await update((e) => ({
-				...e,
-				token,
-				tokenExpires: Number.isFinite(tokenExpires) ? tokenExpires : now()
-			}));
-			return token;
+			const expires = Date.parse(String(answer.body.expires));
+			return update((e) => e.credential === used ? {
+				entry: {
+					...e,
+					token,
+					tokenExpires: Number.isFinite(expires) ? expires : now()
+				},
+				result: token
+			} : {
+				entry: null,
+				result: void 0
+			});
 		}
 		if (answer.status === 401 && answer.body.code === "pairing-ended") {
 			emit({
 				type: "log",
 				text: `the office server says this machine's pairing has ended: ${String(answer.body.error ?? "")}`
 			});
-			await update(drop);
 			asked = true;
-			return;
+			return update((e) => ({
+				entry: e.credential === used ? drop(e) : null,
+				result: void 0
+			}));
 		}
 		throw new Error(`the office server answered ${answer.status} when renewing this machine's token`);
 	}
 	async function stopAnswering() {
 		if (!callback) return;
-		if (callback.timer) clearTimeout(callback.timer);
+		for (const timer of callback.timers) clearTimeout(timer);
 		callback.server.close();
 		callback = null;
-		await update(({ waiting: _, ...rest }) => rest).catch(() => {});
+		await update((e) => ({
+			entry: e.waiting ? (({ waiting: _, ...rest }) => rest)(e) : null,
+			result: void 0
+		})).catch(() => {});
 		await releaseLock(lock, pid).catch(() => {});
+	}
+	async function keep(credential) {
+		for (let i = 0; i < WRITE_TRIES; i++) try {
+			await update((e) => ({
+				entry: (({ waiting: _, ...rest }) => ({
+					...rest,
+					credential
+				}))(e),
+				result: void 0
+			}));
+			return true;
+		} catch (err) {
+			emit({
+				type: "log",
+				text: `couldn't write this machine's credential (try ${i + 1}): ${String(err?.message ?? err)}`
+			});
+			await new Promise((r) => setTimeout(r, retryMs * 2 ** i));
+		}
+		return false;
+	}
+	async function finish(code, verifier, response) {
+		let worked = false;
+		let text = "This machine couldn't be paired: the office server couldn't be reached. Click the link in Claude Code again in a moment.";
+		try {
+			const answer = await post(httpUrl(server, "/pair/token"), {
+				code,
+				verifier
+			});
+			if (answer.status === 200 && typeof answer.body.credential === "string") {
+				worked = await keep(answer.body.credential);
+				text = worked ? "This machine is paired with the office. You can close this tab; Claude Code reports to it within a few seconds." : "The office paired this machine, but its credential couldn't be saved here. Claude Code shows a new link to try again.";
+				emit({
+					type: "log",
+					text: worked ? "this machine is paired with the office server" : "couldn't save this machine's credential; pairing again"
+				});
+			} else {
+				text = "This machine couldn't be paired: the link was used or has expired. Claude Code shows a new one.";
+				emit({
+					type: "log",
+					text: `the office server didn't pair this machine (${answer.status}): ${String(answer.body.error ?? "")}`
+				});
+			}
+		} catch (err) {
+			emit({
+				type: "log",
+				text: `couldn't finish pairing: ${String(err?.message ?? err)}`
+			});
+		}
+		try {
+			response.writeHead(worked ? 200 : 400, HTML).end(page(worked, text));
+		} catch {}
+		await stopAnswering().catch(() => {});
 	}
 	async function startPairing() {
 		const verifier = randomBytes(32).toString("base64url");
 		const challenge = createHash("sha256").update(verifier).digest("base64url");
 		const nonce = randomBytes(16).toString("base64url");
+		let finishing = false;
 		const listener = http.createServer((request, response) => {
 			const url = new URL(request.url ?? "/", "http://127.0.0.1");
 			const code = url.searchParams.get("code");
-			if (request.method !== "GET" || url.pathname !== `/${nonce}` || !code) {
-				response.writeHead(404, HTML).end(page("Not found."));
+			if (request.method !== "GET" || url.pathname !== `/${nonce}` || !code || finishing) {
+				response.writeHead(404, HTML).end(page(false, "Not found."));
 				return;
 			}
-			post(httpUrl(server, "/pair/token"), {
-				code,
-				verifier
-			}).then(async (answer) => {
-				if (answer.status === 200 && typeof answer.body.credential === "string") {
-					const credential = answer.body.credential;
-					await update(({ waiting: _, ...rest }) => ({
-						...rest,
-						credential
-					}));
-					emit({
-						type: "log",
-						text: "this machine is paired with the office server"
-					});
-					response.writeHead(200, HTML).end(page("This machine is paired with the office. You can close this tab; Claude Code reports to it within a few seconds."));
-				} else {
-					emit({
-						type: "log",
-						text: `the office server didn't pair this machine (${answer.status}): ${String(answer.body.error ?? "")}`
-					});
-					response.writeHead(400, HTML).end(page("This machine couldn't be paired: the link was used or has expired. Claude Code shows a new one."));
-				}
-				await stopAnswering();
-			}, (err) => {
-				response.writeHead(502, HTML).end(page("The office server couldn't be reached. Click the link again in a moment."));
-				emit({
-					type: "log",
-					text: `couldn't reach the office server to finish pairing: ${String(err?.message ?? err)}`
-				});
-			});
+			finishing = true;
+			finish(code, verifier, response);
 		});
+		listener.on("error", () => {});
 		await new Promise((resolve, reject) => listener.once("error", reject).listen(0, "127.0.0.1", () => resolve()));
 		listener.unref();
 		const { port } = listener.address();
+		const refresh = setInterval(() => void refreshLock(lock, pid).catch(() => {}), PAIRING_REFRESH_MS);
+		refresh.unref();
 		callback = {
 			server: listener,
-			timer: null
+			timers: [refresh]
 		};
 		try {
+			const machineId = await locked(file, writeLock, pid, isAlive, (all) => {
+				if (all.machine) return {
+					write: null,
+					result: all.machine
+				};
+				const made = randomBytes(16).toString("base64url");
+				return {
+					write: {
+						...all,
+						machine: made
+					},
+					result: made
+				};
+			});
 			const answer = await post(httpUrl(server, "/pair"), {
 				account,
-				machine: { name: machine },
+				machine: {
+					name: machine,
+					id: machineId
+				},
 				callback: `http://127.0.0.1:${port}/${nonce}`,
 				challenge
 			});
@@ -8611,11 +8759,15 @@ function createPairing({ file, lock, server, account, machine, emit, post = post
 				url: answer.body.url,
 				expires: Date.parse(String(answer.body.expires)) || now()
 			};
-			callback.timer = setTimeout(() => void stopAnswering(), Math.max(0, waiting.expires - now()));
-			callback.timer.unref?.();
+			const expiry = setTimeout(() => void stopAnswering(), Math.max(0, waiting.expires - now()));
+			expiry.unref();
+			callback.timers.push(expiry);
 			await update((e) => ({
-				...e,
-				waiting
+				entry: {
+					...e,
+					waiting
+				},
+				result: void 0
 			}));
 			show(waiting);
 		} catch (err) {
@@ -8626,15 +8778,21 @@ function createPairing({ file, lock, server, account, machine, emit, post = post
 	return {
 		async token() {
 			const entry = await mine();
-			if (entry.token && (entry.tokenExpires ?? 0) - RENEW_EARLY_MS > now()) return entry.token;
+			if (entry.token && (entry.tokenExpires ?? 0) - RENEW_EARLY_MS > now()) {
+				plainRefused();
+				return entry.token;
+			}
 			if (entry.credential) {
-				const renewed = await renew(entry);
+				plainRefused();
+				const renewed = await renew(entry.credential);
 				if (renewed) return renewed;
+				const again = await mine();
+				if (again.token && again.token !== entry.token) return again.token;
 			}
 			if (!asked && !entry.waiting) return void 0;
 			if (callback) return null;
-			await fs.mkdir(path.dirname(lock), { recursive: true });
-			if (!await takeLock(lock, pid, isAlive)) {
+			plainRefused();
+			if (!await takeLock(lock, pid, isAlive, false, Date.now(), { freshMs: 6e4 })) {
 				if (entry.waiting && entry.waiting.expires > now()) show(entry.waiting);
 				return null;
 			}
@@ -8643,7 +8801,6 @@ function createPairing({ file, lock, server, account, machine, emit, post = post
 		},
 		async refused(code, sent) {
 			if (code !== "token-expired") asked = true;
-			const entry = await mine();
 			if (code === "not-paired" && sent) {
 				if (!unreadable) emit({
 					type: "log",
@@ -8652,12 +8809,24 @@ function createPairing({ file, lock, server, account, machine, emit, post = post
 				unreadable = true;
 				return;
 			}
-			if (!sent || entry.token !== sent) return;
-			if (code === "token-expired") return update((e) => ({
-				...e,
-				tokenExpires: 0
-			}));
-			if (code === "pairing-ended") await update(drop);
+			if (!sent) return;
+			await update((e) => {
+				if (e.token !== sent) return {
+					entry: null,
+					result: void 0
+				};
+				if (code === "token-expired") return {
+					entry: {
+						...e,
+						tokenExpires: 0
+					},
+					result: void 0
+				};
+				return {
+					entry: code === "pairing-ended" ? drop(e) : null,
+					result: void 0
+				};
+			});
 		},
 		close: stopAnswering
 	};
@@ -8910,6 +9079,20 @@ async function main(argv) {
 		text: `couldn't report the other sessions: ${String(err?.message ?? err)}`
 	}));
 	const server = config.server;
+	if (config.plainRefused) {
+		emit({
+			type: "status",
+			server: config.plainRefused,
+			state: "insecure"
+		});
+		emit({
+			type: "log",
+			text: `not reporting: ${config.plainRefused} is plain ws:// to another machine; use wss://, or set "allowPlainWs": true in config.json`
+		});
+		if (!detached) await closed;
+		await logging;
+		return 0;
+	}
 	emit({
 		type: "status",
 		server,
@@ -9032,10 +9215,12 @@ async function main(argv) {
 				pairing: createPairing({
 					file: pairingPath(claudeDir),
 					lock: pairingLockPath(claudeDir),
+					writeLock: pairingWriteLockPath(claudeDir),
 					server,
 					account: machineAccount,
 					machine,
-					emit
+					emit,
+					allowPlainWs: config.allowPlainWs
 				}),
 				onNotWanted: () => isUnwanted = detached,
 				onMessage: (message) => {

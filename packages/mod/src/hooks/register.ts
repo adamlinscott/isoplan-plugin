@@ -194,6 +194,10 @@ function statusText(line: StatusLine): string {
       return `Isoplan: connected to ${line.server}`;
     case "not-wanted":
       return `Isoplan: this repo isn't in any office on ${line.server}`;
+    case "taken":
+      return "Isoplan: this session belongs to someone else on the office, so it isn't reported";
+    case "insecure":
+      return `Isoplan: not reporting: ${line.server} is plain ws:// to another machine; use wss://, or set "allowPlainWs": true in config.json`;
     case "pairing":
       return pairing ? pairText(pairing) : `Isoplan: waiting for this machine to be paired with ${line.server}`;
     case "disconnected":
