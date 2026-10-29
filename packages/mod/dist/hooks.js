@@ -11,9 +11,11 @@ const notes = /* @__PURE__ */ new Map();
 let asking = false;
 let lastError = null;
 let pairing = null;
+let pairSaid = false;
 function register(on) {
 	on("session.start", async ($, e, next) => {
 		const result = await next(e);
+		pairSaid = false;
 		if (!started) {
 			started = true;
 			run($).catch((err) => $.ui.log("isoplan: the data layer loop failed: " + message(err), { to: "debug" }));
@@ -138,7 +140,8 @@ function handle($, text) {
 			$.ui.log("isoplan: " + line.text, { to: "debug" });
 			break;
 		case "pair":
-			if (pairing?.code !== line.code) $.ui.log(`Isoplan: to report to ${line.server}, pair this machine: open ${line.url} and approve code ${line.code} (it works until ${new Date(line.expires).toLocaleTimeString()}).`);
+			if (!pairSaid) $.ui.log(`Isoplan: to report to ${line.server}, pair this machine: click ${line.url} on this computer and approve it in the office.`);
+			pairSaid = true;
 			pairing = line;
 			$.ui.status(pairText(line));
 			break;
@@ -161,11 +164,11 @@ function statusText(line) {
 			lastError = null;
 			return `Isoplan: connected to ${line.server}`;
 		case "not-wanted": return `Isoplan: this repo isn't in any office on ${line.server}`;
-		case "pairing": return pairing ? pairText(pairing) : `Isoplan: waiting for this machine's pairing with ${line.server} to be approved`;
+		case "pairing": return pairing ? pairText(pairing) : `Isoplan: waiting for this machine to be paired with ${line.server}`;
 		case "disconnected": return `Isoplan: can't reach ${line.server}; retrying in ${Math.max(1, Math.round((line.retryInMs ?? 0) / 1e3))}s`;
 	}
 }
-const pairText = (line) => `Isoplan: pair this machine: open ${line.url} (code ${line.code})`;
+const pairText = (line) => `Isoplan: Pair this machine: ${line.url}`;
 function addNote(line) {
 	const waiting = notes.get(line.agent) ?? [];
 	waiting.push(line.text.length > NOTE_MAX ? line.text.slice(0, 999) + "…" : line.text);

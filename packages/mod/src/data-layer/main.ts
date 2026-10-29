@@ -12,7 +12,7 @@
 // running. Each agent's report is secret-checked before it is sent, and one that matches is held
 // until its owner releases it (src/data-layer/reports.ts). An office server that signs people in
 // wants the machine paired first: the link pairs it, keeping the credential in
-// <claude dir>/isoplan/pairing.json (src/data-layer/pairing.ts).
+// <claude dir>/isoplan/pairing.json, under the machine's Claude account (src/data-layer/pairing.ts).
 //
 //   node dist/data-layer.js --session <session id> --cwd <the session's folder> --detached
 //
@@ -52,7 +52,7 @@ import { createGit } from "./git.js";
 import { accountOf, claudePaths, projectOf } from "./identity.js";
 import { nodeIo } from "./io.js";
 import { createLink, type Link } from "./link.js";
-import { createPairing, pairingPath } from "./pairing.js";
+import { createPairing, pairingLockPath, pairingPath } from "./pairing.js";
 import { openReportHold } from "./reports.js";
 import { cleanTitle, nextTitle, TITLE_SYSTEM, type TitleCache } from "./titles.js";
 
@@ -232,11 +232,14 @@ async function main(argv: string[]): Promise<number> {
 
     if (!link) {
       const where = await resolve(cwd);
-      const account = await accountOf({ readText: (p) => fs.readFile(p, "utf8").catch(() => null), run: io.run }, claudeJson, cwd);
+      const readText = (p: string) => fs.readFile(p, "utf8").catch(() => null);
+      const account = await accountOf({ readText, run: io.run }, claudeJson, cwd);
+      // The pairing is the machine's, whichever folder the session is in.
+      const machineAccount = await accountOf({ readText, run: io.run }, claudeJson, os.homedir());
       link = createLink({
         url: server,
         emit,
-        pairing: createPairing({ file: pairingPath(claudeDir), server, account, machine, emit }),
+        pairing: createPairing({ file: pairingPath(claudeDir), lock: pairingLockPath(claudeDir), server, account: machineAccount, machine, emit }),
         onNotWanted: () => (isUnwanted = detached),
         // The owner released a withheld report: it goes to the link now, not on the next pass.
         onMessage: (message) => {
@@ -277,8 +280,8 @@ async function main(argv: string[]): Promise<number> {
 }
 
 /** A pair line as the log says it. */
-const pairNote = (line: { server: string; code: string; url: string; expires: string }) =>
-  `to report to ${line.server}, pair this machine: open ${line.url} and approve code ${line.code} (it works until ${line.expires})`;
+const pairNote = (line: { server: string; url: string; expires: string }) =>
+  `to report to ${line.server}, pair this machine: click ${line.url} on this computer and approve it in the office (it works until ${line.expires})`;
 
 // Appends to a detached data layer's log, starting it over once it passes LOG_CAP_BYTES.
 async function writeLog(file: string, text: string): Promise<void> {

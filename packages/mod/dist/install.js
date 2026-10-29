@@ -6194,9 +6194,10 @@ const HandoffSchema = object({
 	});
 });
 /**
-* The machine's access token from pairing, which an office server that signs people in requires
-* (it refuses a hello without one as `not-paired`, an expired one as `token-expired`, and one whose
-* account isn't the paired account as `forged-hello`). A server that signs nobody in ignores it.
+* The machine's access token from pairing, which an office server that signs people in requires.
+* It refuses a hello without one as `not-paired`, an expired or unknown one as `token-expired`, one
+* whose pairing was revoked or has lapsed as `pairing-ended`, and one for a session another paired
+* machine reports as `forged-hello`. A server that signs nobody in ignores it.
 */
 const Token = string().min(1).max(200).optional();
 discriminatedUnion("type", [

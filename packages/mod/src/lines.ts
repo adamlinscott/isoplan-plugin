@@ -7,7 +7,7 @@ import type { ConflictMessage, ErrorMessage } from "@isoplan/protocol";
 /**
  * The link to the office server. `waiting`: nothing to report yet, so not connected.
  * `not-wanted`: the server holds this project in no office, so it isn't reported. `pairing`: the
- * machine's code (the last `pair` line) waits for its person to approve it.
+ * machine's link to pair it (the last `pair` line) waits to be clicked.
  */
 export interface StatusLine {
   type: "status";
@@ -32,13 +32,12 @@ export interface TitleAskLine {
 }
 
 /**
- * The office server wants this machine paired (src/data-layer/pairing.ts): its person opens `url`,
- * which is the office's Pair a machine with `code` filled in, and approves it, before `expires`.
+ * The office server wants this machine paired (src/data-layer/pairing.ts): its person clicks `url`
+ * on this computer, before `expires`, and approves it on the floor.
  */
 export interface PairLine {
   type: "pair";
   server: string;
-  code: string;
   url: string;
   expires: string;
 }

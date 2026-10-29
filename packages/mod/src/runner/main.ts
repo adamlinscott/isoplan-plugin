@@ -37,7 +37,7 @@ import { loadConfig, loadSettings } from "../data-layer/config.js";
 import { accountOf, claudePaths } from "../data-layer/identity.js";
 import { nodeIo } from "../data-layer/io.js";
 import { createLink } from "../data-layer/link.js";
-import { createPairing, pairingPath } from "../data-layer/pairing.js";
+import { createPairing, pairingLockPath, pairingPath } from "../data-layer/pairing.js";
 import { HOLD_OFF_MS, alive, holdOff, lockPath, readLock, refreshLock, releaseLock, takeLock } from "../wake/lock.js";
 import { openLedger } from "./caps.js";
 import { createClaudeAnswerer, forkableId } from "./claude.js";
@@ -195,12 +195,12 @@ async function worker(): Promise<number> {
   const emit: Parameters<typeof createLink>[0]["emit"] = (line) => {
     if (line.type === "log") log(line.text);
     else if (line.type === "error") log(`the office server says: ${line.message} (${line.code})`);
-    else if (line.type === "pair") log(`to answer for this machine's rooms through ${line.server}, pair it: open ${line.url} and approve code ${line.code} (it works until ${line.expires})`);
+    else if (line.type === "pair") log(`to answer for this machine's rooms through ${line.server}, pair it: click ${line.url} on this computer and approve it in the office (it works until ${line.expires})`);
   };
   const link = createLink({
     url: first.server,
     emit,
-    pairing: createPairing({ file: pairingPath(claudeDir), server: first.server, account, machine: os.hostname(), emit }),
+    pairing: createPairing({ file: pairingPath(claudeDir), lock: pairingLockPath(claudeDir), server: first.server, account, machine: os.hostname(), emit }),
     onMessage: (message) => runner.take(message),
     onNotWanted: () => {
       notWanted = true;

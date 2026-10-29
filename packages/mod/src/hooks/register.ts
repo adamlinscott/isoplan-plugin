@@ -2,8 +2,8 @@
 // starts the data layer (dist/data-layer.js) for the session and keeps it running, shows the link
 // in one status line, writes the room titles the data layer asks for on the owner's own login,
 // and adds the office server's conflict notes to the agent's next tool result. When the office
-// server wants the machine paired, the code and the link to approve it are in the status line, and
-// once in the transcript, so nobody types a command.
+// server wants the machine paired, a "Pair this machine" link is in the status line while it waits,
+// and in the transcript once per session start, so nobody types a command or is nagged.
 //
 // The data layer talks back as JSON lines on stdout (src/lines.ts). Claude Code closes the child's
 // stdin at launch, so what goes the other way, a title, goes through a file the line names. A data
@@ -31,11 +31,13 @@ let started = false;
 const notes = new Map<string, string[]>();
 let asking = false; // one title call at a time
 let lastError: string | null = null;
-let pairing: PairLine | null = null; // the code waiting to be approved, last shown
+let pairing: PairLine | null = null; // the link waiting to be clicked, last shown
+let pairSaid = false; // a link was put in the transcript since the session started
 
 export function register(on: On): void {
   on("session.start", async ($, e, next) => {
     const result = await next(e);
+    pairSaid = false;
     if (!started) {
       started = true;
       void run($).catch((err) => $.ui.log("isoplan: the data layer loop failed: " + message(err), { to: "debug" }));
@@ -162,10 +164,9 @@ function handle($: Host, text: string): void {
       $.ui.log("isoplan: " + line.text, { to: "debug" });
       break;
     case "pair":
-      // Shown in the transcript once per code; the status line keeps it while it waits.
-      if (pairing?.code !== line.code) {
-        $.ui.log(`Isoplan: to report to ${line.server}, pair this machine: open ${line.url} and approve code ${line.code} (it works until ${new Date(line.expires).toLocaleTimeString()}).`);
-      }
+      // In the transcript once per session start; the status line keeps the newest while it waits.
+      if (!pairSaid) $.ui.log(`Isoplan: to report to ${line.server}, pair this machine: click ${line.url} on this computer and approve it in the office.`);
+      pairSaid = true;
       pairing = line;
       $.ui.status(pairText(line));
       break;
@@ -194,13 +195,13 @@ function statusText(line: StatusLine): string {
     case "not-wanted":
       return `Isoplan: this repo isn't in any office on ${line.server}`;
     case "pairing":
-      return pairing ? pairText(pairing) : `Isoplan: waiting for this machine's pairing with ${line.server} to be approved`;
+      return pairing ? pairText(pairing) : `Isoplan: waiting for this machine to be paired with ${line.server}`;
     case "disconnected":
       return `Isoplan: can't reach ${line.server}; retrying in ${Math.max(1, Math.round((line.retryInMs ?? 0) / 1000))}s`;
   }
 }
 
-const pairText = (line: PairLine) => `Isoplan: pair this machine: open ${line.url} (code ${line.code})`;
+const pairText = (line: PairLine) => `Isoplan: Pair this machine: ${line.url}`;
 
 function addNote(line: ConflictMessage): void {
   const waiting = notes.get(line.agent) ?? [];

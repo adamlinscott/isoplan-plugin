@@ -167,13 +167,19 @@ test("hooks: a title ask is answered by the model and written where the line say
   await vi.waitFor(() => expect(h.written).toEqual([[file, JSON.stringify({ key: "k1", text: "Fixing the wizard" })]]));
 });
 
-test("hooks: a pairing code is in the status line while it waits, and in the transcript once", async () => {
-  const pair: DataLayerLine = { type: "pair", server: "wss://office.team.example/data-layer", code: "ABCD-2345", url: "https://office.team.example/#pair=ABCD-2345", expires: "2026-10-20T09:10:00.000Z" };
-  const pairing: DataLayerLine = { type: "status", server: pair.server, state: "pairing" };
-  const h = await start([pair, pairing, pair, pairing, connected]);
+test("hooks: a pairing link is in the status line while it waits, and in the transcript once per session start", async () => {
+  const pair: DataLayerLine = { type: "pair", server: "wss://office.team.example/data-layer", url: "https://office.team.example/#pair=r1", expires: "2026-10-20T09:10:00.000Z" };
+  const later: DataLayerLine = { ...pair, url: "https://office.team.example/#pair=r2" };
+  const pairing: DataLayerLine = { type: "status", server: "wss://office.team.example/data-layer", state: "pairing" };
+  const h = await start([pair, pairing, later, pairing, connected]);
   await stopped(h);
-  expect(h.status.slice(0, 4)).toEqual(Array(4).fill("Isoplan: pair this machine: open https://office.team.example/#pair=ABCD-2345 (code ABCD-2345)"));
+  expect(h.status.slice(0, 4)).toEqual([
+    "Isoplan: Pair this machine: https://office.team.example/#pair=r1",
+    "Isoplan: Pair this machine: https://office.team.example/#pair=r1",
+    "Isoplan: Pair this machine: https://office.team.example/#pair=r2",
+    "Isoplan: Pair this machine: https://office.team.example/#pair=r2",
+  ]);
   expect(h.status[4]).toBe("Isoplan: connected to ws://127.0.0.1:4747/data-layer");
-  expect(h.logged).toHaveLength(1);
-  expect(h.logged[0]).toMatch(/^Isoplan: to report to wss:\/\/office\.team\.example\/data-layer, pair this machine: open https:\/\/office\.team\.example\/#pair=ABCD-2345 and approve code ABCD-2345/);
+  // A new link ten minutes on goes to the status line, not the transcript again.
+  expect(h.logged).toEqual(["Isoplan: to report to wss://office.team.example/data-layer, pair this machine: click https://office.team.example/#pair=r1 on this computer and approve it in the office."]);
 });
