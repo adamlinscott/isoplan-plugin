@@ -8227,6 +8227,9 @@ function scan(text, patterns) {
 	return patterns.find((p) => p.regex.test(text))?.name ?? null;
 }
 //#endregion
+//#region src/runner/environment.ts
+const runnerEnvPath = (claudeDir) => path.join(claudeDir, "isoplan", "runner", "environment.json");
+//#endregion
 //#region src/runner/start.ts
 /** The runner's lock: `{ pid, code }` of the supervisor that holds it. */
 const runnerLockPath = (claudeDir) => path.join(claudeDir, "isoplan", "runner", "lock.json");
@@ -8278,6 +8281,7 @@ async function supervisor() {
 		extra: { code }
 	}).catch(() => false)) return 0;
 	log(`runner ${process.pid} started`);
+	if (process.argv.includes("--inherited-env")) log(`no environment is recorded in ${runnerEnvPath(claudeDir)}, so the runner runs with its starter's; run the plugin's install script to record one`);
 	const refresh = setInterval(() => {
 		refreshLock(lock, process.pid).then((isHolder) => {
 			if (isHolder) return;

@@ -29,7 +29,7 @@ async function machine({ runner = true } = {}) {
 test("one runner: started when none holds the lock, not while one lives; a dead one's lock is taken over", async () => {
   const m = await machine();
   expect(await m.start()).toBe("started");
-  expect(m.spawned).toEqual([{ args: [m.runnerJs, "--claude-dir", m.claudeDir], cwd: m.claudeDir }]);
+  expect(m.spawned).toEqual([{ args: [m.runnerJs, "--claude-dir", m.claudeDir, "--inherited-env"], cwd: m.claudeDir }]);
   expect(await m.hold(OTHER)).toBe(true);
   expect(await takeLock(m.lock, OTHER + 1, () => true)).toBe(false);
   expect(await m.start(() => true)).toBe("running");

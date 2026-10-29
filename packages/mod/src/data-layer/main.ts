@@ -116,7 +116,7 @@ async function main(argv: string[]): Promise<number> {
   }
 
   const paths = { claudeDir, settings: path.join(claudeDir, "settings.json") };
-  const start = (args: string[], dir: string) => spawn(process.execPath, args, { cwd: dir, detached: true, stdio: "ignore", windowsHide: true }).on("error", () => {}).unref();
+  const start = (args: string[], dir: string, env?: Record<string, string>) => spawn(process.execPath, args, { cwd: dir, env, detached: true, stdio: "ignore", windowsHide: true }).on("error", () => {}).unref();
   const installing = detached
     ? Promise.resolve([])
     : installWake(paths, path.join(here, "data-layer.js"), path.join(here, "wake.js"), {

@@ -37,7 +37,7 @@ function readStdin(): Promise<string> {
 }
 
 const claudeDir = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
-const start = (args: string[], cwd: string) => spawn(process.execPath, args, { cwd, detached: true, stdio: "ignore", windowsHide: true }).on("error", () => {}).unref();
+const start = (args: string[], cwd: string, env?: Record<string, string>) => spawn(process.execPath, args, { cwd, env, detached: true, stdio: "ignore", windowsHide: true }).on("error", () => {}).unref();
 try {
   await wake(await readStdin(), { claudeDir, spawn: start });
 } catch {

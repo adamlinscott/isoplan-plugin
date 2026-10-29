@@ -16,6 +16,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { alive, readLock, releaseLock } from "../wake/lock.js";
 import { wakeRecordPath } from "../wake/wake.js";
+import { recordedEnv } from "./environment.js";
 
 /** The runner's lock: `{ pid, code }` of the supervisor that holds it. */
 export const runnerLockPath = (claudeDir: string) => path.join(claudeDir, "isoplan", "runner", "lock.json");
@@ -40,8 +41,8 @@ async function liveRunner(claudeDir: string, now: number, isAlive: (pid: number)
 
 export interface StartOptions {
   claudeDir: string;
-  /** Starts `node <args>` in `cwd`, detached, and doesn't wait for it. */
-  spawn(args: string[], cwd: string): void;
+  /** Starts `node <args>` in `cwd`, detached, with `env` (else this process's), and doesn't wait for it. */
+  spawn(args: string[], cwd: string, env?: Record<string, string>): void;
   isAlive?: (pid: number) => boolean;
   kill?: (pid: number) => void;
   now?: () => number;
@@ -78,8 +79,11 @@ export async function startRunner({ claudeDir, spawn, isAlive = alive, kill = (p
     if (live.extra.code === code) return "running";
     await stopRunner(claudeDir, { isAlive, kill, now, expect: { pid: live.pid!, code: live.extra.code } });
   }
-  // The config folder goes with it, so the runner uses the one its starter found, whatever its environment says.
-  spawn([runner, "--claude-dir", claudeDir], claudeDir);
+  // The config folder goes with it, so the runner uses the one its starter found, whatever its
+  // environment says. The environment is the one install recorded (environment.ts), never this
+  // session's; without one the runner inherits it, and says so in its log.
+  const env = await recordedEnv(claudeDir);
+  spawn([runner, "--claude-dir", claudeDir, ...(env ? [] : ["--inherited-env"])], claudeDir, env ?? undefined);
   return "started";
 }
 

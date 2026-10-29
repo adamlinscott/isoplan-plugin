@@ -30,6 +30,8 @@ The runner reads these files. Each file in `~/.claude/isoplan/` is optional:
 
 The caps are counted on each machine: someone with two machines has two of each.
 
+The runner starts with an environment recorded from the shell that ran the install script, in `~/.claude/isoplan/runner/environment.json`, never with the environment of the session that happened to start it, so a project's settings `env` block can't reach it or its forks. Only the operating system's basics, proxy and certificate settings, and the login and provider variables (`ANTHROPIC_*`, Bedrock, Vertex, `AWS_*`, Google Cloud's, `CLAUDE_CODE_OAUTH_TOKEN`, `CLAUDE_CONFIG_DIR`) are recorded. You can edit the file; the install script writes it again each time it runs, and uninstall removes it. Without it (installed only through the plugin, or before it existed) the runner uses its starter's environment and says so in its log.
+
 The fork reads no settings files, so a login or proxy that comes from `settings.json` (an `apiKeyHelper`, or an `env` block) doesn't reach it, and its rooms say they can't answer. Claude Code's own login and auth from environment variables (an API key, Bedrock, Vertex) work.
 
 Its log is `~/.claude/isoplan/logs/runner.log`, and its count of answers and tokens for the last day is in `~/.claude/isoplan/runner/ledger.json`.

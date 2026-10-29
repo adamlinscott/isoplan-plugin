@@ -43,6 +43,7 @@ import { anyRoomSince, askableMs, NOT_WANTED_CODE, supervise } from "./lifecycle
 import { loadPrompts } from "./prompts.js";
 import { createRunner, type RunnerSettings } from "./runner.js";
 import { loadPatterns, scan } from "./scan.js";
+import { runnerEnvPath } from "./environment.js";
 import { applyClaudeDir, LOCK_REFRESH_MS, RUNNER_FRESH_MS, runnerCode, runnerLockPath } from "./start.js";
 
 // The runner's log starts over once it is this big.
@@ -76,6 +77,7 @@ async function supervisor(): Promise<number> {
   const code = await runnerCode(self);
   if (!(await takeLock(lock, process.pid, alive, false, Date.now(), { freshMs: RUNNER_FRESH_MS, extra: { code } }).catch(() => false))) return 0;
   log(`runner ${process.pid} started`);
+  if (process.argv.includes("--inherited-env")) log(`no environment is recorded in ${runnerEnvPath(claudeDir)}, so the runner runs with its starter's; run the plugin's install script to record one`);
   // Kept fresh, so a lock left by a crash or a reboot goes stale. One another runner took (a
   // newer version, say) ends this one; its worker follows, ending its forks, as its stdin closes.
   const refresh = setInterval(() => {

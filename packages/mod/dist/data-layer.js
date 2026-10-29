@@ -6353,6 +6353,19 @@ async function writeWhole(file, text) {
 	}
 }
 //#endregion
+//#region src/runner/environment.ts
+const runnerEnvPath = (claudeDir) => path.join(claudeDir, "isoplan", "runner", "environment.json");
+/** The recorded environment, or null when there is none, or it doesn't parse, so the starter's is used. */
+async function recordedEnv(claudeDir) {
+	try {
+		const { env } = JSON.parse(await fs.readFile(runnerEnvPath(claudeDir), "utf8"));
+		if (!env || typeof env !== "object" || Array.isArray(env)) return null;
+		return Object.fromEntries(Object.entries(env).filter((e) => typeof e[1] === "string"));
+	} catch {
+		return null;
+	}
+}
+//#endregion
 //#region src/runner/start.ts
 /** The runner's lock: `{ pid, code }` of the supervisor that holds it. */
 const runnerLockPath = (claudeDir) => path.join(claudeDir, "isoplan", "runner", "lock.json");
@@ -6407,11 +6420,13 @@ async function startRunner({ claudeDir, spawn, isAlive = alive, kill = (pid) => 
 			}
 		});
 	}
+	const env = await recordedEnv(claudeDir);
 	spawn([
 		runner,
 		"--claude-dir",
-		claudeDir
-	], claudeDir);
+		claudeDir,
+		...env ? [] : ["--inherited-env"]
+	], claudeDir, env ?? void 0);
 	return "started";
 }
 /**
@@ -8199,8 +8214,9 @@ async function main(argv) {
 		claudeDir,
 		settings: path.join(claudeDir, "settings.json")
 	};
-	const start = (args, dir) => spawn(process.execPath, args, {
+	const start = (args, dir, env) => spawn(process.execPath, args, {
 		cwd: dir,
+		env,
 		detached: true,
 		stdio: "ignore",
 		windowsHide: true
