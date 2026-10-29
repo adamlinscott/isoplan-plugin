@@ -177,8 +177,11 @@ export async function installWake(
   return [...changes, ...done];
 }
 
-// The runner's state and the sessions' traces, removed before the hooks.
-const WRITTEN = ["runner", "live", "logs", "titles"];
+// The runner's state, the machine's pairing credential (pairing.json), and the sessions' traces:
+// locks, logs, title files and released-report hashes. Removed before the hooks.
+const WRITTEN = ["runner", "pairing.json", "live", "logs", "titles", "released"];
+// What a session's data layer writes as it runs, so may come back during an uninstall.
+const SESSION_TRACES = ["live", "titles", "released"];
 
 export interface UninstallOptions {
   /** Leave wake.json as `{ "disabled": true }`, so a plugin still installed doesn't put the hook back. */
@@ -203,7 +206,8 @@ export interface Uninstalled {
  * Takes out everything install and the plugin put in place, in this order: the running runner;
  * under <claude dir>/isoplan the session locks (a detached data layer stops once its lock isn't
  * its own); a wait of `settleMs`; the runner's copy and its records (environment, ledger, lock),
- * the logs and the title files, and claude-binary.json unless it was set by hand; then the wake
+ * the pairing credential, the logs, the title files and the released-report hashes, and
+ * claude-binary.json unless it was set by hand; then the wake
  * hooks in settings.json, and wake.mjs and wake.json. What else is in the folder, the files a
  * person writes, is kept, and the folder goes once it is empty. Throws when settings.json can't be
  * merged, with the hooks and wake.mjs still in place and settings.json not written.
@@ -231,7 +235,7 @@ export async function uninstall(paths: Paths, { optOut = false, settleMs = 0, co
   }
   const binary = claudeBinaryPath(paths.claudeDir);
   if (!(await isHandSet(binary))) await remove(binary);
-  if (confirm && ((await exists(path.join(dir, "live"))) || (await exists(path.join(dir, "titles"))))) {
+  if (confirm && (await Promise.all(SESSION_TRACES.map((name) => exists(path.join(dir, name))))).includes(true)) {
     return stopped("stopped: a session still running the plugin wrote its files again; the hook stays, to try again on a later prompt");
   }
   if (!(await isStillGone())) return stopped(reinstalled);

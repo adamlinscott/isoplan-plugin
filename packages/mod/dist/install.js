@@ -6590,15 +6590,23 @@ async function installWake(paths, dataLayer, wakeSource, { auto = false, runnerF
 }
 const WRITTEN = [
 	"runner",
+	"pairing.json",
 	"live",
 	"logs",
-	"titles"
+	"titles",
+	"released"
+];
+const SESSION_TRACES = [
+	"live",
+	"titles",
+	"released"
 ];
 /**
 * Takes out everything install and the plugin put in place, in this order: the running runner;
 * under <claude dir>/isoplan the session locks (a detached data layer stops once its lock isn't
 * its own); a wait of `settleMs`; the runner's copy and its records (environment, ledger, lock),
-* the logs and the title files, and claude-binary.json unless it was set by hand; then the wake
+* the pairing credential, the logs, the title files and the released-report hashes, and
+* claude-binary.json unless it was set by hand; then the wake
 * hooks in settings.json, and wake.mjs and wake.json. What else is in the folder, the files a
 * person writes, is kept, and the folder goes once it is empty. Throws when settings.json can't be
 * merged, with the hooks and wake.mjs still in place and settings.json not written.
@@ -6631,7 +6639,7 @@ async function uninstall$1(paths, { optOut = false, settleMs = 0, confirm, runne
 	}
 	const binary = claudeBinaryPath(paths.claudeDir);
 	if (!await isHandSet(binary)) await remove(binary);
-	if (confirm && (await exists(path.join(dir, "live")) || await exists(path.join(dir, "titles")))) return stopped("stopped: a session still running the plugin wrote its files again; the hook stays, to try again on a later prompt");
+	if (confirm && (await Promise.all(SESSION_TRACES.map((name) => exists(path.join(dir, name))))).includes(true)) return stopped("stopped: a session still running the plugin wrote its files again; the hook stays, to try again on a later prompt");
 	if (!await isStillGone()) return stopped(reinstalled);
 	changes.push(...await uninstallHooks(paths));
 	await remove(wakeScriptPath(paths.claudeDir));

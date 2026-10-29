@@ -21,13 +21,13 @@ The plugin needs Node.js on `PATH`. When it first starts it puts a small hook in
 
 Claude Code runs nothing of a plugin's when you disable or uninstall it, so the hook in your settings looks for itself, each time a session takes a prompt, at what Claude Code records: `installed_plugins.json`, and `enabledPlugins` in your settings, the project's settings and a `managed-settings.json` file (not managed settings from MDM or the claude.ai console, which it can't read).
 
-**Disable** it (`/plugin disable isoplan@isoplan`, the plugin manager, or `claude plugin disable`) and reporting stops: the hook stops the runner and starts nothing, and the sessions' data layers stop. Every file stays. Disabled in one project only, that project's sessions aren't reported. Enable it again and the next prompt starts them again.
+**Disable** it (`/plugin disable isoplan@isoplan`, the plugin manager, or `claude plugin disable`) and reporting stops: the hook stops the runner and starts nothing, and the sessions' data layers stop. Every file stays, the pairing credential too. Disabled in one project only, that project's sessions aren't reported. Enable it again and the next prompt starts them again.
 
 **Uninstall** it (`/plugin uninstall isoplan@isoplan`, the plugin manager, or `claude plugin uninstall isoplan@isoplan`) and, the next time a session takes a prompt, the hook takes everything out in the background:
 
 - the runner, which it stops;
-- what the plugin wrote in `~/.claude/isoplan/`: the runner's copy and its records (`runner/`: the app, `environment.json`, the ledger, the lock), the session locks (`live/`), the logs (`logs/`), the title files (`titles/`), and `claude-binary.json` unless you set it by hand;
-- last, the hook in `~/.claude/settings.json` (every other hook and setting is kept), and the hook script and its record (`wake.mjs`, `wake.json`).
+- what the plugin wrote in `~/.claude/isoplan/`: the runner's copy and its records (`runner/`: the app, `environment.json`, the ledger, the lock), the machine's pairing credential (`pairing.json`), the session locks (`live/`), the logs (`logs/`), the title files (`titles/`), the hashes of reports you released (`released/`), and `claude-binary.json` unless you set it by hand;
+- last, the hook in `~/.claude/settings.json` (every other hook and setting is kept), the hook script and its record (`wake.mjs`, `wake.json`), and the uninstall's own lock and log (`uninstall.json`, `uninstall.log`).
 
 The files you write are kept: `config.json`, `runner.json`, `secret-patterns.json`, and a `claude-binary.json` you set by hand, so a reinstall picks them up again. Delete `~/.claude/isoplan/` yourself to take those too; once nothing is left in it, uninstall removes the folder.
 
