@@ -3,6 +3,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { randomUUID } from "node:crypto";
 //#region ../../node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/core/util.js
 function getEnumValues(entries) {
 	const numericValues = Object.values(entries).filter((v) => typeof v === "number");
@@ -5876,7 +5877,8 @@ discriminatedUnion("type", [
 			v: Version,
 			id: RequestId,
 			kind: literal("write-brief"),
-			handoff: HandoffSchema
+			handoff: HandoffSchema,
+			fallback: literal(true).optional()
 		}),
 		object({
 			type: literal("reply"),
@@ -5901,7 +5903,9 @@ discriminatedUnion("type", [
 			type: literal("refusal"),
 			v: Version,
 			id: RequestId,
-			reason: literal("withheld")
+			reason: literal("withheld"),
+			file: string().min(1).optional(),
+			unchecked: array(string().min(1)).optional()
 		}),
 		object({
 			type: literal("refusal"),
@@ -5918,6 +5922,12 @@ discriminatedUnion("type", [
 		handoff: HandoffSchema
 	}),
 	object({
+		type: literal("hand-over-check"),
+		v: Version,
+		to: string().min(1),
+		handoff: HandoffId
+	}),
+	object({
 		type: literal("take"),
 		v: Version,
 		code: string().min(1)
@@ -5926,6 +5936,7 @@ discriminatedUnion("type", [
 		type: literal("taken"),
 		v: Version,
 		handoff: HandoffId,
+		session: string().min(1).optional(),
 		failures: array(object({
 			step: _enum([
 				"worktree",
@@ -5938,66 +5949,115 @@ discriminatedUnion("type", [
 		}))
 	})
 ]);
-const OfficeServerMessageSchema = discriminatedUnion("type", [
+/** Asks the data layer to send its facts in full. */
+const RepairMessageSchema = object({
+	type: literal("repair"),
+	v: Version,
+	reason: string().optional()
+});
+/** A note for the later editor of `file`, which the data layer adds to `agent`'s next tool result. */
+const ConflictMessageSchema = object({
+	type: literal("conflict"),
+	v: Version,
+	agent: string().min(1),
+	file: string().min(1),
+	text: string().min(1)
+});
+/** Something the data layer should show. */
+const ErrorMessageSchema = object({
+	type: literal("error"),
+	v: Version,
+	code: string().min(1),
+	message: string()
+});
+/**
+* Something for the machine to answer, with a reply or a refusal carrying the same id. `session` is
+* the session it concerns: the lead whose fork answers or writes the brief, or the session whose
+* agent asked its owner. `room` is the room the caps count against.
+*/
+const RequestMessageSchema = discriminatedUnion("kind", [
 	object({
-		type: literal("repair"),
+		type: literal("request"),
 		v: Version,
-		reason: string().optional()
+		id: RequestId,
+		kind: literal("answer-question"),
+		session: string().min(1),
+		room: string().min(1),
+		from: Account,
+		question: string().min(1)
 	}),
 	object({
-		type: literal("conflict"),
+		type: literal("request"),
 		v: Version,
-		agent: string().min(1),
-		file: string().min(1),
-		text: string().min(1)
+		id: RequestId,
+		kind: literal("write-brief"),
+		session: string().min(1),
+		room: string().min(1),
+		handoff: HandoffId,
+		to: Account
 	}),
 	object({
-		type: literal("error"),
+		type: literal("request"),
 		v: Version,
-		code: string().min(1),
-		message: string()
-	}),
-	discriminatedUnion("kind", [
-		object({
-			type: literal("request"),
-			v: Version,
-			id: RequestId,
-			kind: literal("answer-question"),
-			session: string().min(1),
-			room: string().min(1),
-			from: Account,
-			question: string().min(1)
-		}),
-		object({
-			type: literal("request"),
-			v: Version,
-			id: RequestId,
-			kind: literal("write-brief"),
-			session: string().min(1),
-			room: string().min(1),
-			handoff: HandoffId,
-			to: Account
-		}),
-		object({
-			type: literal("request"),
-			v: Version,
-			id: RequestId,
-			kind: literal("owner-answer"),
-			session: string().min(1),
-			question: string().min(1),
-			answers: record(string(), string())
-		})
-	]),
-	object({
-		type: literal("release"),
-		v: Version,
-		id: RequestId
-	}),
-	object({
-		type: literal("handoff"),
-		v: Version,
-		handoff: HandoffSchema
+		id: RequestId,
+		kind: literal("owner-answer"),
+		session: string().min(1),
+		question: string().min(1),
+		answers: record(string(), string())
 	})
+]);
+/**
+* The request is over (its handoff was cancelled, dismissed or replaced): the machine drops what it
+* holds for it, and doesn't send or push what it was still writing.
+*/
+const DropMessageSchema = object({
+	type: literal("drop"),
+	v: Version,
+	id: RequestId
+});
+/**
+* The owner released what the secret scan withheld, so the machine sends it now. On the runner's
+* link `id` is the request whose reply was withheld; on a session's link it is the withheld
+* report's `withheld.id`, and only that exact report is released.
+*/
+const ReleaseMessageSchema = object({
+	type: literal("release"),
+	v: Version,
+	id: RequestId
+});
+/**
+* A handoff for the receiver to take: sent to their runner when they take it from the floor, or to
+* their session in answer to a take code.
+*/
+const HandoffMessageSchema = object({
+	type: literal("handoff"),
+	v: Version,
+	handoff: HandoffSchema,
+	mode: _enum(["terminal", "headless"]).optional(),
+	session: string().uuid().optional()
+});
+/** A hand-over-check passed: `to` is the receiver the server found for the name given. */
+const HandOverReadyMessageSchema = object({
+	type: literal("hand-over-ready"),
+	v: Version,
+	handoff: HandoffId,
+	to: Account
+});
+const OfficeServerMessageSchema = discriminatedUnion("type", [
+	RepairMessageSchema,
+	ConflictMessageSchema,
+	ErrorMessageSchema,
+	RequestMessageSchema,
+	ReleaseMessageSchema,
+	HandoffMessageSchema,
+	object({
+		type: literal("handed-over"),
+		v: Version,
+		handoff: HandoffId,
+		to: Account
+	}),
+	HandOverReadyMessageSchema,
+	DropMessageSchema
 ]);
 /** Validates a message a data layer received from an office server. */
 function parseOfficeServerMessage(value) {
@@ -6019,6 +6079,48 @@ function parse(schema, value) {
 		kind: "invalid",
 		error: prettifyError(result.error)
 	};
+}
+//#endregion
+//#region ../protocol/dist/project-id.js
+/**
+* A project's id and name. With a git remote the id is `host/owner/repo` (any deeper path kept, as
+* for GitLab subgroups), the same whichever form or letter case the remote is written in, so a
+* repository cloned on several machines is one project. A repo with no remote, a remote that is a
+* local path, or one that can't be read is `local:<machine>/<root>`, its working tree's root path.
+* Never throws, so a remote's credentials never reach an error message.
+*/
+function projectId(remoteUrl, local) {
+	const remote = remoteUrl === null || isLocalPath(remoteUrl.trim()) ? null : splitRemote(remoteUrl.trim());
+	const segments = remote?.path.replace(/\/+$/, "").replace(/\.git$/, "").split("/").filter(Boolean);
+	if (!remote || !segments || segments.length === 0) {
+		const root = local.root.replace(/\\/g, "/").replace(/\/+$/, "");
+		return {
+			id: `local:${local.machine}/${root}`,
+			name: root.split("/").pop() || root
+		};
+	}
+	return {
+		id: [remote.host, ...segments].join("/").toLowerCase(),
+		name: segments[segments.length - 1]
+	};
+}
+function isLocalPath(remote) {
+	return remote === "" || /^(?:[/.~\\]|[A-Za-z]:[\\/]|file:)/.test(remote);
+}
+function splitRemote(remote) {
+	if (remote.includes("://")) {
+		if (!URL.canParse(remote)) return null;
+		const url = new URL(remote);
+		return url.hostname ? {
+			host: url.hostname,
+			path: url.pathname
+		} : null;
+	}
+	const scp = /^(?:[^@/]+@)?([^:/]+):(.+)$/.exec(remote);
+	return scp ? {
+		host: scp[1],
+		path: scp[2]
+	} : null;
 }
 //#endregion
 //#region src/data-layer/config.ts
@@ -6425,7 +6527,7 @@ function createLink({ url, hello, emit, minIntervalMs = 1e3, retryBaseMs = 1e3, 
 				isUnwanted = true;
 				onNotWanted?.();
 			}
-		} else if (onMessage && (message.type === "request" || message.type === "release" || message.type === "handoff")) onMessage(message);
+		} else if (onMessage && (message.type === "request" || message.type === "release" || message.type === "handoff" || message.type === "drop")) onMessage(message);
 		else emit({
 			type: "log",
 			text: `the office server sent a ${message.type} message, which this data layer doesn't handle yet`
@@ -8001,7 +8103,1010 @@ function fill(template, values) {
 	return template.replace(/\{\{(\w+)\}\}/g, (whole, key) => Object.hasOwn(values, key) ? values[key] : whole);
 }
 //#endregion
+//#region src/handoff/git.ts
+/** The handoff's branch. */
+const handoffBranch = (id) => `isoplan/handoff/${id}`;
+var HandoffGitError = class extends Error {
+	kind;
+	detail;
+	constructor(kind, detail) {
+		super(detail);
+		this.kind = kind;
+		this.detail = detail;
+	}
+};
+/** What the server is told for each kind of git failure. */
+const GIT_FAILED = {
+	"not-a-repo": "the session's folder isn't in a git repo",
+	"no-commit": "the session's repo has no commit to hand over from",
+	"no-remote": "the session's repo has no remote to push the handoff's branch to",
+	lfs: "the session's repo uses Git LFS, whose files a handoff can't push yet",
+	"timed-out": "git took too long to push the handoff's branch",
+	rejected: "the remote rejected the handoff's branch",
+	failed: "git couldn't push the handoff's branch"
+};
+const REPO_VARIABLES = [
+	"GIT_DIR",
+	"GIT_WORK_TREE",
+	"GIT_INDEX_FILE",
+	"GIT_COMMON_DIR",
+	"GIT_OBJECT_DIRECTORY",
+	"GIT_NAMESPACE"
+];
+/**
+* The environment git runs with: no terminal prompt and no credential manager window; ssh in batch
+* mode, unless the person chose their own ssh (GIT_SSH_COMMAND, GIT_SSH, or core.sshCommand in the
+* repo's config, `sshCommandSet`); and none of the inherited variables that would point it at
+* another repo.
+*/
+function noPromptEnv(env, sshCommandSet = false) {
+	const out = {};
+	for (const [key, value] of Object.entries(env)) if (value !== void 0 && !REPO_VARIABLES.includes(key.toUpperCase())) out[key] = value;
+	out.GIT_TERMINAL_PROMPT = "0";
+	out.GCM_INTERACTIVE = "never";
+	if (!out.GIT_SSH_COMMAND && !out.GIT_SSH && !sshCommandSet) out.GIT_SSH_COMMAND = "ssh -o BatchMode=yes";
+	return out;
+}
+function spawnGit(args, cwd, env, timeoutMs) {
+	return new Promise((resolve) => {
+		let stdout = "";
+		let stderr = "";
+		let timedOut = false;
+		const child = spawn("git", args, {
+			cwd,
+			env,
+			stdio: [
+				"pipe",
+				"pipe",
+				"pipe"
+			],
+			windowsHide: true,
+			detached: process.platform !== "win32"
+		});
+		child.stdin.end();
+		child.stdout.setEncoding("utf8").on("data", (piece) => stdout += piece);
+		child.stderr.setEncoding("utf8").on("data", (piece) => stderr = (stderr + piece).slice(-2e3));
+		const timer = setTimeout(() => {
+			timedOut = true;
+			killTree(child);
+		}, timeoutMs);
+		child.on("error", (err) => {
+			clearTimeout(timer);
+			resolve({
+				code: null,
+				stdout,
+				stderr: err.message,
+				timedOut
+			});
+		});
+		child.on("close", (code) => {
+			clearTimeout(timer);
+			resolve({
+				code,
+				stdout,
+				stderr,
+				timedOut
+			});
+		});
+	});
+}
+function createRunGit(baseEnv = process.env) {
+	const sshCommand = /* @__PURE__ */ new Map();
+	return async (args, { cwd, env, timeoutMs }) => {
+		const key = pathKey(cwd);
+		if (!sshCommand.has(key)) sshCommand.set(key, spawnGit([
+			"config",
+			"--get",
+			"core.sshCommand"
+		], cwd, noPromptEnv(baseEnv, true), timeoutMs).then((r) => r.code === 0 && r.stdout.trim() !== ""));
+		return spawnGit(args, cwd, {
+			...noPromptEnv(baseEnv, await sshCommand.get(key)),
+			...env
+		}, timeoutMs);
+	};
+}
+/** A remote URL with any user name and password taken out, so a token in it never leaves. */
+function withoutCredentials(remote) {
+	return remote.replace(/^([a-z][a-z0-9+.-]*:\/\/)[^/@]*@/i, "$1");
+}
+/** Whether two remote URLs name the same repository: the same project id, or the same local path. */
+function sameRemote(a, b) {
+	const local = {
+		machine: "",
+		root: ""
+	};
+	const pa = projectId(withoutCredentials(a), local).id;
+	const pb = projectId(withoutCredentials(b), local).id;
+	if (!pa.startsWith("local:") || !pb.startsWith("local:")) return pa === pb;
+	const asPath = (r) => pathKey(path.resolve(r.replace(/^file:\/\//, ""))).replace(/(\/\.git|\.git)$/, "");
+	return asPath(a) === asPath(b);
+}
+/** The repo's remotes with their fetch and push URLs (which may hold spaces: a local path). */
+async function remotesOf(run, cwd, timeoutMs) {
+	const r = await run([
+		"config",
+		"--local",
+		"--get-regexp",
+		"^remote\\..*\\.(url|pushurl)$"
+	], {
+		cwd,
+		timeoutMs
+	});
+	if (r.code !== 0) return r.code === 1 ? [] : null;
+	const out = /* @__PURE__ */ new Map();
+	for (const line of r.stdout.split(/\r?\n/)) {
+		const m = /^remote\.(.+)\.(?:url|pushurl) (.*)$/.exec(line);
+		if (m) out.set(m[1], [...out.get(m[1]) ?? [], m[2]]);
+	}
+	return [...out].map(([name, urls]) => ({
+		name,
+		urls
+	}));
+}
+const UNTRACKED_MAX = 50;
+/**
+* The untracked files in the repo at `cwd` that .gitignore doesn't match, by path from the repo's
+* top; null when git couldn't list them. Files git ignores are never listed.
+*/
+async function untracked(run, cwd, timeoutMs) {
+	const r = await run([
+		"ls-files",
+		"--others",
+		"--exclude-standard",
+		"--full-name",
+		"-z",
+		":/"
+	], {
+		cwd,
+		timeoutMs
+	});
+	if (r.code !== 0) return null;
+	return r.stdout.split("\0").filter(Boolean).sort();
+}
+const listed = (files) => files.slice(0, UNTRACKED_MAX).map((f) => `\`${f}\``).join(", ") + (files.length > UNTRACKED_MAX ? `, and ${files.length - UNTRACKED_MAX} more` : "");
+/** The brief request's last line: the untracked files the brief should say the purpose of. */
+const untrackedLine = (files) => files === null ? "The untracked files couldn't be listed, so don't name any." : files.length ? `The untracked files are: ${listed(files)}. Say what each is for.` : "There are no untracked files.";
+/**
+* The runner's note at the end of every brief: what is pushed, from where, and what isn't, as of
+* `at` (a brief withheld and released later still describes the tree as it was then).
+*/
+function handoffNote({ branch, from, files, at }) {
+	const when = at.toISOString().slice(0, 16).replace("T", " ") + " UTC";
+	const lines = [`Handed over by Isoplan on the branch ${branch}${from ? `, made from ${from}` : ""}, with the tracked changes in a work-in-progress commit. This describes the work tree as of ${when}.`];
+	if (files === null) lines.push("Untracked files: unknown, since git couldn't list them.");
+	else if (files.length) lines.push(`Untracked files, not handed over: ${listed(files)}.`);
+	return lines.join("\n");
+}
+/** What a handoff from `cwd` would start from: the repo, its current branch and its untracked files. */
+async function prepare(run, cwd, timeoutMs) {
+	const top = await run(["rev-parse", "--show-toplevel"], {
+		cwd,
+		timeoutMs
+	});
+	if (top.code !== 0) throw new HandoffGitError(top.timedOut ? "timed-out" : "not-a-repo", `git rev-parse in ${cwd}: ${top.stderr.trim()}`);
+	const toplevel = top.stdout.trim();
+	const head = await run([
+		"symbolic-ref",
+		"--short",
+		"-q",
+		"HEAD"
+	], {
+		cwd: toplevel,
+		timeoutMs
+	});
+	return {
+		toplevel,
+		from: head.code === 0 && head.stdout.trim() ? head.stdout.trim() : null,
+		files: await untracked(run, toplevel, timeoutMs)
+	};
+}
+/**
+* The files a patch (`git log -p -U0`) adds lines to, with those lines, and the binary files it adds
+* or changes, which can't be read. A `+++ ` line is a file's header only right after its `--- `
+* line; anywhere else it is an added line that starts with `++`.
+*/
+function addedLines(diff) {
+	const lines = /* @__PURE__ */ new Map();
+	const binary = /* @__PURE__ */ new Set();
+	let file = null;
+	let previous = "";
+	for (const line of diff.split("\n")) {
+		const header = line.startsWith("+++ ") && previous.startsWith("--- ");
+		const bin = /^Binary files .* and (?:b\/)?(.+) differ$/.exec(line);
+		if (header) file = line === "+++ /dev/null" ? null : line.slice(4).replace(/^b\//, "");
+		else if (line.startsWith("diff --git ")) file = null;
+		else if (bin && bin[1] !== "/dev/null") binary.add(bin[1]);
+		else if (file && line.startsWith("+")) lines.set(file, (lines.get(file) ?? "") + line.slice(1) + "\n");
+		previous = line;
+	}
+	return {
+		lines,
+		binary: [...binary].sort()
+	};
+}
+const IDENTITY = {
+	GIT_AUTHOR_NAME: "Isoplan handoff",
+	GIT_AUTHOR_EMAIL: "handoff@isoplan.invalid",
+	GIT_COMMITTER_NAME: "Isoplan handoff",
+	GIT_COMMITTER_EMAIL: "handoff@isoplan.invalid"
+};
+/**
+* Commits the tracked changes at `cwd` and pushes that commit alone to isoplan/handoff/<id>, with
+* force, since the branch is the handoff's own and a second hand-over of the same room replaces it.
+* The remote is the one the current branch pushes to (branch.<x>.pushRemote, remote.pushDefault,
+* then branch.<x>.remote, then origin), and the repo it records names its push URL, where the branch
+* is. Throws a HandoffGitError.
+*/
+async function pushHandoff(run, cwd, id, timeoutMs, { scan, pushAnyway } = {}) {
+	const branch = handoffBranch(id);
+	const { toplevel, from } = await prepare(run, cwd, timeoutMs);
+	const at = {
+		cwd: toplevel,
+		timeoutMs
+	};
+	const git = async (args, env) => {
+		const r = await run(args, {
+			...at,
+			env
+		});
+		if (r.timedOut) throw new HandoffGitError("timed-out", `git ${args[0]} took longer than ${Math.round(timeoutMs / 1e3)} s`);
+		return r;
+	};
+	const must = async (args, kind = "failed", env) => {
+		const r = await git(args, env);
+		if (r.code !== 0) throw new HandoffGitError(kind, `git ${args.join(" ")}: ${r.stderr.trim()}`);
+		return r.stdout.trim();
+	};
+	const head = await git([
+		"rev-parse",
+		"--verify",
+		"-q",
+		"HEAD"
+	]);
+	if (head.code !== 0) throw new HandoffGitError("no-commit", `${toplevel} has no commit yet`);
+	const parent = head.stdout.trim();
+	const remotes = (await must(["remote"])).split(/\r?\n/).filter(Boolean);
+	const setting = async (key) => (await git([
+		"config",
+		"--get",
+		key
+	])).stdout.trim();
+	const remote = [
+		from ? await setting(`branch.${from}.pushRemote`) : "",
+		await setting("remote.pushDefault"),
+		from ? await setting(`branch.${from}.remote`) : ""
+	].find((r) => remotes.includes(r)) ?? (remotes.includes("origin") ? "origin" : remotes.length === 1 ? remotes[0] : null);
+	if (!remote) throw new HandoffGitError("no-remote", `${toplevel} has ${remotes.length ? `several remotes and none is origin: ${remotes.join(", ")}` : "no remote"}`);
+	const url = await must([
+		"remote",
+		"get-url",
+		"--push",
+		remote
+	], "no-remote");
+	const fallback = (await git([
+		"symbolic-ref",
+		"--short",
+		"-q",
+		`refs/remotes/${remote}/HEAD`
+	])).stdout.trim().replace(`${remote}/`, "");
+	if (branch === from || branch === fallback) throw new HandoffGitError("failed", `${branch} is the current or the default branch, which a handoff never pushes`);
+	if (pushAnyway) {
+		if ((await git([
+			"cat-file",
+			"-e",
+			`${pushAnyway}^{commit}`
+		])).code !== 0) throw new HandoffGitError("failed", `the held commit ${pushAnyway} is gone from ${toplevel}`);
+		return { repo: await send(pushAnyway) };
+	}
+	async function send(commit) {
+		if ((await git([
+			"grep",
+			"-q",
+			"-I",
+			"filter=lfs",
+			commit,
+			"--",
+			".gitattributes",
+			"**/.gitattributes"
+		])).code === 0) throw new HandoffGitError("lfs", `${toplevel} uses Git LFS`);
+		const pushed = await git([
+			"push",
+			"--no-verify",
+			"--porcelain",
+			remote,
+			`+${commit}:refs/heads/${branch}`
+		]);
+		if (pushed.code !== 0) throw new HandoffGitError(/rejected|denied|declined/i.test(pushed.stderr + pushed.stdout) ? "rejected" : "failed", `git push ${remote} ${branch}: ${(pushed.stderr || pushed.stdout).trim()}`);
+		return {
+			path: ".",
+			remote: withoutCredentials(url),
+			branch,
+			commit
+		};
+	}
+	const index = path.join(await fs.mkdtemp(path.join(os.tmpdir(), "isoplan-handoff-")), "index");
+	try {
+		const real = path.resolve(toplevel, await must([
+			"rev-parse",
+			"--git-path",
+			"index"
+		]));
+		const copied = await fs.copyFile(real, index).then(() => true, () => false);
+		const withIndex = { GIT_INDEX_FILE: index };
+		if (!copied) await must(["read-tree", "HEAD"], "failed", withIndex);
+		await must([
+			"add",
+			"-u",
+			"--",
+			":/"
+		], "failed", withIndex);
+		const tree = await must(["write-tree"], "failed", withIndex);
+		let commit = parent;
+		if (tree !== await must(["rev-parse", `${parent}^{tree}`])) {
+			const named = (await git(["config", "user.email"])).code === 0;
+			commit = await must([
+				"-c",
+				"commit.gpgSign=false",
+				"commit-tree",
+				"--no-gpg-sign",
+				tree,
+				"-p",
+				parent,
+				"-m",
+				`WIP: Isoplan handoff ${id}\n\nThe tracked changes${from ? ` on ${from}` : ""}, handed over as they were.`
+			], "failed", named ? void 0 : IDENTITY);
+		}
+		if (scan) {
+			const { lines, binary } = addedLines(await must([
+				"log",
+				"-p",
+				"-U0",
+				"--no-color",
+				"--no-ext-diff",
+				"--no-renames",
+				"--diff-merges=first-parent",
+				"--format=",
+				commit,
+				"--not",
+				`--remotes=${remote}`
+			]));
+			for (const [file, text] of lines) if (await scan(text)) return {
+				held: file,
+				commit,
+				unchecked: binary
+			};
+		}
+		return { repo: await send(commit) };
+	} finally {
+		await fs.rm(path.dirname(index), {
+			recursive: true,
+			force: true
+		}).catch(() => {});
+	}
+}
+//#endregion
+//#region src/handoff/take.ts
+/** The repo's own labelled settings file, at its top. */
+const REPO_CONFIG = "isoplan.json";
+/** The handoff's folder on this machine: its brief, launcher and setup log. */
+const handoffDir = (claudeDir, id) => path.join(claudeDir, "isoplan", "handoffs", id);
+const tail = (text) => (text.length > 2e3 ? "…" + text.slice(-2e3) : text).trim();
+/** The main checkout of a clone of `remote` on this machine, the most recently used first, and that remote's name there; null with none. */
+async function findClone(io, run, projectsDir, remote, since, timeoutMs) {
+	const transcripts = [];
+	for (const dir of await io.listDir(projectsDir)) {
+		if (!dir.isDir) continue;
+		for (const entry of await io.listDir(path.join(projectsDir, dir.name))) {
+			if (entry.isDir || !entry.name.endsWith(".jsonl")) continue;
+			const file = path.join(projectsDir, dir.name, entry.name);
+			const st = await io.stat(file);
+			if (!st || st.mtimeMs < since) continue;
+			const cwd = await cwdOf(io, file, st.size);
+			if (cwd) transcripts.push({
+				cwd,
+				at: st.mtimeMs
+			});
+		}
+	}
+	transcripts.sort((a, b) => b.at - a.at);
+	const tried = /* @__PURE__ */ new Set();
+	for (const { cwd } of transcripts) {
+		if (tried.has(pathKey(cwd))) continue;
+		tried.add(pathKey(cwd));
+		if (!(await io.stat(cwd))?.isDir) continue;
+		const where = await run([
+			"rev-parse",
+			"--path-format=absolute",
+			"--show-toplevel",
+			"--git-common-dir"
+		], {
+			cwd,
+			timeoutMs
+		});
+		if (where.code !== 0) continue;
+		const [toplevel, commonDir] = where.stdout.split(/\r?\n/).map((s) => s.trim());
+		if (!toplevel || !commonDir) continue;
+		const main = normalize(commonDir).endsWith("/.git") ? path.dirname(commonDir) : toplevel;
+		if (tried.has(`main:${pathKey(main)}`)) continue;
+		tried.add(`main:${pathKey(main)}`);
+		const match = (await remotesOf(run, main, timeoutMs))?.find((r) => r.urls.some((url) => sameRemote(url, remote)));
+		if (match) return {
+			dir: path.resolve(main),
+			remote: match.name
+		};
+	}
+	return null;
+}
+async function cwdOf(io, file, size) {
+	for (const text of (await io.read(file, 0, Math.min(size, 65536)).catch(() => "")).split("\n")) {
+		if (!text.includes("\"cwd\"")) continue;
+		try {
+			const cwd = JSON.parse(text).cwd;
+			if (typeof cwd === "string" && cwd) return cwd;
+		} catch {}
+	}
+	return null;
+}
+/** `worktreeSetup` from isoplan.json's text, for this platform: null when it names no command here. Throws when malformed. */
+function parseSetup(text, platform, defaultTimeoutMs) {
+	const setup = JSON.parse(text)?.worktreeSetup;
+	if (setup === void 0) return null;
+	if (!setup || typeof setup !== "object") throw new Error(`"worktreeSetup" in ${REPO_CONFIG} must be an object`);
+	const key = platform === "win32" ? "windows" : platform === "darwin" ? "mac" : "linux";
+	const c = setup.command;
+	const command = c && typeof c === "object" ? c[key] : c;
+	if (command !== void 0 && (typeof command !== "string" || !command.trim())) throw new Error(`"worktreeSetup.command" in ${REPO_CONFIG} must be a command, or { "windows", "mac" } commands`);
+	const t = setup.timeoutMinutes;
+	if (t !== void 0 && !(typeof t === "number" && Number.isFinite(t) && t > 0)) throw new Error(`"worktreeSetup.timeoutMinutes" in ${REPO_CONFIG} must be a number of minutes above 0`);
+	return command ? {
+		command,
+		timeoutMs: typeof t === "number" ? t * 6e4 : defaultTimeoutMs
+	} : null;
+}
+/**
+* isoplan.json from the remote's default branch, as this clone knows it, and never from any other
+* branch. The default branch is `<remote>/HEAD`, else what the remote says its HEAD is; the branch
+* is fetched so the file is current. `problem` says why it couldn't be read; `text` is null when
+* the default branch has no isoplan.json.
+*/
+async function readSetupFile(run, clone, timeoutMs) {
+	const git = (args) => run(args, {
+		cwd: clone.dir,
+		timeoutMs
+	});
+	let branch = (await git([
+		"symbolic-ref",
+		"-q",
+		"--short",
+		`refs/remotes/${clone.remote}/HEAD`
+	])).stdout.trim().replace(`${clone.remote}/`, "");
+	if (!branch) {
+		const said = await git([
+			"ls-remote",
+			"--symref",
+			clone.remote,
+			"HEAD"
+		]);
+		branch = /^ref: refs\/heads\/(\S+)\s+HEAD$/m.exec(said.stdout)?.[1] ?? "";
+	}
+	if (!branch) return {
+		text: null,
+		problem: `Setup was skipped: ${clone.remote}'s default branch couldn't be told, so ${REPO_CONFIG} couldn't be read from it.`
+	};
+	const fetched = await git([
+		"fetch",
+		"-q",
+		clone.remote,
+		`+refs/heads/${branch}:refs/remotes/${clone.remote}/${branch}`
+	]);
+	if (fetched.code !== 0) return {
+		text: null,
+		problem: `Setup was skipped: ${clone.remote}/${branch} couldn't be fetched to read ${REPO_CONFIG}:\n${fetched.stderr}`
+	};
+	const shown = await git(["show", `refs/remotes/${clone.remote}/${branch}:${REPO_CONFIG}`]);
+	return {
+		text: shown.code === 0 ? shown.stdout : null,
+		problem: null
+	};
+}
+/** Runs `command` with the system shell, hidden; resolves with whether it exited 0, its output's end and whether it timed out. */
+function runShell(command, { cwd, env, timeoutMs }) {
+	return new Promise((resolve) => {
+		let output = "";
+		let timedOut = false;
+		const child = spawn(command, {
+			cwd,
+			env,
+			shell: true,
+			stdio: [
+				"pipe",
+				"pipe",
+				"pipe"
+			],
+			windowsHide: true,
+			detached: process.platform !== "win32"
+		});
+		child.stdin.end();
+		const keep = (piece) => output = (output + piece).slice(-65536);
+		child.stdout.setEncoding("utf8").on("data", keep);
+		child.stderr.setEncoding("utf8").on("data", keep);
+		const timer = setTimeout(() => {
+			timedOut = true;
+			killTree(child);
+		}, timeoutMs);
+		child.on("error", (err) => {
+			clearTimeout(timer);
+			resolve({
+				ok: false,
+				output: output + err.message,
+				timedOut
+			});
+		});
+		child.on("close", (code) => {
+			clearTimeout(timer);
+			resolve({
+				ok: code === 0 && !timedOut,
+				output: timedOut ? `${output}\nIt was stopped after ${Math.round(timeoutMs / 6e4)} minutes.` : output,
+				timedOut
+			});
+		});
+	});
+}
+const cmdQuote = (s) => `"${s.replace(/"/g, "").replace(/%/g, "%%")}"`;
+const shQuote = (s) => `'${s.replace(/'/g, `'\\''`)}'`;
+/**
+* The launcher that runs Claude Code in `dir`, and the command that opens it in a terminal: on
+* Windows a .cmd file that `start` opens in a new console (a Windows Terminal tab where that is the
+* default), on a Mac a .command file that Terminal opens. Null on any other platform.
+* CLAUDE_CONFIG_DIR, when set, is written into the launcher, since Terminal.app starts it with its
+* own environment, not the runner's.
+*/
+function launch(platform, { folder, dir, argv, title, configDir }) {
+	const name = title.replace(/["%^&|<>!()@]/g, "");
+	if (platform === "win32") {
+		const file = path.win32.join(folder, "open.cmd");
+		return {
+			file,
+			text: [
+				"@echo off",
+				"chcp 65001>nul",
+				`title ${name}`,
+				...configDir ? [`set "CLAUDE_CONFIG_DIR=${configDir.replace(/"/g, "").replace(/%/g, "%%")}"`] : [],
+				`cd /d ${cmdQuote(dir)}`,
+				argv.map(cmdQuote).join(" "),
+				""
+			].join("\r\n"),
+			command: [
+				process.env.ComSpec || "cmd.exe",
+				"/d",
+				"/c",
+				"start",
+				`"${name}"`,
+				"cmd.exe",
+				"/k",
+				`""${file}""`
+			]
+		};
+	}
+	if (platform === "darwin") {
+		const file = path.posix.join(folder, "open.command");
+		return {
+			file,
+			text: [
+				"#!/bin/sh",
+				...configDir ? [`export CLAUDE_CONFIG_DIR=${shQuote(configDir)}`] : [],
+				`cd ${shQuote(dir)} || exit 1`,
+				`exec ${argv.map(shQuote).join(" ")}`,
+				""
+			].join("\n"),
+			command: [
+				"open",
+				"-a",
+				"Terminal",
+				file
+			]
+		};
+	}
+	return null;
+}
+/** Writes the launcher and runs the command that opens it; rejects when it couldn't. */
+async function openLaunch(l, env) {
+	await fs.writeFile(l.file, l.text, { mode: 493 });
+	const [cmd, ...args] = l.command;
+	await new Promise((resolve, reject) => {
+		const child = spawn(cmd, args, {
+			env,
+			stdio: "ignore",
+			detached: true,
+			windowsHide: true,
+			windowsVerbatimArguments: process.platform === "win32"
+		});
+		const timer = setTimeout(() => (child.unref(), resolve()), 15e3);
+		child.on("error", (err) => (clearTimeout(timer), reject(err)));
+		child.on("exit", (code) => (clearTimeout(timer), code === 0 ? resolve() : reject(/* @__PURE__ */ new Error(`${path.basename(cmd)} exited with code ${code}`))));
+	});
+}
+function hidden([cmd, ...args], cwd, env, timeoutMs) {
+	return new Promise((resolve) => {
+		let stdout = "";
+		let stderr = "";
+		const child = spawn(cmd, args, {
+			cwd,
+			env,
+			stdio: [
+				"ignore",
+				"pipe",
+				"pipe"
+			],
+			windowsHide: true
+		});
+		child.stdout.setEncoding("utf8").on("data", (piece) => stdout += piece);
+		child.stderr.setEncoding("utf8").on("data", (piece) => stderr = (stderr + piece).slice(-2e3));
+		const timer = setTimeout(() => killTree(child), timeoutMs);
+		child.on("error", (err) => (clearTimeout(timer), resolve({
+			code: null,
+			stdout,
+			stderr: err.message
+		})));
+		child.on("close", (code) => (clearTimeout(timer), resolve({
+			code,
+			stdout,
+			stderr
+		})));
+	});
+}
+/** Starts `claude --bg`, hidden, which returns once the background session is up; rejects when it couldn't. */
+async function startBackground({ argv, cwd }, env) {
+	const r = await hidden(argv, cwd, env, 6e4);
+	if (r.code !== 0) throw new Error((r.stderr || r.stdout).trim() || `claude exited with code ${r.code}`);
+}
+/** The session ids of the background sessions `claude agents --json --all --cwd <cwd>` lists. */
+async function listAgents(bin, cwd, env) {
+	const r = await hidden([
+		...claudeCommand(bin),
+		"agents",
+		"--json",
+		"--all",
+		"--cwd",
+		cwd
+	], cwd, env, 3e4);
+	if (r.code !== 0) return [];
+	try {
+		const listed = JSON.parse(r.stdout);
+		return (Array.isArray(listed) ? listed : listed?.agents ?? []).map((a) => a?.sessionId).filter((id) => typeof id === "string");
+	} catch {
+		return [];
+	}
+}
+/** The key Claude Code keeps a folder under in .claude.json's projects: forward slashes on Windows too. */
+const trustKey = (dir, platform) => platform === "win32" ? path.win32.resolve(dir).replace(/\\/g, "/") : path.posix.resolve(dir);
+/**
+* Records Claude Code's trust for `dir` alone in .claude.json (projects[dir].hasTrustDialogAccepted),
+* changing nothing else in the file: it is read, changed in that one place, written beside itself
+* and moved over it.
+*/
+async function trustFolder(claudeJson, dir, platform) {
+	const text = await fs.readFile(claudeJson, "utf8").catch((err) => err.code === "ENOENT" ? "{}" : Promise.reject(err));
+	const config = JSON.parse(text);
+	const key = trustKey(dir, platform);
+	if (config.projects?.[key]?.hasTrustDialogAccepted === true) return;
+	config.projects = config.projects ?? {};
+	config.projects[key] = {
+		...config.projects[key] ?? {},
+		hasTrustDialogAccepted: true
+	};
+	const temp = `${claudeJson}.isoplan-${process.pid}`;
+	await fs.writeFile(temp, JSON.stringify(config, null, 2) + (text.endsWith("\n") ? "\n" : ""), { mode: 384 });
+	await fs.rename(temp, claudeJson);
+}
+/** The first thing the new session is told. */
+function takePrompt(id, brief, setupLog) {
+	return [
+		`Isoplan handoff ${id}: you are taking this work over.`,
+		`Read its brief in ${brief} first.`,
+		...setupLog ? [`The worktree's setup script failed; the end of its output is in ${setupLog}.`] : [],
+		"Then say where things stand and what you would do next, and wait for me before changing anything."
+	].join(" ");
+}
+/**
+* Claude Code's command line for the new session. The prompt comes first: `--add-dir` takes every
+* argument after it, and would take the prompt too.
+*/
+function sessionArgv(bin, { prompt, session, name, folder, headless }) {
+	return [
+		...claudeCommand(bin),
+		prompt,
+		...headless ? ["--bg"] : [],
+		"--session-id",
+		session,
+		"--name",
+		name,
+		"--add-dir",
+		folder
+	];
+}
+/** The commits this machine took of a handoff before, which a re-take may move past. */
+async function takenBefore(folder) {
+	try {
+		const { commits } = JSON.parse(await fs.readFile(path.join(folder, "taken.json"), "utf8"));
+		return Array.isArray(commits) ? commits.filter((c) => typeof c === "string" && /^[0-9a-f]{40,64}$/.test(c)) : [];
+	} catch {
+		return [];
+	}
+}
+async function recordTaken(folder, commit) {
+	const commits = [.../* @__PURE__ */ new Set([...await takenBefore(folder), commit])].slice(-50);
+	await fs.mkdir(folder, { recursive: true });
+	await fs.writeFile(path.join(folder, "taken.json"), JSON.stringify({
+		about: "The commits of this handoff taken on this machine, which a later take may replace.",
+		commits
+	}, null, 2) + "\n");
+}
+let emptyHooks = null;
+const noHooks = async () => ["-c", `core.hooksPath=${await (emptyHooks ??= fs.mkdtemp(path.join(os.tmpdir(), "isoplan-no-hooks-")))}`];
+/** Takes the handoff on this machine; never throws. */
+async function takeHandoff(message, o) {
+	const { handoff } = message;
+	const headless = message.mode === "headless";
+	const failures = [];
+	const done = (session) => ({
+		type: "taken",
+		v: 1,
+		handoff: handoff.id,
+		...session ? { session } : {},
+		failures
+	});
+	const fail = async (step, output) => {
+		const matched = await o.scan(output);
+		failures.push({
+			step,
+			output: matched ? `The end of its output is withheld here: it matches a secret pattern. It is on ${o.machine}.` : tail(output)
+		});
+	};
+	if (message.mode !== "terminal" && message.mode !== "headless") {
+		await fail("open", "The office server didn't say how to open the session, so none was opened: take it again from the floor.");
+		return done();
+	}
+	try {
+		const s = await o.settings();
+		const timeoutMs = s.gitTimeoutSeconds * 1e3;
+		const branch = handoffBranch(handoff.id);
+		const repo = handoff.repos.find((r) => r.path === ".") ?? handoff.repos[0];
+		const now = (o.now ?? Date.now)();
+		const clone = await findClone(o.io, o.run, path.join(o.claudeDir, "projects"), repo.remote, now - s.cloneSearchDays * 864e5, timeoutMs);
+		if (!clone) {
+			await fail("worktree", `No clone of ${repo.remote} was found on ${o.machine}: none of its Claude Code sessions from the last ${s.cloneSearchDays} days ran in one. Open Claude Code once in your clone of the repo, then take the handoff again, or copy its prompt into a session there.`);
+			return done();
+		}
+		const git = (args, cwd) => o.run(args, {
+			cwd,
+			timeoutMs
+		});
+		const folder = handoffDir(o.claudeDir, handoff.id);
+		const exempt = await takenBefore(folder);
+		const fetched = await git([
+			"fetch",
+			clone.remote,
+			`+refs/heads/${branch}:refs/remotes/${clone.remote}/${branch}`
+		], clone.dir);
+		if (fetched.code !== 0) {
+			await fail("worktree", `git fetch ${clone.remote} ${branch} in ${clone.dir} failed${fetched.timedOut ? " (it took too long)" : ""}:\n${fetched.stderr}`);
+			return done();
+		}
+		const dir = await worktreeFor(o.run, clone.dir, clone.remote, branch, handoff.id, exempt, timeoutMs);
+		if (typeof dir !== "string") {
+			await fail("worktree", dir.error);
+			return done();
+		}
+		await recordTaken(folder, await resolved(o.run, dir, "HEAD", timeoutMs) ?? repo.commit);
+		await fs.mkdir(folder, { recursive: true });
+		const briefFile = path.join(folder, "brief.md");
+		await fs.writeFile(briefFile, handoff.brief + "\n");
+		const env = forkEnv(o.env);
+		let setupLog = null;
+		const config = await readSetupFile(o.run, clone, timeoutMs);
+		if (config.problem) await fail("setup", config.problem);
+		let setup = null;
+		try {
+			setup = config.text === null ? null : parseSetup(config.text, o.platform, s.setupTimeoutMinutes * 6e4);
+		} catch (err) {
+			await fail("setup", `${REPO_CONFIG} couldn't be read: ${err.message}`);
+		}
+		if (setup) {
+			o.log(`handoff ${handoff.id}: running the worktree setup script in ${dir}`);
+			const r = await runShell(setup.command, {
+				cwd: dir,
+				env: {
+					...env,
+					ISOPLAN_HANDOFF_ID: handoff.id,
+					ISOPLAN_HANDOFF_BRANCH: branch
+				},
+				timeoutMs: setup.timeoutMs
+			});
+			if (!r.ok) {
+				setupLog = path.join(folder, "setup.log");
+				await fs.writeFile(setupLog, r.output);
+				await fail("setup", r.output || "The setup script failed with no output.");
+			}
+		}
+		const bin = await o.claude();
+		if (!bin) {
+			await fail("open", "The claude binary wasn't found on this machine: run the plugin's install script, or set its path in ~/.claude/isoplan/claude-binary.json.");
+			return done();
+		}
+		const id = message.session ?? (o.newSession ?? randomUUID)();
+		const name = `Isoplan handoff ${handoff.id}`;
+		const argv = sessionArgv(bin, {
+			prompt: takePrompt(handoff.id, briefFile, setupLog),
+			session: id,
+			name,
+			folder,
+			headless
+		});
+		if (headless) {
+			try {
+				await trustFolder(o.claudeJson, dir, o.platform);
+				await (o.start ?? startBackground)({
+					argv,
+					cwd: dir
+				}, env);
+			} catch (err) {
+				await fail("open", `The headless session couldn't be started: ${err.message}. The worktree is ${dir}.`);
+				return done();
+			}
+			const end = Date.now() + (o.confirmMs ?? 15e3);
+			let listed = false;
+			while (!listed && Date.now() < end) {
+				listed = (await (o.agents ?? listAgents)(bin, dir, env)).includes(id);
+				if (!listed) await new Promise((r) => setTimeout(r, 500));
+			}
+			if (!listed) {
+				await fail("open", `claude --bg returned, but \`claude agents\` doesn't list session ${id} in ${dir}, so it may not have started. Open Claude Code there yourself.`);
+				return done();
+			}
+			o.log(`handoff ${handoff.id}: started background Claude Code session ${id} in ${dir}`);
+			return done(`claude-code:${id}`);
+		}
+		const l = launch(o.platform, {
+			folder,
+			dir,
+			argv,
+			title: name,
+			configDir: o.env.CLAUDE_CONFIG_DIR ?? null
+		});
+		if (!l) {
+			await fail("open", `Opening a terminal isn't supported on ${o.platform} yet. The worktree is ${dir} and the brief is ${briefFile}: open Claude Code there yourself.`);
+			return done();
+		}
+		try {
+			await (o.open ?? openLaunch)(l, env);
+		} catch (err) {
+			await fail("open", `The terminal couldn't be opened: ${err.message}. The worktree is ${dir}.`);
+			return done();
+		}
+		o.log(`handoff ${handoff.id}: opened Claude Code session ${id} in ${dir}`);
+		return done(`claude-code:${id}`);
+	} catch (err) {
+		o.log(`handoff ${handoff.id}: taking it failed: ${err?.stack ?? String(err)}`);
+		if (!failures.length) failures.push({
+			step: "worktree",
+			output: "The runner failed while taking the handoff; its log on this machine says why."
+		});
+		return done();
+	}
+}
+/**
+* How many commits `ref` has that neither the new tip nor any commit this machine took of the
+* handoff before (`exempt`, which a new hand-over replaces) has: the receiver's own work. Null when
+* git can't say.
+*/
+async function ahead(run, cwd, tip, exempt, ref, timeoutMs) {
+	const known = [];
+	for (const c of exempt) if ((await run([
+		"cat-file",
+		"-e",
+		`${c}^{commit}`
+	], {
+		cwd,
+		timeoutMs
+	})).code === 0) known.push(c);
+	const r = await run([
+		"rev-list",
+		"--count",
+		ref,
+		"--not",
+		tip,
+		...known
+	], {
+		cwd,
+		timeoutMs
+	});
+	return r.code === 0 ? Number(r.stdout.trim()) : null;
+}
+/** What a ref points at now, or null. */
+async function resolved(run, cwd, ref, timeoutMs) {
+	const r = await run([
+		"rev-parse",
+		"--verify",
+		"-q",
+		ref
+	], {
+		cwd,
+		timeoutMs
+	});
+	return r.code === 0 ? r.stdout.trim() : null;
+}
+async function worktreeFor(run, clone, remote, branch, id, exempt, timeoutMs) {
+	const tip = `refs/remotes/${remote}/${branch}`;
+	const hooksOff = await noHooks();
+	const base = path.join(path.dirname(clone), `${path.basename(clone)}-handoff-${id}`);
+	for (let n = 1; n < 10; n++) {
+		const dir = n === 1 ? base : `${base}-${n}`;
+		if (await fs.stat(dir).then(() => true, () => false)) {
+			const head = await run([
+				"rev-parse",
+				"--abbrev-ref",
+				"HEAD"
+			], {
+				cwd: dir,
+				timeoutMs
+			});
+			if (head.code !== 0 || head.stdout.trim() !== branch) continue;
+			const dirty = (await run([
+				"status",
+				"--porcelain",
+				"--untracked-files=no"
+			], {
+				cwd: dir,
+				timeoutMs
+			})).stdout.trim() !== "";
+			const extra = await ahead(run, dir, tip, exempt, "HEAD", timeoutMs);
+			if (dirty || extra !== 0) return { error: `${dir}, this handoff's worktree from before, has work that isn't in the handoff as handed over now (${dirty ? "uncommitted changes" : `${extra ?? "some"} commit(s)`}), so it was left as it is. Commit and push it, or move it aside, then take the handoff again.` };
+			const moved = await run([
+				...hooksOff,
+				"reset",
+				"-q",
+				"--keep",
+				tip
+			], {
+				cwd: dir,
+				timeoutMs
+			});
+			return moved.code === 0 ? dir : { error: `${dir} couldn't be moved to the handoff as handed over now:\n${moved.stderr}` };
+		}
+		if ((await run([
+			"rev-parse",
+			"--verify",
+			"-q",
+			`refs/heads/${branch}`
+		], {
+			cwd: clone,
+			timeoutMs
+		})).code === 0) {
+			const extra = await ahead(run, clone, tip, exempt, `refs/heads/${branch}`, timeoutMs);
+			if (extra !== 0) return { error: `The local branch ${branch} in ${clone} has ${extra ?? "some"} commit(s) that aren't in the handoff as handed over now, so no worktree was made over it. Push or move them, then take the handoff again.` };
+		}
+		const r = await run([
+			...hooksOff,
+			"worktree",
+			"add",
+			"--track",
+			"-B",
+			branch,
+			dir,
+			`${remote}/${branch}`
+		], {
+			cwd: clone,
+			timeoutMs
+		});
+		return r.code === 0 ? dir : { error: `git worktree add ${dir} failed${r.timedOut ? " (it took too long)" : ""}:\n${r.stderr}` };
+	}
+	return { error: `${base} and the next eight names beside it are taken by other folders` };
+}
+//#endregion
 //#region src/runner/runner.ts
+/** A push that failed, with what the server is told; anything else thrown is told only that it failed. */
+var PushFailed = class extends Error {};
 const REMEMBER = 200;
 const COMPACTED_NOTE = "Note from Isoplan: this session was compacted, so its earlier work survives only as a summary and the details may be thin.";
 /** What the server is told for each kind of fork failure. */
@@ -8011,13 +9116,16 @@ const FAILED = {
 	"not-set-up": "this machine can't run the fork; its owner can see why in the runner's log"
 };
 const REMEMBER_DROPPED = 200;
-function createRunner({ answerer, ledger, settings, prompts, scan, send, log, isDir, isReported, push, now = Date.now }) {
+function createRunner({ answerer, ledger, settings, prompts, scan, send, log, isDir, isReported, push, prepareBrief, take, now = Date.now }) {
 	const rooms = /* @__PURE__ */ new Map();
 	const running = /* @__PURE__ */ new Set();
 	const finished = /* @__PURE__ */ new Map();
 	const held = /* @__PURE__ */ new Map();
 	const released = /* @__PURE__ */ new Set();
 	const dropped = /* @__PURE__ */ new Set();
+	const taking = /* @__PURE__ */ new Set();
+	const takes = /* @__PURE__ */ new Set();
+	const dropping = /* @__PURE__ */ new Set();
 	let forking = 0;
 	const waiting = [];
 	async function forkSlot(max) {
@@ -8043,6 +9151,10 @@ function createRunner({ answerer, ledger, settings, prompts, scan, send, log, is
 		cap
 	});
 	function deliver(id, message) {
+		if (dropping.delete(id)) {
+			log(`${id} was dropped by the office server, so what it came to isn't sent`);
+			return;
+		}
 		finished.delete(id);
 		finished.set(id, message);
 		if (finished.size > REMEMBER) finished.delete(finished.keys().next().value);
@@ -8064,42 +9176,95 @@ function createRunner({ answerer, ledger, settings, prompts, scan, send, log, is
 		if (request.kind === "write-brief" && !push) return unavailable(id, "this plugin version can't hand a room over from the floor yet");
 		const s = await settings();
 		const p = await prompts();
+		const isBrief = request.kind === "write-brief";
+		let brief = {
+			files: [],
+			note: ""
+		};
+		if (isBrief && prepareBrief) try {
+			brief = await prepareBrief(lead, request.handoff);
+		} catch (err) {
+			log(`${id}: ${err.message}`);
+			return unavailable(id, err instanceof PushFailed ? err.message : "the handoff's branch couldn't be pushed");
+		}
+		const fallback = (why) => {
+			log(`${id}: the fork didn't write the brief (${why}), so the server writes it from the room's feed`);
+			return `No brief was written by the session: ${why}.${brief.note ? `\n\n${brief.note}` : ""}`;
+		};
 		const expected = estimate(lead.context, s);
 		const cap = overCap(ledger.entries(now()), room, expected, now(), s);
-		if (cap) return overCapRefusal(id, cap);
-		const reservation = ledger.reserve({
-			at: now(),
-			room,
-			usage: expected
-		});
-		const isBrief = request.kind === "write-brief";
-		const text = isBrief ? fill(p.brief, { to: request.to.name || request.to.id }) : fill(p.question, {
-			from: request.from.name || request.from.id,
-			question: request.question
-		});
-		const free = await forkSlot(s.maxForks);
-		const answered = await answerer.ask(session, lead, {
-			instructions: p.instructions,
-			request: text,
-			timeoutMs: (isBrief ? s.briefTimeoutSeconds : s.answerTimeoutSeconds) * 1e3
-		}).finally(free);
-		await (!answered.ok && answered.kind === "not-set-up" ? reservation.cancel() : reservation.settle(answered.usage ?? expected)).catch((err) => log(`couldn't record ${id} in the ledger: ${err.message}`));
-		if (!answered.ok) {
-			log(`${id}: ${answered.detail}`);
-			return unavailable(id, FAILED[answered.kind]);
-		}
-		const body = lead.compacted ? `${COMPACTED_NOTE}\n\n${answered.text}` : answered.text;
-		const reply = isBrief ? async () => ({
-			type: "reply",
-			v: 1,
-			id,
-			kind: "write-brief",
-			handoff: {
-				id: request.handoff,
-				brief: body,
-				repos: await push(session, lead, request.handoff)
+		let body;
+		let isFallback = false;
+		if (cap) {
+			if (!isBrief) return overCapRefusal(id, cap);
+			body = fallback(`the ${cap} cap is reached`);
+			isFallback = true;
+		} else {
+			const reservation = ledger.reserve({
+				at: now(),
+				room,
+				usage: expected
+			});
+			const text = isBrief ? fill(p.brief, {
+				to: request.to.name || request.to.id,
+				untracked: untrackedLine(brief.files)
+			}) : fill(p.question, {
+				from: request.from.name || request.from.id,
+				question: request.question
+			});
+			const free = await forkSlot(s.maxForks);
+			const answered = await answerer.ask(session, lead, {
+				instructions: p.instructions,
+				request: text,
+				timeoutMs: (isBrief ? s.briefTimeoutSeconds : s.answerTimeoutSeconds) * 1e3
+			}).finally(free);
+			await (!answered.ok && answered.kind === "not-set-up" ? reservation.cancel() : reservation.settle(answered.usage ?? expected)).catch((err) => log(`couldn't record ${id} in the ledger: ${err.message}`));
+			if (!answered.ok) {
+				log(`${id}: ${answered.detail}`);
+				if (!isBrief) return unavailable(id, FAILED[answered.kind]);
+				body = fallback(FAILED[answered.kind]);
+				isFallback = true;
+			} else {
+				body = lead.compacted ? `${COMPACTED_NOTE}\n\n${answered.text}` : answered.text;
+				if (brief.note) body = `${body}\n\n${brief.note}`;
 			}
-		}) : async () => ({
+		}
+		const pushAndReply = async (pushAnyway) => {
+			if (dropping.has(id)) return unavailable(id, "the handoff was cancelled, so nothing was pushed");
+			let pushed;
+			try {
+				pushed = await push(session, lead, request.handoff, pushAnyway);
+			} catch (err) {
+				log(`${id}: the push failed: ${err.message}`);
+				return unavailable(id, err instanceof PushFailed ? err.message : "the handoff's branch couldn't be pushed");
+			}
+			if (!Array.isArray(pushed)) {
+				const { held: file, commit, unchecked } = pushed;
+				log(`withheld the handoff's commit ${commit} for ${id} in ${room}: the lines it adds to ${file} match a secret pattern`);
+				hold(id, () => pushAndReply(commit));
+				return {
+					type: "refusal",
+					v: 1,
+					id,
+					reason: "withheld",
+					file,
+					...unchecked.length ? { unchecked } : {}
+				};
+			}
+			return {
+				type: "reply",
+				v: 1,
+				id,
+				kind: "write-brief",
+				handoff: {
+					id: request.handoff,
+					brief: body,
+					repos: pushed
+				},
+				...isFallback ? { fallback: true } : {}
+			};
+		};
+		const reply = isBrief ? () => pushAndReply(null) : async () => ({
 			type: "reply",
 			v: 1,
 			id,
@@ -8113,6 +9278,15 @@ function createRunner({ answerer, ledger, settings, prompts, scan, send, log, is
 			log(`${id} was released while it was being written, so it is sent`);
 			return reply();
 		}
+		hold(id, reply);
+		return {
+			type: "refusal",
+			v: 1,
+			id,
+			reason: "withheld"
+		};
+	}
+	function hold(id, reply) {
 		held.set(id, reply);
 		if (held.size > 50) {
 			const oldest = held.keys().next().value;
@@ -8121,12 +9295,6 @@ function createRunner({ answerer, ledger, settings, prompts, scan, send, log, is
 			if (dropped.size > REMEMBER_DROPPED) dropped.delete(dropped.values().next().value);
 			log(`dropped the withheld reply for ${oldest}: more than 50 are held`);
 		}
-		return {
-			type: "refusal",
-			v: 1,
-			id,
-			reason: "withheld"
-		};
 	}
 	async function release(id) {
 		const reply = held.get(id);
@@ -8155,8 +9323,23 @@ function createRunner({ answerer, ledger, settings, prompts, scan, send, log, is
 				release(message.id);
 				return;
 			}
+			if (message.type === "drop") {
+				if (held.delete(message.id)) log(`dropped the withheld reply for ${message.id}: its handoff is over`);
+				else if (running.has(message.id)) dropping.add(message.id);
+				return;
+			}
 			if (message.type === "handoff") {
-				log(`the office server sent handoff ${message.handoff.id} to take, which this runner doesn't handle yet`);
+				const handoff = message.handoff;
+				const takeId = message.session ?? handoff.id;
+				if (!take) log(`the office server sent handoff ${handoff.id} to take, which this runner doesn't handle yet`);
+				else if (taking.has(handoff.id)) log(`handoff ${handoff.id} is being taken already`);
+				else if (takes.has(takeId)) log(`take ${takeId} of handoff ${handoff.id} was run already, so it isn't run again`);
+				else {
+					takes.add(takeId);
+					if (takes.size > REMEMBER) takes.delete(takes.values().next().value);
+					taking.add(handoff.id);
+					take(message).then(send, (err) => log(`handoff ${handoff.id}: taking it failed: ${err?.stack ?? String(err)}`)).finally(() => taking.delete(handoff.id));
+				}
 				return;
 			}
 			if (message.kind === "owner-answer") {
@@ -8182,7 +9365,7 @@ function createRunner({ answerer, ledger, settings, prompts, scan, send, log, is
 			});
 			rooms.set(room, turn);
 		},
-		idle: () => running.size === 0,
+		idle: () => running.size === 0 && taking.size === 0,
 		async settled() {
 			while (rooms.size) await Promise.all(rooms.values());
 		}
@@ -8353,13 +9536,21 @@ async function worker() {
 		config
 	});
 	process.on("exit", () => answerer.close());
+	const git = createRunGit();
+	const gitMs = async () => (await settings()).gitTimeoutSeconds * 1e3;
+	const told = (err) => {
+		if (!(err instanceof HandoffGitError)) throw err;
+		log(`handoff git: ${err.detail}`);
+		return new PushFailed(GIT_FAILED[err.kind]);
+	};
+	const scanText = async (text) => scan(text, await loadPatterns(path.join(appDir, "secret-patterns.json"), path.join(isoplanDir, "secret-patterns.json"), log));
 	let send = () => {};
 	const runner = createRunner({
 		answerer,
 		ledger: await openLedger(path.join(isoplanDir, "runner", "ledger.json")),
 		settings,
 		prompts: () => loadPrompts(path.join(appDir, "prompts")),
-		scan: async (text) => scan(text, await loadPatterns(path.join(appDir, "secret-patterns.json"), path.join(isoplanDir, "secret-patterns.json"), log)),
+		scan: scanText,
 		send: (message) => send(message),
 		log,
 		isDir: (p) => fs.stat(p).then((s) => s.isDirectory(), () => false),
@@ -8368,7 +9559,39 @@ async function worker() {
 			const lock = id ? await readLock(lockPath(claudeDir, id)) : null;
 			if (!id || lock && lock.pid === null && lock.until !== null && lock.until > Date.now()) return false;
 			return Date.now() - lead.lastActive <= askableMs(await config().catch(() => first));
-		}
+		},
+		prepareBrief: async (lead, handoff) => {
+			const { from, files } = await prepare(git, lead.cwd, await gitMs()).catch((err) => Promise.reject(told(err)));
+			return {
+				files,
+				note: handoffNote({
+					branch: handoffBranch(handoff),
+					from,
+					files,
+					at: /* @__PURE__ */ new Date()
+				})
+			};
+		},
+		push: async (_session, lead, handoff, pushAnyway) => {
+			const pushed = await pushHandoff(git, lead.cwd, handoff, await gitMs(), {
+				scan: scanText,
+				...pushAnyway ? { pushAnyway } : {}
+			}).catch((err) => Promise.reject(told(err)));
+			return "held" in pushed ? pushed : [pushed.repo];
+		},
+		take: (message) => takeHandoff(message, {
+			run: git,
+			io,
+			claudeDir,
+			machine: os.hostname(),
+			platform: process.platform,
+			env: process.env,
+			settings,
+			claude: () => claudeBinary(claudeDir, process.env, process.platform, os.homedir()),
+			claudeJson,
+			scan: scanText,
+			log
+		})
 	});
 	let notWanted = false;
 	let wake = () => {};

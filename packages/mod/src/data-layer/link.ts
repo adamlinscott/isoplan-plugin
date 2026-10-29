@@ -21,6 +21,7 @@ import {
   PROTOCOL_VERSION,
   type DataLayerMessage,
   type Facts,
+  type DropMessage,
   type HandoffMessage,
   type HelloMessage,
   type RefusalMessage,
@@ -28,6 +29,7 @@ import {
   type ReplyMessage,
   type RequestMessage,
   type RunnerHelloMessage,
+  type TakenMessage,
 } from "@isoplan/protocol";
 import type { DataLayerLine } from "../lines.js";
 import { diffFacts } from "./changes.js";
@@ -54,14 +56,17 @@ export interface LinkOptions {
   random?: () => number;
 }
 
+/** What a runner sends back: a reply, a refusal, or what it did with a handoff it took. */
+type Outgoing = ReplyMessage | RefusalMessage | TakenMessage;
+
 /** What the server asks of a machine, rather than of a session's facts. */
-export type ServerAsk = RequestMessage | ReleaseMessage | HandoffMessage;
+export type ServerAsk = RequestMessage | ReleaseMessage | HandoffMessage | DropMessage;
 
 export interface Link {
   /** The session's facts now; what differs from what the server has goes out when the pace allows. */
   update(facts: Facts): void;
-  /** A reply or refusal. One sent while the link is down goes out after the next hello. */
-  send(message: ReplyMessage | RefusalMessage): void;
+  /** A reply, refusal or taken. One sent while the link is down goes out after the next hello. */
+  send(message: Outgoing): void;
   close(): void;
 }
 
@@ -77,7 +82,7 @@ export function createLink({
   onMessage,
   random = Math.random,
 }: LinkOptions): Link {
-  const outbox: { message: ReplyMessage | RefusalMessage; at: number }[] = [];
+  const outbox: { message: Outgoing; at: number }[] = [];
   let latest: Facts | null = null;
   let socket: WebSocket | null = null;
   let isOpen = false;
@@ -199,7 +204,7 @@ export function createLink({
         isUnwanted = true;
         onNotWanted?.();
       }
-    } else if (onMessage && (message.type === "request" || message.type === "release" || message.type === "handoff")) {
+    } else if (onMessage && (message.type === "request" || message.type === "release" || message.type === "handoff" || message.type === "drop")) {
       onMessage(message);
     } else {
       emit({ type: "log", text: `the office server sent a ${message.type} message, which this data layer doesn't handle yet` });

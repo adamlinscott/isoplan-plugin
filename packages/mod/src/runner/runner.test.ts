@@ -1,6 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
-import { PROTOCOL_VERSION, type HandoffRepo, type RefusalMessage, type ReplyMessage, type RequestMessage } from "@isoplan/protocol";
+import { PROTOCOL_VERSION, type HandoffMessage, type HandoffRepo, type RefusalMessage, type ReplyMessage, type RequestMessage, type TakenMessage } from "@isoplan/protocol";
 import { expect, test } from "vitest";
 import { modDir, tempRoot } from "../data-layer/fixture.js";
 import { loadSettings } from "../data-layer/config.js";
@@ -8,10 +8,12 @@ import { nodeIo } from "../data-layer/io.js";
 import type { Answered, Answerer, Ask, Lead } from "./answerer.js";
 import { openLedger, type Entry } from "./caps.js";
 import { loadPrompts } from "./prompts.js";
-import { COMPACTED_NOTE, createRunner, MAX_HELD, type RunnerOptions, type RunnerSettings } from "./runner.js";
+import { COMPACTED_NOTE, createRunner, MAX_HELD, PushFailed, type RunnerOptions, type RunnerSettings } from "./runner.js";
 import { loadPatterns, scan, UNREADABLE } from "./scan.js";
 
 const NOW = Date.parse("2026-10-29T12:00:00Z");
+// A fake AWS key id, split so no key-shaped string sits in the source.
+const AWS_KEY = "AKIA" + "ABCDEFGHIJKLMNOP";
 const defaults = JSON.parse(fs.readFileSync(path.join(modDir, "runner.json"), "utf8")) as RunnerSettings;
 
 const question = (id: string, room = "room-1", session = "claude-code:lead-1"): RequestMessage => ({
@@ -47,7 +49,7 @@ async function setup({ lead, settings, entries, ...opts }: Partial<Omit<RunnerOp
   const ledgerFile = path.join(dir, "ledger.json");
   if (entries) fs.writeFileSync(ledgerFile, JSON.stringify(entries));
   const ledger = await openLedger(ledgerFile);
-  const sent: (ReplyMessage | RefusalMessage)[] = [];
+  const sent: (ReplyMessage | RefusalMessage | TakenMessage)[] = [];
   const logs: string[] = [];
   const patterns = await loadPatterns(path.join(modDir, "secret-patterns.json"), path.join(dir, "none.json"), (t) => logs.push(t));
   const runner = createRunner({
@@ -95,7 +97,7 @@ test("runner: answers one at a time per room; other rooms don't wait", async () 
   await t.asked(3);
   t.askFor("q2")!.settle(ok("two"));
   await t.runner.settled();
-  expect(t.sent.map((m) => [m.id, m.type === "reply" && m.kind === "answer-question" ? m.answer : m.type])).toEqual([
+  expect(t.sent.map((m) => ["id" in m && m.id, m.type === "reply" && m.kind === "answer-question" ? m.answer : m.type])).toEqual([
     ["q1", "one"],
     ["q3", "three"],
     ["q2", "two"],
@@ -118,7 +120,7 @@ test("runner: a secret in the answer is withheld, and the owner's release sends 
   const t = await setup();
   t.runner.take(question("q1"));
   await t.asked(1);
-  t.asks[0]!.settle(ok("The deploy key is AKIAABCDEFGHIJKLMNOP, in the vault."));
+  t.asks[0]!.settle(ok(`The deploy key is ${AWS_KEY}, in the vault.`));
   await t.runner.settled();
   expect(t.sent).toEqual([{ type: "refusal", v: PROTOCOL_VERSION, id: "q1", reason: "withheld" }]);
   expect(t.logs.join("\n")).toContain('matches the secret pattern "AWS access key id"');
@@ -129,7 +131,7 @@ test("runner: a secret in the answer is withheld, and the owner's release sends 
   expect(t.asks).toHaveLength(1);
   expect(t.sent.slice(1)).toEqual([
     { type: "refusal", v: PROTOCOL_VERSION, id: "q1", reason: "withheld" },
-    { type: "reply", v: PROTOCOL_VERSION, id: "q1", kind: "answer-question", answer: "The deploy key is AKIAABCDEFGHIJKLMNOP, in the vault." },
+    { type: "reply", v: PROTOCOL_VERSION, id: "q1", kind: "answer-question", answer: `The deploy key is ${AWS_KEY}, in the vault.` },
   ]);
   // Nothing held under an id is refused with the reason.
   t.runner.take({ type: "release", v: PROTOCOL_VERSION, id: "nope" });
@@ -150,6 +152,104 @@ test("runner: a brief is scanned too, and carries the repos the handoff pushed",
   t.runner.take({ type: "release", v: PROTOCOL_VERSION, id: "b1" });
   await t.sentN(2);
   expect(t.sent[1]).toEqual({ type: "reply", v: PROTOCOL_VERSION, id: "b1", kind: "write-brief", handoff: { id: "h-1", brief: 'Goal: ship. Set password: "hunter2hunter2" first.', repos } });
+});
+
+test("runner: a brief is asked for with the untracked files named, ends with the note, and is pushed only once it clears the scan", async () => {
+  const repos: HandoffRepo[] = [{ path: ".", remote: "origin", branch: "isoplan/handoff/h-1", commit: "a".repeat(40) }];
+  const pushed: string[] = [];
+  const t = await setup({ prepareBrief: async () => ({ files: [".env.local"], note: "Handed over by Isoplan on isoplan/handoff/h-1." }), push: async (_s, _l, h) => (pushed.push(h), repos) });
+  t.runner.take(brief("b1"));
+  await t.asked(1);
+  expect(t.asks[0]!.ask.request).toContain("The untracked files are: `.env.local`. Say what each is for.");
+  expect(pushed).toEqual([]);
+  t.asks[0]!.settle(ok("Goal: ship. `.env.local` points the app at a local API."));
+  await t.runner.settled();
+  expect(t.sent).toEqual([{ type: "reply", v: PROTOCOL_VERSION, id: "b1", kind: "write-brief", handoff: { id: "h-1", brief: "Goal: ship. `.env.local` points the app at a local API.\n\nHanded over by Isoplan on isoplan/handoff/h-1.", repos } }]);
+  expect(pushed).toEqual(["h-1"]);
+});
+
+test("runner: a brief the fork can't write still goes, marked fallback, with the note; a push that fails is refused with its reason", async () => {
+  const repos: HandoffRepo[] = [{ path: ".", remote: "origin", branch: "isoplan/handoff/h-1", commit: "a".repeat(40) }];
+  const t = await setup({ prepareBrief: async () => ({ files: [], note: "The note." }), push: async () => repos });
+  t.runner.take(brief("b1"));
+  await t.asked(1);
+  t.asks[0]!.settle({ ok: false, kind: "timed-out", detail: "no answer within 240 s", usage: null });
+  await t.runner.settled();
+  expect(t.sent).toEqual([{ type: "reply", v: PROTOCOL_VERSION, id: "b1", kind: "write-brief", fallback: true, handoff: { id: "h-1", brief: "No brief was written by the session: the fork took too long to answer.\n\nThe note.", repos } }]);
+
+  const over = await setup({ settings: { answersPerMachinePerDay: 1 }, entries: [{ at: NOW - 1000, room: "a", usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } }], prepareBrief: async () => ({ files: [], note: "The note." }), push: async () => repos });
+  over.runner.take(brief("b2"));
+  await over.runner.settled();
+  expect(over.asks).toEqual([]);
+  expect(over.sent[0]).toMatchObject({ kind: "write-brief", fallback: true });
+
+  const rejected = await setup({ push: async () => Promise.reject(new PushFailed("the remote rejected the handoff's branch")) });
+  rejected.runner.take(brief("b3"));
+  await rejected.asked(1);
+  rejected.asks[0]!.settle(ok("Goal: ship."));
+  await rejected.runner.settled();
+  expect(rejected.sent).toEqual([{ type: "refusal", v: PROTOCOL_VERSION, id: "b3", reason: "unavailable", detail: "the remote rejected the handoff's branch" }]);
+});
+
+test("runner: a commit with a possible secret holds the push, naming the file; the owner's release pushes that exact commit", async () => {
+  const repos: HandoffRepo[] = [{ path: ".", remote: "origin", branch: "isoplan/handoff/h-1", commit: "c".repeat(40) }];
+  const pushes: (string | null)[] = [];
+  const t = await setup({
+    push: async (_s, _l, _h, pushAnyway) => (pushes.push(pushAnyway), pushAnyway ? repos : { held: "config/dev.ts", commit: "c".repeat(40), unchecked: ["logo.png"] }),
+  });
+  t.runner.take(brief("b1"));
+  await t.asked(1);
+  t.asks[0]!.settle(ok("Goal: ship."));
+  await t.runner.settled();
+  expect(t.sent).toEqual([{ type: "refusal", v: PROTOCOL_VERSION, id: "b1", reason: "withheld", file: "config/dev.ts", unchecked: ["logo.png"] }]);
+  expect(t.logs.join("\n")).not.toContain("AWS");
+  t.runner.take({ type: "release", v: PROTOCOL_VERSION, id: "b1" });
+  await t.sentN(2);
+  expect(pushes).toEqual([null, "c".repeat(40)]);
+  expect(t.sent[1]).toEqual({ type: "reply", v: PROTOCOL_VERSION, id: "b1", kind: "write-brief", handoff: { id: "h-1", brief: "Goal: ship.", repos } });
+});
+
+test("runner: a drop ends a request: what is held goes, and one still being written neither pushes nor sends", async () => {
+  const pushes: (string | null)[] = [];
+  const t = await setup({ push: async (_s, _l, _h, pushAnyway) => (pushes.push(pushAnyway), { held: "a.ts", commit: "c".repeat(40), unchecked: [] }) });
+  t.runner.take(brief("b1"));
+  await t.asked(1);
+  t.asks[0]!.settle(ok("Goal: ship."));
+  await t.runner.settled();
+  t.runner.take({ type: "drop", v: PROTOCOL_VERSION, id: "b1" });
+  t.runner.take({ type: "release", v: PROTOCOL_VERSION, id: "b1" });
+  await t.sentN(2);
+  expect(pushes).toEqual([null]);
+  expect(t.sent[1]).toMatchObject({ id: "b1", reason: "unavailable" });
+
+  const running = await setup({ push: async (_s, _l, _h, pushAnyway) => (pushes.push(pushAnyway), []) });
+  running.runner.take(brief("b2"));
+  await running.asked(1);
+  running.runner.take({ type: "drop", v: PROTOCOL_VERSION, id: "b2" });
+  running.asks[0]!.settle(ok("Goal: ship."));
+  await running.runner.settled();
+  expect(running.sent).toEqual([]);
+  expect(pushes).toEqual([null]);
+});
+
+test("runner: a handoff to take goes to take once at a time, and what it did goes back as taken", async () => {
+  let finish: () => void = () => {};
+  const taken: string[] = [];
+  const t = await setup({
+    take: async (m) => {
+      taken.push(`${m.handoff.id} ${m.mode}`);
+      await new Promise<void>((r) => (finish = r));
+      return { type: "taken", v: PROTOCOL_VERSION, handoff: m.handoff.id, session: "claude-code:new", failures: [] };
+    },
+  });
+  const handoff: HandoffMessage = { type: "handoff", v: PROTOCOL_VERSION, mode: "headless", handoff: { id: "h-1", brief: "b", repos: [{ path: ".", remote: "origin", branch: "isoplan/handoff/h-1", commit: "a".repeat(40) }] } };
+  t.runner.take(handoff);
+  t.runner.take(handoff);
+  expect(taken).toEqual(["h-1 headless"]);
+  expect(t.runner.idle()).toBe(false);
+  finish();
+  await t.sentN(1);
+  expect(t.sent).toEqual([{ type: "taken", v: PROTOCOL_VERSION, handoff: "h-1", session: "claude-code:new", failures: [] }]);
 });
 
 test("runner: without the handoff's push, a brief is refused before the fork runs", async () => {
@@ -236,7 +336,7 @@ test("runner: a failed fork is refused with its kind alone, the details logged, 
   t.runner.take(question("q2", "room-2"));
   await t.asked(2);
   t.askFor("q1")!.settle({ ok: false, kind: "timed-out", detail: "no answer within 120 s", usage: null });
-  t.askFor("q2")!.settle({ ok: false, kind: "failed", detail: "turn 2 stopped with error_during_execution: AKIAABCDEFGHIJKLMNOP in C:/Users/ada/secret", usage });
+  t.askFor("q2")!.settle({ ok: false, kind: "failed", detail: `turn 2 stopped with error_during_execution: ${AWS_KEY} in C:/Users/ada/secret`, usage });
   await t.runner.settled();
   expect(t.sent).toEqual([
     { type: "refusal", v: PROTOCOL_VERSION, id: "q1", reason: "unavailable", detail: "the fork took too long to answer" },
@@ -269,13 +369,13 @@ test("runner: a release that arrives while its answer is being written is applie
   t.runner.take(question("q1"));
   await t.asked(1);
   t.runner.take({ type: "release", v: PROTOCOL_VERSION, id: "q1" });
-  t.asks[0]!.settle(ok("The key is AKIAABCDEFGHIJKLMNOP."));
+  t.asks[0]!.settle(ok(`The key is ${AWS_KEY}.`));
   await t.runner.settled();
-  expect(t.sent).toEqual([{ type: "reply", v: PROTOCOL_VERSION, id: "q1", kind: "answer-question", answer: "The key is AKIAABCDEFGHIJKLMNOP." }]);
+  expect(t.sent).toEqual([{ type: "reply", v: PROTOCOL_VERSION, id: "q1", kind: "answer-question", answer: `The key is ${AWS_KEY}.` }]);
   // A release doesn't carry over to a later answer under another id.
   t.runner.take(question("q2"));
   await t.asked(2);
-  t.asks[1]!.settle(ok("The key is AKIAABCDEFGHIJKLMNOP."));
+  t.asks[1]!.settle(ok(`The key is ${AWS_KEY}.`));
   await t.runner.settled();
   expect(t.sent[1]).toEqual({ type: "refusal", v: PROTOCOL_VERSION, id: "q2", reason: "withheld" });
 });
@@ -285,7 +385,7 @@ test("runner: at most MAX_HELD replies are held; the oldest goes first", async (
   for (let i = 0; i <= MAX_HELD; i++) {
     t.runner.take(question(`q${i}`, `room-${i}`));
     await t.asked(i + 1);
-    t.asks[i]!.settle(ok("AKIAABCDEFGHIJKLMNOP"));
+    t.asks[i]!.settle(ok(`${AWS_KEY}`));
   }
   await t.runner.settled();
   t.runner.take({ type: "release", v: PROTOCOL_VERSION, id: "q0" });
@@ -293,7 +393,7 @@ test("runner: at most MAX_HELD replies are held; the oldest goes first", async (
   await t.sentN(MAX_HELD + 3);
   expect(t.sent.slice(-2)).toEqual([
     { type: "refusal", v: PROTOCOL_VERSION, id: "q0", reason: "unavailable", detail: `its withheld reply was dropped to make room: more than ${MAX_HELD} were held at once, so ask again` },
-    { type: "reply", v: PROTOCOL_VERSION, id: `q${MAX_HELD}`, kind: "answer-question", answer: "AKIAABCDEFGHIJKLMNOP" },
+    { type: "reply", v: PROTOCOL_VERSION, id: `q${MAX_HELD}`, kind: "answer-question", answer: `${AWS_KEY}` },
   ]);
 });
 

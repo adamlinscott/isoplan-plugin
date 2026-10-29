@@ -21,14 +21,24 @@
 // A request id seen before isn't run again: one still running is left to finish, and one that
 // finished gets the same answer again, so a server that asks twice doesn't pay twice.
 //
-// A brief's reply also carries the repos pushed for the handoff, which is the handoff's own work
-// (#48); without `push` a write-brief is refused before the fork runs. owner-answer requests go to
-// the live session, not the runner (#50), and handoffs to take are #48's; both are refused or logged.
+// A brief (#48) is asked for with the session's untracked files named (`prepareBrief`), and ends
+// with the runner's note of what was pushed. When the fork can't write it (it failed, or a cap is
+// reached), the reply still goes, marked `fallback`, with the note alone, and the server writes the
+// rest from the room's feed. Its branch is pushed (`push`) only once the brief has cleared the scan
+// or been released. The push scans what it would send: on a match nothing is pushed, the refusal is
+// `withheld` naming the file (never the pattern) and the files it couldn't read, and the owner's
+// release pushes that exact commit anyway. A push that fails is refused `unavailable` with the
+// reason. Without `push` a write-brief is refused before the fork runs. A `drop` ends a request: what
+// is held for it goes, and one still running neither pushes nor sends. A handoff to take goes to
+// `take`, with how to open its session; each take (the session id the server chose) runs once, however
+// often it is sent, and what it did goes back as `taken`. owner-answer requests go to the live session, not
+// the runner (#50).
 
-import { PROTOCOL_VERSION, type HandoffRepo, type RefusalMessage, type ReplyMessage, type RequestMessage } from "@isoplan/protocol";
+import { PROTOCOL_VERSION, type HandoffMessage, type HandoffRepo, type RefusalMessage, type ReplyMessage, type RequestMessage, type TakenMessage } from "@isoplan/protocol";
 import type { ServerAsk } from "../data-layer/link.js";
 import type { Answerer, FailureKind, Lead } from "./answerer.js";
 import { estimate, overCap, type Cap, type CapSettings, type Ledger } from "./caps.js";
+import { untrackedLine } from "../handoff/git.js";
 import { fill, type Prompts } from "./prompts.js";
 
 /** What runner.json says, as the runner uses it. */
@@ -39,6 +49,9 @@ export interface RunnerSettings extends CapSettings {
 }
 
 type Outgoing = ReplyMessage | RefusalMessage;
+
+/** A push that failed, with what the server is told; anything else thrown is told only that it failed. */
+export class PushFailed extends Error {}
 type Ask = Extract<RequestMessage, { kind: "answer-question" | "write-brief" }>;
 
 export interface RunnerOptions {
@@ -49,13 +62,21 @@ export interface RunnerOptions {
   prompts: () => Promise<Prompts>;
   /** The name of the secret pattern `text` matches, or null. */
   scan: (text: string) => Promise<string | null>;
-  send: (message: Outgoing) => void;
+  send: (message: Outgoing | TakenMessage) => void;
   log: (text: string) => void;
   isDir: (path: string) => Promise<boolean>;
   /** Whether the data layer would report this session, so the server may ask about it. */
   isReported: (session: string, lead: Lead) => Promise<boolean>;
   /** Pushes the handoff's work and returns its repos (#48); without it, briefs are refused. */
-  push?: (session: string, lead: Lead, handoff: string) => Promise<HandoffRepo[]>;
+  /**
+   * Pushes the handoff's work and returns its repos (#48), or the file whose added lines matched a
+   * secret pattern, with nothing pushed, unless `pushAnyway`. Without it, briefs are refused.
+   */
+  push?: (session: string, lead: Lead, handoff: string, pushAnyway: string | null) => Promise<HandoffRepo[] | { held: string; commit: string; unchecked: string[] }>;
+  /** The untracked files the brief names (null when unknown), and the note it ends with (#48). Throws PushFailed when there is no repo to push. */
+  prepareBrief?: (lead: Lead, handoff: string) => Promise<{ files: string[] | null; note: string }>;
+  /** Takes a handoff on this machine (#48); without it, handoffs are logged as not handled. */
+  take?: (message: HandoffMessage) => Promise<TakenMessage>;
   now?: () => number;
 }
 
@@ -84,13 +105,16 @@ const FAILED: Record<FailureKind, string> = {
 // Ids of replies dropped from the held set, remembered so a release for one says so.
 const REMEMBER_DROPPED = 200;
 
-export function createRunner({ answerer, ledger, settings, prompts, scan, send, log, isDir, isReported, push, now = Date.now }: RunnerOptions): Runner {
+export function createRunner({ answerer, ledger, settings, prompts, scan, send, log, isDir, isReported, push, prepareBrief, take, now = Date.now }: RunnerOptions): Runner {
   const rooms = new Map<string, Promise<void>>(); // each room's last queued request
   const running = new Set<string>(); // ids queued or running
   const finished = new Map<string, Outgoing>(); // id → what was last sent for it
-  const held = new Map<string, () => Promise<ReplyMessage>>(); // withheld replies, by id, oldest first
+  const held = new Map<string, () => Promise<Outgoing>>(); // withheld replies, by id, oldest first
   const released = new Set<string>(); // released while still running
   const dropped = new Set<string>(); // dropped from `held` to make room, oldest first
+  const taking = new Set<string>(); // handoffs being taken now
+  const takes = new Set<string>(); // the takes run so far, by take id, oldest first
+  const dropping = new Set<string>(); // requests dropped while they ran
   let forking = 0; // forks running now
   const waiting: (() => void)[] = []; // requests waiting for a fork, in order
 
@@ -108,6 +132,10 @@ export function createRunner({ answerer, ledger, settings, prompts, scan, send, 
   const overCapRefusal = (id: string, cap: Cap): RefusalMessage => ({ type: "refusal", v: PROTOCOL_VERSION, id, reason: "over-cap", cap });
 
   function deliver(id: string, message: Outgoing) {
+    if (dropping.delete(id)) {
+      log(`${id} was dropped by the office server, so what it came to isn't sent`);
+      return;
+    }
     finished.delete(id);
     finished.set(id, message);
     if (finished.size > REMEMBER) finished.delete(finished.keys().next().value!);
@@ -131,29 +159,71 @@ export function createRunner({ answerer, ledger, settings, prompts, scan, send, 
 
     const s = await settings();
     const p = await prompts();
+    const isBrief = request.kind === "write-brief";
+    let brief: { files: string[] | null; note: string } = { files: [], note: "" };
+    if (isBrief && prepareBrief) {
+      try {
+        brief = await prepareBrief(lead, request.handoff);
+      } catch (err) {
+        log(`${id}: ${(err as Error).message}`);
+        return unavailable(id, err instanceof PushFailed ? err.message : "the handoff's branch couldn't be pushed");
+      }
+    }
+    // A brief the fork can't write still goes, as the runner's note alone, for the server to fill in.
+    const fallback = (why: string) => {
+      log(`${id}: the fork didn't write the brief (${why}), so the server writes it from the room's feed`);
+      return `No brief was written by the session: ${why}.${brief.note ? `\n\n${brief.note}` : ""}`;
+    };
     const expected = estimate(lead.context, s);
     // Checked and reserved with no await between, so two rooms can't both take the last of a cap.
     const cap = overCap(ledger.entries(now()), room, expected, now(), s);
-    if (cap) return overCapRefusal(id, cap);
-    const reservation = ledger.reserve({ at: now(), room, usage: expected });
-
-    const isBrief = request.kind === "write-brief";
-    const text = isBrief ? fill(p.brief, { to: request.to.name || request.to.id }) : fill(p.question, { from: request.from.name || request.from.id, question: request.question });
-    const free = await forkSlot(s.maxForks);
-    const answered = await answerer.ask(session, lead, { instructions: p.instructions, request: text, timeoutMs: (isBrief ? s.briefTimeoutSeconds : s.answerTimeoutSeconds) * 1000 }).finally(free);
-    // No fork ran when it couldn't be set up: the answer and its tokens are given back. One that ran
-    // but failed before it was metered keeps its estimate.
-    const recorded = !answered.ok && answered.kind === "not-set-up" ? reservation.cancel() : reservation.settle(answered.usage ?? expected);
-    await recorded.catch((err: unknown) => log(`couldn't record ${id} in the ledger: ${(err as Error).message}`));
-    if (!answered.ok) {
-      log(`${id}: ${answered.detail}`);
-      return unavailable(id, FAILED[answered.kind]);
+    let body: string;
+    let isFallback = false;
+    if (cap) {
+      if (!isBrief) return overCapRefusal(id, cap);
+      body = fallback(`the ${cap} cap is reached`);
+      isFallback = true;
+    } else {
+      const reservation = ledger.reserve({ at: now(), room, usage: expected });
+      const text = isBrief
+        ? fill(p.brief, { to: request.to.name || request.to.id, untracked: untrackedLine(brief.files) })
+        : fill(p.question, { from: request.from.name || request.from.id, question: request.question });
+      const free = await forkSlot(s.maxForks);
+      const answered = await answerer.ask(session, lead, { instructions: p.instructions, request: text, timeoutMs: (isBrief ? s.briefTimeoutSeconds : s.answerTimeoutSeconds) * 1000 }).finally(free);
+      // No fork ran when it couldn't be set up: the answer and its tokens are given back. One that ran
+      // but failed before it was metered keeps its estimate.
+      const recorded = !answered.ok && answered.kind === "not-set-up" ? reservation.cancel() : reservation.settle(answered.usage ?? expected);
+      await recorded.catch((err: unknown) => log(`couldn't record ${id} in the ledger: ${(err as Error).message}`));
+      if (!answered.ok) {
+        log(`${id}: ${answered.detail}`);
+        if (!isBrief) return unavailable(id, FAILED[answered.kind]);
+        body = fallback(FAILED[answered.kind]);
+        isFallback = true;
+      } else {
+        body = lead.compacted ? `${COMPACTED_NOTE}\n\n${answered.text}` : answered.text;
+        if (brief.note) body = `${body}\n\n${brief.note}`;
+      }
     }
 
-    const body = lead.compacted ? `${COMPACTED_NOTE}\n\n${answered.text}` : answered.text;
-    const reply: () => Promise<ReplyMessage> = isBrief
-      ? async () => ({ type: "reply", v: PROTOCOL_VERSION, id, kind: "write-brief", handoff: { id: request.handoff, brief: body, repos: await push!(session, lead, request.handoff) } })
-      : async () => ({ type: "reply", v: PROTOCOL_VERSION, id, kind: "answer-question", answer: body });
+    // The brief's push, held in turn when its commit adds a possible secret; released, it pushes anyway.
+    const pushAndReply = async (pushAnyway: string | null): Promise<Outgoing> => {
+      if (dropping.has(id)) return unavailable(id, "the handoff was cancelled, so nothing was pushed");
+      let pushed: HandoffRepo[] | { held: string; commit: string; unchecked: string[] };
+      try {
+        pushed = await push!(session, lead, (request as Extract<Ask, { kind: "write-brief" }>).handoff, pushAnyway);
+      } catch (err) {
+        log(`${id}: the push failed: ${(err as Error).message}`);
+        return unavailable(id, err instanceof PushFailed ? err.message : "the handoff's branch couldn't be pushed");
+      }
+      if (!Array.isArray(pushed)) {
+        const { held: file, commit, unchecked } = pushed;
+        log(`withheld the handoff's commit ${commit} for ${id} in ${room}: the lines it adds to ${file} match a secret pattern`);
+        hold(id, () => pushAndReply(commit));
+        return { type: "refusal", v: PROTOCOL_VERSION, id, reason: "withheld", file, ...(unchecked.length ? { unchecked } : {}) };
+      }
+      return { type: "reply", v: PROTOCOL_VERSION, id, kind: "write-brief", handoff: { id: (request as Extract<Ask, { kind: "write-brief" }>).handoff, brief: body, repos: pushed }, ...(isFallback ? { fallback: true as const } : {}) };
+    };
+    const reply: () => Promise<Outgoing> = isBrief ? () => pushAndReply(null) : async () => ({ type: "reply", v: PROTOCOL_VERSION, id, kind: "answer-question", answer: body });
     const matched = await scan(body);
     if (!matched) return reply();
     log(`withheld the ${isBrief ? "brief" : "answer"} for ${id} in ${room}: it matches the secret pattern "${matched}"`);
@@ -161,6 +231,12 @@ export function createRunner({ answerer, ledger, settings, prompts, scan, send, 
       log(`${id} was released while it was being written, so it is sent`);
       return reply();
     }
+    hold(id, reply);
+    return { type: "refusal", v: PROTOCOL_VERSION, id, reason: "withheld" };
+  }
+
+  // Keeps a withheld reply for its release, dropping the oldest past MAX_HELD.
+  function hold(id: string, reply: () => Promise<Outgoing>) {
     held.set(id, reply);
     if (held.size > MAX_HELD) {
       const oldest = held.keys().next().value!;
@@ -169,7 +245,6 @@ export function createRunner({ answerer, ledger, settings, prompts, scan, send, 
       if (dropped.size > REMEMBER_DROPPED) dropped.delete(dropped.values().next().value!);
       log(`dropped the withheld reply for ${oldest}: more than ${MAX_HELD} are held`);
     }
-    return { type: "refusal", v: PROTOCOL_VERSION, id, reason: "withheld" };
   }
 
   async function release(id: string) {
@@ -200,8 +275,25 @@ export function createRunner({ answerer, ledger, settings, prompts, scan, send, 
         void release(message.id);
         return;
       }
+      if (message.type === "drop") {
+        if (held.delete(message.id)) log(`dropped the withheld reply for ${message.id}: its handoff is over`);
+        else if (running.has(message.id)) dropping.add(message.id);
+        return;
+      }
       if (message.type === "handoff") {
-        log(`the office server sent handoff ${message.handoff.id} to take, which this runner doesn't handle yet`);
+        const handoff = message.handoff;
+        const takeId = message.session ?? handoff.id;
+        if (!take) log(`the office server sent handoff ${handoff.id} to take, which this runner doesn't handle yet`);
+        else if (taking.has(handoff.id)) log(`handoff ${handoff.id} is being taken already`);
+        else if (takes.has(takeId)) log(`take ${takeId} of handoff ${handoff.id} was run already, so it isn't run again`);
+        else {
+          takes.add(takeId);
+          if (takes.size > REMEMBER) takes.delete(takes.values().next().value!);
+          taking.add(handoff.id);
+          void take(message)
+            .then(send, (err: unknown) => log(`handoff ${handoff.id}: taking it failed: ${(err as Error)?.stack ?? String(err)}`))
+            .finally(() => taking.delete(handoff.id));
+        }
         return;
       }
       if (message.kind === "owner-answer") {
@@ -231,7 +323,7 @@ export function createRunner({ answerer, ledger, settings, prompts, scan, send, 
         });
       rooms.set(room, turn);
     },
-    idle: () => running.size === 0,
+    idle: () => running.size === 0 && taking.size === 0,
     async settled() {
       while (rooms.size) await Promise.all(rooms.values());
     },

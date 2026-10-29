@@ -10,5 +10,8 @@
   "estimatedOutputTokens": 2000,
   "answerTimeoutSeconds": 120,
   "briefTimeoutSeconds": 240,
-  "maxForks": 2
+  "maxForks": 2,
+  "gitTimeoutSeconds": 120,
+  "setupTimeoutMinutes": 15,
+  "cloneSearchDays": 30
 }

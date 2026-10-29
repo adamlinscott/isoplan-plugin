@@ -104,7 +104,9 @@ export const ChangesMessageSchema = z.object({
 /** The answer to a request, carrying the request's id and kind. */
 export const ReplyMessageSchema = z.discriminatedUnion("kind", [
   z.object({ type: z.literal("reply"), v: Version, id: RequestId, kind: z.literal("answer-question"), answer: z.string().min(1) }),
-  z.object({ type: z.literal("reply"), v: Version, id: RequestId, kind: z.literal("write-brief"), handoff: HandoffSchema }),
+  // `fallback`: the fork couldn't write the brief, so `brief` is only the runner's note of what was
+  // pushed, and the server writes the rest from the room's feed. The branch is pushed either way.
+  z.object({ type: z.literal("reply"), v: Version, id: RequestId, kind: z.literal("write-brief"), handoff: HandoffSchema, fallback: z.literal(true).optional() }),
   // The owner's answer reached the question that was waiting for it.
   z.object({ type: z.literal("reply"), v: Version, id: RequestId, kind: z.literal("owner-answer") }),
 ]);
@@ -123,7 +125,17 @@ export const RefusalMessageSchema = z.discriminatedUnion("reason", [
     reason: z.literal("over-cap"),
     cap: z.enum(["room-hour", "owner-day", "owner-tokens"]),
   }),
-  z.object({ type: z.literal("refusal"), v: Version, id: RequestId, reason: z.literal("withheld") }),
+  // `file`: what was withheld is the handoff's commit, whose added lines in that file matched (the
+  // pattern itself stays on the machine); without it, the brief or answer.
+  // `unchecked`: files the commit adds that the scan can't read (binary), named so the owner knows.
+  z.object({
+    type: z.literal("refusal"),
+    v: Version,
+    id: RequestId,
+    reason: z.literal("withheld"),
+    file: z.string().min(1).optional(),
+    unchecked: z.array(z.string().min(1)).optional(),
+  }),
   z.object({ type: z.literal("refusal"), v: Version, id: RequestId, reason: z.literal("unavailable"), detail: z.string().min(1) }),
 ]);
 
@@ -138,6 +150,17 @@ export const HandOverMessageSchema = z.object({
   handoff: HandoffSchema,
 });
 
+/**
+ * The sender's session asks, before it pushes, whether a hand-over with this id to `to` would be
+ * taken: the server answers hand-over-ready, or an error saying why not.
+ */
+export const HandOverCheckMessageSchema = z.object({
+  type: z.literal("hand-over-check"),
+  v: Version,
+  to: z.string().min(1),
+  handoff: HandoffId,
+});
+
 /** The receiver's session asks for the handoff a take code stands for. */
 export const TakeMessageSchema = z.object({
   type: z.literal("take"),
@@ -147,12 +170,15 @@ export const TakeMessageSchema = z.object({
 
 /**
  * The receiver took the handoff and joins its room. Each step that failed is listed with the repo it
- * was for and the end of its output; the session opens anyway.
+ * was for and the end of its output; a failed setup step doesn't stop the session opening. From a runner, `session` is the
+ * session it opened, which joins the room; without one no session opened (no clone to work in, or
+ * no terminal), so the handoff is still there to take. From a session, the session itself joins.
  */
 export const TakenMessageSchema = z.object({
   type: z.literal("taken"),
   v: Version,
   handoff: HandoffId,
+  session: z.string().min(1).optional(),
   failures: z.array(
     z.object({
       step: z.enum(["worktree", "setup", "checkout", "open"]),
@@ -170,6 +196,7 @@ export const DataLayerMessageSchema = z.discriminatedUnion("type", [
   ReplyMessageSchema,
   RefusalMessageSchema,
   HandOverMessageSchema,
+  HandOverCheckMessageSchema,
   TakeMessageSchema,
   TakenMessageSchema,
 ]);
@@ -242,6 +269,16 @@ export const RequestMessageSchema = z.discriminatedUnion("kind", [
 ]);
 
 /**
+ * The request is over (its handoff was cancelled, dismissed or replaced): the machine drops what it
+ * holds for it, and doesn't send or push what it was still writing.
+ */
+export const DropMessageSchema = z.object({
+  type: z.literal("drop"),
+  v: Version,
+  id: RequestId,
+});
+
+/**
  * The owner released what the secret scan withheld, so the machine sends it now. On the runner's
  * link `id` is the request whose reply was withheld; on a session's link it is the withheld
  * report's `withheld.id`, and only that exact report is released.
@@ -260,6 +297,26 @@ export const HandoffMessageSchema = z.object({
   type: z.literal("handoff"),
   v: Version,
   handoff: HandoffSchema,
+  // To a runner: how to open the session (a terminal, by default, or headless, with no window), and
+  // the session id to open it under, which is the one the server will let join the room.
+  mode: z.enum(["terminal", "headless"]).optional(),
+  session: z.string().uuid().optional(),
+});
+
+/** A hand-over-check passed: `to` is the receiver the server found for the name given. */
+export const HandOverReadyMessageSchema = z.object({
+  type: z.literal("hand-over-ready"),
+  v: Version,
+  handoff: HandoffId,
+  to: Account,
+});
+
+/** The sender's hand-over reached the room: `to` is the receiver the server found for the name given. */
+export const HandedOverMessageSchema = z.object({
+  type: z.literal("handed-over"),
+  v: Version,
+  handoff: HandoffId,
+  to: Account,
 });
 
 export const OfficeServerMessageSchema = z.discriminatedUnion("type", [
@@ -269,6 +326,9 @@ export const OfficeServerMessageSchema = z.discriminatedUnion("type", [
   RequestMessageSchema,
   ReleaseMessageSchema,
   HandoffMessageSchema,
+  HandedOverMessageSchema,
+  HandOverReadyMessageSchema,
+  DropMessageSchema,
 ]);
 
 export type Project = z.infer<typeof ProjectSchema>;
@@ -291,6 +351,10 @@ export type RequestMessage = z.infer<typeof RequestMessageSchema>;
 export type RequestKind = RequestMessage["kind"];
 export type ReleaseMessage = z.infer<typeof ReleaseMessageSchema>;
 export type HandoffMessage = z.infer<typeof HandoffMessageSchema>;
+export type HandedOverMessage = z.infer<typeof HandedOverMessageSchema>;
+export type HandOverCheckMessage = z.infer<typeof HandOverCheckMessageSchema>;
+export type HandOverReadyMessage = z.infer<typeof HandOverReadyMessageSchema>;
+export type DropMessage = z.infer<typeof DropMessageSchema>;
 export type OfficeServerMessage = z.infer<typeof OfficeServerMessageSchema>;
 
 /**

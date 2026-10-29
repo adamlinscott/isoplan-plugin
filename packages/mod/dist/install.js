@@ -6235,7 +6235,8 @@ discriminatedUnion("type", [
 			v: Version,
 			id: RequestId,
 			kind: literal("write-brief"),
-			handoff: HandoffSchema
+			handoff: HandoffSchema,
+			fallback: literal(true).optional()
 		}),
 		object({
 			type: literal("reply"),
@@ -6260,7 +6261,9 @@ discriminatedUnion("type", [
 			type: literal("refusal"),
 			v: Version,
 			id: RequestId,
-			reason: literal("withheld")
+			reason: literal("withheld"),
+			file: string().min(1).optional(),
+			unchecked: array(string().min(1)).optional()
 		}),
 		object({
 			type: literal("refusal"),
@@ -6277,6 +6280,12 @@ discriminatedUnion("type", [
 		handoff: HandoffSchema
 	}),
 	object({
+		type: literal("hand-over-check"),
+		v: Version,
+		to: string().min(1),
+		handoff: HandoffId
+	}),
+	object({
 		type: literal("take"),
 		v: Version,
 		code: string().min(1)
@@ -6285,6 +6294,7 @@ discriminatedUnion("type", [
 		type: literal("taken"),
 		v: Version,
 		handoff: HandoffId,
+		session: string().min(1).optional(),
 		failures: array(object({
 			step: _enum([
 				"worktree",
@@ -6297,66 +6307,115 @@ discriminatedUnion("type", [
 		}))
 	})
 ]);
-discriminatedUnion("type", [
+/** Asks the data layer to send its facts in full. */
+const RepairMessageSchema = object({
+	type: literal("repair"),
+	v: Version,
+	reason: string().optional()
+});
+/** A note for the later editor of `file`, which the data layer adds to `agent`'s next tool result. */
+const ConflictMessageSchema = object({
+	type: literal("conflict"),
+	v: Version,
+	agent: string().min(1),
+	file: string().min(1),
+	text: string().min(1)
+});
+/** Something the data layer should show. */
+const ErrorMessageSchema = object({
+	type: literal("error"),
+	v: Version,
+	code: string().min(1),
+	message: string()
+});
+/**
+* Something for the machine to answer, with a reply or a refusal carrying the same id. `session` is
+* the session it concerns: the lead whose fork answers or writes the brief, or the session whose
+* agent asked its owner. `room` is the room the caps count against.
+*/
+const RequestMessageSchema = discriminatedUnion("kind", [
 	object({
-		type: literal("repair"),
+		type: literal("request"),
 		v: Version,
-		reason: string().optional()
+		id: RequestId,
+		kind: literal("answer-question"),
+		session: string().min(1),
+		room: string().min(1),
+		from: Account,
+		question: string().min(1)
 	}),
 	object({
-		type: literal("conflict"),
+		type: literal("request"),
 		v: Version,
-		agent: string().min(1),
-		file: string().min(1),
-		text: string().min(1)
+		id: RequestId,
+		kind: literal("write-brief"),
+		session: string().min(1),
+		room: string().min(1),
+		handoff: HandoffId,
+		to: Account
 	}),
 	object({
-		type: literal("error"),
+		type: literal("request"),
 		v: Version,
-		code: string().min(1),
-		message: string()
-	}),
-	discriminatedUnion("kind", [
-		object({
-			type: literal("request"),
-			v: Version,
-			id: RequestId,
-			kind: literal("answer-question"),
-			session: string().min(1),
-			room: string().min(1),
-			from: Account,
-			question: string().min(1)
-		}),
-		object({
-			type: literal("request"),
-			v: Version,
-			id: RequestId,
-			kind: literal("write-brief"),
-			session: string().min(1),
-			room: string().min(1),
-			handoff: HandoffId,
-			to: Account
-		}),
-		object({
-			type: literal("request"),
-			v: Version,
-			id: RequestId,
-			kind: literal("owner-answer"),
-			session: string().min(1),
-			question: string().min(1),
-			answers: record(string(), string())
-		})
-	]),
-	object({
-		type: literal("release"),
-		v: Version,
-		id: RequestId
-	}),
-	object({
-		type: literal("handoff"),
-		v: Version,
-		handoff: HandoffSchema
+		id: RequestId,
+		kind: literal("owner-answer"),
+		session: string().min(1),
+		question: string().min(1),
+		answers: record(string(), string())
 	})
+]);
+/**
+* The request is over (its handoff was cancelled, dismissed or replaced): the machine drops what it
+* holds for it, and doesn't send or push what it was still writing.
+*/
+const DropMessageSchema = object({
+	type: literal("drop"),
+	v: Version,
+	id: RequestId
+});
+/**
+* The owner released what the secret scan withheld, so the machine sends it now. On the runner's
+* link `id` is the request whose reply was withheld; on a session's link it is the withheld
+* report's `withheld.id`, and only that exact report is released.
+*/
+const ReleaseMessageSchema = object({
+	type: literal("release"),
+	v: Version,
+	id: RequestId
+});
+/**
+* A handoff for the receiver to take: sent to their runner when they take it from the floor, or to
+* their session in answer to a take code.
+*/
+const HandoffMessageSchema = object({
+	type: literal("handoff"),
+	v: Version,
+	handoff: HandoffSchema,
+	mode: _enum(["terminal", "headless"]).optional(),
+	session: string().uuid().optional()
+});
+/** A hand-over-check passed: `to` is the receiver the server found for the name given. */
+const HandOverReadyMessageSchema = object({
+	type: literal("hand-over-ready"),
+	v: Version,
+	handoff: HandoffId,
+	to: Account
+});
+discriminatedUnion("type", [
+	RepairMessageSchema,
+	ConflictMessageSchema,
+	ErrorMessageSchema,
+	RequestMessageSchema,
+	ReleaseMessageSchema,
+	HandoffMessageSchema,
+	object({
+		type: literal("handed-over"),
+		v: Version,
+		handoff: HandoffId,
+		to: Account
+	}),
+	HandOverReadyMessageSchema,
+	DropMessageSchema
 ]);
 //#endregion
 //#region src/sweep/find.ts
