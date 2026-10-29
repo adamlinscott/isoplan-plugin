@@ -493,6 +493,7 @@ async function recordedState(paths, cwd) {
 const WRITTEN = [
 	"runner",
 	"pairing.json",
+	"pairing.lock",
 	"live",
 	"logs",
 	"titles",

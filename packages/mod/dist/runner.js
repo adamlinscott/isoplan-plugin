@@ -3,7 +3,8 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { randomUUID } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
+import http from "node:http";
 //#region ../../node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/core/util.js
 function getEnumValues(entries) {
 	const numericValues = Object.values(entries).filter((v) => typeof v === "number");
@@ -5835,6 +5836,13 @@ const HandoffSchema = object({
 		});
 	});
 });
+/**
+* The machine's access token from pairing, which an office server that signs people in requires.
+* It refuses a hello without one as `not-paired`, an expired or unknown one as `token-expired`, one
+* whose pairing was revoked or has lapsed as `pairing-ended`, and one for a session another paired
+* machine reports as `forged-hello`. A server that signs nobody in ignores it.
+*/
+const Token = string().min(1).max(200).optional();
 discriminatedUnion("type", [
 	object({
 		type: literal("hello"),
@@ -5843,13 +5851,15 @@ discriminatedUnion("type", [
 		account: Account,
 		machine: Machine,
 		session: string().min(1),
-		project: ProjectSchema
+		project: ProjectSchema,
+		token: Token
 	}),
 	object({
 		type: literal("runner"),
 		v: Version,
 		account: Account,
-		machine: Machine
+		machine: Machine,
+		token: Token
 	}),
 	object({
 		type: literal("full"),
@@ -6380,9 +6390,10 @@ const key = (...parts) => JSON.stringify(parts);
 const same = (a, b) => a !== void 0 && JSON.stringify(a) === JSON.stringify(b);
 //#endregion
 //#region src/data-layer/link.ts
+const STABLE_MS$1 = 3e4;
 const OUTBOX_MAX = 100;
 const OUTBOX_MAX_AGE_MS = 36e5;
-function createLink({ url, hello, emit, minIntervalMs = 1e3, retryBaseMs = 1e3, retryCapMs = 3e4, notWantedRetryMs = 36e5, onNotWanted, onMessage, random = Math.random }) {
+function createLink({ url, hello, emit, minIntervalMs = 1e3, retryBaseMs = 1e3, retryCapMs = 3e4, notWantedRetryMs = 36e5, onNotWanted, onPairingEnded, onMessage, pairing, pairPollMs = 5e3, random = Math.random }) {
 	const outbox = [];
 	let latest = null;
 	let socket = null;
@@ -6395,8 +6406,33 @@ function createLink({ url, hello, emit, minIntervalMs = 1e3, retryBaseMs = 1e3, 
 	let retry = null;
 	let isClosed = false;
 	let isUnwanted = false;
+	let sentToken;
+	let refusing = Promise.resolve();
+	let isRefused = false;
+	let refusals = 0;
+	let stable = null;
 	function connect() {
 		retry = null;
+		if (!pairing) return open(void 0);
+		refusing.then(() => pairing.token()).then((token) => {
+			if (isClosed) return;
+			if (token !== null) return open(token);
+			emit({
+				type: "status",
+				server: url,
+				state: "pairing"
+			});
+			retry = setTimeout(connect, pairPollMs);
+		}, (err) => {
+			if (isClosed) return;
+			emit({
+				type: "log",
+				text: `couldn't pair with the office server: ${String(err?.message ?? err)}`
+			});
+			dropped();
+		});
+	}
+	function open(token) {
 		emit({
 			type: "status",
 			server: url,
@@ -6404,12 +6440,17 @@ function createLink({ url, hello, emit, minIntervalMs = 1e3, retryBaseMs = 1e3, 
 		});
 		const ws = new WebSocket(url);
 		socket = ws;
+		sentToken = token;
 		ws.onopen = () => {
 			if (socket !== ws) return;
 			failures = 0;
 			isOpen = true;
 			seq = 0;
-			send(hello);
+			stable = setTimeout(() => refusals = 0, STABLE_MS$1);
+			send(token ? {
+				...hello,
+				token
+			} : hello);
 			for (const { message, at } of outbox.splice(0)) if (Date.now() - at < OUTBOX_MAX_AGE_MS) send(message);
 			sendFull();
 			emit({
@@ -6438,7 +6479,21 @@ function createLink({ url, hello, emit, minIntervalMs = 1e3, retryBaseMs = 1e3, 
 		sent = null;
 		if (pacing) clearTimeout(pacing);
 		pacing = null;
+		if (stable) clearTimeout(stable);
+		stable = null;
 		if (isClosed) return;
+		if (isRefused) {
+			isRefused = false;
+			const delay = Math.min(retryCapMs, retryBaseMs * 2 ** refusals++);
+			emit({
+				type: "status",
+				server: url,
+				state: "disconnected",
+				retryInMs: delay
+			});
+			retry = setTimeout(connect, delay);
+			return;
+		}
 		if (isUnwanted) {
 			isUnwanted = false;
 			failures = 0;
@@ -6521,7 +6576,15 @@ function createLink({ url, hello, emit, minIntervalMs = 1e3, retryBaseMs = 1e3, 
 			type: "log",
 			text: `the office server sent a note for ${message.agent}, not an agent of this session`
 		});
-		else if (message.type === "conflict" || message.type === "error") {
+		else if (pairing && message.type === "error" && (message.code === "not-paired" || message.code === "pairing-ended" || message.code === "token-expired")) {
+			isRefused = true;
+			refusing = pairing.refused(message.code, sentToken).catch(() => {});
+			if (message.code === "pairing-ended" && onPairingEnded) refusing.then(onPairingEnded);
+			emit(message.code === "token-expired" ? {
+				type: "log",
+				text: "the office server says this machine's token has expired; renewing it"
+			} : message);
+		} else if (message.type === "conflict" || message.type === "error") {
 			emit(message);
 			if (message.type === "error" && message.code === "not-wanted") {
 				isUnwanted = true;
@@ -6554,6 +6617,8 @@ function createLink({ url, hello, emit, minIntervalMs = 1e3, retryBaseMs = 1e3, 
 			isClosed = true;
 			if (pacing) clearTimeout(pacing);
 			if (retry) clearTimeout(retry);
+			if (stable) clearTimeout(stable);
+			pairing?.close();
 			socket?.close();
 		}
 	};
@@ -6688,6 +6753,227 @@ function alive(pid) {
 	} catch (err) {
 		return err.code === "EPERM";
 	}
+}
+//#endregion
+//#region src/data-layer/pairing.ts
+/** Renewed this long before it runs out. */
+const RENEW_EARLY_MS = 3e5;
+const pairingPath = (claudeDir) => path.join(claudeDir, "isoplan", "pairing.json");
+const pairingLockPath = (claudeDir) => path.join(claudeDir, "isoplan", "pairing.lock");
+const postJson = async (url, body) => {
+	const response = await fetch(url, {
+		method: "POST",
+		headers: { "content-type": "application/json" },
+		body: JSON.stringify(body),
+		signal: AbortSignal.timeout(15e3)
+	});
+	const value = await response.json().catch(() => ({}));
+	return {
+		status: response.status,
+		body: value && typeof value === "object" ? value : {}
+	};
+};
+/** The server's http address for a data-layer path: ws(s)://host/data-layer → http(s)://host/data-layer/<path>. */
+function httpUrl(server, sub) {
+	const url = new URL(server);
+	url.protocol = url.protocol === "wss:" ? "https:" : "http:";
+	url.pathname = url.pathname.replace(/\/$/, "") + sub;
+	url.search = "";
+	return url.toString();
+}
+async function readPairing(file) {
+	try {
+		const value = JSON.parse(await fs.readFile(file, "utf8"));
+		return value && typeof value.accounts === "object" && value.accounts ? value : { accounts: {} };
+	} catch {
+		return { accounts: {} };
+	}
+}
+/** Written whole, through a temp file, so a reader never sees half of it; owner-only. */
+async function writePairing(file, value) {
+	await fs.mkdir(path.dirname(file), { recursive: true });
+	const temp = `${file}.${process.pid}.${randomBytes(4).toString("hex")}`;
+	await fs.writeFile(temp, JSON.stringify(value, null, 2) + "\n", { mode: 384 });
+	try {
+		await fs.rename(temp, file);
+	} catch (err) {
+		await fs.rm(temp, { force: true }).catch(() => {});
+		throw err;
+	}
+}
+const HTML = {
+	"content-type": "text/html; charset=utf-8",
+	connection: "close"
+};
+const page = (text) => `<!doctype html><meta charset="utf-8"><title>Isoplan</title><p style="font:16px system-ui;margin:3em auto;max-width:30em">${text}</p>`;
+function createPairing({ file, lock, server, account, machine, emit, post = postJson, now = Date.now, pid = process.pid, isAlive = alive }) {
+	let asked = false;
+	let shown = null;
+	let unreadable = false;
+	let callback = null;
+	const mine = async () => {
+		const entry = (await readPairing(file)).accounts[account.id];
+		return entry && entry.server === server ? entry : { server };
+	};
+	const update = async (change) => {
+		const all = await readPairing(file);
+		const kept = all.accounts[account.id];
+		all.accounts[account.id] = change(kept && kept.server === server ? kept : { server });
+		await writePairing(file, all);
+	};
+	const drop = ({ credential: _, token: __, tokenExpires: ___, ...rest }) => rest;
+	const show = (waiting) => {
+		if (shown === waiting.url) return;
+		shown = waiting.url;
+		emit({
+			type: "pair",
+			server,
+			url: waiting.url,
+			expires: new Date(waiting.expires).toISOString()
+		});
+	};
+	async function renew(entry) {
+		const answer = await post(httpUrl(server, "/token"), { credential: entry.credential });
+		if (answer.status === 200 && typeof answer.body.token === "string") {
+			const token = answer.body.token;
+			const tokenExpires = Date.parse(String(answer.body.expires));
+			await update((e) => ({
+				...e,
+				token,
+				tokenExpires: Number.isFinite(tokenExpires) ? tokenExpires : now()
+			}));
+			return token;
+		}
+		if (answer.status === 401 && answer.body.code === "pairing-ended") {
+			emit({
+				type: "log",
+				text: `the office server says this machine's pairing has ended: ${String(answer.body.error ?? "")}`
+			});
+			await update(drop);
+			asked = true;
+			return;
+		}
+		throw new Error(`the office server answered ${answer.status} when renewing this machine's token`);
+	}
+	async function stopAnswering() {
+		if (!callback) return;
+		if (callback.timer) clearTimeout(callback.timer);
+		callback.server.close();
+		callback = null;
+		await update(({ waiting: _, ...rest }) => rest).catch(() => {});
+		await releaseLock(lock, pid).catch(() => {});
+	}
+	async function startPairing() {
+		const verifier = randomBytes(32).toString("base64url");
+		const challenge = createHash("sha256").update(verifier).digest("base64url");
+		const nonce = randomBytes(16).toString("base64url");
+		const listener = http.createServer((request, response) => {
+			const url = new URL(request.url ?? "/", "http://127.0.0.1");
+			const code = url.searchParams.get("code");
+			if (request.method !== "GET" || url.pathname !== `/${nonce}` || !code) {
+				response.writeHead(404, HTML).end(page("Not found."));
+				return;
+			}
+			post(httpUrl(server, "/pair/token"), {
+				code,
+				verifier
+			}).then(async (answer) => {
+				if (answer.status === 200 && typeof answer.body.credential === "string") {
+					const credential = answer.body.credential;
+					await update(({ waiting: _, ...rest }) => ({
+						...rest,
+						credential
+					}));
+					emit({
+						type: "log",
+						text: "this machine is paired with the office server"
+					});
+					response.writeHead(200, HTML).end(page("This machine is paired with the office. You can close this tab; Claude Code reports to it within a few seconds."));
+				} else {
+					emit({
+						type: "log",
+						text: `the office server didn't pair this machine (${answer.status}): ${String(answer.body.error ?? "")}`
+					});
+					response.writeHead(400, HTML).end(page("This machine couldn't be paired: the link was used or has expired. Claude Code shows a new one."));
+				}
+				await stopAnswering();
+			}, (err) => {
+				response.writeHead(502, HTML).end(page("The office server couldn't be reached. Click the link again in a moment."));
+				emit({
+					type: "log",
+					text: `couldn't reach the office server to finish pairing: ${String(err?.message ?? err)}`
+				});
+			});
+		});
+		await new Promise((resolve, reject) => listener.once("error", reject).listen(0, "127.0.0.1", () => resolve()));
+		listener.unref();
+		const { port } = listener.address();
+		callback = {
+			server: listener,
+			timer: null
+		};
+		try {
+			const answer = await post(httpUrl(server, "/pair"), {
+				account,
+				machine: { name: machine },
+				callback: `http://127.0.0.1:${port}/${nonce}`,
+				challenge
+			});
+			if (answer.status !== 200 || typeof answer.body.url !== "string") throw new Error(`the office server answered ${answer.status} when asked to pair${answer.body.error ? `: ${String(answer.body.error)}` : ""}`);
+			const waiting = {
+				url: answer.body.url,
+				expires: Date.parse(String(answer.body.expires)) || now()
+			};
+			callback.timer = setTimeout(() => void stopAnswering(), Math.max(0, waiting.expires - now()));
+			callback.timer.unref?.();
+			await update((e) => ({
+				...e,
+				waiting
+			}));
+			show(waiting);
+		} catch (err) {
+			await stopAnswering();
+			throw err;
+		}
+	}
+	return {
+		async token() {
+			const entry = await mine();
+			if (entry.token && (entry.tokenExpires ?? 0) - RENEW_EARLY_MS > now()) return entry.token;
+			if (entry.credential) {
+				const renewed = await renew(entry);
+				if (renewed) return renewed;
+			}
+			if (!asked && !entry.waiting) return void 0;
+			if (callback) return null;
+			await fs.mkdir(path.dirname(lock), { recursive: true });
+			if (!await takeLock(lock, pid, isAlive)) {
+				if (entry.waiting && entry.waiting.expires > now()) show(entry.waiting);
+				return null;
+			}
+			await startPairing();
+			return null;
+		},
+		async refused(code, sent) {
+			if (code !== "token-expired") asked = true;
+			const entry = await mine();
+			if (code === "not-paired" && sent) {
+				if (!unreadable) emit({
+					type: "log",
+					text: "the office server didn't find this machine's token in its hello; it may be older than pairing. The credential is kept."
+				});
+				unreadable = true;
+				return;
+			}
+			if (!sent || entry.token !== sent) return;
+			if (code === "token-expired") return update((e) => ({
+				...e,
+				tokenExpires: 0
+			}));
+			if (code === "pairing-ended") await update(drop);
+		},
+		close: stopAnswering
+	};
 }
 //#endregion
 //#region src/runner/caps.ts
@@ -8063,6 +8349,7 @@ async function supervise({ run, log, sleep = (ms) => new Promise((r) => setTimeo
 		const code = await run();
 		if (code === 0) return "done";
 		if (code === 3) return "not-wanted";
+		if (code === 4) return "unpaired";
 		failures = now() - startedAt >= STABLE_MS ? 1 : failures + 1;
 		const how = code === null ? "was killed" : `exited with code ${code}`;
 		if (failures >= 5) {
@@ -9510,8 +9797,8 @@ async function supervisor() {
 		})
 	});
 	clearInterval(refresh);
-	if (stopped === "done") {
-		log(`runner ${process.pid} stopped: no room on this machine is lit`);
+	if (stopped === "done" || stopped === "unpaired") {
+		log(`runner ${process.pid} stopped: ${stopped === "done" ? "no room on this machine is lit" : "the office server says this machine's pairing has ended"}`);
 		await releaseLock(lock, process.pid).catch(() => {});
 	} else {
 		const why = stopped === "not-wanted" ? "the office server doesn't want this machine's runner" : "its worker kept crashing as it started";
@@ -9594,25 +9881,41 @@ async function worker() {
 		})
 	});
 	let notWanted = false;
+	let unpaired = false;
 	let wake = () => {};
+	const account = await accountOf({
+		readText: (p) => fs.readFile(p, "utf8").catch(() => null),
+		run: io.run
+	}, claudeJson, os.homedir());
+	const emit = (line) => {
+		if (line.type === "log") log(line.text);
+		else if (line.type === "error") log(`the office server says: ${line.message} (${line.code})`);
+		else if (line.type === "pair") log(`to answer for this machine's rooms through ${line.server}, pair it: click ${line.url} on this computer and approve it in the office (it works until ${line.expires})`);
+	};
 	const link = createLink({
 		url: first.server,
-		emit: (line) => {
-			if (line.type === "log") log(line.text);
-			else if (line.type === "error") log(`the office server says: ${line.message} (${line.code})`);
-		},
+		emit,
+		pairing: createPairing({
+			file: pairingPath(claudeDir),
+			lock: pairingLockPath(claudeDir),
+			server: first.server,
+			account,
+			machine: os.hostname(),
+			emit
+		}),
 		onMessage: (message) => runner.take(message),
 		onNotWanted: () => {
 			notWanted = true;
 			wake();
 		},
+		onPairingEnded: () => {
+			unpaired = true;
+			wake();
+		},
 		hello: {
 			type: "runner",
 			v: 1,
-			account: await accountOf({
-				readText: (p) => fs.readFile(p, "utf8").catch(() => null),
-				run: io.run
-			}, claudeJson, os.homedir()),
+			account,
 			machine: { name: os.hostname() }
 		}
 	});
@@ -9622,13 +9925,13 @@ async function worker() {
 	const gone = new Promise((resolve) => process.stdin.on("end", resolve).on("error", resolve).resume()).then(() => orphaned = true);
 	for (;;) {
 		await Promise.race([new Promise((r) => (wake = r, setTimeout(r, CHECK_MS))), gone]);
-		if (orphaned || notWanted) break;
+		if (orphaned || notWanted || unpaired) break;
 		if (!runner.idle()) continue;
 		const window = askableMs(await config().catch(() => first));
 		if (!await anyRoomSince(io, path.join(claudeDir, "projects"), Date.now() - window)) break;
 	}
 	link.close();
-	return notWanted ? 3 : 0;
+	return notWanted ? 3 : unpaired ? 4 : 0;
 }
 process.exitCode = await (process.argv.includes("--worker") ? worker() : supervisor());
 await logging;

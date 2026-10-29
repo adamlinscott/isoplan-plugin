@@ -268,3 +268,24 @@ test("link: hellos refused again and again back off, doubling up to the cap, tho
   const waits = lines.flatMap((x) => (x.type === "status" && x.state === "disconnected" ? [x.retryInMs] : []));
   expect(waits.slice(0, 5)).toEqual([20, 40, 80, 80, 80]);
 });
+
+test("link: a runner's hello carries the machine's token too, and pairing-ended is told once the credential is dropped", async () => {
+  const s = await server();
+  s.wss.on("connection", (ws) => {
+    ws.once("message", () => {
+      ws.send(JSON.stringify({ type: "error", v: PROTOCOL_VERSION, code: "pairing-ended", message: "revoked" }));
+      ws.close(1008, "pairing-ended");
+    });
+  });
+  const events: string[] = [];
+  const pairing = {
+    token: async () => "machine" + "-token",
+    refused: async (code: Refusal) => void events.push(`refused ${code}`),
+    close: async () => {},
+  };
+  const runnerHello: RunnerHelloMessage = { type: "runner", v: PROTOCOL_VERSION, account: hello.account, machine: hello.machine };
+  link(s.url, { hello: runnerHello, pairing, onPairingEnded: () => events.push("ended") });
+  await until(() => events.includes("ended"));
+  expect(s.got[0]).toMatchObject({ type: "runner", token: "machine-token" });
+  expect(events.slice(0, 2)).toEqual(["refused pairing-ended", "ended"]);
+});

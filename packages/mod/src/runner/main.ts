@@ -16,7 +16,8 @@
 // runs into it and keeps it fresh, and runs the worker, starting it again after a crash
 // (lifecycle.ts). After MAX_FAST_FAILURES quick crashes in a row it gives up and lets the lock go.
 // The worker holds one link to the office server, opened with a runner hello carrying the machine's
-// pairing token when the server signs people in (src/data-layer/pairing.ts; a code to approve goes
+// pairing token when the server signs people in, under the machine's Claude account
+// (src/data-layer/pairing.ts; a link to approve goes
 // to the log, and the data layers show the same one in Claude Code), and stays up while
 // any session on the machine is inside its lights-off window. A server that doesn't want this
 // machine's runner ends it, and it holds off starting again for HOLD_OFF_MS. The worker exits when
@@ -42,7 +43,7 @@ import { HOLD_OFF_MS, alive, holdOff, lockPath, readLock, refreshLock, releaseLo
 import { openLedger } from "./caps.js";
 import { createClaudeAnswerer, forkableId } from "./claude.js";
 import { claudeBinary } from "./claude-binary.js";
-import { anyRoomSince, askableMs, NOT_WANTED_CODE, supervise } from "./lifecycle.js";
+import { anyRoomSince, askableMs, NOT_WANTED_CODE, supervise, UNPAIRED_CODE } from "./lifecycle.js";
 import { loadPrompts } from "./prompts.js";
 import { createRunGit, GIT_FAILED, handoffBranch, handoffNote, HandoffGitError, prepare, pushHandoff } from "../handoff/git.js";
 import { takeHandoff, type TakeSettings } from "../handoff/take.js";
@@ -108,8 +109,10 @@ async function supervisor(): Promise<number> {
       }),
   });
   clearInterval(refresh);
-  if (stopped === "done") {
-    log(`runner ${process.pid} stopped: no room on this machine is lit`);
+  if (stopped === "done" || stopped === "unpaired") {
+    // Unpaired, it doesn't hold off: the sessions' data layers pair the machine again, and the next
+    // start, from one of them or the wake hook, picks up the new credential.
+    log(`runner ${process.pid} stopped: ${stopped === "done" ? "no room on this machine is lit" : "the office server says this machine's pairing has ended"}`);
     await releaseLock(lock, process.pid).catch(() => {});
   } else {
     // Neither goes away by starting again: it holds off, which a newer version ends for a crash loop.
@@ -190,6 +193,7 @@ async function worker(): Promise<number> {
   });
 
   let notWanted = false;
+  let unpaired = false;
   let wake: () => void = () => {};
   const account = await accountOf({ readText: (p) => fs.readFile(p, "utf8").catch(() => null), run: io.run }, claudeJson, os.homedir());
   const emit: Parameters<typeof createLink>[0]["emit"] = (line) => {
@@ -204,6 +208,11 @@ async function worker(): Promise<number> {
     onMessage: (message) => runner.take(message),
     onNotWanted: () => {
       notWanted = true;
+      wake();
+    },
+    // A revoked or lapsed pairing ends the runner: its data layers pair the machine again.
+    onPairingEnded: () => {
+      unpaired = true;
       wake();
     },
     hello: {
@@ -221,13 +230,13 @@ async function worker(): Promise<number> {
   const gone = new Promise<void>((resolve) => process.stdin.on("end", resolve).on("error", resolve).resume()).then(() => (orphaned = true));
   for (;;) {
     await Promise.race([new Promise<void>((r) => ((wake = r), setTimeout(r, CHECK_MS))), gone]);
-    if (orphaned || notWanted) break;
+    if (orphaned || notWanted || unpaired) break;
     if (!runner.idle()) continue;
     const window = askableMs(await config().catch(() => first));
     if (!(await anyRoomSince(io, path.join(claudeDir, "projects"), Date.now() - window))) break;
   }
   link.close();
-  return notWanted ? NOT_WANTED_CODE : 0;
+  return notWanted ? NOT_WANTED_CODE : unpaired ? UNPAIRED_CODE : 0;
 }
 
 process.exitCode = await (process.argv.includes("--worker") ? worker() : supervisor());

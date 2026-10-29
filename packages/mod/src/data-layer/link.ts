@@ -62,6 +62,8 @@ export interface LinkOptions {
   /** How long a link the server didn't want waits before asking again. */
   notWantedRetryMs?: number;
   onNotWanted?: () => void;
+  /** The server said this machine's pairing has ended, once `pairing` has dropped the credential. */
+  onPairingEnded?: () => void;
   /** Takes the server's requests, releases and handoffs; without it they are logged as not handled. */
   onMessage?: (message: ServerAsk) => void;
   /** Where the hello's token comes from, for a server that signs people in. */
@@ -94,6 +96,7 @@ export function createLink({
   retryCapMs = 30000,
   notWantedRetryMs = 3600000,
   onNotWanted,
+  onPairingEnded,
   onMessage,
   pairing,
   pairPollMs = 5000,
@@ -254,6 +257,7 @@ export function createLink({
     } else if (pairing && message.type === "error" && (message.code === "not-paired" || message.code === "pairing-ended" || message.code === "token-expired")) {
       isRefused = true;
       refusing = pairing.refused(message.code, sentToken).catch(() => {});
+      if (message.code === "pairing-ended" && onPairingEnded) void refusing.then(onPairingEnded);
       // The server's own words on how to pair are passed on; a renewal is the link's own business.
       emit(message.code === "token-expired" ? { type: "log", text: "the office server says this machine's token has expired; renewing it" } : message);
     } else if (message.type === "conflict" || message.type === "error") {

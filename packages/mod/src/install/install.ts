@@ -228,9 +228,10 @@ async function finishOptOut({ claudeDir, settings }: Paths): Promise<string[]> {
   return changes;
 }
 
-// The runner's state, the machine's pairing credential (pairing.json), and the sessions' traces:
-// locks, logs, title files and released-report hashes. Removed before the hooks.
-const WRITTEN = ["runner", "pairing.json", "live", "logs", "titles", "released"];
+// The runner's state, the machine's pairing credential (pairing.json) and the lock of a pairing
+// under way (pairing.lock), and the sessions' traces: locks, logs, title files and released-report
+// hashes. Removed before the hooks.
+const WRITTEN = ["runner", "pairing.json", "pairing.lock", "live", "logs", "titles", "released"];
 // What a session's data layer writes as it runs, so may come back during an uninstall.
 const SESSION_TRACES = ["live", "titles", "released"];
 

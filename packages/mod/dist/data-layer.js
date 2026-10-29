@@ -8211,7 +8211,7 @@ const same = (a, b) => a !== void 0 && JSON.stringify(a) === JSON.stringify(b);
 const STABLE_MS = 3e4;
 const OUTBOX_MAX = 100;
 const OUTBOX_MAX_AGE_MS = 36e5;
-function createLink({ url, hello, emit, minIntervalMs = 1e3, retryBaseMs = 1e3, retryCapMs = 3e4, notWantedRetryMs = 36e5, onNotWanted, onMessage, pairing, pairPollMs = 5e3, random = Math.random }) {
+function createLink({ url, hello, emit, minIntervalMs = 1e3, retryBaseMs = 1e3, retryCapMs = 3e4, notWantedRetryMs = 36e5, onNotWanted, onPairingEnded, onMessage, pairing, pairPollMs = 5e3, random = Math.random }) {
 	const outbox = [];
 	let latest = null;
 	let socket = null;
@@ -8397,6 +8397,7 @@ function createLink({ url, hello, emit, minIntervalMs = 1e3, retryBaseMs = 1e3, 
 		else if (pairing && message.type === "error" && (message.code === "not-paired" || message.code === "pairing-ended" || message.code === "token-expired")) {
 			isRefused = true;
 			refusing = pairing.refused(message.code, sentToken).catch(() => {});
+			if (message.code === "pairing-ended" && onPairingEnded) refusing.then(onPairingEnded);
 			emit(message.code === "token-expired" ? {
 				type: "log",
 				text: "the office server says this machine's token has expired; renewing it"
@@ -8487,6 +8488,10 @@ async function writePairing(file, value) {
 		throw err;
 	}
 }
+const HTML = {
+	"content-type": "text/html; charset=utf-8",
+	connection: "close"
+};
 const page = (text) => `<!doctype html><meta charset="utf-8"><title>Isoplan</title><p style="font:16px system-ui;margin:3em auto;max-width:30em">${text}</p>`;
 function createPairing({ file, lock, server, account, machine, emit, post = postJson, now = Date.now, pid = process.pid, isAlive = alive }) {
 	let asked = false;
@@ -8553,7 +8558,7 @@ function createPairing({ file, lock, server, account, machine, emit, post = post
 			const url = new URL(request.url ?? "/", "http://127.0.0.1");
 			const code = url.searchParams.get("code");
 			if (request.method !== "GET" || url.pathname !== `/${nonce}` || !code) {
-				response.writeHead(404, { "content-type": "text/html; charset=utf-8" }).end(page("Not found."));
+				response.writeHead(404, HTML).end(page("Not found."));
 				return;
 			}
 			post(httpUrl(server, "/pair/token"), {
@@ -8570,17 +8575,17 @@ function createPairing({ file, lock, server, account, machine, emit, post = post
 						type: "log",
 						text: "this machine is paired with the office server"
 					});
-					response.writeHead(200, { "content-type": "text/html; charset=utf-8" }).end(page("This machine is paired with the office. You can close this tab; Claude Code reports to it within a few seconds."));
+					response.writeHead(200, HTML).end(page("This machine is paired with the office. You can close this tab; Claude Code reports to it within a few seconds."));
 				} else {
 					emit({
 						type: "log",
 						text: `the office server didn't pair this machine (${answer.status}): ${String(answer.body.error ?? "")}`
 					});
-					response.writeHead(400, { "content-type": "text/html; charset=utf-8" }).end(page("This machine couldn't be paired: the link was used or has expired. Claude Code shows a new one."));
+					response.writeHead(400, HTML).end(page("This machine couldn't be paired: the link was used or has expired. Claude Code shows a new one."));
 				}
 				await stopAnswering();
 			}, (err) => {
-				response.writeHead(502, { "content-type": "text/html; charset=utf-8" }).end(page("The office server couldn't be reached. Click the link again in a moment."));
+				response.writeHead(502, HTML).end(page("The office server couldn't be reached. Click the link again in a moment."));
 				emit({
 					type: "log",
 					text: `couldn't reach the office server to finish pairing: ${String(err?.message ?? err)}`
