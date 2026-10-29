@@ -5976,10 +5976,16 @@ discriminatedUnion("type", [
 	object({
 		type: literal("ask-room"),
 		v: Version,
-		question: string().trim().min(1).max(4e3)
+		question: string().trim().min(1).max(4e3),
+		key: string().min(1).max(100).optional()
 	}),
 	object({
 		type: literal("ask-check"),
+		v: Version,
+		question: RequestId
+	}),
+	object({
+		type: literal("asked-ack"),
 		v: Version,
 		question: RequestId
 	})
@@ -6106,7 +6112,15 @@ const OfficeServerMessageSchema = discriminatedUnion("type", [
 			"dropped"
 		]),
 		answer: string().min(1).optional(),
-		note: string().min(1).optional()
+		note: string().min(1).optional(),
+		owner: string().optional()
+	}),
+	object({
+		type: literal("ask-rights"),
+		v: Version,
+		room: string().min(1),
+		owner: Account,
+		granted: boolean()
 	})
 ]);
 /** Validates a message a data layer received from an office server. */
@@ -8484,7 +8498,7 @@ function createLink({ url, hello, emit, minIntervalMs = 1e3, retryBaseMs = 1e3, 
 		} else if (message.type === "error" && message.code === "forged-hello") {
 			isTaken = true;
 			emit(message);
-		} else if (message.type === "conflict" || message.type === "error" || message.type === "asked") {
+		} else if (message.type === "conflict" || message.type === "error" || message.type === "asked" || message.type === "ask-rights") {
 			emit(message);
 			if (message.type === "error" && message.code === "not-wanted") {
 				isUnwanted = true;

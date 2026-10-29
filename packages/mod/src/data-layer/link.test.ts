@@ -157,10 +157,12 @@ test("link: the server's conflict notes, errors and late answers from the room g
   s.sockets[0]!.send(JSON.stringify(conflict));
   s.sockets[0]!.send(JSON.stringify({ type: "error", v: PROTOCOL_VERSION, code: "not-paired", message: "Pair this machine first." }));
   const asked = { type: "asked", v: PROTOCOL_VERSION, question: "q-1", text: "Which branch?", state: "answered", answer: "feat/migrate-v2." };
+  const rights = { type: "ask-rights", v: PROTOCOL_VERSION, room: "room:claude-code:a1", owner: { id: "p-adam", name: "Adam" }, granted: true };
   s.sockets[0]!.send(JSON.stringify(asked));
+  s.sockets[0]!.send(JSON.stringify(rights));
   s.sockets[0]!.send(JSON.stringify({ type: "conflict", v: PROTOCOL_VERSION + 1 }));
-  await until(() => lines.length >= 6);
-  expect(lines.slice(2)).toEqual([conflict, { type: "error", v: PROTOCOL_VERSION, code: "not-paired", message: "Pair this machine first." }, asked, { type: "log", text: expect.stringContaining("unsupported-version") }]);
+  await until(() => lines.length >= 7);
+  expect(lines.slice(2)).toEqual([conflict, { type: "error", v: PROTOCOL_VERSION, code: "not-paired", message: "Pair this machine first." }, asked, rights, { type: "log", text: expect.stringContaining("unsupported-version") }]);
 });
 
 test("link: not-wanted is passed on, then the link waits and asks again only after notWantedRetryMs", async () => {

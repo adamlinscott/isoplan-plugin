@@ -2,7 +2,7 @@
 // spawned it. The hooks module can't write to the process once it has started (its stdin closes at
 // launch), so anything it sends back goes through a file the line names.
 
-import type { AskedMessage, ConflictMessage, ErrorMessage } from "@isoplan/protocol";
+import type { AskedMessage, AskRightsMessage, ConflictMessage, ErrorMessage } from "@isoplan/protocol";
 
 /**
  * The link to the office server. `waiting`: nothing to report yet, so not connected.
@@ -58,7 +58,7 @@ export interface TitleReply {
 
 /**
  * Office server messages are passed on as the server sent them (repair is the data layer's own); an
- * `asked` is the room's answer to a question the session's agent asked, arriving after it stopped
- * waiting (#49).
+ * `asked` is the end of a question the session's agent asked the room, arriving after it stopped
+ * waiting, and `ask-rights` whether the session may ask its room (#49).
  */
-export type DataLayerLine = StatusLine | TitleAskLine | PairLine | LogLine | ConflictMessage | ErrorMessage | AskedMessage;
+export type DataLayerLine = StatusLine | TitleAskLine | PairLine | LogLine | ConflictMessage | ErrorMessage | AskedMessage | AskRightsMessage;
