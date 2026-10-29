@@ -1,9 +1,9 @@
 // The install script: puts the wake hook in Claude Code's user settings without a session, as the
 // plugin's data layer does when it starts, or takes out everything install and the plugin put in
 // place (install.ts). An uninstall while Claude Code still lists the plugin as installed leaves
-// wake.json marking the hook as uninstalled, so the plugin's data layer doesn't put it back. Installing also backfills: every
-// session written inside the window is reported now rather than on its next turn, so running it
-// again fills the office back in. It also records the `claude` binary and starts the machine's
+// wake.json marking the hook as uninstalled, so the plugin's data layer doesn't put it back.
+// Installing also backfills: every session written inside the window is reported now rather than
+// on its next turn, so running it again fills the office back in. It also records the `claude` binary and starts the machine's
 // runner (src/runner), which answers for its rooms, with an environment recorded from this shell.
 //
 //   node dist/install.js [--uninstall]
@@ -35,7 +35,8 @@ const uninstall = process.argv.includes("--uninstall");
 const start = (args: string[], cwd: string, env?: Record<string, string>) => spawn(process.execPath, args, { cwd, env, detached: true, stdio: "ignore", windowsHide: true }).on("error", () => {}).unref();
 
 try {
-  // Any install of a plugin named isoplan, from whichever marketplace, or records that can't be read, keep the opt-out.
+  // The opt-out is kept while Claude Code lists a plugin named isoplan, from any marketplace, or
+  // while its records can't be read.
   const isListed = async () => (await installedPlugins(paths.plugins))?.some((id) => id.startsWith("isoplan@")) ?? true;
   const changes = uninstall
     ? await uninstallAll(paths, { optOut: await isListed(), settleMs: SETTLE_MS })
