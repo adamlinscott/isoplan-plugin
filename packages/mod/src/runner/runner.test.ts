@@ -8,7 +8,7 @@ import { nodeIo } from "../data-layer/io.js";
 import type { Answered, Answerer, Ask, Lead } from "./answerer.js";
 import { openLedger, type Entry } from "./caps.js";
 import { loadPrompts } from "./prompts.js";
-import { COMPACTED_NOTE, createRunner, type RunnerOptions, type RunnerSettings } from "./runner.js";
+import { COMPACTED_NOTE, createRunner, MAX_HELD, type RunnerOptions, type RunnerSettings } from "./runner.js";
 import { loadPatterns, scan } from "./scan.js";
 
 const NOW = Date.parse("2026-10-29T12:00:00Z");
@@ -33,6 +33,7 @@ function stub(lead: Partial<Lead> = {}) {
   const answerer: Answerer = {
     lead: async (session) => (session.startsWith("claude-code:") ? { cwd: root, working: false, compacted: false, context: 100000, ...lead } : null),
     ask: (session, _lead, ask) => new Promise((settle) => asks.push({ session, ask, settle })),
+    close: () => {},
   };
   return { answerer, asks, root };
 }
@@ -142,12 +143,12 @@ test("runner: a brief is scanned too, and carries the repos the handoff pushed",
   await t.asked(1);
   expect(t.asks[0]!.ask.request).toContain("Write the handoff brief now, for Bob");
   expect(t.asks[0]!.ask.timeoutMs).toBe(defaults.briefTimeoutSeconds * 1000);
-  t.asks[0]!.settle(ok("Goal: ship. Set password=hunter2hunter2 first."));
+  t.asks[0]!.settle(ok('Goal: ship. Set password: "hunter2hunter2" first.'));
   await t.runner.settled();
   expect(t.sent).toEqual([{ type: "refusal", v: PROTOCOL_VERSION, id: "b1", reason: "withheld" }]);
   t.runner.take({ type: "release", v: PROTOCOL_VERSION, id: "b1" });
   await t.sentN(2);
-  expect(t.sent[1]).toEqual({ type: "reply", v: PROTOCOL_VERSION, id: "b1", kind: "write-brief", handoff: { id: "h-1", brief: "Goal: ship. Set password=hunter2hunter2 first.", repos } });
+  expect(t.sent[1]).toEqual({ type: "reply", v: PROTOCOL_VERSION, id: "b1", kind: "write-brief", handoff: { id: "h-1", brief: 'Goal: ship. Set password: "hunter2hunter2" first.', repos } });
 });
 
 test("runner: without the handoff's push, a brief is refused before the fork runs", async () => {
@@ -158,12 +159,13 @@ test("runner: without the handoff's push, a brief is refused before the fork run
   expect(t.sent).toEqual([{ type: "refusal", v: PROTOCOL_VERSION, id: "b1", reason: "unavailable", detail: "this plugin version can't hand a room over from the floor yet" }]);
 });
 
-test("runner: a session whose worktree was deleted is refused with the reason", async () => {
+test("runner: a session whose worktree was deleted is refused with the reason; its path stays in the local log", async () => {
   const t = await setup({ lead: { cwd: path.join(tempRoot(), "deleted-worktree") } });
   t.runner.take(question("q1"));
   await t.runner.settled();
   expect(t.asks).toEqual([]);
-  expect(t.sent).toEqual([{ type: "refusal", v: PROTOCOL_VERSION, id: "q1", reason: "unavailable", detail: expect.stringMatching(/^the session's folder .*deleted-worktree is gone/) }]);
+  expect(t.sent).toEqual([{ type: "refusal", v: PROTOCOL_VERSION, id: "q1", reason: "unavailable", detail: "the session's folder is gone, so its lead can't be asked" }]);
+  expect(t.logs.join("\n")).toContain("deleted-worktree");
 });
 
 test("runner: a lead mid-turn, or a session this machine doesn't have, is refused; a compacted one is answered with a note", async () => {
@@ -171,7 +173,7 @@ test("runner: a lead mid-turn, or a session this machine doesn't have, is refuse
   busy.runner.take(question("q1"));
   busy.runner.take(question("q2", "room-1", "codex:elsewhere"));
   await busy.runner.settled();
-  expect(busy.sent.map((m) => m.type === "refusal" && m.reason === "unavailable" && m.detail)).toEqual(["the session's lead is mid-turn; ask again once its turn ends", "this machine has no session codex:elsewhere"]);
+  expect(busy.sent.map((m) => m.type === "refusal" && m.reason === "unavailable" && m.detail)).toEqual(["the session's lead is mid-turn; ask again once its turn ends", "this machine has no such session"]);
 
   const compacted = await setup({ lead: { compacted: true } });
   compacted.runner.take(question("q1"));
@@ -211,7 +213,7 @@ test("runner: what the fork used goes in the ledger, which a restarted runner re
   expect((await openLedger(t.ledgerFile)).entries(NOW)).toEqual([{ at: NOW, room: "room-1", usage }]);
 });
 
-test("runner: answers per room per hour and per owner per day are capped", async () => {
+test("runner: answers per room per hour and per machine per day are capped", async () => {
   const at = (room: string, ago: number): Entry => ({ at: NOW - ago, room, usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } });
   const room = await setup({ settings: { answersPerRoomPerHour: 2 }, entries: [at("room-1", 1000), at("room-1", 2000), at("room-1", 3600001)] });
   room.runner.take(question("q1", "room-1"));
@@ -221,19 +223,85 @@ test("runner: answers per room per hour and per owner per day are capped", async
   expect(room.sent).toEqual([{ type: "refusal", v: PROTOCOL_VERSION, id: "q1", reason: "over-cap", cap: "room-hour" }]);
   expect(room.asks).toHaveLength(1);
 
-  const owner = await setup({ settings: { answersPerOwnerPerDay: 2 }, entries: [at("a", 1000), at("b", 5 * 3600000)] });
+  const owner = await setup({ settings: { answersPerMachinePerDay: 2 }, entries: [at("a", 1000), at("b", 5 * 3600000)] });
   owner.runner.take(question("q1", "room-3"));
   await owner.runner.settled();
   expect(owner.sent).toEqual([{ type: "refusal", v: PROTOCOL_VERSION, id: "q1", reason: "over-cap", cap: "owner-day" }]);
 });
 
-test("runner: a failed fork is refused with the reason and still counted", async () => {
+test("runner: a failed fork is refused with its kind alone, the details logged, and still counted", async () => {
+  const t = await setup();
+  t.runner.take(question("q1"));
+  t.runner.take(question("q2", "room-2"));
+  await t.asked(2);
+  t.askFor("q1")!.settle({ ok: false, kind: "timed-out", detail: "no answer within 120 s", usage: null });
+  t.askFor("q2")!.settle({ ok: false, kind: "failed", detail: "turn 2 stopped with error_during_execution: AKIAABCDEFGHIJKLMNOP in C:/Users/ada/secret", usage });
+  await t.runner.settled();
+  expect(t.sent).toEqual([
+    { type: "refusal", v: PROTOCOL_VERSION, id: "q1", reason: "unavailable", detail: "the fork took too long to answer" },
+    { type: "refusal", v: PROTOCOL_VERSION, id: "q2", reason: "unavailable", detail: "the fork couldn't answer" },
+  ]);
+  expect([...t.logs].sort()).toEqual(["q1: no answer within 120 s", expect.stringContaining("q2: turn 2 stopped")]);
+});
+
+test("runner: a reservation counts at once, so rooms answering together can't overshoot a machine cap", async () => {
+  const t = await setup({ settings: { answersPerMachinePerDay: 2 } });
+  for (const room of ["a", "b", "c"]) t.runner.take(question(`q-${room}`, room));
+  await t.asked(2);
+  await t.sentN(1);
+  // Whichever room came third is refused; the other two run.
+  expect(t.sent).toEqual([{ type: "refusal", v: PROTOCOL_VERSION, id: expect.stringMatching(/^q-/), reason: "over-cap", cap: "owner-day" }]);
+  await new Promise((r) => setTimeout(r, 50));
+  expect(t.asks).toHaveLength(2);
+  // The token budget too: two leads whose estimates fit alone, but not together.
+  const big = await setup({ lead: { context: 1_000_000 } }); // each estimates 2.21M against 5M
+  for (const room of ["a", "b", "c"]) big.runner.take(question(`q-${room}`, room));
+  await big.asked(2);
+  await big.sentN(1);
+  expect(big.sent).toEqual([{ type: "refusal", v: PROTOCOL_VERSION, id: expect.stringMatching(/^q-/), reason: "over-cap", cap: "owner-tokens" }]);
+  await new Promise((r) => setTimeout(r, 50));
+  expect(big.asks).toHaveLength(2);
+});
+
+test("runner: a release that arrives while its answer is being written is applied when it lands", async () => {
   const t = await setup();
   t.runner.take(question("q1"));
   await t.asked(1);
-  t.asks[0]!.settle({ ok: false, error: "no answer within 120 s", usage: null });
+  t.runner.take({ type: "release", v: PROTOCOL_VERSION, id: "q1" });
+  t.asks[0]!.settle(ok("The key is AKIAABCDEFGHIJKLMNOP."));
   await t.runner.settled();
-  expect(t.sent).toEqual([{ type: "refusal", v: PROTOCOL_VERSION, id: "q1", reason: "unavailable", detail: "the fork couldn't answer: no answer within 120 s" }]);
+  expect(t.sent).toEqual([{ type: "reply", v: PROTOCOL_VERSION, id: "q1", kind: "answer-question", answer: "The key is AKIAABCDEFGHIJKLMNOP." }]);
+  // A release doesn't carry over to a later answer under another id.
+  t.runner.take(question("q2"));
+  await t.asked(2);
+  t.asks[1]!.settle(ok("The key is AKIAABCDEFGHIJKLMNOP."));
+  await t.runner.settled();
+  expect(t.sent[1]).toEqual({ type: "refusal", v: PROTOCOL_VERSION, id: "q2", reason: "withheld" });
+});
+
+test("runner: at most MAX_HELD replies are held; the oldest goes first", async () => {
+  const t = await setup({ settings: { answersPerRoomPerHour: 1000, answersPerMachinePerDay: 1000, tokenBudgetPerMachinePerDay: 1e12 } });
+  for (let i = 0; i <= MAX_HELD; i++) {
+    t.runner.take(question(`q${i}`, `room-${i}`));
+    await t.asked(i + 1);
+    t.asks[i]!.settle(ok("AKIAABCDEFGHIJKLMNOP"));
+  }
+  await t.runner.settled();
+  t.runner.take({ type: "release", v: PROTOCOL_VERSION, id: "q0" });
+  t.runner.take({ type: "release", v: PROTOCOL_VERSION, id: `q${MAX_HELD}` });
+  await t.sentN(MAX_HELD + 3);
+  expect(t.sent.slice(-2)).toEqual([
+    { type: "refusal", v: PROTOCOL_VERSION, id: "q0", reason: "unavailable", detail: expect.stringContaining("nothing is withheld") },
+    { type: "reply", v: PROTOCOL_VERSION, id: `q${MAX_HELD}`, kind: "answer-question", answer: "AKIAABCDEFGHIJKLMNOP" },
+  ]);
+});
+
+test("runner: the ledger entry of an unmetered failure keeps its estimate", async () => {
+  const t = await setup();
+  t.runner.take(question("q1"));
+  await t.asked(1);
+  t.asks[0]!.settle({ ok: false, kind: "timed-out", detail: "no answer within 120 s", usage: null });
+  await t.runner.settled();
   // Unmetered, it counts at its estimate.
   expect(t.ledger.entries(NOW)).toEqual([{ at: NOW, room: "room-1", usage: { input: 0, output: 2000, cacheWrite: 100000, cacheRead: 200000 } }]);
 });
@@ -248,7 +316,7 @@ test("runner: an owner's answer isn't the runner's; a handoff to take is logged"
 
 test("runner.json: the labelled defaults load, and the owner's file overrides them per key", async () => {
   const user = path.join(tempRoot(), "runner.json");
-  fs.writeFileSync(user, JSON.stringify({ claudeModel: "sonnet", answersPerRoomPerHour: 3, tokenBudgetPerOwnerPerDay: -1 }));
+  fs.writeFileSync(user, JSON.stringify({ claudeModel: "sonnet", answersPerRoomPerHour: 3, tokenBudgetPerMachinePerDay: -1 }));
   const s = await loadSettings<RunnerSettings & { claudeModel: string }>(nodeIo(), path.join(modDir, "runner.json"), user);
   expect(defaults).toMatchObject({ claudeModel: "opus" });
   expect(s).toEqual({ ...defaults, claudeModel: "sonnet", answersPerRoomPerHour: 3 });

@@ -6087,42 +6087,97 @@ async function findClaude(env, platform, home, exists = isFile) {
 //#region src/wake/lock.ts
 const lockPath = (claudeDir, sessionId) => path.join(claudeDir, "isoplan", "live", `${sessionId}.json`);
 const HOLD_OFF_MS = 36e5;
-async function readLock(file) {
+async function readText(file) {
 	try {
-		const { pid, until } = JSON.parse(await fs.readFile(file, "utf8"));
+		const [text, st] = await Promise.all([fs.readFile(file, "utf8"), fs.stat(file)]);
 		return {
-			pid: Number.isSafeInteger(pid) && pid > 0 ? pid : null,
-			until: typeof until === "number" ? until : null
+			text,
+			mtimeMs: st.mtimeMs
 		};
 	} catch {
 		return null;
 	}
 }
+function parseLock(text, mtimeMs) {
+	try {
+		const { pid, until, ...extra } = JSON.parse(text);
+		return {
+			pid: Number.isSafeInteger(pid) && pid > 0 ? pid : null,
+			until: typeof until === "number" ? until : null,
+			mtimeMs,
+			extra
+		};
+	} catch {
+		return null;
+	}
+}
+async function readLock(file) {
+	const r = await readText(file);
+	return r && parseLock(r.text, r.mtimeMs);
+}
 /** The pid the lock names, or null when there is none or it can't be read. */
 async function lockHolder(file) {
 	return (await readLock(file))?.pid ?? null;
 }
-/** Whether the session is held: by a live pid, or by a hold-off that hasn't ended. */
-async function isHeld(file, now = Date.now(), isAlive = alive) {
-	const lock = await readLock(file);
-	return !!lock && (lock.until !== null && lock.until > now || lock.pid !== null && isAlive(lock.pid));
+const held = (lock, now, { isAlive = alive, freshMs }) => !!lock && (lock.until !== null && lock.until > now || lock.pid !== null && isAlive(lock.pid) && (freshMs === void 0 || now - lock.mtimeMs < freshMs));
+/** Whether the lock is held: by a live pid (kept fresh, under `freshMs`), or by a hold-off that hasn't ended. */
+async function isHeld(file, now = Date.now(), isAlive = alive, rule = {}) {
+	return held(await readLock(file), now, {
+		...rule,
+		isAlive
+	});
 }
 /**
-* Takes the lock for `pid`; false when the session is held (`isHeld`). With `force` (the plugin's
-* data layer) it is taken regardless: a detached one holding it sees that and steps aside.
+* Takes the lock for `pid`; false when it is held (`isHeld`). With `force` (the plugin's data
+* layer) it is taken regardless: a detached one holding it sees that and steps aside. `extra` is
+* written into the lock beside the pid.
+*
+* A new lock is created exclusively, so of two takers at once only one gets it. A stale one is
+* moved aside by rename, which only one taker can do to the same file, and the taker checks that
+* what it moved is the lock it judged stale: one that moved another taker's new lock instead puts
+* it back and loses.
 */
-async function takeLock(file, pid, isAlive = alive, force = false, now = Date.now()) {
+async function takeLock(file, pid, isAlive = alive, force = false, now = Date.now(), { freshMs, extra = {} } = {}) {
 	await fs.mkdir(path.dirname(file), { recursive: true });
-	const body = JSON.stringify({ pid });
-	try {
-		await fs.writeFile(file, body, { flag: "wx" });
-		return true;
-	} catch (err) {
-		if (err.code !== "EEXIST") throw err;
+	const body = JSON.stringify({
+		pid,
+		...extra
+	});
+	for (let tries = 0; tries < 5; tries++) {
+		try {
+			await fs.writeFile(file, body, { flag: "wx" });
+			return true;
+		} catch (err) {
+			if (err.code !== "EEXIST") throw err;
+		}
+		const seen = await readText(file);
+		if (!seen) continue;
+		const lock = parseLock(seen.text, seen.mtimeMs);
+		if (!force && lock?.pid !== pid && held(lock, now, {
+			isAlive,
+			freshMs
+		})) return false;
+		const aside = `${file}.${pid}-${Math.random().toString(36).slice(2)}`;
+		try {
+			await fs.rename(file, aside);
+		} catch (err) {
+			if ([
+				"ENOENT",
+				"EPERM",
+				"EBUSY",
+				"EACCES"
+			].includes(err.code ?? "")) continue;
+			throw err;
+		}
+		if (await fs.readFile(aside, "utf8").catch(() => null) !== seen.text) {
+			await fs.link(aside, file).catch(() => {});
+			await fs.rm(aside, { force: true });
+			if (!force) return false;
+			continue;
+		}
+		await fs.rm(aside, { force: true });
 	}
-	if (!force && await lockHolder(file) !== pid && await isHeld(file, now, isAlive)) return false;
-	await fs.writeFile(file, body);
-	return true;
+	return false;
 }
 /** Removes the lock if it still names `pid`. */
 async function releaseLock(file, pid) {
@@ -6151,6 +6206,19 @@ const wakeRecordPath = (claudeDir) => path.join(claudeDir, "isoplan", "wake.json
 const WAKE_EVENTS = ["UserPromptSubmit", "Stop"];
 const TIMEOUT_SECONDS = 10;
 const wakeScriptPath = (claudeDir) => path.join(claudeDir, "isoplan", "wake.mjs");
+/** Where install copies the runner and the defaults it reads, under the plugin's own layout. */
+const runnerAppDir = (claudeDir) => path.join(claudeDir, "isoplan", "runner", "app");
+const RUNNER_FILES = [
+	"config.json",
+	"runner.json",
+	"secret-patterns.json",
+	"prompts/instructions.md",
+	"prompts/question.md",
+	"prompts/brief.md",
+	"dist/runner.js"
+];
+/** A file's name in the copy: the bundle is an ES module and no package.json beside the copy says so, so it is .mjs, as wake.mjs is. */
+const copiedAs = (file) => file.replace(/\.js$/, ".mjs");
 /**
 * The hook's command. Shell form, quoted, with forward slashes, so Git Bash, PowerShell and sh all
 * read the path the same way.
@@ -6159,10 +6227,11 @@ const wakeCommand = (script) => `node "${script.replace(/\\/g, "/")}"`;
 const isWake = (hook) => typeof hook?.command === "string" && /isoplan[\\/]+wake\.mjs/.test(hook.command);
 /**
 * Copies `wakeSource` (dist/wake.js) into place, records `dataLayer`, and adds or updates the hooks.
+* With `runnerFrom` (the plugin's folder) it copies the runner too, and records the copy.
 * Returns what it changed, [] when it was all there. Throws when settings.json can't be merged.
 * With `auto` (the plugin's data layer) it does nothing once the hook has been uninstalled.
 */
-async function installWake({ claudeDir, settings }, dataLayer, wakeSource, { auto = false, runner, findClaude } = {}) {
+async function installWake({ claudeDir, settings }, dataLayer, wakeSource, { auto = false, runnerFrom, findClaude } = {}) {
 	if (auto && await isOptedOut(claudeDir)) return [];
 	const current = await readSettings(settings);
 	const script = wakeScriptPath(claudeDir);
@@ -6199,18 +6268,37 @@ async function installWake({ claudeDir, settings }, dataLayer, wakeSource, { aut
 		if (!found) done.push(`added the wake hook to ${settings} on ${event}`);
 		else if (changed) done.push(`updated the wake hook in ${settings} on ${event}`);
 	}
+	const changes = [];
+	let runner;
+	if (runnerFrom) {
+		const app = runnerAppDir(claudeDir);
+		let copied = false;
+		for (const file of RUNNER_FILES) if (await writeIfChanged(path.join(app, copiedAs(file)), await fs.readFile(path.join(runnerFrom, file), "utf8"))) copied = true;
+		runner = path.join(app, copiedAs("dist/runner.js"));
+		if (copied) changes.push(`copied the runner to ${app}`);
+	}
 	const record = runner ? {
 		dataLayer,
 		runner
 	} : { dataLayer };
-	const changes = [];
 	await fs.mkdir(path.dirname(script), { recursive: true });
 	if (await writeIfChanged(script, await fs.readFile(wakeSource, "utf8"))) changes.push(`copied the wake hook to ${script}`);
 	if (await writeIfChanged(wakeRecordPath(claudeDir), JSON.stringify(record, null, 2) + "\n")) changes.push(`recorded the data layer at ${dataLayer}${runner ? ` and the runner at ${runner}` : ""}`);
-	const claude = findClaude ? await findClaude() : null;
-	if (claude && await writeIfChanged(claudeBinaryPath(claudeDir), JSON.stringify({ path: claude }, null, 2) + "\n")) changes.push(`recorded the claude binary at ${claude}`);
+	const claude = findClaude && !await isHandSet(claudeBinaryPath(claudeDir)) ? await findClaude() : null;
+	if (claude && await writeIfChanged(claudeBinaryPath(claudeDir), JSON.stringify({
+		path: claude,
+		auto: true
+	}, null, 2) + "\n")) changes.push(`recorded the claude binary at ${claude}`);
 	if (done.length) await writeSettings(settings, current);
 	return [...changes, ...done];
+}
+async function isHandSet(file) {
+	try {
+		const record = JSON.parse(await fs.readFile(file, "utf8"));
+		return typeof record.path === "string" && record.path !== "" && record.auto !== true;
+	} catch {
+		return false;
+	}
 }
 async function isOptedOut(claudeDir) {
 	try {
@@ -6258,19 +6346,66 @@ async function writeWhole(file, text) {
 }
 //#endregion
 //#region src/runner/start.ts
-/** The runner's lock: `{ pid }` of the supervisor that holds it. */
+/** The runner's lock: `{ pid, code }` of the supervisor that holds it. */
 const runnerLockPath = (claudeDir) => path.join(claudeDir, "isoplan", "runner", "lock.json");
-/** True when a runner was started. Nothing recorded, or a recorded runner that is gone, starts none. */
-async function startRunner({ claudeDir, spawn, isAlive = alive }) {
-	if (await isHeld(runnerLockPath(claudeDir), Date.now(), isAlive)) return false;
+/** What names a runner.js's code: its size and write time. Null when it is gone. */
+async function runnerCode(file) {
+	const st = await fs.stat(file).catch(() => null);
+	return st && st.isFile() ? `${st.size}-${Math.round(st.mtimeMs)}` : null;
+}
+/** The live runner's lock: a hold-off that hasn't ended, or a live pid that keeps it fresh. */
+async function liveRunner(claudeDir, now, isAlive) {
+	const lock = await readLock(runnerLockPath(claudeDir));
+	if (!lock) return null;
+	if (lock.until !== null && lock.until > now) return {
+		...lock,
+		isHoldOff: true
+	};
+	if (lock.pid !== null && isAlive(lock.pid) && now - lock.mtimeMs < 9e4) return {
+		...lock,
+		isHoldOff: false
+	};
+	return null;
+}
+/**
+* True when a runner was started. Nothing recorded, or a recorded runner that is gone, starts none;
+* a live one running the recorded code is left alone, and one running older code is replaced.
+*/
+async function startRunner({ claudeDir, spawn, isAlive = alive, kill = (pid) => process.kill(pid), now = Date.now }) {
 	let runner;
 	try {
 		runner = JSON.parse(await fs.readFile(wakeRecordPath(claudeDir), "utf8")).runner;
 	} catch {
 		return false;
 	}
-	if (typeof runner !== "string" || !await fs.stat(runner).then((s) => s.isFile(), () => false)) return false;
-	spawn([runner], claudeDir);
+	if (typeof runner !== "string") return false;
+	const code = await runnerCode(runner);
+	if (!code) return false;
+	const live = await liveRunner(claudeDir, now(), isAlive);
+	if (live && (live.isHoldOff || live.extra.code === code)) return false;
+	if (live) await stopRunner(claudeDir, {
+		isAlive,
+		kill,
+		now
+	});
+	spawn([
+		runner,
+		"--claude-dir",
+		claudeDir
+	], claudeDir);
+	return true;
+}
+/**
+* Ends the running runner, for uninstall and updates: its worker and forks follow once its
+* supervisor has gone. True when one was running. A stale lock's pid is never killed.
+*/
+async function stopRunner(claudeDir, { isAlive = alive, kill = (pid) => process.kill(pid), now = Date.now } = {}) {
+	const live = await liveRunner(claudeDir, now(), isAlive);
+	if (!live || live.isHoldOff || live.pid === null) return false;
+	try {
+		kill(live.pid);
+	} catch {}
+	await fs.rm(runnerLockPath(claudeDir), { force: true });
 	return true;
 }
 //#endregion
@@ -7739,6 +7874,8 @@ const key = (...parts) => JSON.stringify(parts);
 const same = (a, b) => a !== void 0 && JSON.stringify(a) === JSON.stringify(b);
 //#endregion
 //#region src/data-layer/link.ts
+const OUTBOX_MAX = 100;
+const OUTBOX_MAX_AGE_MS = 36e5;
 function createLink({ url, hello, emit, minIntervalMs = 1e3, retryBaseMs = 1e3, retryCapMs = 3e4, notWantedRetryMs = 36e5, onNotWanted, onMessage, random = Math.random }) {
 	const outbox = [];
 	let latest = null;
@@ -7767,7 +7904,7 @@ function createLink({ url, hello, emit, minIntervalMs = 1e3, retryBaseMs = 1e3, 
 			isOpen = true;
 			seq = 0;
 			send(hello);
-			for (const message of outbox.splice(0)) send(message);
+			for (const { message, at } of outbox.splice(0)) if (Date.now() - at < OUTBOX_MAX_AGE_MS) send(message);
 			sendFull();
 			emit({
 				type: "status",
@@ -7899,7 +8036,13 @@ function createLink({ url, hello, emit, minIntervalMs = 1e3, retryBaseMs = 1e3, 
 		},
 		send(message) {
 			if (isOpen && socket.readyState === WebSocket.OPEN) send(message);
-			else outbox.push(message);
+			else {
+				outbox.push({
+					message,
+					at: Date.now()
+				});
+				if (outbox.length > OUTBOX_MAX) outbox.shift();
+			}
 		},
 		close() {
 			isClosed = true;
@@ -8041,7 +8184,7 @@ async function main(argv) {
 	}).on("error", () => {}).unref();
 	const installing = detached ? Promise.resolve([]) : installWake(paths, path.join(here, "data-layer.js"), path.join(here, "wake.js"), {
 		auto: true,
-		runner: path.join(here, "runner.js"),
+		runnerFrom: path.join(here, ".."),
 		findClaude: () => findClaude(process.env, process.platform, os.homedir())
 	}).then((changes) => (changes.forEach((text) => emit({
 		type: "log",

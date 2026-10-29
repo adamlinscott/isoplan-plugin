@@ -33,7 +33,7 @@ try {
   const changes = uninstall
     ? await uninstallWake(paths)
     : await installWake(paths, path.join(here, "data-layer.js"), path.join(here, "wake.js"), {
-        runner: path.join(here, "runner.js"),
+        runnerFrom: path.join(here, ".."),
         findClaude: () => findClaude(process.env, process.platform, os.homedir()),
       });
   for (const change of changes) console.log(change);

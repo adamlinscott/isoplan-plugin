@@ -1,8 +1,8 @@
 // Finding the `claude` binary, for the Claude Code answerer (claude.ts). Install looks for it and
 // records it in <claude dir>/isoplan/claude-binary.json, since the runner may be started where PATH
 // is shorter (from a hook, or an app opened from the Dock), and the runner falls back to looking
-// again when nothing was recorded. The record is plain JSON, `{ "path": "..." }`, so it can be set
-// by hand where the lookup misses.
+// again when nothing was recorded. The record is plain JSON, `{ "path": "..." }`; install marks its
+// own with `"auto": true`, so one set by hand, without it, is kept by later installs.
 //
 // Kept free of zod and the protocol so install stays small.
 

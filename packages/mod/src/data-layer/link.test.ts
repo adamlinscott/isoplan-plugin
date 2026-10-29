@@ -208,3 +208,16 @@ test("link: a runner's link passes the server's requests on, and a reply sent wh
   expect(types(s.got)).toEqual(["runner", "runner", "reply"]);
   expect(s.got[2]).toMatchObject({ id: "q1", answer: "Because." });
 });
+
+test("link: replies kept while down are bounded, the oldest dropped first", async () => {
+  const s = await server();
+  const runnerHello: RunnerHelloMessage = { type: "runner", v: PROTOCOL_VERSION, account: hello.account, machine: hello.machine };
+  const { link: l, lines } = link(s.url, { hello: runnerHello });
+  await until(() => s.got.length === 1);
+  s.sockets[0]!.terminate();
+  await until(() => lines.some((x) => x.type === "status" && x.state === "disconnected"));
+  for (let i = 0; i < 101; i++) l.send({ type: "refusal", v: PROTOCOL_VERSION, id: `q${i}`, reason: "withheld" });
+  await until(() => s.got.length === 102);
+  await new Promise((r) => setTimeout(r, 50));
+  expect(s.got.slice(2).map((m) => m.id)).toEqual(Array.from({ length: 100 }, (_, i) => `q${i + 1}`));
+});

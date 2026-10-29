@@ -1,4 +1,4 @@
-import { execFile, spawn } from "node:child_process";
+import { execFile, spawn, spawnSync } from "node:child_process";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -6272,6 +6272,8 @@ const key = (...parts) => JSON.stringify(parts);
 const same = (a, b) => a !== void 0 && JSON.stringify(a) === JSON.stringify(b);
 //#endregion
 //#region src/data-layer/link.ts
+const OUTBOX_MAX = 100;
+const OUTBOX_MAX_AGE_MS = 36e5;
 function createLink({ url, hello, emit, minIntervalMs = 1e3, retryBaseMs = 1e3, retryCapMs = 3e4, notWantedRetryMs = 36e5, onNotWanted, onMessage, random = Math.random }) {
 	const outbox = [];
 	let latest = null;
@@ -6300,7 +6302,7 @@ function createLink({ url, hello, emit, minIntervalMs = 1e3, retryBaseMs = 1e3, 
 			isOpen = true;
 			seq = 0;
 			send(hello);
-			for (const message of outbox.splice(0)) send(message);
+			for (const { message, at } of outbox.splice(0)) if (Date.now() - at < OUTBOX_MAX_AGE_MS) send(message);
 			sendFull();
 			emit({
 				type: "status",
@@ -6432,7 +6434,13 @@ function createLink({ url, hello, emit, minIntervalMs = 1e3, retryBaseMs = 1e3, 
 		},
 		send(message) {
 			if (isOpen && socket.readyState === WebSocket.OPEN) send(message);
-			else outbox.push(message);
+			else {
+				outbox.push({
+					message,
+					at: Date.now()
+				});
+				if (outbox.length > OUTBOX_MAX) outbox.shift();
+			}
 		},
 		close() {
 			isClosed = true;
@@ -6444,46 +6452,109 @@ function createLink({ url, hello, emit, minIntervalMs = 1e3, retryBaseMs = 1e3, 
 }
 //#endregion
 //#region src/wake/lock.ts
-async function readLock(file) {
+const HOLD_OFF_MS = 36e5;
+async function readText(file) {
 	try {
-		const { pid, until } = JSON.parse(await fs.readFile(file, "utf8"));
+		const [text, st] = await Promise.all([fs.readFile(file, "utf8"), fs.stat(file)]);
 		return {
-			pid: Number.isSafeInteger(pid) && pid > 0 ? pid : null,
-			until: typeof until === "number" ? until : null
+			text,
+			mtimeMs: st.mtimeMs
 		};
 	} catch {
 		return null;
 	}
 }
+function parseLock(text, mtimeMs) {
+	try {
+		const { pid, until, ...extra } = JSON.parse(text);
+		return {
+			pid: Number.isSafeInteger(pid) && pid > 0 ? pid : null,
+			until: typeof until === "number" ? until : null,
+			mtimeMs,
+			extra
+		};
+	} catch {
+		return null;
+	}
+}
+async function readLock(file) {
+	const r = await readText(file);
+	return r && parseLock(r.text, r.mtimeMs);
+}
 /** The pid the lock names, or null when there is none or it can't be read. */
 async function lockHolder(file) {
 	return (await readLock(file))?.pid ?? null;
 }
-/** Whether the session is held: by a live pid, or by a hold-off that hasn't ended. */
-async function isHeld(file, now = Date.now(), isAlive = alive) {
-	const lock = await readLock(file);
-	return !!lock && (lock.until !== null && lock.until > now || lock.pid !== null && isAlive(lock.pid));
-}
+const held = (lock, now, { isAlive = alive, freshMs }) => !!lock && (lock.until !== null && lock.until > now || lock.pid !== null && isAlive(lock.pid) && (freshMs === void 0 || now - lock.mtimeMs < freshMs));
 /**
-* Takes the lock for `pid`; false when the session is held (`isHeld`). With `force` (the plugin's
-* data layer) it is taken regardless: a detached one holding it sees that and steps aside.
+* Takes the lock for `pid`; false when it is held (`isHeld`). With `force` (the plugin's data
+* layer) it is taken regardless: a detached one holding it sees that and steps aside. `extra` is
+* written into the lock beside the pid.
+*
+* A new lock is created exclusively, so of two takers at once only one gets it. A stale one is
+* moved aside by rename, which only one taker can do to the same file, and the taker checks that
+* what it moved is the lock it judged stale: one that moved another taker's new lock instead puts
+* it back and loses.
 */
-async function takeLock(file, pid, isAlive = alive, force = false, now = Date.now()) {
+async function takeLock(file, pid, isAlive = alive, force = false, now = Date.now(), { freshMs, extra = {} } = {}) {
 	await fs.mkdir(path.dirname(file), { recursive: true });
-	const body = JSON.stringify({ pid });
-	try {
-		await fs.writeFile(file, body, { flag: "wx" });
-		return true;
-	} catch (err) {
-		if (err.code !== "EEXIST") throw err;
+	const body = JSON.stringify({
+		pid,
+		...extra
+	});
+	for (let tries = 0; tries < 5; tries++) {
+		try {
+			await fs.writeFile(file, body, { flag: "wx" });
+			return true;
+		} catch (err) {
+			if (err.code !== "EEXIST") throw err;
+		}
+		const seen = await readText(file);
+		if (!seen) continue;
+		const lock = parseLock(seen.text, seen.mtimeMs);
+		if (!force && lock?.pid !== pid && held(lock, now, {
+			isAlive,
+			freshMs
+		})) return false;
+		const aside = `${file}.${pid}-${Math.random().toString(36).slice(2)}`;
+		try {
+			await fs.rename(file, aside);
+		} catch (err) {
+			if ([
+				"ENOENT",
+				"EPERM",
+				"EBUSY",
+				"EACCES"
+			].includes(err.code ?? "")) continue;
+			throw err;
+		}
+		if (await fs.readFile(aside, "utf8").catch(() => null) !== seen.text) {
+			await fs.link(aside, file).catch(() => {});
+			await fs.rm(aside, { force: true });
+			if (!force) return false;
+			continue;
+		}
+		await fs.rm(aside, { force: true });
 	}
-	if (!force && await lockHolder(file) !== pid && await isHeld(file, now, isAlive)) return false;
-	await fs.writeFile(file, body);
+	return false;
+}
+/** Marks the lock `pid` holds as fresh; false when another has taken it. */
+async function refreshLock(file, pid, now = Date.now()) {
+	if (await lockHolder(file) !== pid) return false;
+	const t = new Date(now);
+	await fs.utimes(file, t, t);
 	return true;
 }
 /** Removes the lock if it still names `pid`. */
 async function releaseLock(file, pid) {
 	if (await lockHolder(file) === pid) await fs.rm(file, { force: true });
+}
+/** Turns the lock `pid` holds into a hold-off until `until`; one another has taken is left. */
+async function holdOff(file, pid, until) {
+	if (await lockHolder(file) === pid) await fs.writeFile(file, JSON.stringify({
+		pid: 0,
+		until
+	}));
 }
 function alive(pid) {
 	try {
@@ -6510,15 +6581,13 @@ function estimate(context, s) {
 		cacheRead: 2 * context
 	};
 }
-/** The answer-count cap one more answer in `room` would go over, or null. */
-function countCap(entries, room, now, s) {
-	if (entries.filter((e) => e.room === room && now - e.at < HOUR_MS).length >= s.answersPerRoomPerHour) return "room-hour";
-	if (entries.filter((e) => now - e.at < DAY_MS).length >= s.answersPerOwnerPerDay) return "owner-day";
+/** The cap one more answer in `room`, expected to use `expected`, would go over, or null. */
+function overCap(entries, room, expected, now, s) {
+	const day = entries.filter((e) => now - e.at < DAY_MS);
+	if (day.filter((e) => e.room === room && now - e.at < HOUR_MS).length >= s.answersPerRoomPerHour) return "room-hour";
+	if (day.length >= s.answersPerMachinePerDay) return "owner-day";
+	if (day.reduce((sum, e) => sum + weighted(e.usage, s), 0) + weighted(expected, s) > s.tokenBudgetPerMachinePerDay) return "owner-tokens";
 	return null;
-}
-/** Whether `expected` on top of the last day's tokens goes over the budget. */
-function overBudget(entries, expected, now, s) {
-	return entries.filter((e) => now - e.at < DAY_MS).reduce((sum, e) => sum + weighted(e.usage, s), 0) + weighted(expected, s) > s.tokenBudgetPerOwnerPerDay;
 }
 /** The ledger in `file`; one that is missing or doesn't parse starts empty. */
 async function openLedger(file) {
@@ -6528,14 +6597,27 @@ async function openLedger(file) {
 		if (Array.isArray(value)) entries = value.filter(isEntry);
 	} catch {}
 	const recent = (now) => entries.filter((e) => now - e.at < DAY_MS);
-	return {
-		entries: recent,
-		async add(entry) {
-			entries = [...recent(entry.at), entry];
+	let writing = Promise.resolve();
+	const save = () => {
+		const text = JSON.stringify(entries) + "\n";
+		writing = writing.then(async () => {
 			await fs.mkdir(path.dirname(file), { recursive: true });
 			const temp = `${file}.${process.pid}`;
-			await fs.writeFile(temp, JSON.stringify(entries) + "\n");
+			await fs.writeFile(temp, text);
 			await fs.rename(temp, file);
+		});
+		return writing;
+	};
+	return {
+		entries: recent,
+		reserve(entry) {
+			const held = { ...entry };
+			entries = [...recent(entry.at), held];
+			save().catch(() => {});
+			return (usage) => {
+				held.usage = usage;
+				return save();
+			};
 		}
 	};
 }
@@ -7615,6 +7697,7 @@ async function claudeBinary(claudeDir, env, platform, home) {
 //#endregion
 //#region src/runner/claude.ts
 const PREFIX = "claude-code:";
+const EXIT_GRACE_MS = 5e3;
 /** Every flag of the fork's command line, after the binary. */
 function forkArgs(sessionId, model) {
 	return [
@@ -7637,10 +7720,29 @@ function forkArgs(sessionId, model) {
 		"--verbose"
 	];
 }
-/** The fork's environment: this one's, less Claude Code's own variables, bar CLAUDE_CONFIG_DIR. */
+/**
+* The variables Claude Code sets for the processes it starts, which tie them to that session: its
+* marker and entrypoint, the session's ids, its messaging socket and token, its own path and pid,
+* the session's plugin folders and effort, and its IDE port.
+*/
+const FORK_ENV_DROPPED = [
+	"CLAUDECODE",
+	"CLAUDE_CODE_ENTRYPOINT",
+	"CLAUDE_CODE_SESSION_ID",
+	"CLAUDE_CODE_CHILD_SESSION",
+	"CLAUDE_CODE_SESSION_ATTENDED",
+	"CLAUDE_CODE_MESSAGING_SOCKET",
+	"CLAUDE_CODE_MESSAGING_TOKEN",
+	"CLAUDE_CODE_EXECPATH",
+	"CLAUDE_CODE_PLUGIN_DIRS",
+	"CLAUDE_CODE_SSE_PORT",
+	"CLAUDE_PID",
+	"CLAUDE_EFFORT"
+];
+/** The fork's environment: this one's, less FORK_ENV_DROPPED. */
 function forkEnv(env) {
 	const out = {};
-	for (const [key, value] of Object.entries(env)) if (value !== void 0 && (!key.startsWith("CLAUDE") || key === "CLAUDE_CONFIG_DIR")) out[key] = value;
+	for (const [key, value] of Object.entries(env)) if (value !== void 0 && !FORK_ENV_DROPPED.includes(key)) out[key] = value;
 	return out;
 }
 /** One user turn as a stream-json input line. */
@@ -7654,6 +7756,29 @@ const userTurn = (text) => JSON.stringify({
 		}]
 	}
 }) + "\n";
+/** A session id names a transcript file and goes on the command line: a plain name, not an option. */
+const forkableId = (session) => {
+	const id = session.startsWith(PREFIX) ? session.slice(12) : null;
+	return id && /^\w[\w-]*$/.test(id) ? id : null;
+};
+/** Ends a process and everything it started: on Windows `kill` reaches only the process itself. */
+function killTree(child, platform = process.platform) {
+	if (child.exitCode !== null || child.signalCode !== null || child.pid === void 0) return;
+	if (platform === "win32") spawnSync("taskkill", [
+		"/pid",
+		String(child.pid),
+		"/T",
+		"/F"
+	], {
+		windowsHide: true,
+		stdio: "ignore"
+	});
+	else try {
+		process.kill(-child.pid, "SIGKILL");
+	} catch {
+		child.kill("SIGKILL");
+	}
+}
 const defaultSpawn = ([cmd, ...args], { cwd, env }) => spawn(cmd, args, {
 	cwd,
 	env,
@@ -7662,32 +7787,32 @@ const defaultSpawn = ([cmd, ...args], { cwd, env }) => spawn(cmd, args, {
 		"pipe",
 		"pipe"
 	],
-	windowsHide: true
+	windowsHide: true,
+	detached: process.platform !== "win32"
 });
 function createClaudeAnswerer({ claudeDir, binary, model, config, spawn = defaultSpawn, env = process.env, now = Date.now }) {
-	const idOf = (session) => {
-		const id = session.startsWith(PREFIX) ? session.slice(12) : null;
-		return id && /^[\w-]+$/.test(id) ? id : null;
-	};
+	const forks = /* @__PURE__ */ new Set();
 	return {
 		async lead(session) {
-			const id = idOf(session);
+			const id = forkableId(session);
 			return id ? createClaudeCode({
 				...nodeIo(),
 				claudeDir
 			}).lead(id, now(), await config()) : null;
 		},
 		async ask(session, lead, ask) {
-			const id = idOf(session);
+			const id = forkableId(session);
 			if (!id) return {
 				ok: false,
-				error: `${session} isn't a Claude Code session`,
+				kind: "not-set-up",
+				detail: `${session} isn't a Claude Code session this runner can fork`,
 				usage: null
 			};
 			const bin = await binary();
 			if (!bin) return {
 				ok: false,
-				error: "the claude binary wasn't found; run the plugin's install script, or set its path in ~/.claude/isoplan/claude-binary.json",
+				kind: "not-set-up",
+				detail: "the claude binary wasn't found; run the plugin's install script, or set its path in ~/.claude/isoplan/claude-binary.json",
 				usage: null
 			};
 			let child;
@@ -7699,15 +7824,22 @@ function createClaudeAnswerer({ claudeDir, binary, model, config, spawn = defaul
 			} catch (err) {
 				return {
 					ok: false,
-					error: `couldn't start claude: ${err.message}`,
+					kind: "not-set-up",
+					detail: `couldn't start claude: ${err.message}`,
 					usage: null
 				};
 			}
+			forks.add(child);
+			child.on("close", () => forks.delete(child));
 			return drive(child, ask);
+		},
+		close() {
+			for (const child of forks) killTree(child);
+			forks.clear();
 		}
 	};
 }
-/** Runs the two turns over a started fork and settles once it has exited or timed out. */
+/** Runs the two turns over a started fork and settles with turn 2's result, a failure or the timeout. */
 function drive(child, { instructions, request, timeoutMs }) {
 	return new Promise((resolve) => {
 		const usage = {
@@ -7718,8 +7850,6 @@ function drive(child, { instructions, request, timeoutMs }) {
 		};
 		let metered = false;
 		let turn = 1;
-		let reply = null;
-		let failure = null;
 		let buffer = "";
 		let stderr = "";
 		let isDone = false;
@@ -7728,15 +7858,17 @@ function drive(child, { instructions, request, timeoutMs }) {
 			isDone = true;
 			clearTimeout(timer);
 			resolve(answered);
+			setTimeout(() => killTree(child), EXIT_GRACE_MS).unref();
 		};
-		const fail = (error) => finish({
+		const fail = (kind, detail) => finish({
 			ok: false,
-			error,
+			kind,
+			detail,
 			usage: metered ? usage : null
 		});
 		const timer = setTimeout(() => {
-			fail(`no answer within ${Math.round(timeoutMs / 1e3)} s`);
-			child.kill();
+			fail("timed-out", `no answer within ${Math.round(timeoutMs / 1e3)} s`);
+			killTree(child);
 		}, timeoutMs);
 		const onResult = (e) => {
 			if (!(typeof e.num_turns === "number" && e.num_turns >= 1)) return;
@@ -7747,17 +7879,24 @@ function drive(child, { instructions, request, timeoutMs }) {
 			usage.cacheRead += n("cache_read_input_tokens");
 			usage.cacheWrite += n("cache_creation_input_tokens");
 			metered = true;
-			if (e.is_error || e.subtype !== "success") failure = `the fork stopped with ${String(e.subtype ?? "an error")}${typeof e.result === "string" && e.result ? `: ${e.result}` : ""}`;
+			if (e.is_error || e.subtype !== "success") {
+				fail("failed", `turn ${turn} stopped with ${String(e.subtype ?? "an error")}${typeof e.result === "string" && e.result ? `: ${e.result}` : ""}`);
+				killTree(child);
+				return;
+			}
 			if (turn === 1) {
-				if (failure) {
-					fail(failure);
-					child.kill();
-					return;
-				}
 				turn = 2;
 				child.stdin.write(userTurn(request));
 				child.stdin.end();
-			} else if (!failure) reply = typeof e.result === "string" ? e.result.trim() : "";
+				return;
+			}
+			const text = typeof e.result === "string" ? e.result.trim() : "";
+			if (text) finish({
+				ok: true,
+				text,
+				usage
+			});
+			else fail("failed", "the fork answered with nothing");
 		};
 		child.stdout.setEncoding("utf8").on("data", (piece) => {
 			buffer += piece;
@@ -7774,17 +7913,8 @@ function drive(child, { instructions, request, timeoutMs }) {
 		});
 		child.stderr.setEncoding("utf8").on("data", (piece) => stderr = (stderr + piece).slice(-2e3));
 		child.stdin.on("error", () => {});
-		child.on("error", (err) => fail(`couldn't run claude: ${err.message}`));
-		child.on("close", (code) => {
-			if (failure) fail(failure);
-			else if (reply) finish({
-				ok: true,
-				text: reply,
-				usage
-			});
-			else if (reply === "") fail("the fork answered with nothing");
-			else fail(`claude exited${code === null ? "" : ` with code ${code}`} before answering${stderr.trim() ? `: ${stderr.trim().split("\n").slice(-3).join(" ")}` : ""}`);
-		});
+		child.on("error", (err) => fail("not-set-up", `couldn't run claude: ${err.message}`));
+		child.on("close", (code) => fail("failed", `claude exited${code === null ? "" : ` with code ${code}`} before answering${stderr.trim() ? `: ${stderr.trim().split("\n").slice(-3).join(" ")}` : ""}`));
 		child.stdin.write(userTurn(instructions));
 	});
 }
@@ -7793,16 +7923,22 @@ function drive(child, { instructions, request, timeoutMs }) {
 const RETRY_BASE_MS = 1e3;
 const RETRY_CAP_MS = 6e4;
 const STABLE_MS = 6e4;
-/** Runs the worker until it exits cleanly, starting it again after each crash. */
+/** Runs the worker until it exits cleanly, starting it again after each crash, up to MAX_FAST_FAILURES in a row. */
 async function supervise({ run, log, sleep = (ms) => new Promise((r) => setTimeout(r, ms)), now = Date.now }) {
 	let failures = 0;
 	for (;;) {
 		const startedAt = now();
 		const code = await run();
-		if (code === 0) return;
+		if (code === 0) return "done";
+		if (code === 3) return "not-wanted";
 		failures = now() - startedAt >= STABLE_MS ? 1 : failures + 1;
+		const how = code === null ? "was killed" : `exited with code ${code}`;
+		if (failures >= 5) {
+			log(`the runner's worker ${how}, the ${failures}th time in a row within a minute of starting; giving up until the runner is started again`);
+			return "gave-up";
+		}
 		const delay = Math.min(RETRY_CAP_MS, RETRY_BASE_MS * 2 ** (failures - 1));
-		log(`the runner's worker ${code === null ? "was killed" : `exited with code ${code}`}; starting it again in ${Math.round(delay / 1e3)} s`);
+		log(`the runner's worker ${how}; starting it again in ${Math.round(delay / 1e3)} s`);
 		await sleep(delay);
 	}
 }
@@ -7838,17 +7974,31 @@ function fill(template, values) {
 //#region src/runner/runner.ts
 const REMEMBER = 200;
 const COMPACTED_NOTE = "Note from Isoplan: this session was compacted, so its earlier work survives only as a summary and the details may be thin.";
+/** What the server is told for each kind of fork failure. */
+const FAILED = {
+	"timed-out": "the fork took too long to answer",
+	failed: "the fork couldn't answer",
+	"not-set-up": "this machine can't run the fork; its owner can see why in the runner's log"
+};
 function createRunner({ answerer, ledger, settings, prompts, scan, send, log, isDir, push, now = Date.now }) {
 	const rooms = /* @__PURE__ */ new Map();
 	const running = /* @__PURE__ */ new Set();
 	const finished = /* @__PURE__ */ new Map();
 	const held = /* @__PURE__ */ new Map();
+	const released = /* @__PURE__ */ new Set();
 	const unavailable = (id, detail) => ({
 		type: "refusal",
 		v: 1,
 		id,
 		reason: "unavailable",
 		detail
+	});
+	const overCapRefusal = (id, cap) => ({
+		type: "refusal",
+		v: 1,
+		id,
+		reason: "over-cap",
+		cap
 	});
 	function deliver(id, message) {
 		finished.delete(id);
@@ -7858,29 +8008,24 @@ function createRunner({ answerer, ledger, settings, prompts, scan, send, log, is
 	}
 	async function answer(request) {
 		const { id, room, session } = request;
-		const s = await settings();
-		const cap = countCap(ledger.entries(now()), room, now(), s);
-		if (cap) return {
-			type: "refusal",
-			v: 1,
-			id,
-			reason: "over-cap",
-			cap
-		};
 		const lead = await answerer.lead(session);
-		if (!lead) return unavailable(id, `this machine has no session ${session}`);
-		if (!await isDir(lead.cwd)) return unavailable(id, `the session's folder ${lead.cwd} is gone, so its lead can't be asked`);
+		if (!lead) return unavailable(id, "this machine has no such session");
+		if (!await isDir(lead.cwd)) {
+			log(`${id}: the folder of ${session}, ${lead.cwd}, is gone`);
+			return unavailable(id, "the session's folder is gone, so its lead can't be asked");
+		}
 		if (lead.working) return unavailable(id, "the session's lead is mid-turn; ask again once its turn ends");
 		if (request.kind === "write-brief" && !push) return unavailable(id, "this plugin version can't hand a room over from the floor yet");
-		const expected = estimate(lead.context, s);
-		if (overBudget(ledger.entries(now()), expected, now(), s)) return {
-			type: "refusal",
-			v: 1,
-			id,
-			reason: "over-cap",
-			cap: "owner-tokens"
-		};
+		const s = await settings();
 		const p = await prompts();
+		const expected = estimate(lead.context, s);
+		const cap = overCap(ledger.entries(now()), room, expected, now(), s);
+		if (cap) return overCapRefusal(id, cap);
+		const settle = ledger.reserve({
+			at: now(),
+			room,
+			usage: expected
+		});
 		const isBrief = request.kind === "write-brief";
 		const text = isBrief ? fill(p.brief, { to: request.to.name || request.to.id }) : fill(p.question, {
 			from: request.from.name || request.from.id,
@@ -7891,12 +8036,11 @@ function createRunner({ answerer, ledger, settings, prompts, scan, send, log, is
 			request: text,
 			timeoutMs: (isBrief ? s.briefTimeoutSeconds : s.answerTimeoutSeconds) * 1e3
 		});
-		await ledger.add({
-			at: now(),
-			room,
-			usage: answered.usage ?? expected
-		}).catch((err) => log(`couldn't record the answer in the ledger: ${err.message}`));
-		if (!answered.ok) return unavailable(id, `the fork couldn't answer: ${answered.error}`);
+		await settle(answered.usage ?? expected).catch((err) => log(`couldn't record ${id} in the ledger: ${err.message}`));
+		if (!answered.ok) {
+			log(`${id}: ${answered.detail}`);
+			return unavailable(id, FAILED[answered.kind]);
+		}
 		const body = lead.compacted ? `${COMPACTED_NOTE}\n\n${answered.text}` : answered.text;
 		const reply = isBrief ? async () => ({
 			type: "reply",
@@ -7916,21 +8060,32 @@ function createRunner({ answerer, ledger, settings, prompts, scan, send, log, is
 			answer: body
 		});
 		const matched = await scan(body);
-		if (matched) {
-			log(`withheld the ${isBrief ? "brief" : "answer"} for ${id} in ${room}: it matches the secret pattern "${matched}"`);
-			held.set(id, reply);
-			return {
-				type: "refusal",
-				v: 1,
-				id,
-				reason: "withheld"
-			};
+		if (!matched) return reply();
+		log(`withheld the ${isBrief ? "brief" : "answer"} for ${id} in ${room}: it matches the secret pattern "${matched}"`);
+		if (released.delete(id)) {
+			log(`${id} was released while it was being written, so it is sent`);
+			return reply();
 		}
-		return reply();
+		held.set(id, reply);
+		if (held.size > 50) {
+			const oldest = held.keys().next().value;
+			held.delete(oldest);
+			log(`dropped the withheld reply for ${oldest}: more than 50 are held`);
+		}
+		return {
+			type: "refusal",
+			v: 1,
+			id,
+			reason: "withheld"
+		};
 	}
 	async function release(id) {
 		const reply = held.get(id);
 		if (!reply) {
+			if (running.has(id)) {
+				released.add(id);
+				return;
+			}
 			const sent = finished.get(id);
 			if (sent?.type === "reply") send(sent);
 			else send(unavailable(id, "nothing is withheld under this id here; the runner may have restarted since, so ask again"));
@@ -7940,7 +8095,8 @@ function createRunner({ answerer, ledger, settings, prompts, scan, send, log, is
 		try {
 			deliver(id, await reply());
 		} catch (err) {
-			deliver(id, unavailable(id, `couldn't send the released reply: ${err.message}`));
+			log(`${id}: couldn't send the released reply: ${err.message}`);
+			deliver(id, unavailable(id, "the released reply couldn't be sent"));
 		}
 	}
 	return {
@@ -7966,8 +8122,12 @@ function createRunner({ answerer, ledger, settings, prompts, scan, send, log, is
 				return;
 			}
 			running.add(id);
-			const turn = (rooms.get(room) ?? Promise.resolve()).then(() => answer(request)).catch((err) => unavailable(id, `the runner failed: ${err?.message ?? String(err)}`)).then((message) => deliver(id, message)).finally(() => {
+			const turn = (rooms.get(room) ?? Promise.resolve()).then(() => answer(request)).catch((err) => {
+				log(`${id}: the runner failed: ${err?.stack ?? String(err)}`);
+				return unavailable(id, "the runner failed");
+			}).then((message) => deliver(id, message)).finally(() => {
 				running.delete(id);
+				released.delete(id);
 				if (rooms.get(room) === turn) rooms.delete(room);
 			});
 			rooms.set(room, turn);
@@ -8024,15 +8184,23 @@ function scan(text, patterns) {
 }
 //#endregion
 //#region src/runner/start.ts
-/** The runner's lock: `{ pid }` of the supervisor that holds it. */
+/** The runner's lock: `{ pid, code }` of the supervisor that holds it. */
 const runnerLockPath = (claudeDir) => path.join(claudeDir, "isoplan", "runner", "lock.json");
+const LOCK_REFRESH_MS = 3e4;
+/** What names a runner.js's code: its size and write time. Null when it is gone. */
+async function runnerCode(file) {
+	const st = await fs.stat(file).catch(() => null);
+	return st && st.isFile() ? `${st.size}-${Math.round(st.mtimeMs)}` : null;
+}
 //#endregion
 //#region src/runner/main.ts
 const LOG_CAP_BYTES = 262144;
 const CHECK_MS = 6e4;
 const self = fileURLToPath(import.meta.url);
 const here = path.dirname(self);
-const modDir = path.join(here, "..");
+const appDir = path.join(here, "..");
+const dirFlag = process.argv.indexOf("--claude-dir");
+if (dirFlag >= 0 && process.argv[dirFlag + 1] && path.resolve(process.argv[dirFlag + 1]) !== path.resolve(os.homedir(), ".claude")) process.env.CLAUDE_CONFIG_DIR = process.argv[dirFlag + 1];
 const { dir: claudeDir, json: claudeJson } = claudePaths(process.env, os.homedir());
 const isoplanDir = path.join(claudeDir, "isoplan");
 const logFile = path.join(isoplanDir, "logs", "runner.log");
@@ -8049,12 +8217,28 @@ async function writeLog(text) {
 }
 async function supervisor() {
 	const lock = runnerLockPath(claudeDir);
-	if (!await takeLock(lock, process.pid, alive).catch(() => false)) return 0;
+	const code = await runnerCode(self);
+	if (!await takeLock(lock, process.pid, alive, false, Date.now(), {
+		freshMs: 9e4,
+		extra: { code }
+	}).catch(() => false)) return 0;
 	log(`runner ${process.pid} started`);
-	await supervise({
+	const refresh = setInterval(() => {
+		refreshLock(lock, process.pid).then((isHolder) => {
+			if (isHolder) return;
+			log(`runner ${process.pid} stopped: another runner took its lock`);
+			process.exit(0);
+		}, () => {});
+	}, LOCK_REFRESH_MS);
+	const stopped = await supervise({
 		log,
 		run: () => new Promise((resolve) => {
-			const worker = spawn(process.execPath, [self, "--worker"], {
+			const child = spawn(process.execPath, [
+				self,
+				"--claude-dir",
+				claudeDir,
+				"--worker"
+			], {
 				cwd: claudeDir,
 				stdio: [
 					"pipe",
@@ -8064,22 +8248,28 @@ async function supervisor() {
 				windowsHide: true
 			});
 			let stderr = "";
-			worker.stderr.setEncoding("utf8").on("data", (piece) => stderr = (stderr + piece).slice(-4e3));
-			worker.on("error", (err) => (log(`couldn't start the runner's worker: ${err.message}`), resolve(1)));
-			worker.on("close", (code) => {
+			child.stderr.setEncoding("utf8").on("data", (piece) => stderr = (stderr + piece).slice(-4e3));
+			child.on("error", (err) => (log(`couldn't start the runner's worker: ${err.message}`), resolve(1)));
+			child.on("close", (exit) => {
 				if (stderr.trim()) log(`the runner's worker wrote: ${stderr.trim()}`);
-				resolve(code);
+				resolve(exit);
 			});
 		})
 	});
-	log(`runner ${process.pid} stopped: no room on this machine is lit`);
-	await releaseLock(lock, process.pid).catch(() => {});
+	clearInterval(refresh);
+	if (stopped === "not-wanted") {
+		log(`runner ${process.pid} stopped: the office server doesn't want this machine's runner; it won't start again for ${HOLD_OFF_MS / 6e4} minutes`);
+		await holdOff(lock, process.pid, Date.now() + HOLD_OFF_MS).catch(() => {});
+	} else {
+		if (stopped === "done") log(`runner ${process.pid} stopped: no room on this machine is lit`);
+		await releaseLock(lock, process.pid).catch(() => {});
+	}
 	return 0;
 }
 async function worker() {
 	const io = nodeIo();
-	const config = () => loadConfig(io, path.join(modDir, "config.json"), path.join(isoplanDir, "config.json"));
-	const settings = () => loadSettings(io, path.join(modDir, "runner.json"), path.join(isoplanDir, "runner.json"));
+	const config = () => loadConfig(io, path.join(appDir, "config.json"), path.join(isoplanDir, "config.json"));
+	const settings = () => loadSettings(io, path.join(appDir, "runner.json"), path.join(isoplanDir, "runner.json"));
 	const first = await config();
 	await settings();
 	const answerer = createClaudeAnswerer({
@@ -8088,17 +8278,20 @@ async function worker() {
 		model: async () => (await settings()).claudeModel,
 		config
 	});
+	process.on("exit", () => answerer.close());
 	let send = () => {};
 	const runner = createRunner({
 		answerer,
 		ledger: await openLedger(path.join(isoplanDir, "runner", "ledger.json")),
 		settings,
-		prompts: () => loadPrompts(path.join(modDir, "prompts")),
-		scan: async (text) => scan(text, await loadPatterns(path.join(modDir, "secret-patterns.json"), path.join(isoplanDir, "secret-patterns.json"), log)),
+		prompts: () => loadPrompts(path.join(appDir, "prompts")),
+		scan: async (text) => scan(text, await loadPatterns(path.join(appDir, "secret-patterns.json"), path.join(isoplanDir, "secret-patterns.json"), log)),
 		send: (message) => send(message),
 		log,
 		isDir: (p) => fs.stat(p).then((s) => s.isDirectory(), () => false)
 	});
+	let notWanted = false;
+	let wake = () => {};
 	const link = createLink({
 		url: first.server,
 		emit: (line) => {
@@ -8106,6 +8299,10 @@ async function worker() {
 			else if (line.type === "error") log(`the office server says: ${line.message} (${line.code})`);
 		},
 		onMessage: (message) => runner.take(message),
+		onNotWanted: () => {
+			notWanted = true;
+			wake();
+		},
 		hello: {
 			type: "runner",
 			v: 1,
@@ -8121,14 +8318,14 @@ async function worker() {
 	let orphaned = false;
 	const gone = new Promise((resolve) => process.stdin.on("end", resolve).on("error", resolve).resume()).then(() => orphaned = true);
 	for (;;) {
-		await Promise.race([new Promise((r) => setTimeout(r, CHECK_MS)), gone]);
-		if (orphaned) break;
+		await Promise.race([new Promise((r) => (wake = r, setTimeout(r, CHECK_MS))), gone]);
+		if (orphaned || notWanted) break;
 		if (!runner.idle()) continue;
 		const window = askableMs(await config().catch(() => first));
 		if (!await anyRoomSince(io, path.join(claudeDir, "projects"), Date.now() - window)) break;
 	}
 	link.close();
-	return 0;
+	return notWanted ? 3 : 0;
 }
 process.exitCode = await (process.argv.includes("--worker") ? worker() : supervisor());
 await logging;

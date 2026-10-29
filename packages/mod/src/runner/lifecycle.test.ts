@@ -3,31 +3,34 @@ import path from "node:path";
 import { expect, test } from "vitest";
 import { NOW, line, session, tempRoot, touch } from "../data-layer/fixture.js";
 import { nodeIo } from "../data-layer/io.js";
-import { lockHolder, takeLock } from "../wake/lock.js";
+import { holdOff, lockHolder, refreshLock, takeLock } from "../wake/lock.js";
 import { wakeRecordPath } from "../wake/wake.js";
-import { anyRoomSince, askableMs, supervise } from "./lifecycle.js";
-import { runnerLockPath, startRunner, stopRunner } from "./start.js";
+import { anyRoomSince, askableMs, MAX_FAST_FAILURES, NOT_WANTED_CODE, supervise } from "./lifecycle.js";
+import { RUNNER_FRESH_MS, runnerCode, runnerLockPath, startRunner, stopRunner } from "./start.js";
 
 const OTHER = 4242; // a pid that isn't this process
 
-function machine({ runner = true } = {}) {
+async function machine({ runner = true } = {}) {
   const claudeDir = path.join(tempRoot(), ".claude");
-  const runnerJs = path.join(claudeDir, "..", "dist", "runner.js");
+  const runnerJs = path.join(claudeDir, "isoplan", "runner", "app", "dist", "runner.mjs");
   fs.mkdirSync(path.dirname(runnerJs), { recursive: true });
-  fs.writeFileSync(runnerJs, "");
-  fs.mkdirSync(path.join(claudeDir, "isoplan"), { recursive: true });
+  fs.writeFileSync(runnerJs, "// v1");
   fs.writeFileSync(wakeRecordPath(claudeDir), JSON.stringify(runner ? { dataLayer: "x", runner: runnerJs } : { dataLayer: "x" }));
   const spawned: { args: string[]; cwd: string }[] = [];
-  const start = (isAlive: (pid: number) => boolean = () => true) => startRunner({ claudeDir, spawn: (args, cwd) => spawned.push({ args, cwd }), isAlive });
-  return { claudeDir, runnerJs, spawned, start, lock: runnerLockPath(claudeDir) };
+  const killed: number[] = [];
+  const lock = runnerLockPath(claudeDir);
+  const opts = (isAlive: (pid: number) => boolean = () => true) => ({ claudeDir, spawn: (args: string[], cwd: string) => spawned.push({ args, cwd }), isAlive, kill: (pid: number) => killed.push(pid) });
+  const start = (isAlive?: (pid: number) => boolean) => startRunner(opts(isAlive));
+  // A supervisor's lock, as main.ts takes it: its pid and the code it runs.
+  const hold = async (pid: number) => takeLock(lock, pid, () => false, false, Date.now(), { extra: { code: await runnerCode(runnerJs) } });
+  return { claudeDir, runnerJs, spawned, killed, start, lock, hold, opts };
 }
 
 test("one runner: started when none holds the lock, not while one lives; a dead one's lock is taken over", async () => {
-  const m = machine();
+  const m = await machine();
   expect(await m.start()).toBe(true);
-  expect(m.spawned).toEqual([{ args: [m.runnerJs], cwd: m.claudeDir }]);
-  // The supervisor takes the lock as it starts; a second one is refused while it lives.
-  expect(await takeLock(m.lock, OTHER)).toBe(true);
+  expect(m.spawned).toEqual([{ args: [m.runnerJs, "--claude-dir", m.claudeDir], cwd: m.claudeDir }]);
+  expect(await m.hold(OTHER)).toBe(true);
   expect(await takeLock(m.lock, OTHER + 1, () => true)).toBe(false);
   expect(await m.start(() => true)).toBe(false);
   // It crashed hard and left its lock: the next start takes over.
@@ -35,47 +38,96 @@ test("one runner: started when none holds the lock, not while one lives; a dead 
   expect(await takeLock(m.lock, OTHER + 1, () => false)).toBe(true);
   expect(await lockHolder(m.lock)).toBe(OTHER + 1);
   expect(m.spawned).toHaveLength(2);
+  expect(m.killed).toEqual([]);
 });
 
-test("one runner: nothing starts when install recorded no runner, or it is gone", async () => {
-  const none = machine({ runner: false });
+test("one runner: of two starters taking a stale lock at once, exactly one wins", async () => {
+  const m = await machine();
+  for (let round = 0; round < 30; round++) {
+    fs.writeFileSync(m.lock, JSON.stringify({ pid: OTHER }));
+    const won = await Promise.all([OTHER + 1, OTHER + 2, OTHER + 3].map((pid) => takeLock(m.lock, pid, (p) => p !== OTHER)));
+    expect(won.filter(Boolean)).toHaveLength(1);
+    expect(await lockHolder(m.lock)).toBe([OTHER + 1, OTHER + 2, OTHER + 3][won.indexOf(true)]);
+  }
+  expect(fs.readdirSync(path.dirname(m.lock))).toEqual(["app", "lock.json"]);
+});
+
+test("one runner: a lock not kept fresh is stale though its pid is live, so a reused pid is neither the runner nor killed", async () => {
+  const m = await machine();
+  await m.hold(OTHER);
+  const old = new Date(Date.now() - RUNNER_FRESH_MS - 1000);
+  fs.utimesSync(m.lock, old, old);
+  expect(await stopRunner(m.claudeDir, m.opts())).toBe(false);
+  expect(m.killed).toEqual([]);
+  expect(await m.start()).toBe(true);
+  // The runner keeps its lock fresh, and then it counts again.
+  expect(await refreshLock(m.lock, OTHER)).toBe(true);
+  expect(await refreshLock(m.lock, OTHER + 1)).toBe(false);
+  expect(await m.start()).toBe(false);
+});
+
+test("one runner: a runner on older code is stopped and a new one started; uninstall stops one and clears its lock", async () => {
+  const m = await machine();
+  await m.hold(OTHER);
+  expect(await m.start()).toBe(false);
+  fs.writeFileSync(m.runnerJs, "// v2, from a plugin update");
+  expect(await m.start()).toBe(true);
+  expect(m.killed).toEqual([OTHER]);
+  expect(fs.existsSync(m.lock)).toBe(false);
+  expect(m.spawned).toHaveLength(1);
+
+  await m.hold(OTHER + 1);
+  expect(await stopRunner(m.claudeDir, m.opts())).toBe(true);
+  expect(m.killed).toEqual([OTHER, OTHER + 1]);
+  expect(await stopRunner(m.claudeDir, m.opts())).toBe(false);
+});
+
+test("one runner: a hold-off keeps it from starting; nothing starts when install recorded no runner, or it is gone", async () => {
+  const held = await machine();
+  await held.hold(OTHER);
+  await holdOff(held.lock, OTHER, Date.now() + 60000);
+  expect(await held.start(() => false)).toBe(false);
+  expect(await stopRunner(held.claudeDir, held.opts())).toBe(false);
+  const none = await machine({ runner: false });
   expect(await none.start()).toBe(false);
-  const gone = machine();
+  const gone = await machine();
   fs.rmSync(gone.runnerJs);
   expect(await gone.start()).toBe(false);
-  expect([...none.spawned, ...gone.spawned]).toEqual([]);
+  expect([...held.spawned, ...none.spawned, ...gone.spawned]).toEqual([]);
 });
 
-test("one runner: uninstall stops the one running and clears its lock", async () => {
-  const m = machine();
-  await takeLock(m.lock, process.pid);
-  const killed: number[] = [];
-  expect(await stopRunner(m.claudeDir, (pid) => killed.push(pid))).toBe(true);
-  expect(killed).toEqual([process.pid]);
-  expect(fs.existsSync(m.lock)).toBe(false);
-  expect(await stopRunner(m.claudeDir, (pid) => killed.push(pid))).toBe(false);
-});
-
-test("lifecycle: the supervisor starts a crashed worker again with a backoff, and ends when it exits cleanly", async () => {
+function supervised(codes: (number | null)[], runMs: (run: number) => number = () => 10) {
   let clock = 0;
-  const codes = [1, null, 1, 0];
+  let runs = 0;
   const slept: number[] = [];
   const logs: string[] = [];
-  let runs = 0;
-  await supervise({
+  const stopped = supervise({
     run: async () => {
-      runs++;
-      // The third run stays up past a minute, so the crash after it starts the backoff over.
-      clock += runs === 3 ? 61000 : 10;
-      return codes.shift()!;
+      clock += runMs(++runs);
+      return codes.length ? codes.shift()! : 1;
     },
     sleep: async (ms) => void slept.push(ms),
     now: () => clock,
     log: (t) => logs.push(t),
   });
-  expect(runs).toBe(4);
-  expect(slept).toEqual([1000, 2000, 1000]);
-  expect(logs[1]).toBe("the runner's worker was killed; starting it again in 2 s");
+  return { stopped, slept, logs, runs: () => runs };
+}
+
+test("lifecycle: the supervisor starts a crashed worker again with a backoff, and ends when it exits cleanly", async () => {
+  // The third run stays up past a minute, so the crash after it starts the backoff over.
+  const s = supervised([1, null, 1, 0], (run) => (run === 3 ? 61000 : 10));
+  expect(await s.stopped).toBe("done");
+  expect(s.runs()).toBe(4);
+  expect(s.slept).toEqual([1000, 2000, 1000]);
+  expect(s.logs[1]).toBe("the runner's worker was killed; starting it again in 2 s");
+});
+
+test("lifecycle: a worker that keeps dying as it starts is given up on, with the reason logged", async () => {
+  const s = supervised([]);
+  expect(await s.stopped).toBe("gave-up");
+  expect(s.runs()).toBe(MAX_FAST_FAILURES);
+  expect(s.logs.at(-1)).toContain(`the ${MAX_FAST_FAILURES}th time in a row within a minute of starting; giving up`);
+  expect(await supervised([NOT_WANTED_CODE]).stopped).toBe("not-wanted");
 });
 
 test("lifecycle: the worker stays while any room is inside its lights-off window", async () => {

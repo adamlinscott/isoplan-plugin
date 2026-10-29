@@ -11,6 +11,13 @@ const RETRY_CAP_MS = 60000;
 // A worker that stayed up this long was healthy: the next crash starts the backoff over.
 const STABLE_MS = 60000;
 
+// A worker that dies this many times in a row soon after starting won't get better by itself (a
+// broken runner.json, a server address that can't be used): the supervisor gives up.
+export const MAX_FAST_FAILURES = 5;
+
+/** The worker's exit code when the office server doesn't want this machine's runner. */
+export const NOT_WANTED_CODE = 3;
+
 export interface SuperviseOptions {
   /** Runs the worker until it exits; its exit code, or null for a signal. */
   run: () => Promise<number | null>;
@@ -19,16 +26,25 @@ export interface SuperviseOptions {
   now?: () => number;
 }
 
-/** Runs the worker until it exits cleanly, starting it again after each crash. */
-export async function supervise({ run, log, sleep = (ms) => new Promise((r) => setTimeout(r, ms)), now = Date.now }: SuperviseOptions): Promise<void> {
+/** Why the supervisor stopped. */
+export type Stopped = "done" | "not-wanted" | "gave-up";
+
+/** Runs the worker until it exits cleanly, starting it again after each crash, up to MAX_FAST_FAILURES in a row. */
+export async function supervise({ run, log, sleep = (ms) => new Promise((r) => setTimeout(r, ms)), now = Date.now }: SuperviseOptions): Promise<Stopped> {
   let failures = 0;
   for (;;) {
     const startedAt = now();
     const code = await run();
-    if (code === 0) return;
+    if (code === 0) return "done";
+    if (code === NOT_WANTED_CODE) return "not-wanted";
     failures = now() - startedAt >= STABLE_MS ? 1 : failures + 1;
+    const how = code === null ? "was killed" : `exited with code ${code}`;
+    if (failures >= MAX_FAST_FAILURES) {
+      log(`the runner's worker ${how}, the ${failures}th time in a row within a minute of starting; giving up until the runner is started again`);
+      return "gave-up";
+    }
     const delay = Math.min(RETRY_CAP_MS, RETRY_BASE_MS * 2 ** (failures - 1));
-    log(`the runner's worker ${code === null ? "was killed" : `exited with code ${code}`}; starting it again in ${Math.round(delay / 1000)} s`);
+    log(`the runner's worker ${how}; starting it again in ${Math.round(delay / 1000)} s`);
     await sleep(delay);
   }
 }

@@ -3,10 +3,16 @@
 //
 // The hook script is copied to <claude dir>/isoplan/wake.mjs, a path that outlives plugin updates
 // and their versioned cache folders, and wake.json beside it records where the current data layer
-// and the machine's runner (src/runner) are; claude-binary.json records the `claude` binary the
-// runner's fork runs. settings.json gets one command hook on UserPromptSubmit and one on Stop.
-// They are found again by the wake.mjs path in their command, not by a field of their own, which
-// Claude Code's settings check might refuse; so an install updates them in place and never adds a second, and every other
+// and the machine's runner (src/runner) are. The runner is copied too, into
+// <claude dir>/isoplan/runner/app, with the defaults it reads beside it, for the same reason: a
+// runner left running from a versioned folder would lose its files at the next update. A new copy
+// replaces the running runner when it is next started (src/runner/start.ts). claude-binary.json
+// records the `claude` binary the runner's fork runs, as `{ path, auto: true }`; one without
+// `auto` was set by hand and is kept.
+//
+// settings.json gets one command hook on UserPromptSubmit and one on Stop. They are found again by
+// the wake.mjs path in their command, not by a field of their own, which Claude Code's settings
+// check might refuse; so an install updates them in place and never adds a second, and every other
 // hook and setting is kept, though the file's formatting comes back normalised (two-space JSON, no
 // byte order mark). A settings.json that doesn't parse is left alone. Each file is written whole
 // beside its target and moved over it, so neither Claude Code nor a running hook reads half of one.
@@ -32,6 +38,16 @@ export interface Paths {
 
 export const wakeScriptPath = (claudeDir: string) => path.join(claudeDir, "isoplan", "wake.mjs");
 
+/** Where install copies the runner and the defaults it reads, under the plugin's own layout. */
+export const runnerAppDir = (claudeDir: string) => path.join(claudeDir, "isoplan", "runner", "app");
+
+// The runner's files, by their path in the plugin's folder. runner.js goes last, so a runner
+// started on new code finds the new defaults beside it.
+export const RUNNER_FILES = ["config.json", "runner.json", "secret-patterns.json", "prompts/instructions.md", "prompts/question.md", "prompts/brief.md", "dist/runner.js"];
+
+/** A file's name in the copy: the bundle is an ES module and no package.json beside the copy says so, so it is .mjs, as wake.mjs is. */
+export const copiedAs = (file: string) => file.replace(/\.js$/, ".mjs");
+
 /**
  * The hook's command. Shell form, quoted, with forward slashes, so Git Bash, PowerShell and sh all
  * read the path the same way.
@@ -44,6 +60,7 @@ const isWake = (hook: unknown) => typeof (hook as Json | null)?.command === "str
 
 /**
  * Copies `wakeSource` (dist/wake.js) into place, records `dataLayer`, and adds or updates the hooks.
+ * With `runnerFrom` (the plugin's folder) it copies the runner too, and records the copy.
  * Returns what it changed, [] when it was all there. Throws when settings.json can't be merged.
  * With `auto` (the plugin's data layer) it does nothing once the hook has been uninstalled.
  */
@@ -51,7 +68,7 @@ export async function installWake(
   { claudeDir, settings }: Paths,
   dataLayer: string,
   wakeSource: string,
-  { auto = false, runner, findClaude }: { auto?: boolean; runner?: string; findClaude?: () => Promise<string | null> } = {},
+  { auto = false, runnerFrom, findClaude }: { auto?: boolean; runnerFrom?: string; findClaude?: () => Promise<string | null> } = {},
 ): Promise<string[]> {
   if (auto && (await isOptedOut(claudeDir))) return [];
   const current = await readSettings(settings);
@@ -88,14 +105,22 @@ export async function installWake(
   }
 
   // The script and its record go first, so the hooks never name a script that isn't there.
-  const record: WakeRecord = runner ? { dataLayer, runner } : { dataLayer };
   const changes: string[] = [];
+  let runner: string | undefined;
+  if (runnerFrom) {
+    const app = runnerAppDir(claudeDir);
+    let copied = false;
+    for (const file of RUNNER_FILES) if (await writeIfChanged(path.join(app, copiedAs(file)), await fs.readFile(path.join(runnerFrom, file), "utf8"))) copied = true;
+    runner = path.join(app, copiedAs("dist/runner.js"));
+    if (copied) changes.push(`copied the runner to ${app}`);
+  }
+  const record: WakeRecord = runner ? { dataLayer, runner } : { dataLayer };
   await fs.mkdir(path.dirname(script), { recursive: true });
   if (await writeIfChanged(script, await fs.readFile(wakeSource, "utf8"))) changes.push(`copied the wake hook to ${script}`);
   if (await writeIfChanged(wakeRecordPath(claudeDir), JSON.stringify(record, null, 2) + "\n")) changes.push(`recorded the data layer at ${dataLayer}${runner ? ` and the runner at ${runner}` : ""}`);
   // The runner's fork needs the claude binary; a hook's PATH may not name it, so it is found now.
-  const claude = findClaude ? await findClaude() : null;
-  if (claude && (await writeIfChanged(claudeBinaryPath(claudeDir), JSON.stringify({ path: claude }, null, 2) + "\n"))) changes.push(`recorded the claude binary at ${claude}`);
+  const claude = findClaude && !(await isHandSet(claudeBinaryPath(claudeDir))) ? await findClaude() : null;
+  if (claude && (await writeIfChanged(claudeBinaryPath(claudeDir), JSON.stringify({ path: claude, auto: true }, null, 2) + "\n"))) changes.push(`recorded the claude binary at ${claude}`);
   if (done.length) await writeSettings(settings, current);
   return [...changes, ...done];
 }
@@ -135,6 +160,16 @@ export async function uninstallWake({ claudeDir, settings }: Paths): Promise<str
     changes.push(`marked the wake hook as uninstalled in ${wakeRecordPath(claudeDir)}, so the plugin won't put it back`);
   }
   return changes;
+}
+
+// Whether the claude-binary.json record names a path someone set by hand: one without `auto`.
+async function isHandSet(file: string): Promise<boolean> {
+  try {
+    const record = JSON.parse(await fs.readFile(file, "utf8")) as { path?: unknown; auto?: unknown };
+    return typeof record.path === "string" && record.path !== "" && record.auto !== true;
+  } catch {
+    return false;
+  }
 }
 
 // Whether wake.json says the hook was uninstalled.

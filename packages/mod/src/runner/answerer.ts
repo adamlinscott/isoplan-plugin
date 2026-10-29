@@ -31,12 +31,23 @@ export interface Ask {
   timeoutMs: number;
 }
 
-/** The answer's text, or why there is none; usage is what was spent either way, when known. */
-export type Answered = { ok: true; text: string; usage: Usage } | { ok: false; error: string; usage: Usage | null };
+/**
+ * Why there is no answer, as the server is told it: a kind, never the fork's own output, which
+ * hasn't been through the secret scan.
+ */
+export type FailureKind = "timed-out" | "failed" | "not-set-up";
+
+/**
+ * The answer's text, or why there is none: `kind` for the server, `detail` for the local log
+ * only. Usage is what was spent either way, when known.
+ */
+export type Answered = { ok: true; text: string; usage: Usage } | { ok: false; kind: FailureKind; detail: string; usage: Usage | null };
 
 export interface Answerer {
   /** The session's lead, or null when this answerer has no such session on this machine. */
   lead(session: string): Promise<Lead | null>;
   /** Answers `ask` from a fork of the session's lead, never changing the session itself. */
   ask(session: string, lead: Lead, ask: Ask): Promise<Answered>;
+  /** Ends every fork still running, at once, as the runner exits. */
+  close(): void;
 }

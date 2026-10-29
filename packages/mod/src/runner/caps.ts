@@ -1,12 +1,15 @@
-// The runner's caps (E6), set in runner.json: answers per room in the last hour, answers by this
-// machine's owner in the last day, and a token budget for the owner's last day. The windows roll
-// rather than reset at midnight.
+// The runner's caps (E6), set in runner.json: answers per room in the last hour, answers on this
+// machine in the last day, and a token budget for this machine's last day. They are counted per
+// machine: someone with two machines has two of each. The windows roll rather than reset at
+// midnight.
 //
 // Tokens are counted as input-token equivalents: each kind is weighted by runner.json, since a
 // cache write costs more than plain input and a cache read far less. A request is checked against
 // the budget with an estimate made from the lead's context before it runs (#44: turn 1 may write
-// the whole context to cache, then each turn reads it), and what the fork actually used is what is
-// recorded. The ledger is kept in a file, so a restarted runner doesn't start the day over.
+// the whole context to cache, then each turn reads it). The estimate is reserved in the ledger as
+// the request passes, so requests in other rooms running at the same time count it, and is settled
+// to what the fork actually used once it is done. The ledger is kept in a file, so a restarted
+// runner doesn't start the day over.
 
 import fs from "node:fs/promises";
 import path from "node:path";
@@ -18,8 +21,8 @@ const DAY_MS = 24 * HOUR_MS;
 /** What runner.json says about caps and how tokens are weighed. */
 export interface CapSettings {
   answersPerRoomPerHour: number;
-  answersPerOwnerPerDay: number;
-  tokenBudgetPerOwnerPerDay: number;
+  answersPerMachinePerDay: number;
+  tokenBudgetPerMachinePerDay: number;
   inputTokenWeight: number;
   cacheWriteTokenWeight: number;
   cacheReadTokenWeight: number;
@@ -27,13 +30,14 @@ export interface CapSettings {
   estimatedOutputTokens: number;
 }
 
-/** One answer or brief the fork ran for. */
+/** One answer or brief the fork ran for, or is running for. */
 export interface Entry {
   at: number;
   room: string;
   usage: Usage;
 }
 
+/** The caps by the names the protocol gives them. */
 export type Cap = "room-hour" | "owner-day" | "owner-tokens";
 
 /** The tokens `usage` counts for against the budget. */
@@ -46,23 +50,24 @@ export function estimate(context: number, s: CapSettings): Usage {
   return { input: 0, output: s.estimatedOutputTokens, cacheWrite: context, cacheRead: 2 * context };
 }
 
-/** The answer-count cap one more answer in `room` would go over, or null. */
-export function countCap(entries: Entry[], room: string, now: number, s: CapSettings): Cap | null {
-  if (entries.filter((e) => e.room === room && now - e.at < HOUR_MS).length >= s.answersPerRoomPerHour) return "room-hour";
-  if (entries.filter((e) => now - e.at < DAY_MS).length >= s.answersPerOwnerPerDay) return "owner-day";
+/** The cap one more answer in `room`, expected to use `expected`, would go over, or null. */
+export function overCap(entries: Entry[], room: string, expected: Usage, now: number, s: CapSettings): Cap | null {
+  const day = entries.filter((e) => now - e.at < DAY_MS);
+  if (day.filter((e) => e.room === room && now - e.at < HOUR_MS).length >= s.answersPerRoomPerHour) return "room-hour";
+  if (day.length >= s.answersPerMachinePerDay) return "owner-day";
+  const spent = day.reduce((sum, e) => sum + weighted(e.usage, s), 0);
+  if (spent + weighted(expected, s) > s.tokenBudgetPerMachinePerDay) return "owner-tokens";
   return null;
 }
 
-/** Whether `expected` on top of the last day's tokens goes over the budget. */
-export function overBudget(entries: Entry[], expected: Usage, now: number, s: CapSettings): boolean {
-  const spent = entries.filter((e) => now - e.at < DAY_MS).reduce((sum, e) => sum + weighted(e.usage, s), 0);
-  return spent + weighted(expected, s) > s.tokenBudgetPerOwnerPerDay;
-}
-
 export interface Ledger {
-  /** The entries of the last day. */
+  /** The entries of the last day, reserved ones among them. */
   entries(now: number): Entry[];
-  add(entry: Entry): Promise<void>;
+  /**
+   * Counts `entry` at once, and returns what settles it to the usage it turned out to have. Call
+   * it straight after checking `overCap`, with no await between, so no other request slips in.
+   */
+  reserve(entry: Entry): (usage: Usage) => Promise<void>;
 }
 
 /** The ledger in `file`; one that is missing or doesn't parse starts empty. */
@@ -75,14 +80,27 @@ export async function openLedger(file: string): Promise<Ledger> {
     // Nothing recorded yet.
   }
   const recent = (now: number) => entries.filter((e) => now - e.at < DAY_MS);
-  return {
-    entries: recent,
-    async add(entry) {
-      entries = [...recent(entry.at), entry];
+  let writing = Promise.resolve();
+  const save = () => {
+    const text = JSON.stringify(entries) + "\n";
+    writing = writing.then(async () => {
       await fs.mkdir(path.dirname(file), { recursive: true });
       const temp = `${file}.${process.pid}`;
-      await fs.writeFile(temp, JSON.stringify(entries) + "\n");
+      await fs.writeFile(temp, text);
       await fs.rename(temp, file);
+    });
+    return writing;
+  };
+  return {
+    entries: recent,
+    reserve(entry) {
+      const held = { ...entry };
+      entries = [...recent(entry.at), held];
+      void save().catch(() => {});
+      return (usage) => {
+        held.usage = usage;
+        return save();
+      };
     },
   };
 }

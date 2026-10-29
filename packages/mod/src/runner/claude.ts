@@ -3,28 +3,42 @@
 //   claude -p --resume <lead> --fork-session --no-session-persistence --tools "" --setting-sources ""
 //     --strict-mcp-config --model <model> --input-format stream-json --output-format stream-json --verbose
 //
-// - The fork runs in the lead's folder, with Claude Code's own CLAUDE* variables taken out of its
-//   environment (all but CLAUDE_CONFIG_DIR, which says where the session is). It has no tools and
-//   no MCP servers; `--setting-sources ""` reads no settings file, so neither this plugin nor the
-//   wake hook loads in it, and nothing it does reaches the office server. It is never saved.
+// - The fork runs in the lead's folder. It has no tools and no MCP servers; `--setting-sources ""`
+//   reads no settings file, so neither this plugin nor the wake hook loads in it, and nothing it does
+//   reaches the office server. It is never saved. A login that comes from settings.json
+//   (apiKeyHelper, its env block) doesn't reach it either; Claude Code's own login and auth from
+//   environment variables do.
+// - Its environment is the runner's, less the variables that tie a process to the Claude Code
+//   session it was started from (FORK_ENV_DROPPED): the runner is started from hooks, so it
+//   inherits them, and a fork that kept them would pass as part of that session or load its
+//   plugins. Provider and auth variables (CLAUDE_CODE_USE_BEDROCK, CLAUDE_CODE_USE_VERTEX,
+//   CLAUDE_CODE_OAUTH_TOKEN, ANTHROPIC_*, CLAUDE_CONFIG_DIR...) are kept.
 // - Two turns. Turn 1 is the fixed instruction block, the same bytes every time, so its end is a
 //   cache breakpoint every later fork of the lead reads; turn 2 is the question or the brief request.
 // - A lead with leftover background tasks first replays them as empty results (`num_turns: 0`).
-//   Turn 2 goes only after a result with `num_turns` ≥ 1, and the last result is the reply.
+//   Turn 2 goes only after a result with `num_turns` ≥ 1. Turn 2's result is the reply, taken as
+//   soon as it arrives; a fork that doesn't exit soon after is ended.
 // - Stdin closes after turn 2, or the process waits for more.
 // - Tokens come from each turn's `result.usage`, never `total_cost_usd` or `modelUsage`, into which
-//   a resumed fork restores the lead's own earlier cost.
+//   a resumed fork restores the lead's own earlier cost. `result.usage` is that turn's alone, not a
+//   running total: on a resumed Haiku fork (29 Oct 2026, Claude Code 2.1.312) turn 2 read 4,706
+//   cached tokens, turn 1's 3,877 read plus its 829 written, and wrote 286 output tokens against
+//   turn 1's 151, the same as its `model_usage_since_last_result`. So the two turns are summed.
+// - A fork that times out, or is still running when the runner exits, is ended with its whole
+//   process tree.
 
-import { spawn as nodeSpawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { spawn as nodeSpawn, spawnSync, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { createClaudeCode } from "../data-layer/claude-code.js";
 import type { Config } from "../data-layer/config.js";
 import { nodeIo } from "../data-layer/io.js";
-import type { Answered, Answerer, Ask, Usage } from "./answerer.js";
+import type { Answered, Answerer, Ask, FailureKind, Usage } from "./answerer.js";
 import { claudeCommand } from "./claude-binary.js";
 
 const PREFIX = "claude-code:";
-// The end of the fork's stderr kept for a failure's reason.
+// The end of the fork's stderr kept for the local log.
 const STDERR_CHARS = 2000;
+// How long a fork that has answered gets to exit by itself.
+const EXIT_GRACE_MS = 5000;
 
 /** Every flag of the fork's command line, after the binary. */
 export function forkArgs(sessionId: string, model: string): string[] {
@@ -49,15 +63,55 @@ export function forkArgs(sessionId: string, model: string): string[] {
   ];
 }
 
-/** The fork's environment: this one's, less Claude Code's own variables, bar CLAUDE_CONFIG_DIR. */
+/**
+ * The variables Claude Code sets for the processes it starts, which tie them to that session: its
+ * marker and entrypoint, the session's ids, its messaging socket and token, its own path and pid,
+ * the session's plugin folders and effort, and its IDE port.
+ */
+export const FORK_ENV_DROPPED = [
+  "CLAUDECODE",
+  "CLAUDE_CODE_ENTRYPOINT",
+  "CLAUDE_CODE_SESSION_ID",
+  "CLAUDE_CODE_CHILD_SESSION",
+  "CLAUDE_CODE_SESSION_ATTENDED",
+  "CLAUDE_CODE_MESSAGING_SOCKET",
+  "CLAUDE_CODE_MESSAGING_TOKEN",
+  "CLAUDE_CODE_EXECPATH",
+  "CLAUDE_CODE_PLUGIN_DIRS",
+  "CLAUDE_CODE_SSE_PORT",
+  "CLAUDE_PID",
+  "CLAUDE_EFFORT",
+];
+
+/** The fork's environment: this one's, less FORK_ENV_DROPPED. */
 export function forkEnv(env: Record<string, string | undefined>): Record<string, string> {
   const out: Record<string, string> = {};
-  for (const [key, value] of Object.entries(env)) if (value !== undefined && (!key.startsWith("CLAUDE") || key === "CLAUDE_CONFIG_DIR")) out[key] = value;
+  for (const [key, value] of Object.entries(env)) if (value !== undefined && !FORK_ENV_DROPPED.includes(key)) out[key] = value;
   return out;
 }
 
 /** One user turn as a stream-json input line. */
 export const userTurn = (text: string) => JSON.stringify({ type: "user", message: { role: "user", content: [{ type: "text", text }] } }) + "\n";
+
+/** A session id names a transcript file and goes on the command line: a plain name, not an option. */
+export const forkableId = (session: string): string | null => {
+  const id = session.startsWith(PREFIX) ? session.slice(PREFIX.length) : null;
+  return id && /^\w[\w-]*$/.test(id) ? id : null;
+};
+
+/** Ends a process and everything it started: on Windows `kill` reaches only the process itself. */
+export function killTree(child: ChildProcessWithoutNullStreams, platform = process.platform): void {
+  if (child.exitCode !== null || child.signalCode !== null || child.pid === undefined) return;
+  if (platform === "win32") spawnSync("taskkill", ["/pid", String(child.pid), "/T", "/F"], { windowsHide: true, stdio: "ignore" });
+  else {
+    try {
+      // The fork leads its own process group (spawned detached), so the group goes with it.
+      process.kill(-child.pid, "SIGKILL");
+    } catch {
+      child.kill("SIGKILL");
+    }
+  }
+}
 
 export type Spawn = (argv: string[], opts: { cwd: string; env: Record<string, string> }) => ChildProcessWithoutNullStreams;
 
@@ -74,44 +128,45 @@ export interface ClaudeAnswererOptions {
   now?: () => number;
 }
 
-const defaultSpawn: Spawn = ([cmd, ...args], { cwd, env }) => nodeSpawn(cmd!, args, { cwd, env, stdio: ["pipe", "pipe", "pipe"], windowsHide: true });
+const defaultSpawn: Spawn = ([cmd, ...args], { cwd, env }) =>
+  nodeSpawn(cmd!, args, { cwd, env, stdio: ["pipe", "pipe", "pipe"], windowsHide: true, detached: process.platform !== "win32" });
 
 export function createClaudeAnswerer({ claudeDir, binary, model, config, spawn = defaultSpawn, env = process.env, now = Date.now }: ClaudeAnswererOptions): Answerer {
-  // A session id names a transcript file, so it must be a plain name.
-  const idOf = (session: string) => {
-    const id = session.startsWith(PREFIX) ? session.slice(PREFIX.length) : null;
-    return id && /^[\w-]+$/.test(id) ? id : null;
-  };
+  const forks = new Set<ChildProcessWithoutNullStreams>();
   return {
     async lead(session) {
-      const id = idOf(session);
+      const id = forkableId(session);
       // A fresh read each time: the runner asks rarely, and a cache would keep every session it was asked about.
       return id ? createClaudeCode({ ...nodeIo(), claudeDir }).lead(id, now(), await config()) : null;
     },
     async ask(session, lead, ask) {
-      const id = idOf(session);
-      if (!id) return { ok: false, error: `${session} isn't a Claude Code session`, usage: null };
+      const id = forkableId(session);
+      if (!id) return { ok: false, kind: "not-set-up", detail: `${session} isn't a Claude Code session this runner can fork`, usage: null };
       const bin = await binary();
-      if (!bin) return { ok: false, error: "the claude binary wasn't found; run the plugin's install script, or set its path in ~/.claude/isoplan/claude-binary.json", usage: null };
+      if (!bin) return { ok: false, kind: "not-set-up", detail: "the claude binary wasn't found; run the plugin's install script, or set its path in ~/.claude/isoplan/claude-binary.json", usage: null };
       let child: ChildProcessWithoutNullStreams;
       try {
         child = spawn([...claudeCommand(bin), ...forkArgs(id, await model())], { cwd: lead.cwd, env: forkEnv(env) });
       } catch (err) {
-        return { ok: false, error: `couldn't start claude: ${(err as Error).message}`, usage: null };
+        return { ok: false, kind: "not-set-up", detail: `couldn't start claude: ${(err as Error).message}`, usage: null };
       }
+      forks.add(child);
+      child.on("close", () => forks.delete(child));
       return drive(child, ask);
+    },
+    close() {
+      for (const child of forks) killTree(child);
+      forks.clear();
     },
   };
 }
 
-/** Runs the two turns over a started fork and settles once it has exited or timed out. */
+/** Runs the two turns over a started fork and settles with turn 2's result, a failure or the timeout. */
 export function drive(child: ChildProcessWithoutNullStreams, { instructions, request, timeoutMs }: Ask): Promise<Answered> {
   return new Promise((resolve) => {
     const usage: Usage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
     let metered = false;
     let turn = 1;
-    let reply: string | null = null;
-    let failure: string | null = null;
     let buffer = "";
     let stderr = "";
     let isDone = false;
@@ -121,11 +176,13 @@ export function drive(child: ChildProcessWithoutNullStreams, { instructions, req
       isDone = true;
       clearTimeout(timer);
       resolve(answered);
+      // An answered fork should exit by itself now; one that doesn't is ended.
+      setTimeout(() => killTree(child), EXIT_GRACE_MS).unref();
     };
-    const fail = (error: string) => finish({ ok: false, error, usage: metered ? usage : null });
+    const fail = (kind: FailureKind, detail: string) => finish({ ok: false, kind, detail, usage: metered ? usage : null });
     const timer = setTimeout(() => {
-      fail(`no answer within ${Math.round(timeoutMs / 1000)} s`);
-      child.kill();
+      fail("timed-out", `no answer within ${Math.round(timeoutMs / 1000)} s`);
+      killTree(child);
     }, timeoutMs);
 
     const onResult = (e: Record<string, any>) => {
@@ -138,17 +195,20 @@ export function drive(child: ChildProcessWithoutNullStreams, { instructions, req
       usage.cacheRead += n("cache_read_input_tokens");
       usage.cacheWrite += n("cache_creation_input_tokens");
       metered = true;
-      if (e.is_error || e.subtype !== "success") failure = `the fork stopped with ${String(e.subtype ?? "an error")}${typeof e.result === "string" && e.result ? `: ${e.result}` : ""}`;
+      if (e.is_error || e.subtype !== "success") {
+        fail("failed", `turn ${turn} stopped with ${String(e.subtype ?? "an error")}${typeof e.result === "string" && e.result ? `: ${e.result}` : ""}`);
+        killTree(child);
+        return;
+      }
       if (turn === 1) {
-        if (failure) {
-          fail(failure);
-          child.kill();
-          return;
-        }
         turn = 2;
         child.stdin.write(userTurn(request));
         child.stdin.end();
-      } else if (!failure) reply = typeof e.result === "string" ? e.result.trim() : "";
+        return;
+      }
+      const text = typeof e.result === "string" ? e.result.trim() : "";
+      if (text) finish({ ok: true, text, usage });
+      else fail("failed", "the fork answered with nothing");
     };
 
     child.stdout.setEncoding("utf8").on("data", (piece: string) => {
@@ -169,13 +229,8 @@ export function drive(child: ChildProcessWithoutNullStreams, { instructions, req
     child.stderr.setEncoding("utf8").on("data", (piece: string) => (stderr = (stderr + piece).slice(-STDERR_CHARS)));
     // A fork that exits early breaks the pipe; its exit says why.
     child.stdin.on("error", () => {});
-    child.on("error", (err) => fail(`couldn't run claude: ${err.message}`));
-    child.on("close", (code) => {
-      if (failure) fail(failure);
-      else if (reply) finish({ ok: true, text: reply, usage });
-      else if (reply === "") fail("the fork answered with nothing");
-      else fail(`claude exited${code === null ? "" : ` with code ${code}`} before answering${stderr.trim() ? `: ${stderr.trim().split("\n").slice(-3).join(" ")}` : ""}`);
-    });
+    child.on("error", (err) => fail("not-set-up", `couldn't run claude: ${err.message}`));
+    child.on("close", (code) => fail("failed", `claude exited${code === null ? "" : ` with code ${code}`} before answering${stderr.trim() ? `: ${stderr.trim().split("\n").slice(-3).join(" ")}` : ""}`));
 
     child.stdin.write(userTurn(instructions));
   });

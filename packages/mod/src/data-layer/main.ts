@@ -121,7 +121,7 @@ async function main(argv: string[]): Promise<number> {
     ? Promise.resolve([])
     : installWake(paths, path.join(here, "data-layer.js"), path.join(here, "wake.js"), {
         auto: true,
-        runner: path.join(here, "runner.js"),
+        runnerFrom: path.join(here, ".."),
         findClaude: () => findClaude(process.env, process.platform, os.homedir()),
       }).then(
         (changes) => (changes.forEach((text) => emit({ type: "log", text })), changes),

@@ -1,8 +1,8 @@
 {
   "claudeModel": "opus",
   "answersPerRoomPerHour": 10,
-  "answersPerOwnerPerDay": 40,
-  "tokenBudgetPerOwnerPerDay": 5000000,
+  "answersPerMachinePerDay": 40,
+  "tokenBudgetPerMachinePerDay": 5000000,
   "inputTokenWeight": 1,
   "cacheWriteTokenWeight": 2,
   "cacheReadTokenWeight": 0.1,
