@@ -306,6 +306,12 @@ test("a withheld report parses with its hold id, and not without one", () => {
   expect(parseDataLayerMessage({ ...valid.full, facts: { ...facts, reports: [{ ...report, withheld: { id: "" } }] } })).toMatchObject({ ok: false, kind: "invalid" });
 });
 
+test("a question parses with answerable, and not with answerable false", () => {
+  const [question] = facts.questions!;
+  expect(parseDataLayerMessage({ ...valid.full, facts: { ...facts, questions: [{ ...question, answerable: true }] } })).toMatchObject({ ok: true });
+  expect(parseDataLayerMessage({ ...valid.full, facts: { ...facts, questions: [{ ...question, answerable: false }] } })).toMatchObject({ ok: false, kind: "invalid" });
+});
+
 describe("handoff", () => {
   const [repo] = handoff.repos;
   const withRepo = (change: object) => ({ ...valid.handoff, handoff: { ...handoff, repos: [{ ...repo, ...change }] } });
