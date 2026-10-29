@@ -5,10 +5,12 @@
 //    whose remote is the handoff's (the same project id, or the same path for a local remote) is the
 //    clone. Without one nothing can be made, so no session opens and the handoff stays to be taken.
 // 2. The worktree: a sibling of the clone, <clone>-handoff-<id>, on isoplan/handoff/<id>, tracking
-//    the remote's branch. One made for this handoff before moves to the branch as handed over now,
-//    unless it holds work that isn't in it (uncommitted changes, or commits not on the new tip): then
-//    it is left as it is and the take is refused with a note. A local branch is never reset over
-//    commits the remote doesn't have.
+//    the remote's branch, made and moved with the repo's hooks off (they are the sender's, from the
+//    branch). One made for this handoff before moves to the branch as handed over now, unless it
+//    holds work that isn't in it: uncommitted changes to tracked files, or any commit that is neither
+//    in the new tip nor one of the commits this machine took of this handoff before (taken.json in
+//    the handoff's folder). Then it is left as it is and the take is refused with a note. A local
+//    branch is never reset over such commits.
 // 3. The setup script (E11): `worktreeSetup` in isoplan.json at the repo's top, read from the
 //    receiver's own copy of the remote's default branch, and never from any other branch, so neither
 //    the handoff nor whatever the clone has checked out can change what runs. When the default branch
@@ -18,21 +20,25 @@
 //    folder.
 // 4. Claude Code in the worktree, under the session id the server chose, so that session alone may
 //    join the room, told to read the brief, which is in brief.md in the handoff's folder
-//    (<claude dir>/isoplan/handoffs/<id>/). As the receiver chose on the floor:
+//    (<claude dir>/isoplan/handoffs/<id>/). As the receiver chose on the floor, and only as they
+//    said: a handoff that doesn't say is refused.
 //    - `terminal`: a terminal window, the only thing here that opens one, and only for that click
 //      (Windows: `start`, a Windows Terminal tab where that is the default; Mac: Terminal.app);
-//    - `headless`: `claude -p` in the worktree with no window at all. It reads the brief and answers
-//      once, then exits, and the receiver resumes it (`claude --resume <id>` in the worktree), where a
+//    - `headless`: a background session, `claude --bg`, with no window. Claude Code starts one only
+//      in a folder it trusts, and a new worktree isn't, so the worktree's path alone is recorded as
+//      trusted in .claude.json first: the floor told the receiver it would be. The session is
+//      confirmed through `claude agents --json`; the receiver opens it with `claude attach`, and a
 //      harness that shows the repo's worktrees (Orca, for example) finds the worktree.
 //
-// A step that fails is reported with the end of its output, and the rest still runs: a failed setup
-// script still opens the session. Output leaves the machine only after the secret scan.
+// A failed setup script doesn't stop the rest: the session still opens, and the step is reported
+// with the end of its output. Output leaves the machine only after the secret scan.
 
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { PROTOCOL_VERSION, type Handoff, type HandoffMessage, type HandoffRepo, type TakenMessage } from "@isoplan/protocol";
+import os from "node:os";
 import { normalize, pathKey } from "../data-layer/git.js";
 import type { NodeIo } from "../data-layer/io.js";
 import { claudeCommand } from "../runner/claude-binary.js";
@@ -60,8 +66,8 @@ export interface Launch {
   command: string[];
 }
 
-/** How a headless session is started: `argv` in `cwd`, with no window. */
-export interface Headless {
+/** How a background session is started: `argv` in `cwd`, with no window. */
+export interface Background {
   argv: string[];
   cwd: string;
 }
@@ -81,8 +87,14 @@ export interface TakeOptions {
   log: (text: string) => void;
   /** Runs a launch; resolves once the terminal has been asked to open. */
   open?: (launch: Launch, env: Record<string, string>) => Promise<void>;
-  /** Starts a headless session; resolves once it has started. */
-  start?: (headless: Headless, env: Record<string, string>) => Promise<void>;
+  /** Claude Code's .claude.json, where a folder's trust is kept. */
+  claudeJson: string;
+  /** Starts a background session; resolves once `claude --bg` has returned. */
+  start?: (background: Background, env: Record<string, string>) => Promise<void>;
+  /** The session ids of the background sessions Claude Code lists in `cwd`. */
+  agents?: (bin: string, cwd: string, env: Record<string, string>) => Promise<string[]>;
+  /** How long to wait for a background session to be listed. */
+  confirmMs?: number;
   now?: () => number;
   newSession?: () => string;
 }
@@ -119,7 +131,7 @@ export async function findClone(io: NodeIo, run: RunGit, projectsDir: string, re
     const main = normalize(commonDir).endsWith("/.git") ? path.dirname(commonDir) : toplevel;
     if (tried.has(`main:${pathKey(main)}`)) continue;
     tried.add(`main:${pathKey(main)}`);
-    const match = (await remotesOf(run, main, timeoutMs))?.find((r) => sameRemote(r.url, remote));
+    const match = (await remotesOf(run, main, timeoutMs))?.find((r) => r.urls.some((url) => sameRemote(url, remote)));
     if (match) return { dir: path.resolve(main), remote: match.name };
   }
   return null;
@@ -230,7 +242,8 @@ export function launch(platform: NodeJS.Platform, { folder, dir, argv, title, co
   const name = title.replace(/["%^&|<>!()@]/g, "");
   if (platform === "win32") {
     const file = path.win32.join(folder, "open.cmd");
-    const text = ["@echo off", `title ${name}`, ...(configDir ? [`set "CLAUDE_CONFIG_DIR=${configDir.replace(/"/g, "").replace(/%/g, "%%")}"`] : []), `cd /d ${cmdQuote(dir)}`, argv.map(cmdQuote).join(" "), ""].join("\r\n");
+    // UTF-8 from the first line on, so a path with letters outside the console's code page works.
+    const text = ["@echo off", "chcp 65001>nul", `title ${name}`, ...(configDir ? [`set "CLAUDE_CONFIG_DIR=${configDir.replace(/"/g, "").replace(/%/g, "%%")}"`] : []), `cd /d ${cmdQuote(dir)}`, argv.map(cmdQuote).join(" "), ""].join("\r\n");
     // cmd /k keeps a quoted path's quotes only when nothing special is in it, else it takes off the
     // outer pair: with two pairs, the path keeps one either way.
     return { file, text, command: [process.env.ComSpec || "cmd.exe", "/d", "/c", "start", `"${name}"`, "cmd.exe", "/k", `""${file}""`] };
@@ -256,13 +269,57 @@ export async function openLaunch(l: Launch, env: Record<string, string>): Promis
   });
 }
 
-/** Starts a headless session: hidden, detached, with nothing to read its output; resolves once it has started. */
-export function startHeadless({ argv: [cmd, ...args], cwd }: Headless, env: Record<string, string>): Promise<void> {
-  return new Promise((resolve, reject) => {
-    const child = spawn(cmd!, args, { cwd, env, stdio: "ignore", detached: true, windowsHide: true });
-    child.on("error", reject);
-    child.on("spawn", () => (child.unref(), resolve()));
+// Runs a command hidden and waits for it, with its output; never opens a window.
+function hidden([cmd, ...args]: string[], cwd: string, env: Record<string, string>, timeoutMs: number): Promise<{ code: number | null; stdout: string; stderr: string }> {
+  return new Promise((resolve) => {
+    let stdout = "";
+    let stderr = "";
+    const child = spawn(cmd!, args, { cwd, env, stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
+    child.stdout.setEncoding("utf8").on("data", (piece: string) => (stdout += piece));
+    child.stderr.setEncoding("utf8").on("data", (piece: string) => (stderr = (stderr + piece).slice(-OUTPUT_TAIL)));
+    const timer = setTimeout(() => killTree(child as never), timeoutMs);
+    child.on("error", (err) => (clearTimeout(timer), resolve({ code: null, stdout, stderr: err.message })));
+    child.on("close", (code) => (clearTimeout(timer), resolve({ code, stdout, stderr })));
   });
+}
+
+/** Starts `claude --bg`, hidden, which returns once the background session is up; rejects when it couldn't. */
+export async function startBackground({ argv, cwd }: Background, env: Record<string, string>): Promise<void> {
+  const r = await hidden(argv, cwd, env, 60000);
+  if (r.code !== 0) throw new Error((r.stderr || r.stdout).trim() || `claude exited with code ${r.code}`);
+}
+
+/** The session ids of the background sessions `claude agents --json --all --cwd <cwd>` lists. */
+export async function listAgents(bin: string, cwd: string, env: Record<string, string>): Promise<string[]> {
+  const r = await hidden([...claudeCommand(bin), "agents", "--json", "--all", "--cwd", cwd], cwd, env, 30000);
+  if (r.code !== 0) return [];
+  try {
+    const listed = JSON.parse(r.stdout) as unknown;
+    const rows = Array.isArray(listed) ? listed : ((listed as { agents?: unknown })?.agents ?? []);
+    return (rows as { sessionId?: unknown }[]).map((a) => a?.sessionId).filter((id): id is string => typeof id === "string");
+  } catch {
+    return [];
+  }
+}
+
+/** The key Claude Code keeps a folder under in .claude.json's projects: forward slashes on Windows too. */
+export const trustKey = (dir: string, platform: NodeJS.Platform) => (platform === "win32" ? path.win32.resolve(dir).replace(/\\/g, "/") : path.posix.resolve(dir));
+
+/**
+ * Records Claude Code's trust for `dir` alone in .claude.json (projects[dir].hasTrustDialogAccepted),
+ * changing nothing else in the file: it is read, changed in that one place, written beside itself
+ * and moved over it.
+ */
+export async function trustFolder(claudeJson: string, dir: string, platform: NodeJS.Platform): Promise<void> {
+  const text = await fs.readFile(claudeJson, "utf8").catch((err: NodeJS.ErrnoException) => (err.code === "ENOENT" ? "{}" : Promise.reject(err)));
+  const config = JSON.parse(text) as { projects?: Record<string, Record<string, unknown>> };
+  const key = trustKey(dir, platform);
+  if (config.projects?.[key]?.hasTrustDialogAccepted === true) return;
+  config.projects = config.projects ?? {};
+  config.projects[key] = { ...(config.projects[key] ?? {}), hasTrustDialogAccepted: true };
+  const temp = `${claudeJson}.isoplan-${process.pid}`;
+  await fs.writeFile(temp, JSON.stringify(config, null, 2) + (text.endsWith("\n") ? "\n" : ""), { mode: 0o600 });
+  await fs.rename(temp, claudeJson);
 }
 
 /** The first thing the new session is told. */
@@ -280,8 +337,29 @@ export function takePrompt(id: string, brief: string, setupLog: string | null): 
  * argument after it, and would take the prompt too.
  */
 export function sessionArgv(bin: string, { prompt, session, name, folder, headless }: { prompt: string; session: string; name: string; folder: string; headless: boolean }): string[] {
-  return [...claudeCommand(bin), ...(headless ? ["-p"] : []), prompt, "--session-id", session, "--name", name, "--add-dir", folder];
+  return [...claudeCommand(bin), prompt, ...(headless ? ["--bg"] : []), "--session-id", session, "--name", name, "--add-dir", folder];
 }
+
+/** The commits this machine took of a handoff before, which a re-take may move past. */
+async function takenBefore(folder: string): Promise<string[]> {
+  try {
+    const { commits } = JSON.parse(await fs.readFile(path.join(folder, "taken.json"), "utf8")) as { commits?: unknown };
+    return Array.isArray(commits) ? commits.filter((c): c is string => typeof c === "string" && /^[0-9a-f]{40,64}$/.test(c)) : [];
+  } catch {
+    return [];
+  }
+}
+
+async function recordTaken(folder: string, commit: string): Promise<void> {
+  const commits = [...new Set([...(await takenBefore(folder)), commit])].slice(-50);
+  await fs.mkdir(folder, { recursive: true });
+  await fs.writeFile(path.join(folder, "taken.json"), JSON.stringify({ about: "The commits of this handoff taken on this machine, which a later take may replace.", commits }, null, 2) + "\n");
+}
+
+// An empty folder as core.hooksPath, so no hook of the repo's runs while the handoff's branch is
+// checked out: they would be the sender's, from that branch.
+let emptyHooks: Promise<string> | null = null;
+const noHooks = async () => ["-c", `core.hooksPath=${await (emptyHooks ??= fs.mkdtemp(path.join(os.tmpdir(), "isoplan-no-hooks-")))}`];
 
 /** Takes the handoff on this machine; never throws. */
 export async function takeHandoff(message: Pick<HandoffMessage, "handoff" | "mode" | "session">, o: TakeOptions): Promise<TakenMessage> {
@@ -293,6 +371,11 @@ export async function takeHandoff(message: Pick<HandoffMessage, "handoff" | "mod
     const matched = await o.scan(output);
     failures.push({ step, output: matched ? `The end of its output is withheld here: it matches a secret pattern. It is on ${o.machine}.` : tail(output) });
   };
+  // A window opens only when the receiver asked for a terminal: a handoff that doesn't say is refused.
+  if (message.mode !== "terminal" && message.mode !== "headless") {
+    await fail("open", "The office server didn't say how to open the session, so none was opened: take it again from the floor.");
+    return done();
+  }
   try {
     const s = await o.settings();
     const timeoutMs = s.gitTimeoutSeconds * 1000;
@@ -307,19 +390,19 @@ export async function takeHandoff(message: Pick<HandoffMessage, "handoff" | "mod
       return done();
     }
     const git = (args: string[], cwd: string) => o.run(args, { cwd, timeoutMs });
-    const before = await resolved(o.run, clone.dir, `refs/remotes/${clone.remote}/${branch}`, timeoutMs);
+    const folder = handoffDir(o.claudeDir, handoff.id);
+    const exempt = await takenBefore(folder);
     const fetched = await git(["fetch", clone.remote, `+refs/heads/${branch}:refs/remotes/${clone.remote}/${branch}`], clone.dir);
     if (fetched.code !== 0) {
       await fail("worktree", `git fetch ${clone.remote} ${branch} in ${clone.dir} failed${fetched.timedOut ? " (it took too long)" : ""}:\n${fetched.stderr}`);
       return done();
     }
-    const dir = await worktreeFor(o.run, clone.dir, clone.remote, branch, handoff.id, before, timeoutMs);
+    const dir = await worktreeFor(o.run, clone.dir, clone.remote, branch, handoff.id, exempt, timeoutMs);
     if (typeof dir !== "string") {
       await fail("worktree", dir.error);
       return done();
     }
-
-    const folder = handoffDir(o.claudeDir, handoff.id);
+    await recordTaken(folder, (await resolved(o.run, dir, "HEAD", timeoutMs)) ?? repo.commit);
     await fs.mkdir(folder, { recursive: true });
     const briefFile = path.join(folder, "brief.md");
     await fs.writeFile(briefFile, handoff.brief + "\n");
@@ -355,12 +438,24 @@ export async function takeHandoff(message: Pick<HandoffMessage, "handoff" | "mod
     const argv = sessionArgv(bin, { prompt: takePrompt(handoff.id, briefFile, setupLog), session: id, name, folder, headless });
     if (headless) {
       try {
-        await (o.start ?? startHeadless)({ argv, cwd: dir }, env);
+        // The floor told the receiver: this trusts the worktree, so its settings, hooks and scripts run.
+        await trustFolder(o.claudeJson, dir, o.platform);
+        await (o.start ?? startBackground)({ argv, cwd: dir }, env);
       } catch (err) {
         await fail("open", `The headless session couldn't be started: ${(err as Error).message}. The worktree is ${dir}.`);
         return done();
       }
-      o.log(`handoff ${handoff.id}: started headless Claude Code session ${id} in ${dir}`);
+      const end = Date.now() + (o.confirmMs ?? 15000);
+      let listed = false;
+      while (!listed && Date.now() < end) {
+        listed = (await (o.agents ?? listAgents)(bin, dir, env)).includes(id);
+        if (!listed) await new Promise((r) => setTimeout(r, 500));
+      }
+      if (!listed) {
+        await fail("open", `claude --bg returned, but \`claude agents\` doesn't list session ${id} in ${dir}, so it may not have started. Open Claude Code there yourself.`);
+        return done();
+      }
+      o.log(`handoff ${handoff.id}: started background Claude Code session ${id} in ${dir}`);
       return done(`claude-code:${id}`);
     }
     const l = launch(o.platform, { folder, dir, argv, title: name, configDir: o.env.CLAUDE_CONFIG_DIR ?? null });
@@ -384,12 +479,14 @@ export async function takeHandoff(message: Pick<HandoffMessage, "handoff" | "mod
 }
 
 /**
- * How many commits `ref` has that neither the new tip nor the one fetched before it (`before`, the
- * handoff as it was last handed over, which a new hand-over replaces) has: the receiver's own work.
- * Null when git can't say.
+ * How many commits `ref` has that neither the new tip nor any commit this machine took of the
+ * handoff before (`exempt`, which a new hand-over replaces) has: the receiver's own work. Null when
+ * git can't say.
  */
-async function ahead(run: RunGit, cwd: string, tip: string, before: string | null, ref: string, timeoutMs: number): Promise<number | null> {
-  const r = await run(["rev-list", "--count", ref, "--not", tip, ...(before ? [before] : [])], { cwd, timeoutMs });
+async function ahead(run: RunGit, cwd: string, tip: string, exempt: string[], ref: string, timeoutMs: number): Promise<number | null> {
+  const known: string[] = [];
+  for (const c of exempt) if ((await run(["cat-file", "-e", `${c}^{commit}`], { cwd, timeoutMs })).code === 0) known.push(c);
+  const r = await run(["rev-list", "--count", ref, "--not", tip, ...known], { cwd, timeoutMs });
   return r.code === 0 ? Number(r.stdout.trim()) : null;
 }
 
@@ -401,41 +498,51 @@ async function resolved(run: RunGit, cwd: string, ref: string, timeoutMs: number
 
 /**
  * The shortcut's checkout (/isoplan:take): the handoff's branch in the session's own folder, fetched
- * from the remote there that is the handoff's. A local branch of that name moves to the fetched tip,
- * unless it has commits the tip doesn't, which would be lost: then it is left as it is. No setup
- * script runs: the person, or their harness, set up this folder. Returns the failed steps, each with
- * the end of git's output, and the remote's name there.
+ * from the remote there that is the handoff's, with the repo's hooks off. A folder with uncommitted
+ * changes to tracked files is left as it is, rather than carrying them over. A local branch of that
+ * name moves to the fetched tip, unless it has commits that are neither in the tip nor ones this
+ * machine took of the handoff before (recorded in `folder`), which would be lost: then it is left as
+ * it is. No setup script runs: the person, or their harness, set up this folder. Returns the failed
+ * steps, each with the end of git's output, and the remote's name there.
  */
-export async function checkoutHere(run: RunGit, cwd: string, handoff: Handoff, timeoutMs: number): Promise<{ failures: Failure[]; remote: string | null }> {
+export async function checkoutHere(run: RunGit, cwd: string, handoff: Handoff, folder: string, timeoutMs: number): Promise<{ failures: Failure[]; remote: string | null }> {
   const repo = handoff.repos.find((r) => r.path === ".") ?? handoff.repos[0]!;
   const branch = handoffBranch(handoff.id);
   const git = (args: string[]) => run(args, { cwd, timeoutMs });
   const remotes = await remotesOf(run, cwd, timeoutMs);
   const failed = (output: string, remote: string | null = null) => ({ failures: [{ step: "checkout" as const, output: tail(output) }], remote });
   if (!remotes) return failed(`${cwd} isn't in a git repo.`);
-  const name = remotes.find((r) => sameRemote(r.url, repo.remote))?.name;
+  const name = remotes.find((r) => r.urls.some((url) => sameRemote(url, repo.remote)))?.name;
   if (!name) return failed(`No remote of the repo in ${cwd} is ${repo.remote}, the repo the handoff was pushed to.`);
+  if ((await git(["status", "--porcelain", "--untracked-files=no"])).stdout.trim()) {
+    return failed(`${cwd} has uncommitted changes to tracked files, so the handoff's branch wasn't checked out over them. Commit or stash them, then take it again.`, name);
+  }
   const tip = `refs/remotes/${name}/${branch}`;
-  const before = await resolved(run, cwd, tip, timeoutMs);
   const fetched = await git(["fetch", name, `+refs/heads/${branch}:${tip}`]);
   if (fetched.code !== 0) return failed(`git fetch ${name} ${branch}: ${fetched.stderr}`, name);
+  const hooksOff = await noHooks();
+  const ok = async () => {
+    await recordTaken(folder, (await resolved(run, cwd, "HEAD", timeoutMs)) ?? repo.commit);
+    return { failures: [], remote: name };
+  };
   const local = await git(["rev-parse", "--verify", "-q", `refs/heads/${branch}`]);
   if (local.code !== 0) {
-    const switched = await git(["switch", "--track", "-c", branch, `${name}/${branch}`]);
-    return switched.code === 0 ? { failures: [], remote: name } : failed(`git switch ${branch}: ${switched.stderr}`, name);
+    const switched = await git([...hooksOff, "switch", "--track", "-c", branch, `${name}/${branch}`]);
+    return switched.code === 0 ? ok() : failed(`git switch ${branch}: ${switched.stderr}`, name);
   }
-  const extra = await ahead(run, cwd, tip, before, `refs/heads/${branch}`, timeoutMs);
+  const extra = await ahead(run, cwd, tip, await takenBefore(folder), `refs/heads/${branch}`, timeoutMs);
   if (extra !== 0) return failed(`The local branch ${branch} has ${extra ?? "some"} commit(s) that aren't in the handoff as handed over now, so it was left as it is. Merge or rebase them onto ${name}/${branch} yourself.`, name);
-  const switched = await git(["switch", branch]);
+  const switched = await git([...hooksOff, "switch", branch]);
   if (switched.code !== 0) return failed(`git switch ${branch}: ${switched.stderr}`, name);
-  const moved = await git(["reset", "-q", "--keep", tip]);
-  return moved.code === 0 ? { failures: [], remote: name } : failed(`${branch} couldn't be moved to the handoff as handed over now:\n${moved.stderr}`, name);
+  const moved = await git([...hooksOff, "reset", "-q", "--keep", tip]);
+  return moved.code === 0 ? ok() : failed(`${branch} couldn't be moved to the handoff as handed over now:\n${moved.stderr}`, name);
 }
 
 // The worktree for the handoff: one already made on its branch, moved to the new tip when nothing
 // in it would be lost, else a new sibling of the clone.
-async function worktreeFor(run: RunGit, clone: string, remote: string, branch: string, id: string, before: string | null, timeoutMs: number): Promise<string | { error: string }> {
+async function worktreeFor(run: RunGit, clone: string, remote: string, branch: string, id: string, exempt: string[], timeoutMs: number): Promise<string | { error: string }> {
   const tip = `refs/remotes/${remote}/${branch}`;
+  const hooksOff = await noHooks();
   const base = path.join(path.dirname(clone), `${path.basename(clone)}-handoff-${id}`);
   for (let n = 1; n < 10; n++) {
     const dir = n === 1 ? base : `${base}-${n}`;
@@ -445,19 +552,19 @@ async function worktreeFor(run: RunGit, clone: string, remote: string, branch: s
       if (head.code !== 0 || head.stdout.trim() !== branch) continue;
       // Untracked files (a setup script's own, say) are kept by the reset, so only tracked changes count.
       const dirty = (await run(["status", "--porcelain", "--untracked-files=no"], { cwd: dir, timeoutMs })).stdout.trim() !== "";
-      const extra = await ahead(run, dir, tip, before, "HEAD", timeoutMs);
+      const extra = await ahead(run, dir, tip, exempt, "HEAD", timeoutMs);
       if (dirty || extra !== 0) {
         return { error: `${dir}, this handoff's worktree from before, has work that isn't in the handoff as handed over now (${dirty ? "uncommitted changes" : `${extra ?? "some"} commit(s)`}), so it was left as it is. Commit and push it, or move it aside, then take the handoff again.` };
       }
-      const moved = await run(["reset", "-q", "--keep", tip], { cwd: dir, timeoutMs });
+      const moved = await run([...hooksOff, "reset", "-q", "--keep", tip], { cwd: dir, timeoutMs });
       return moved.code === 0 ? dir : { error: `${dir} couldn't be moved to the handoff as handed over now:\n${moved.stderr}` };
     }
     // A local branch of the handoff's name with commits the remote's doesn't have is never reset.
     if ((await run(["rev-parse", "--verify", "-q", `refs/heads/${branch}`], { cwd: clone, timeoutMs })).code === 0) {
-      const extra = await ahead(run, clone, tip, before, `refs/heads/${branch}`, timeoutMs);
+      const extra = await ahead(run, clone, tip, exempt, `refs/heads/${branch}`, timeoutMs);
       if (extra !== 0) return { error: `The local branch ${branch} in ${clone} has ${extra ?? "some"} commit(s) that aren't in the handoff as handed over now, so no worktree was made over it. Push or move them, then take the handoff again.` };
     }
-    const r = await run(["worktree", "add", "--track", "-B", branch, dir, `${remote}/${branch}`], { cwd: clone, timeoutMs });
+    const r = await run([...hooksOff, "worktree", "add", "--track", "-B", branch, dir, `${remote}/${branch}`], { cwd: clone, timeoutMs });
     return r.code === 0 ? dir : { error: `git worktree add ${dir} failed${r.timedOut ? " (it took too long)" : ""}:\n${r.stderr}` };
   }
   return { error: `${base} and the next eight names beside it are taken by other folders` };

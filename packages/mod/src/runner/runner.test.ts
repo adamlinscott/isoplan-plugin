@@ -191,20 +191,45 @@ test("runner: a brief the fork can't write still goes, marked fallback, with the
   expect(rejected.sent).toEqual([{ type: "refusal", v: PROTOCOL_VERSION, id: "b3", reason: "unavailable", detail: "the remote rejected the handoff's branch" }]);
 });
 
-test("runner: a commit with a possible secret holds the push, naming the file; the owner's release pushes it anyway", async () => {
-  const repos: HandoffRepo[] = [{ path: ".", remote: "origin", branch: "isoplan/handoff/h-1", commit: "a".repeat(40) }];
-  const pushes: boolean[] = [];
-  const t = await setup({ push: async (_s, _l, _h, pushAnyway) => (pushes.push(pushAnyway), pushAnyway ? repos : { held: "config/dev.ts" }) });
+test("runner: a commit with a possible secret holds the push, naming the file; the owner's release pushes that exact commit", async () => {
+  const repos: HandoffRepo[] = [{ path: ".", remote: "origin", branch: "isoplan/handoff/h-1", commit: "c".repeat(40) }];
+  const pushes: (string | null)[] = [];
+  const t = await setup({
+    push: async (_s, _l, _h, pushAnyway) => (pushes.push(pushAnyway), pushAnyway ? repos : { held: "config/dev.ts", commit: "c".repeat(40), unchecked: ["logo.png"] }),
+  });
   t.runner.take(brief("b1"));
   await t.asked(1);
   t.asks[0]!.settle(ok("Goal: ship."));
   await t.runner.settled();
-  expect(t.sent).toEqual([{ type: "refusal", v: PROTOCOL_VERSION, id: "b1", reason: "withheld", file: "config/dev.ts" }]);
+  expect(t.sent).toEqual([{ type: "refusal", v: PROTOCOL_VERSION, id: "b1", reason: "withheld", file: "config/dev.ts", unchecked: ["logo.png"] }]);
   expect(t.logs.join("\n")).not.toContain("AWS");
   t.runner.take({ type: "release", v: PROTOCOL_VERSION, id: "b1" });
   await t.sentN(2);
-  expect(pushes).toEqual([false, true]);
+  expect(pushes).toEqual([null, "c".repeat(40)]);
   expect(t.sent[1]).toEqual({ type: "reply", v: PROTOCOL_VERSION, id: "b1", kind: "write-brief", handoff: { id: "h-1", brief: "Goal: ship.", repos } });
+});
+
+test("runner: a drop ends a request: what is held goes, and one still being written neither pushes nor sends", async () => {
+  const pushes: (string | null)[] = [];
+  const t = await setup({ push: async (_s, _l, _h, pushAnyway) => (pushes.push(pushAnyway), { held: "a.ts", commit: "c".repeat(40), unchecked: [] }) });
+  t.runner.take(brief("b1"));
+  await t.asked(1);
+  t.asks[0]!.settle(ok("Goal: ship."));
+  await t.runner.settled();
+  t.runner.take({ type: "drop", v: PROTOCOL_VERSION, id: "b1" });
+  t.runner.take({ type: "release", v: PROTOCOL_VERSION, id: "b1" });
+  await t.sentN(2);
+  expect(pushes).toEqual([null]);
+  expect(t.sent[1]).toMatchObject({ id: "b1", reason: "unavailable" });
+
+  const running = await setup({ push: async (_s, _l, _h, pushAnyway) => (pushes.push(pushAnyway), []) });
+  running.runner.take(brief("b2"));
+  await running.asked(1);
+  running.runner.take({ type: "drop", v: PROTOCOL_VERSION, id: "b2" });
+  running.asks[0]!.settle(ok("Goal: ship."));
+  await running.runner.settled();
+  expect(running.sent).toEqual([]);
+  expect(pushes).toEqual([null]);
 });
 
 test("runner: a handoff to take goes to take once at a time, and what it did goes back as taken", async () => {

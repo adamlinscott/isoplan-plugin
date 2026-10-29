@@ -16,4 +16,4 @@ Hand this session's work over, through Isoplan, to the person named here: $ARGUM
    It checks with the office server first, then commits the tracked changes to the handoff's own branch, scans the brief and the commit for secrets, pushes that branch alone and sends the brief.
 5. Tell me what it printed.
    - If the brief matched a secret pattern, take that part out of the file and run step 4 again with the same id.
-   - If the commit's added lines in a file matched a secret pattern, nothing was pushed: tell me the file and ask me whether to take the secret out or push anyway. Add `--push-anyway` to step 4 only when I say to.
+   - If what the push would send matched a secret pattern in a file, nothing was pushed: tell me the file, and any it couldn't check, and ask me whether to take the secret out or push anyway. Only when I say to push anyway, run step 4 again with `--push-anyway <commit>`, the commit it printed, which pushes that exact commit.

@@ -1,4 +1,3 @@
-import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import type { Handoff } from "@isoplan/protocol";
@@ -7,7 +6,7 @@ import { tempRoot } from "../data-layer/fixture.js";
 import { nodeIo } from "../data-layer/io.js";
 import { createRunGit, pushHandoff } from "./git.js";
 import { git, remoteAndClone } from "./fixture.js";
-import { checkoutHere, findClone, launch, parseSetup, sessionArgv, takeHandoff, type Headless, type Launch, type TakeOptions } from "./take.js";
+import { checkoutHere, findClone, launch, parseSetup, sessionArgv, takeHandoff, trustFolder, trustKey, type Background, type Launch, type TakeOptions } from "./take.js";
 
 const run = createRunGit();
 const SETTINGS = { gitTimeoutSeconds: 30, setupTimeoutMinutes: 15, cloneSearchDays: 30 };
@@ -40,7 +39,9 @@ async function handedOver(id: string, setup?: unknown) {
   fs.writeFileSync(path.join(projects, "s1.jsonl"), JSON.stringify({ type: "user", cwd: receiver.clone }) + "\n");
   const handoff: Handoff = { id, brief: "Goal: ship the export.", repos: [repo] };
   const opened: Launch[] = [];
-  const started: Headless[] = [];
+  const started: Background[] = [];
+  const claudeJson = path.join(root, ".claude.json");
+  fs.writeFileSync(claudeJson, JSON.stringify({ userID: "u", projects: { "/elsewhere": { hasTrustDialogAccepted: false, allowedTools: ["Read"] } } }, null, 2));
   const options: TakeOptions = {
     run,
     io: nodeIo(),
@@ -52,16 +53,19 @@ async function handedOver(id: string, setup?: unknown) {
     claude: async () => "C:\\Users\\sam\\.local\\bin\\claude.exe",
     scan: async (text) => (text.includes(FAKE_KEY) ? "AWS access key id" : null),
     log: () => {},
+    claudeJson,
     // Nothing here opens a window or starts a process: both are recorded instead.
     open: async (l) => void opened.push(l),
     start: async (h) => void started.push(h),
+    agents: async () => started.map((h) => h.argv[h.argv.indexOf("--session-id") + 1]!),
+    confirmMs: 200,
   };
-  return { root, sender, receiver, handoff, options, opened, started, claudeDir };
+  return { root, sender, receiver, handoff, options, opened, started, claudeDir, claudeJson };
 }
 
 test("taking from the floor: a worktree beside the clone on the handoff's branch, the setup script, then Claude Code with the brief, under the server's session id", async () => {
   const t = await handedOver("h1", { command: "node -e \"require('fs').writeFileSync('setup-ran.txt', process.env.ISOPLAN_HANDOFF_BRANCH)\"" });
-  const taken = await takeHandoff({ handoff: t.handoff, session: SESSION }, t.options);
+  const taken = await takeHandoff({ handoff: t.handoff, mode: "terminal", session: SESSION }, t.options);
   expect(taken).toEqual({ type: "taken", v: 1, handoff: "h1", session: `claude-code:${SESSION}`, failures: [] });
   const dir = `${t.receiver.clone}-handoff-h1`;
   expect(git(dir, "branch", "--show-current")).toBe("isoplan/handoff/h1");
@@ -79,28 +83,54 @@ test("taking from the floor: a worktree beside the clone on the handoff's branch
   expect(t.started).toEqual([]);
 });
 
-test("headless: the same worktree and setup, then claude -p with no window, the prompt first", async () => {
+test("headless: the same worktree and setup, the worktree alone trusted, then claude --bg with no window, confirmed by claude agents", async () => {
   const t = await handedOver("h2", { command: "node -e \"require('fs').writeFileSync('setup-ran.txt', 'yes')\"" });
   const taken = await takeHandoff({ handoff: t.handoff, mode: "headless", session: SESSION }, t.options);
-  expect(taken.session).toBe(`claude-code:${SESSION}`);
+  expect(taken).toMatchObject({ session: `claude-code:${SESSION}`, failures: [] });
   expect(t.opened).toEqual([]);
   const dir = `${t.receiver.clone}-handoff-h2`;
   expect(fs.readFileSync(path.join(dir, "setup-ran.txt"), "utf8")).toBe("yes");
   const [h] = t.started;
   expect(h!.cwd).toBe(dir);
-  expect(h!.argv.slice(0, 2)).toEqual(["C:\\Users\\sam\\.local\\bin\\claude.exe", "-p"]);
-  expect(h!.argv[2]).toMatch(/^Isoplan handoff h2: you are taking this work over\. Read its brief in /);
-  expect(h!.argv.slice(3, 7)).toEqual(["--session-id", SESSION, "--name", "Isoplan handoff h2"]);
+  expect(h!.argv[1]).toMatch(/^Isoplan handoff h2: you are taking this work over\. Read its brief in /);
+  expect(h!.argv.slice(2, 7)).toEqual(["--bg", "--session-id", SESSION, "--name", "Isoplan handoff h2"]);
   expect(h!.argv.at(-2)).toBe("--add-dir");
+  const config = JSON.parse(fs.readFileSync(t.claudeJson, "utf8"));
+  expect(config).toEqual({ userID: "u", projects: { "/elsewhere": { hasTrustDialogAccepted: false, allowedTools: ["Read"] }, [trustKey(dir, "win32")]: { hasTrustDialogAccepted: true } } });
+});
+
+test("headless: a session claude agents doesn't list is reported, not taken", async () => {
+  const t = await handedOver("h2b");
+  const taken = await takeHandoff({ handoff: t.handoff, mode: "headless", session: SESSION }, { ...t.options, agents: async () => [] });
+  expect(taken.session).toBe(undefined);
+  expect(taken.failures).toEqual([{ step: "open", output: expect.stringContaining("doesn't list session") }]);
+});
+
+test("a handoff that doesn't say how to open its session is refused, and opens nothing", async () => {
+  const t = await handedOver("h2c");
+  const taken = await takeHandoff({ handoff: t.handoff }, t.options);
+  expect(taken).toEqual({ type: "taken", v: 1, handoff: "h2c", failures: [{ step: "open", output: expect.stringContaining("didn't say how to open the session") }] });
+  expect(t.opened).toEqual([]);
+  expect(t.started).toEqual([]);
 });
 
 test("the session's command line parses: the prompt is the prompt, and --add-dir takes only the folder", () => {
   expect(sessionArgv("claude", { prompt: "Read it", session: SESSION, name: "n", folder: "/f", headless: false })).toEqual(["claude", "Read it", "--session-id", SESSION, "--name", "n", "--add-dir", "/f"]);
 });
 
+test("trust: only that folder's entry changes, and one already trusted isn't rewritten", async () => {
+  const file = path.join(tempRoot(), ".claude.json");
+  const before = JSON.stringify({ a: 1, projects: { "C:/x": { hasTrustDialogAccepted: true } } }, null, 2);
+  fs.writeFileSync(file, before);
+  await trustFolder(file, "C:\\x", "win32");
+  expect(fs.readFileSync(file, "utf8")).toBe(before);
+  await trustFolder(file, "C:\\work\\app-handoff-h1", "win32");
+  expect(JSON.parse(fs.readFileSync(file, "utf8"))).toEqual({ a: 1, projects: { "C:/x": { hasTrustDialogAccepted: true }, "C:/work/app-handoff-h1": { hasTrustDialogAccepted: true } } });
+});
+
 test("a failing setup script still opens the session, and its output is scanned before it leaves", async () => {
   const t = await handedOver("h3", { command: { windows: `echo key ${FAKE_KEY} && exit 3`, mac: `echo key ${FAKE_KEY}; exit 3` } });
-  const taken = await takeHandoff({ handoff: t.handoff }, t.options);
+  const taken = await takeHandoff({ handoff: t.handoff, mode: "terminal" }, t.options);
   expect(taken.session).toMatch(/^claude-code:/);
   expect(taken.failures).toEqual([{ step: "setup", output: "The end of its output is withheld here: it matches a secret pattern. It is on sam-laptop." }]);
   expect(t.opened[0]!.text).toContain("The worktree's setup script failed; the end of its output is in");
@@ -118,7 +148,7 @@ test("setup is read from the remote's default branch only: never the handoff's b
   fs.writeFileSync(path.join(t.receiver.clone, "isoplan.json"), pwned("from-clone-head.txt"));
   git(t.receiver.clone, "add", "isoplan.json");
   git(t.receiver.clone, "commit", "-q", "-m", "x");
-  await takeHandoff({ handoff: { ...t.handoff, repos: [repo] } }, t.options);
+  await takeHandoff({ handoff: { ...t.handoff, repos: [repo] }, mode: "terminal" }, t.options);
   const dir = `${t.receiver.clone}-handoff-h4`;
   expect(fs.existsSync(path.join(dir, "from-handoff.txt"))).toBe(false);
   expect(fs.existsSync(path.join(dir, "from-clone-head.txt"))).toBe(false);
@@ -127,14 +157,15 @@ test("setup is read from the remote's default branch only: never the handoff's b
 test("with no <remote>/HEAD, the remote says which branch is the default; setup runs from it", async () => {
   const t = await handedOver("h5", { command: "node -e \"require('fs').writeFileSync('setup-ran.txt', 'yes')\"" });
   git(t.receiver.clone, "remote", "set-head", "origin", "-d");
-  const taken = await takeHandoff({ handoff: t.handoff }, t.options);
+  const taken = await takeHandoff({ handoff: t.handoff, mode: "terminal" }, t.options);
   expect(taken.failures).toEqual([]);
   expect(fs.existsSync(path.join(`${t.receiver.clone}-handoff-h5`, "setup-ran.txt"))).toBe(true);
 });
 
 test("a re-take never drops the receiver's work: a worktree with commits or changes not in the new tip is left, and the take refused", async () => {
   const t = await handedOver("h6");
-  await takeHandoff({ handoff: t.handoff }, t.options);
+  const opts = { mode: "terminal" as const };
+  await takeHandoff({ handoff: t.handoff, ...opts }, t.options);
   const dir = `${t.receiver.clone}-handoff-h6`;
   fs.writeFileSync(path.join(dir, "mine.txt"), "the receiver's own\n");
   git(dir, "add", "mine.txt");
@@ -143,7 +174,7 @@ test("a re-take never drops the receiver's work: a worktree with commits or chan
   // Handed over again: the branch is replaced.
   fs.writeFileSync(path.join(t.sender.clone, "app.js"), "console.log('again');\n");
   const repo = await pushed(t.sender.clone, "h6");
-  const again = await takeHandoff({ handoff: { ...t.handoff, repos: [repo] } }, t.options);
+  const again = await takeHandoff({ handoff: { ...t.handoff, repos: [repo] }, ...opts }, t.options);
   expect(again.session).toBe(undefined);
   expect(again.failures).toEqual([{ step: "worktree", output: expect.stringContaining("has work that isn't in the handoff as handed over now (1 commit(s))") }]);
   expect(git(dir, "rev-parse", "HEAD")).toBe(mine);
@@ -151,11 +182,11 @@ test("a re-take never drops the receiver's work: a worktree with commits or chan
   // Uncommitted changes are kept the same way; with neither, it moves to the new tip.
   git(dir, "reset", "-q", "--hard", "origin/isoplan/handoff/h6");
   fs.writeFileSync(path.join(dir, "app.js"), "dirty\n");
-  expect((await takeHandoff({ handoff: { ...t.handoff, repos: [repo] } }, t.options)).failures[0]!.output).toContain("uncommitted changes");
+  expect((await takeHandoff({ handoff: { ...t.handoff, repos: [repo] }, ...opts }, t.options)).failures[0]!.output).toContain("uncommitted changes");
   git(dir, "checkout", "--", "app.js");
   // An untracked file, a setup script's say, doesn't hold it back, and stays.
   fs.writeFileSync(path.join(dir, "setup-ran.txt"), "yes\n");
-  expect((await takeHandoff({ handoff: { ...t.handoff, repos: [repo] } }, t.options)).failures).toEqual([]);
+  expect((await takeHandoff({ handoff: { ...t.handoff, repos: [repo] }, ...opts }, t.options)).failures).toEqual([]);
   expect(fs.readFileSync(path.join(dir, "app.js"), "utf8")).toBe("console.log('again');\n");
   expect(fs.existsSync(path.join(dir, "setup-ran.txt"))).toBe(true);
 });
@@ -163,7 +194,7 @@ test("a re-take never drops the receiver's work: a worktree with commits or chan
 test("with no clone of the repo on the machine, no session opens and the failure says what to do", async () => {
   const t = await handedOver("h7");
   fs.rmSync(path.join(t.claudeDir, "projects"), { recursive: true });
-  const taken = await takeHandoff({ handoff: t.handoff }, t.options);
+  const taken = await takeHandoff({ handoff: t.handoff, mode: "terminal" }, t.options);
   expect(taken.session).toBe(undefined);
   expect(taken.failures).toEqual([{ step: "worktree", output: expect.stringMatching(/^No clone of .* was found on sam-laptop.*copy its prompt/s) }]);
   expect(t.opened).toEqual([]);
@@ -187,26 +218,31 @@ test("findClone: the most recently used clone, with a remote whose path has spac
   expect(await findClone(nodeIo(), run, projects, remote, Date.now() - 86400000, 30000)).toEqual({ dir: path.resolve(newer), remote: "origin" });
 });
 
-test("the shortcut checks the branch out here, moves a local branch to the new tip, and never over commits of its own", async () => {
+test("the shortcut checks the branch out here, moves a local branch to the new tip, and never over commits of its own or a dirty tree", async () => {
   const t = await handedOver("h8");
-  expect((await checkoutHere(run, t.receiver.clone, t.handoff, 30000)).failures).toEqual([]);
+  const folder = path.join(t.claudeDir, "isoplan", "handoffs", "h8");
+  // Uncommitted changes to tracked files aren't carried over.
+  fs.writeFileSync(path.join(t.receiver.clone, "app.js"), "mine, uncommitted\n");
+  expect((await checkoutHere(run, t.receiver.clone, t.handoff, folder, 30000)).failures).toEqual([{ step: "checkout", output: expect.stringContaining("uncommitted changes") }]);
+  git(t.receiver.clone, "checkout", "--", "app.js");
+  expect((await checkoutHere(run, t.receiver.clone, t.handoff, folder, 30000)).failures).toEqual([]);
   expect(git(t.receiver.clone, "branch", "--show-current")).toBe("isoplan/handoff/h8");
   // Handed over again: the local branch moves to the replaced tip.
   git(t.receiver.clone, "switch", "-q", "main");
   fs.writeFileSync(path.join(t.sender.clone, "app.js"), "console.log('again');\n");
   const repo = await pushed(t.sender.clone, "h8");
-  expect((await checkoutHere(run, t.receiver.clone, { ...t.handoff, repos: [repo] }, 30000)).failures).toEqual([]);
+  expect((await checkoutHere(run, t.receiver.clone, { ...t.handoff, repos: [repo] }, folder, 30000)).failures).toEqual([]);
   expect(git(t.receiver.clone, "rev-parse", "HEAD")).toBe(repo.commit);
   // A commit of the receiver's on it is never lost.
   fs.writeFileSync(path.join(t.receiver.clone, "mine.txt"), "mine\n");
   git(t.receiver.clone, "add", "mine.txt");
   git(t.receiver.clone, "commit", "-q", "-m", "mine");
   const mine = git(t.receiver.clone, "rev-parse", "HEAD");
-  expect((await checkoutHere(run, t.receiver.clone, { ...t.handoff, repos: [repo] }, 30000)).failures).toEqual([{ step: "checkout", output: expect.stringContaining("has 1 commit(s) that aren't in the handoff") }]);
+  expect((await checkoutHere(run, t.receiver.clone, { ...t.handoff, repos: [repo] }, folder, 30000)).failures).toEqual([{ step: "checkout", output: expect.stringContaining("has 1 commit(s) that aren't in the handoff") }]);
   expect(git(t.receiver.clone, "rev-parse", "HEAD")).toBe(mine);
   const elsewhere = path.join(t.root, "plain");
   fs.mkdirSync(elsewhere);
-  expect((await checkoutHere(run, elsewhere, t.handoff, 30000)).failures).toEqual([{ step: "checkout", output: expect.stringContaining("isn't in a git repo") }]);
+  expect((await checkoutHere(run, elsewhere, t.handoff, folder, 30000)).failures).toEqual([{ step: "checkout", output: expect.stringContaining("isn't in a git repo") }]);
 });
 
 test("isoplan.json: a command, or one per platform, with an optional timeout; anything else is an error", () => {
@@ -218,17 +254,15 @@ test("isoplan.json: a command, or one per platform, with an optional timeout; an
   expect(() => parseSetup('{"worktreeSetup":{"command":"x","timeoutMinutes":0}}', "darwin", 900000)).toThrow("timeoutMinutes");
 });
 
-test.runIf(process.platform === "win32")("the Windows launcher runs from a folder whose path has & ( ) @ ^ in it, run hidden as cmd /k would", () => {
-  const folder = path.join(tempRoot(), "a&b (c) @d ^e");
-  const dir = path.join(folder, "work & play");
-  fs.mkdirSync(dir, { recursive: true });
-  // The launcher drops quotes, which no Windows path holds, so the script names its file in single ones.
-  const l = launch("win32", { folder, dir, argv: [process.execPath, "-e", "require('fs').writeFileSync('ran.txt', process.cwd())"], title: "Isoplan handoff h1 (test) & co", configDir: null })!;
-  fs.writeFileSync(l.file, l.text);
-  // The same quoting as the launch's cmd /k, through /c, in this hidden console: no window opens.
-  const r = spawnSync(process.env.ComSpec || "cmd.exe", ["/d", "/c", l.command.at(-1)!], { windowsHide: true, windowsVerbatimArguments: true, stdio: "pipe", encoding: "utf8" });
-  expect(r.status).toBe(0);
-  expect(fs.readFileSync(path.join(dir, "ran.txt"), "utf8")).toBe(dir);
+test("the Windows launcher: UTF-8 first, every argument quoted whole, so & ( ) @ ^ and letters outside ASCII in a path come through (written and read, never run)", () => {
+  const folder = "C:\\Users\\Zoë\\.claude\\isoplan\\handoffs\\h1";
+  const dir = "C:\\Work\\R&D (été) @x ^y\\app-handoff-h1";
+  const l = launch("win32", { folder, dir, argv: ["C:\\Users\\Zoë\\.local\\bin\\claude.exe", "Read 100% of it", "--add-dir", folder], title: "Isoplan handoff h1 (test) & co", configDir: null })!;
+  const lines = l.text.split("\r\n");
+  expect(lines.slice(0, 4)).toEqual(["@echo off", "chcp 65001>nul", "title Isoplan handoff h1 test  co", `cd /d "${dir}"`]);
+  expect(lines[4]).toBe(`"C:\\Users\\Zoë\\.local\\bin\\claude.exe" "Read 100%% of it" "--add-dir" "${folder}"`);
+  // cmd /k takes the outer quotes off a path with & or ( in it, so it gets two pairs.
+  expect(l.command.at(-1)).toBe(`""${folder}\\open.cmd""`);
 });
 
 test("on a Mac the launcher is a .command file Terminal opens, with the config folder in it", () => {

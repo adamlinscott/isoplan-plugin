@@ -167,7 +167,7 @@ async function worker(): Promise<number> {
       return { files, note: handoffNote({ branch: handoffBranch(handoff), from, files, at: new Date() }) };
     },
     push: async (_session, lead, handoff, pushAnyway) => {
-      const pushed = await pushHandoff(git, lead.cwd, handoff, await gitMs(), { scan: scanText, pushAnyway }).catch((err) => Promise.reject(told(err)));
+      const pushed = await pushHandoff(git, lead.cwd, handoff, await gitMs(), { scan: scanText, ...(pushAnyway ? { pushAnyway } : {}) }).catch((err) => Promise.reject(told(err)));
       return "held" in pushed ? pushed : [pushed.repo];
     },
     take: (message) =>
@@ -180,6 +180,7 @@ async function worker(): Promise<number> {
         env: process.env,
         settings,
         claude: () => claudeBinary(claudeDir, process.env, process.platform, os.homedir()),
+        claudeJson,
         scan: scanText,
         log,
       }),

@@ -25,11 +25,13 @@
 // with the runner's note of what was pushed. When the fork can't write it (it failed, or a cap is
 // reached), the reply still goes, marked `fallback`, with the note alone, and the server writes the
 // rest from the room's feed. Its branch is pushed (`push`) only once the brief has cleared the scan
-// or been released. The push scans the lines its commit adds: on a match nothing is pushed, the
-// refusal is `withheld` naming the file (never the pattern), and the owner's release pushes it
-// anyway. A push that fails is refused `unavailable` with the reason. Without `push` a write-brief is
-// refused before the fork runs. A handoff to take goes to `take`, with how to open its session, once
-// at a time per handoff, and what it did goes back as `taken`. owner-answer requests go to the live session, not
+// or been released. The push scans what it would send: on a match nothing is pushed, the refusal is
+// `withheld` naming the file (never the pattern) and the files it couldn't read, and the owner's
+// release pushes that exact commit anyway. A push that fails is refused `unavailable` with the
+// reason. Without `push` a write-brief is refused before the fork runs. A `drop` ends a request: what
+// is held for it goes, and one still running neither pushes nor sends. A handoff to take goes to
+// `take`, with how to open its session; each take (the session id the server chose) runs once, however
+// often it is sent, and what it did goes back as `taken`. owner-answer requests go to the live session, not
 // the runner (#50).
 
 import { PROTOCOL_VERSION, type HandoffMessage, type HandoffRepo, type RefusalMessage, type ReplyMessage, type RequestMessage, type TakenMessage } from "@isoplan/protocol";
@@ -70,7 +72,7 @@ export interface RunnerOptions {
    * Pushes the handoff's work and returns its repos (#48), or the file whose added lines matched a
    * secret pattern, with nothing pushed, unless `pushAnyway`. Without it, briefs are refused.
    */
-  push?: (session: string, lead: Lead, handoff: string, pushAnyway: boolean) => Promise<HandoffRepo[] | { held: string }>;
+  push?: (session: string, lead: Lead, handoff: string, pushAnyway: string | null) => Promise<HandoffRepo[] | { held: string; commit: string; unchecked: string[] }>;
   /** The untracked files the brief names (null when unknown), and the note it ends with (#48). Throws PushFailed when there is no repo to push. */
   prepareBrief?: (lead: Lead, handoff: string) => Promise<{ files: string[] | null; note: string }>;
   /** Takes a handoff on this machine (#48); without it, handoffs are logged as not handled. */
@@ -111,6 +113,8 @@ export function createRunner({ answerer, ledger, settings, prompts, scan, send, 
   const released = new Set<string>(); // released while still running
   const dropped = new Set<string>(); // dropped from `held` to make room, oldest first
   const taking = new Set<string>(); // handoffs being taken now
+  const takes = new Set<string>(); // the takes run so far, by take id, oldest first
+  const dropping = new Set<string>(); // requests dropped while they ran
   let forking = 0; // forks running now
   const waiting: (() => void)[] = []; // requests waiting for a fork, in order
 
@@ -128,6 +132,10 @@ export function createRunner({ answerer, ledger, settings, prompts, scan, send, 
   const overCapRefusal = (id: string, cap: Cap): RefusalMessage => ({ type: "refusal", v: PROTOCOL_VERSION, id, reason: "over-cap", cap });
 
   function deliver(id: string, message: Outgoing) {
+    if (dropping.delete(id)) {
+      log(`${id} was dropped by the office server, so what it came to isn't sent`);
+      return;
+    }
     finished.delete(id);
     finished.set(id, message);
     if (finished.size > REMEMBER) finished.delete(finished.keys().next().value!);
@@ -198,8 +206,9 @@ export function createRunner({ answerer, ledger, settings, prompts, scan, send, 
     }
 
     // The brief's push, held in turn when its commit adds a possible secret; released, it pushes anyway.
-    const pushAndReply = async (pushAnyway: boolean): Promise<Outgoing> => {
-      let pushed: HandoffRepo[] | { held: string };
+    const pushAndReply = async (pushAnyway: string | null): Promise<Outgoing> => {
+      if (dropping.has(id)) return unavailable(id, "the handoff was cancelled, so nothing was pushed");
+      let pushed: HandoffRepo[] | { held: string; commit: string; unchecked: string[] };
       try {
         pushed = await push!(session, lead, (request as Extract<Ask, { kind: "write-brief" }>).handoff, pushAnyway);
       } catch (err) {
@@ -207,13 +216,14 @@ export function createRunner({ answerer, ledger, settings, prompts, scan, send, 
         return unavailable(id, err instanceof PushFailed ? err.message : "the handoff's branch couldn't be pushed");
       }
       if (!Array.isArray(pushed)) {
-        log(`withheld the handoff's commit for ${id} in ${room}: the lines it adds to ${pushed.held} match a secret pattern`);
-        hold(id, () => pushAndReply(true));
-        return { type: "refusal", v: PROTOCOL_VERSION, id, reason: "withheld", file: pushed.held };
+        const { held: file, commit, unchecked } = pushed;
+        log(`withheld the handoff's commit ${commit} for ${id} in ${room}: the lines it adds to ${file} match a secret pattern`);
+        hold(id, () => pushAndReply(commit));
+        return { type: "refusal", v: PROTOCOL_VERSION, id, reason: "withheld", file, ...(unchecked.length ? { unchecked } : {}) };
       }
       return { type: "reply", v: PROTOCOL_VERSION, id, kind: "write-brief", handoff: { id: (request as Extract<Ask, { kind: "write-brief" }>).handoff, brief: body, repos: pushed }, ...(isFallback ? { fallback: true as const } : {}) };
     };
-    const reply: () => Promise<Outgoing> = isBrief ? () => pushAndReply(false) : async () => ({ type: "reply", v: PROTOCOL_VERSION, id, kind: "answer-question", answer: body });
+    const reply: () => Promise<Outgoing> = isBrief ? () => pushAndReply(null) : async () => ({ type: "reply", v: PROTOCOL_VERSION, id, kind: "answer-question", answer: body });
     const matched = await scan(body);
     if (!matched) return reply();
     log(`withheld the ${isBrief ? "brief" : "answer"} for ${id} in ${room}: it matches the secret pattern "${matched}"`);
@@ -265,11 +275,20 @@ export function createRunner({ answerer, ledger, settings, prompts, scan, send, 
         void release(message.id);
         return;
       }
+      if (message.type === "drop") {
+        if (held.delete(message.id)) log(`dropped the withheld reply for ${message.id}: its handoff is over`);
+        else if (running.has(message.id)) dropping.add(message.id);
+        return;
+      }
       if (message.type === "handoff") {
         const handoff = message.handoff;
+        const takeId = message.session ?? handoff.id;
         if (!take) log(`the office server sent handoff ${handoff.id} to take, which this runner doesn't handle yet`);
         else if (taking.has(handoff.id)) log(`handoff ${handoff.id} is being taken already`);
+        else if (takes.has(takeId)) log(`take ${takeId} of handoff ${handoff.id} was run already, so it isn't run again`);
         else {
+          takes.add(takeId);
+          if (takes.size > REMEMBER) takes.delete(takes.values().next().value!);
           taking.add(handoff.id);
           void take(message)
             .then(send, (err: unknown) => log(`handoff ${handoff.id}: taking it failed: ${(err as Error)?.stack ?? String(err)}`))

@@ -5904,7 +5904,8 @@ discriminatedUnion("type", [
 			v: Version,
 			id: RequestId,
 			reason: literal("withheld"),
-			file: string().min(1).optional()
+			file: string().min(1).optional(),
+			unchecked: array(string().min(1)).optional()
 		}),
 		object({
 			type: literal("refusal"),
@@ -6006,6 +6007,15 @@ const RequestMessageSchema = discriminatedUnion("kind", [
 	})
 ]);
 /**
+* The request is over (its handoff was cancelled, dismissed or replaced): the machine drops what it
+* holds for it, and doesn't send or push what it was still writing.
+*/
+const DropMessageSchema = object({
+	type: literal("drop"),
+	v: Version,
+	id: RequestId
+});
+/**
 * The owner released what the secret scan withheld, so the machine sends it now. On the runner's
 * link `id` is the request whose reply was withheld; on a session's link it is the withheld
 * report's `withheld.id`, and only that exact report is released.
@@ -6046,7 +6056,8 @@ const OfficeServerMessageSchema = discriminatedUnion("type", [
 		handoff: HandoffId,
 		to: Account
 	}),
-	HandOverReadyMessageSchema
+	HandOverReadyMessageSchema,
+	DropMessageSchema
 ]);
 /** Validates a message a data layer received from an office server. */
 function parseOfficeServerMessage(value) {
@@ -6587,6 +6598,7 @@ const GIT_FAILED = {
 	"not-a-repo": "the session's folder isn't in a git repo",
 	"no-commit": "the session's repo has no commit to hand over from",
 	"no-remote": "the session's repo has no remote to push the handoff's branch to",
+	lfs: "the session's repo uses Git LFS, whose files a handoff can't push yet",
 	"timed-out": "git took too long to push the handoff's branch",
 	rejected: "the remote rejected the handoff's branch",
 	failed: "git couldn't push the handoff's branch"
@@ -6687,21 +6699,26 @@ function sameRemote(a, b) {
 	const asPath = (r) => pathKey(path.resolve(r.replace(/^file:\/\//, ""))).replace(/(\/\.git|\.git)$/, "");
 	return asPath(a) === asPath(b);
 }
-/** The repo's remotes and their fetch URLs, which may hold spaces (a local path). */
+/** The repo's remotes with their fetch and push URLs (which may hold spaces: a local path). */
 async function remotesOf(run, cwd, timeoutMs) {
 	const r = await run([
 		"config",
 		"--local",
 		"--get-regexp",
-		"^remote\\..*\\.url$"
+		"^remote\\..*\\.(url|pushurl)$"
 	], {
 		cwd,
 		timeoutMs
 	});
 	if (r.code !== 0) return r.code === 1 ? [] : null;
-	return r.stdout.split(/\r?\n/).map((line) => /^remote\.(.+)\.url (.*)$/.exec(line)).filter((m) => !!m).map((m) => ({
-		name: m[1],
-		url: m[2]
+	const out = /* @__PURE__ */ new Map();
+	for (const line of r.stdout.split(/\r?\n/)) {
+		const m = /^remote\.(.+)\.(?:url|pushurl) (.*)$/.exec(line);
+		if (m) out.set(m[1], [...out.get(m[1]) ?? [], m[2]]);
+	}
+	return [...out].map(([name, urls]) => ({
+		name,
+		urls
 	}));
 }
 const UNTRACKED_MAX = 50;
@@ -6761,13 +6778,29 @@ async function prepare(run, cwd, timeoutMs) {
 		files: await untracked(run, toplevel, timeoutMs)
 	};
 }
-/** The files `diff` (a `git diff -U0` of the commit) adds lines to, with those lines. */
+/**
+* The files a patch (`git log -p -U0`) adds lines to, with those lines, and the binary files it adds
+* or changes, which can't be read. A `+++ ` line is a file's header only right after its `--- `
+* line; anywhere else it is an added line that starts with `++`.
+*/
 function addedLines(diff) {
-	const out = /* @__PURE__ */ new Map();
+	const lines = /* @__PURE__ */ new Map();
+	const binary = /* @__PURE__ */ new Set();
 	let file = null;
-	for (const line of diff.split("\n")) if (line.startsWith("+++ ")) file = line === "+++ /dev/null" ? null : line.slice(4).replace(/^b\//, "");
-	else if (file && line.startsWith("+")) out.set(file, (out.get(file) ?? "") + line.slice(1) + "\n");
-	return out;
+	let previous = "";
+	for (const line of diff.split("\n")) {
+		const header = line.startsWith("+++ ") && previous.startsWith("--- ");
+		const bin = /^Binary files .* and (?:b\/)?(.+) differ$/.exec(line);
+		if (header) file = line === "+++ /dev/null" ? null : line.slice(4).replace(/^b\//, "");
+		else if (line.startsWith("diff --git ")) file = null;
+		else if (bin && bin[1] !== "/dev/null") binary.add(bin[1]);
+		else if (file && line.startsWith("+")) lines.set(file, (lines.get(file) ?? "") + line.slice(1) + "\n");
+		previous = line;
+	}
+	return {
+		lines,
+		binary: [...binary].sort()
+	};
 }
 const IDENTITY = {
 	GIT_AUTHOR_NAME: "Isoplan handoff",
@@ -6778,9 +6811,11 @@ const IDENTITY = {
 /**
 * Commits the tracked changes at `cwd` and pushes that commit alone to isoplan/handoff/<id>, with
 * force, since the branch is the handoff's own and a second hand-over of the same room replaces it.
-* The repo it records names the push URL, where the branch is. Throws a HandoffGitError.
+* The remote is the one the current branch pushes to (branch.<x>.pushRemote, remote.pushDefault,
+* then branch.<x>.remote, then origin), and the repo it records names its push URL, where the branch
+* is. Throws a HandoffGitError.
 */
-async function pushHandoff(run, cwd, id, timeoutMs, { scan, pushAnyway = false } = {}) {
+async function pushHandoff(run, cwd, id, timeoutMs, { scan, pushAnyway } = {}) {
 	const branch = handoffBranch(id);
 	const { toplevel, from } = await prepare(run, cwd, timeoutMs);
 	const at = {
@@ -6809,12 +6844,16 @@ async function pushHandoff(run, cwd, id, timeoutMs, { scan, pushAnyway = false }
 	if (head.code !== 0) throw new HandoffGitError("no-commit", `${toplevel} has no commit yet`);
 	const parent = head.stdout.trim();
 	const remotes = (await must(["remote"])).split(/\r?\n/).filter(Boolean);
-	const upstream = from ? (await git([
+	const setting = async (key) => (await git([
 		"config",
 		"--get",
-		`branch.${from}.remote`
-	])).stdout.trim() : "";
-	const remote = remotes.includes(upstream) ? upstream : remotes.includes("origin") ? "origin" : remotes.length === 1 ? remotes[0] : null;
+		key
+	])).stdout.trim();
+	const remote = [
+		from ? await setting(`branch.${from}.pushRemote`) : "",
+		await setting("remote.pushDefault"),
+		from ? await setting(`branch.${from}.remote`) : ""
+	].find((r) => remotes.includes(r)) ?? (remotes.includes("origin") ? "origin" : remotes.length === 1 ? remotes[0] : null);
 	if (!remote) throw new HandoffGitError("no-remote", `${toplevel} has ${remotes.length ? `several remotes and none is origin: ${remotes.join(", ")}` : "no remote"}`);
 	const url = await must([
 		"remote",
@@ -6829,6 +6868,40 @@ async function pushHandoff(run, cwd, id, timeoutMs, { scan, pushAnyway = false }
 		`refs/remotes/${remote}/HEAD`
 	])).stdout.trim().replace(`${remote}/`, "");
 	if (branch === from || branch === fallback) throw new HandoffGitError("failed", `${branch} is the current or the default branch, which a handoff never pushes`);
+	if (pushAnyway) {
+		if ((await git([
+			"cat-file",
+			"-e",
+			`${pushAnyway}^{commit}`
+		])).code !== 0) throw new HandoffGitError("failed", `the held commit ${pushAnyway} is gone from ${toplevel}`);
+		return { repo: await send(pushAnyway) };
+	}
+	async function send(commit) {
+		if ((await git([
+			"grep",
+			"-q",
+			"-I",
+			"filter=lfs",
+			commit,
+			"--",
+			".gitattributes",
+			"**/.gitattributes"
+		])).code === 0) throw new HandoffGitError("lfs", `${toplevel} uses Git LFS`);
+		const pushed = await git([
+			"push",
+			"--no-verify",
+			"--porcelain",
+			remote,
+			`+${commit}:refs/heads/${branch}`
+		]);
+		if (pushed.code !== 0) throw new HandoffGitError(/rejected|denied|declined/i.test(pushed.stderr + pushed.stdout) ? "rejected" : "failed", `git push ${remote} ${branch}: ${(pushed.stderr || pushed.stdout).trim()}`);
+		return {
+			path: ".",
+			remote: withoutCredentials(url),
+			branch,
+			commit
+		};
+	}
 	const index = path.join(await fs.mkdtemp(path.join(os.tmpdir(), "isoplan-handoff-")), "index");
 	try {
 		const real = path.resolve(toplevel, await must([
@@ -6860,33 +6933,28 @@ async function pushHandoff(run, cwd, id, timeoutMs, { scan, pushAnyway = false }
 				"-m",
 				`WIP: Isoplan handoff ${id}\n\nThe tracked changes${from ? ` on ${from}` : ""}, handed over as they were.`
 			], "failed", named ? void 0 : IDENTITY);
-			if (scan && !pushAnyway) {
-				const diff = await must([
-					"diff",
-					"--no-color",
-					"--no-ext-diff",
-					"--no-renames",
-					"-U0",
-					parent,
-					commit
-				]);
-				for (const [file, text] of addedLines(diff)) if (await scan(text)) return { held: file };
-			}
 		}
-		const pushed = await git([
-			"push",
-			"--no-verify",
-			"--porcelain",
-			remote,
-			`+${commit}:refs/heads/${branch}`
-		]);
-		if (pushed.code !== 0) throw new HandoffGitError(/rejected|denied|declined/i.test(pushed.stderr + pushed.stdout) ? "rejected" : "failed", `git push ${remote} ${branch}: ${(pushed.stderr || pushed.stdout).trim()}`);
-		return { repo: {
-			path: ".",
-			remote: withoutCredentials(url),
-			branch,
-			commit
-		} };
+		if (scan) {
+			const { lines, binary } = addedLines(await must([
+				"log",
+				"-p",
+				"-U0",
+				"--no-color",
+				"--no-ext-diff",
+				"--no-renames",
+				"--diff-merges=first-parent",
+				"--format=",
+				commit,
+				"--not",
+				`--remotes=${remote}`
+			]));
+			for (const [file, text] of lines) if (await scan(text)) return {
+				held: file,
+				commit,
+				unchecked: binary
+			};
+		}
+		return { repo: await send(commit) };
 	} finally {
 		await fs.rm(path.dirname(index), {
 			recursive: true,
@@ -6972,19 +7040,47 @@ async function setupCommand(run, clone, platform, timeoutMs) {
 		return null;
 	}
 }
+/** The commits this machine took of a handoff before, which a re-take may move past. */
+async function takenBefore(folder) {
+	try {
+		const { commits } = JSON.parse(await fs.readFile(path.join(folder, "taken.json"), "utf8"));
+		return Array.isArray(commits) ? commits.filter((c) => typeof c === "string" && /^[0-9a-f]{40,64}$/.test(c)) : [];
+	} catch {
+		return [];
+	}
+}
+async function recordTaken(folder, commit) {
+	const commits = [.../* @__PURE__ */ new Set([...await takenBefore(folder), commit])].slice(-50);
+	await fs.mkdir(folder, { recursive: true });
+	await fs.writeFile(path.join(folder, "taken.json"), JSON.stringify({
+		about: "The commits of this handoff taken on this machine, which a later take may replace.",
+		commits
+	}, null, 2) + "\n");
+}
+let emptyHooks = null;
+const noHooks = async () => ["-c", `core.hooksPath=${await (emptyHooks ??= fs.mkdtemp(path.join(os.tmpdir(), "isoplan-no-hooks-")))}`];
 /**
-* How many commits `ref` has that neither the new tip nor the one fetched before it (`before`, the
-* handoff as it was last handed over, which a new hand-over replaces) has: the receiver's own work.
-* Null when git can't say.
+* How many commits `ref` has that neither the new tip nor any commit this machine took of the
+* handoff before (`exempt`, which a new hand-over replaces) has: the receiver's own work. Null when
+* git can't say.
 */
-async function ahead(run, cwd, tip, before, ref, timeoutMs) {
+async function ahead(run, cwd, tip, exempt, ref, timeoutMs) {
+	const known = [];
+	for (const c of exempt) if ((await run([
+		"cat-file",
+		"-e",
+		`${c}^{commit}`
+	], {
+		cwd,
+		timeoutMs
+	})).code === 0) known.push(c);
 	const r = await run([
 		"rev-list",
 		"--count",
 		ref,
 		"--not",
 		tip,
-		...before ? [before] : []
+		...known
 	], {
 		cwd,
 		timeoutMs
@@ -7006,12 +7102,14 @@ async function resolved(run, cwd, ref, timeoutMs) {
 }
 /**
 * The shortcut's checkout (/isoplan:take): the handoff's branch in the session's own folder, fetched
-* from the remote there that is the handoff's. A local branch of that name moves to the fetched tip,
-* unless it has commits the tip doesn't, which would be lost: then it is left as it is. No setup
-* script runs: the person, or their harness, set up this folder. Returns the failed steps, each with
-* the end of git's output, and the remote's name there.
+* from the remote there that is the handoff's, with the repo's hooks off. A folder with uncommitted
+* changes to tracked files is left as it is, rather than carrying them over. A local branch of that
+* name moves to the fetched tip, unless it has commits that are neither in the tip nor ones this
+* machine took of the handoff before (recorded in `folder`), which would be lost: then it is left as
+* it is. No setup script runs: the person, or their harness, set up this folder. Returns the failed
+* steps, each with the end of git's output, and the remote's name there.
 */
-async function checkoutHere(run, cwd, handoff, timeoutMs) {
+async function checkoutHere(run, cwd, handoff, folder, timeoutMs) {
 	const repo = handoff.repos.find((r) => r.path === ".") ?? handoff.repos[0];
 	const branch = handoffBranch(handoff.id);
 	const git = (args) => run(args, {
@@ -7027,16 +7125,28 @@ async function checkoutHere(run, cwd, handoff, timeoutMs) {
 		remote
 	});
 	if (!remotes) return failed(`${cwd} isn't in a git repo.`);
-	const name = remotes.find((r) => sameRemote(r.url, repo.remote))?.name;
+	const name = remotes.find((r) => r.urls.some((url) => sameRemote(url, repo.remote)))?.name;
 	if (!name) return failed(`No remote of the repo in ${cwd} is ${repo.remote}, the repo the handoff was pushed to.`);
+	if ((await git([
+		"status",
+		"--porcelain",
+		"--untracked-files=no"
+	])).stdout.trim()) return failed(`${cwd} has uncommitted changes to tracked files, so the handoff's branch wasn't checked out over them. Commit or stash them, then take it again.`, name);
 	const tip = `refs/remotes/${name}/${branch}`;
-	const before = await resolved(run, cwd, tip, timeoutMs);
 	const fetched = await git([
 		"fetch",
 		name,
 		`+refs/heads/${branch}:${tip}`
 	]);
 	if (fetched.code !== 0) return failed(`git fetch ${name} ${branch}: ${fetched.stderr}`, name);
+	const hooksOff = await noHooks();
+	const ok = async () => {
+		await recordTaken(folder, await resolved(run, cwd, "HEAD", timeoutMs) ?? repo.commit);
+		return {
+			failures: [],
+			remote: name
+		};
+	};
 	if ((await git([
 		"rev-parse",
 		"--verify",
@@ -7044,35 +7154,36 @@ async function checkoutHere(run, cwd, handoff, timeoutMs) {
 		`refs/heads/${branch}`
 	])).code !== 0) {
 		const switched = await git([
+			...hooksOff,
 			"switch",
 			"--track",
 			"-c",
 			branch,
 			`${name}/${branch}`
 		]);
-		return switched.code === 0 ? {
-			failures: [],
-			remote: name
-		} : failed(`git switch ${branch}: ${switched.stderr}`, name);
+		return switched.code === 0 ? ok() : failed(`git switch ${branch}: ${switched.stderr}`, name);
 	}
-	const extra = await ahead(run, cwd, tip, before, `refs/heads/${branch}`, timeoutMs);
+	const extra = await ahead(run, cwd, tip, await takenBefore(folder), `refs/heads/${branch}`, timeoutMs);
 	if (extra !== 0) return failed(`The local branch ${branch} has ${extra ?? "some"} commit(s) that aren't in the handoff as handed over now, so it was left as it is. Merge or rebase them onto ${name}/${branch} yourself.`, name);
-	const switched = await git(["switch", branch]);
+	const switched = await git([
+		...hooksOff,
+		"switch",
+		branch
+	]);
 	if (switched.code !== 0) return failed(`git switch ${branch}: ${switched.stderr}`, name);
 	const moved = await git([
+		...hooksOff,
 		"reset",
 		"-q",
 		"--keep",
 		tip
 	]);
-	return moved.code === 0 ? {
-		failures: [],
-		remote: name
-	} : failed(`${branch} couldn't be moved to the handoff as handed over now:\n${moved.stderr}`, name);
+	return moved.code === 0 ? ok() : failed(`${branch} couldn't be moved to the handoff as handed over now:\n${moved.stderr}`, name);
 }
 //#endregion
 //#region src/handoff/main.ts
 const ANSWER_MS = 2e4;
+const ABANDONED_MS = 864e5;
 const here = path.dirname(fileURLToPath(import.meta.url));
 const modDir = path.join(here, "..");
 const { dir: claudeDir, json: claudeJson } = claudePaths(process.env, os.homedir());
@@ -7083,6 +7194,21 @@ const flag = (argv, name) => {
 	const i = argv.indexOf(name);
 	return i >= 0 && argv[i + 1] !== void 0 ? argv[i + 1] : null;
 };
+/** The session's own folder. */
+const sessionDir = () => process.env.CLAUDE_PROJECT_DIR || process.cwd();
+/** Where a prepare keeps the brief until it is sent. */
+const outDir = (id) => path.join(claudeDir, "isoplan", "handoffs", "out", id);
+async function tidyOut() {
+	const root = path.join(claudeDir, "isoplan", "handoffs", "out");
+	for (const name of await fs.readdir(root).catch(() => [])) {
+		const dir = path.join(root, name);
+		const st = await fs.stat(dir).catch(() => null);
+		if (st?.isDirectory() && Date.now() - st.mtimeMs > ABANDONED_MS) await fs.rm(dir, {
+			recursive: true,
+			force: true
+		}).catch(() => {});
+	}
+}
 var Stop = class extends Error {};
 const stop = (text) => {
 	throw new Stop(text);
@@ -7122,9 +7248,10 @@ const nameOf = (argv) => {
 async function prepareCommand(argv) {
 	const to = nameOf(argv);
 	const s = await settings();
-	const prepared = await prepare(run, process.cwd(), s.gitTimeoutSeconds * 1e3).catch((err) => stop(err instanceof HandoffGitError ? `Can't hand over from here: ${GIT_FAILED[err.kind]}.` : String(err)));
+	await tidyOut();
+	const prepared = await prepare(run, sessionDir(), s.gitTimeoutSeconds * 1e3).catch((err) => stop(err instanceof HandoffGitError ? `Can't hand over from here: ${GIT_FAILED[err.kind]}.` : String(err)));
 	const id = newHandoffId();
-	const folder = handoffDir(claudeDir, id);
+	const folder = outDir(id);
 	await fs.mkdir(folder, { recursive: true });
 	const brief = fill((await loadPrompts(path.join(modDir, "prompts"))).brief, {
 		to,
@@ -7142,11 +7269,12 @@ async function handOverCommand(argv) {
 	const id = flag(argv, "--id") || stop("Missing --id: run prepare first.");
 	if (!/^[a-z0-9][a-z0-9-]{0,63}$/.test(id)) stop(`"${id}" isn't a handoff id.`);
 	const to = nameOf(argv);
-	const pushAnyway = argv.includes("--push-anyway");
+	const pushAnyway = flag(argv, "--push-anyway");
+	if (pushAnyway !== null && !/^[0-9a-f]{40}([0-9a-f]{24})?$/.test(pushAnyway)) stop("--push-anyway takes the held commit's full hash, as hand-over printed it.");
 	const file = flag(argv, "--brief") || stop("Missing --brief <file>.");
 	const written = (await fs.readFile(file, "utf8").catch(() => stop(`There is no brief at ${file}: write it there first.`))).trim();
 	if (!written) stop(`The brief at ${file} is empty.`);
-	const cwd = process.cwd();
+	const cwd = sessionDir();
 	const timeoutMs = (await settings()).gitTimeoutSeconds * 1e3;
 	const { from, files } = await prepare(run, cwd, timeoutMs).catch((err) => stop(err instanceof HandoffGitError ? `Can't hand over from here: ${GIT_FAILED[err.kind]}.` : String(err)));
 	const brief = `${written}\n\n${handoffNote({
@@ -7170,9 +7298,12 @@ async function handOverCommand(argv) {
 		if (ready.type === "error") stop(`Nothing was pushed. ${said(ready)}`);
 		const pushed = await pushHandoff(run, cwd, id, timeoutMs, {
 			scan: async (text) => scan(text, patterns),
-			pushAnyway
+			...pushAnyway ? { pushAnyway } : {}
 		}).catch((err) => stop(err instanceof HandoffGitError ? `The handoff wasn't sent: ${GIT_FAILED[err.kind]}.\n${err.detail}` : String(err)));
-		if ("held" in pushed) stop(`Nothing was pushed: the lines the handoff's commit adds to ${pushed.held} match a secret pattern. Take the secret out of that file, or, if it isn't one, run hand-over again with --push-anyway.`);
+		if ("held" in pushed) {
+			const unchecked = pushed.unchecked.length ? ` These files couldn't be checked (binary): ${pushed.unchecked.join(", ")}.` : "";
+			stop(`Nothing was pushed: the lines the push would send to ${pushed.held} match a secret pattern.${unchecked} Take the secret out, or, if it isn't one, run hand-over again with --push-anyway ${pushed.commit} to push that exact commit.`);
+		}
 		const { repo } = pushed;
 		link.send({
 			type: "hand-over",
@@ -7186,7 +7317,12 @@ async function handOverCommand(argv) {
 		});
 		const answer = await link.next((m) => m.type === "handed-over" && m.handoff === id, ANSWER_MS);
 		if (answer.type === "error") stop(`${said(answer)}\nThe branch ${repo.branch} is pushed; run hand-over again with the same id once that is fixed.`);
-		return `Handed over to ${answer.to.name || answer.to.id}, on ${repo.branch}. They will see a Take handoff button in the room on the floor.`;
+		const name = answer.to.name || answer.to.id;
+		if (path.resolve(path.dirname(file)) === path.resolve(outDir(id))) await fs.rm(outDir(id), {
+			recursive: true,
+			force: true
+		}).catch(() => {});
+		return `Handed over to ${name}, on ${repo.branch}. They will see a Take handoff button in the room on the floor.`;
 	} finally {
 		await link.close();
 	}
@@ -7194,7 +7330,7 @@ async function handOverCommand(argv) {
 async function takeCommand(argv) {
 	const code = (argv[0] ?? "").trim();
 	if (!CODE.test(code)) stop("That isn't a take code: it is the eight letters and digits the floor shows, like ABCD-EFGH.");
-	const cwd = process.cwd();
+	const cwd = sessionDir();
 	const timeoutMs = (await settings()).gitTimeoutSeconds * 1e3;
 	const patterns = await loadPatterns(path.join(modDir, "secret-patterns.json"), path.join(isoplanDir, "secret-patterns.json"), () => {});
 	const link = await openSideLink(await server(), await hello(cwd), ANSWER_MS);
@@ -7207,7 +7343,7 @@ async function takeCommand(argv) {
 		const answer = await link.next((m) => m.type === "handoff", ANSWER_MS);
 		if (answer.type === "error") stop(said(answer));
 		const { handoff } = answer;
-		const { failures, remote } = await checkoutHere(run, cwd, handoff, timeoutMs);
+		const { failures, remote } = await checkoutHere(run, cwd, handoff, handoffDir(claudeDir, handoff.id), timeoutMs);
 		const sent = failures.map((f) => scan(f.output, patterns) ? {
 			...f,
 			output: "The end of its output is withheld here: it matches a secret pattern."

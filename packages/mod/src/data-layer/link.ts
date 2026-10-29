@@ -21,6 +21,7 @@ import {
   PROTOCOL_VERSION,
   type DataLayerMessage,
   type Facts,
+  type DropMessage,
   type HandoffMessage,
   type HelloMessage,
   type RefusalMessage,
@@ -59,7 +60,7 @@ export interface LinkOptions {
 type Outgoing = ReplyMessage | RefusalMessage | TakenMessage;
 
 /** What the server asks of a machine, rather than of a session's facts. */
-export type ServerAsk = RequestMessage | ReleaseMessage | HandoffMessage;
+export type ServerAsk = RequestMessage | ReleaseMessage | HandoffMessage | DropMessage;
 
 export interface Link {
   /** The session's facts now; what differs from what the server has goes out when the pace allows. */
@@ -203,7 +204,7 @@ export function createLink({
         isUnwanted = true;
         onNotWanted?.();
       }
-    } else if (onMessage && (message.type === "request" || message.type === "release" || message.type === "handoff")) {
+    } else if (onMessage && (message.type === "request" || message.type === "release" || message.type === "handoff" || message.type === "drop")) {
       onMessage(message);
     } else {
       emit({ type: "log", text: `the office server sent a ${message.type} message, which this data layer doesn't handle yet` });

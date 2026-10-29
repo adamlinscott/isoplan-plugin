@@ -48,15 +48,56 @@ test("a dirty tree: tracked changes go to the handoff's branch alone; the tree, 
   expect(git(remote, "show", `${again.commit}:app.js`)).toBe("console.log(3);");
 });
 
-test("a possible secret in the lines the commit adds holds the push, naming the file; pushing anyway pushes it", async () => {
+test("a possible secret in what the push sends holds it, naming the file and what couldn't be checked; pushing anyway pushes that exact commit", async () => {
   const { remote, clone } = remoteAndClone(tempRoot());
   fs.mkdirSync(path.join(clone, "config"));
   fs.writeFileSync(path.join(clone, "config", "dev.ts"), `export const key = "${FAKE_KEY}";\n`);
-  git(clone, "add", "config/dev.ts");
-  expect(await pushHandoff(run, clone, "h1", MS, { scan })).toEqual({ held: "config/dev.ts" });
+  fs.writeFileSync(path.join(clone, "logo.png"), Buffer.from([0x89, 0x50, 0x4e, 0x47, 0, 0, 0, 1, 2, 3]));
+  git(clone, "add", "config/dev.ts", "logo.png");
+  const held = await pushHandoff(run, clone, "h1", MS, { scan });
+  expect(held).toEqual({ held: "config/dev.ts", commit: expect.stringMatching(/^[0-9a-f]{40}$/), unchecked: ["logo.png"] });
   expect(git(remote, "for-each-ref", "--format=%(refname)")).toBe("refs/heads/main");
-  expect(repoOf(await pushHandoff(run, clone, "h1", MS, { scan, pushAnyway: true })).branch).toBe("isoplan/handoff/h1");
-  expect(addedLines("+++ b/a.ts\n@@ -1 +1 @@\n-old\n+new\n+++ /dev/null\n+gone\n")).toEqual(new Map([["a.ts", "new\n"]]));
+  // The tree changes after the hold; pushing anyway still sends the commit that was held.
+  fs.writeFileSync(path.join(clone, "config", "dev.ts"), "export const key = 'fixed';\n");
+  const pushed = repoOf(await pushHandoff(run, clone, "h1", MS, { scan, pushAnyway: (held as { commit: string }).commit }));
+  expect(pushed.commit).toBe((held as { commit: string }).commit);
+  expect(git(remote, "show", `isoplan/handoff/h1:config/dev.ts`)).toContain(FAKE_KEY);
+});
+
+test("a clean tree still scans the commits the remote doesn't have", async () => {
+  const { remote, clone } = remoteAndClone(tempRoot());
+  fs.writeFileSync(path.join(clone, "local.ts"), `export const key = "${FAKE_KEY}";\n`);
+  git(clone, "add", "local.ts");
+  git(clone, "commit", "-q", "-m", "a local commit");
+  expect(await pushHandoff(run, clone, "h1", MS, { scan })).toMatchObject({ held: "local.ts" });
+  expect(git(remote, "for-each-ref", "--format=%(refname)")).toBe("refs/heads/main");
+});
+
+test("addedLines: a +++ line is a header only after its --- line, so content starting with ++ is scanned", () => {
+  const patch = ["diff --git a/a.ts b/a.ts", "--- a/a.ts", "+++ b/a.ts", "@@ -1 +1,2 @@", "-old", "++++ b/notes.ts", "+new", "diff --git a/x.png b/x.png", "Binary files /dev/null and b/x.png differ", ""].join("\n");
+  expect(addedLines(patch)).toEqual({ lines: new Map([["a.ts", "+++ b/notes.ts\nnew\n"]]), binary: ["x.png"] });
+});
+
+test("a repo that uses Git LFS is refused, with nothing pushed", async () => {
+  const { remote, clone } = remoteAndClone(tempRoot());
+  fs.writeFileSync(path.join(clone, ".gitattributes"), "*.psd filter=lfs diff=lfs merge=lfs -text\n");
+  git(clone, "add", ".gitattributes");
+  await expect(pushHandoff(run, clone, "h1", MS)).rejects.toMatchObject({ kind: "lfs" });
+  expect(git(remote, "for-each-ref", "--format=%(refname)")).toBe("refs/heads/main");
+});
+
+test("the push goes where the branch pushes: branch.<x>.pushRemote, then remote.pushDefault", async () => {
+  const root = tempRoot();
+  const { clone } = remoteAndClone(root);
+  const fork = path.join(root, "fork.git");
+  const other = path.join(root, "other.git");
+  for (const bare of [fork, other]) git(root, "init", "-q", "--bare", bare);
+  git(clone, "remote", "add", "fork", fork);
+  git(clone, "remote", "add", "other", other);
+  git(clone, "config", "remote.pushDefault", "other");
+  expect(repoOf(await pushHandoff(run, clone, "h1", MS)).remote).toBe(other);
+  git(clone, "config", "branch.main.pushRemote", "fork");
+  expect(repoOf(await pushHandoff(run, clone, "h2", MS)).remote).toBe(fork);
 });
 
 test("the push goes to the push URL, which the handoff records; the sender's pre-push hook doesn't run, and nothing is signed", async () => {
@@ -124,5 +165,6 @@ test("the note and the request name untracked files, capped, and say when they a
   const spaced = path.join(tempRoot(), "with spaces");
   fs.mkdirSync(spaced);
   const { remote, clone } = remoteAndClone(spaced);
-  expect(await remotesOf(run, clone, MS)).toEqual([{ name: "origin", url: remote }]);
+  git(clone, "config", "remote.origin.pushurl", "git@github.com:team/app.git");
+  expect(await remotesOf(run, clone, MS)).toEqual([{ name: "origin", urls: [remote, "git@github.com:team/app.git"] }]);
 });

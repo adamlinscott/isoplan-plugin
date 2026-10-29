@@ -6035,7 +6035,8 @@ discriminatedUnion("type", [
 			v: Version,
 			id: RequestId,
 			reason: literal("withheld"),
-			file: string().min(1).optional()
+			file: string().min(1).optional(),
+			unchecked: array(string().min(1)).optional()
 		}),
 		object({
 			type: literal("refusal"),
@@ -6137,6 +6138,15 @@ const RequestMessageSchema = discriminatedUnion("kind", [
 	})
 ]);
 /**
+* The request is over (its handoff was cancelled, dismissed or replaced): the machine drops what it
+* holds for it, and doesn't send or push what it was still writing.
+*/
+const DropMessageSchema = object({
+	type: literal("drop"),
+	v: Version,
+	id: RequestId
+});
+/**
 * The owner released what the secret scan withheld, so the machine sends it now. On the runner's
 * link `id` is the request whose reply was withheld; on a session's link it is the withheld
 * report's `withheld.id`, and only that exact report is released.
@@ -6177,7 +6187,8 @@ discriminatedUnion("type", [
 		handoff: HandoffId,
 		to: Account
 	}),
-	HandOverReadyMessageSchema
+	HandOverReadyMessageSchema,
+	DropMessageSchema
 ]);
 //#endregion
 //#region ../protocol/dist/project-id.js
