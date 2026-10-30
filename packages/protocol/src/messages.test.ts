@@ -307,6 +307,12 @@ describe("handoff", () => {
     ["a path into .git", withRepo({ path: "libs/.git/hooks" }), "handoff.repos[0].path"],
     ["a path into .git as Windows also reads it", withRepo({ path: "libs/.GIT. /hooks" }), "handoff.repos[0].path"],
     ["a path into .git by its short name", withRepo({ path: "libs\\GIT~1\\hooks" }), "handoff.repos[0].path"],
+    ["a path into .git by an NTFS stream", withRepo({ path: ".git::$INDEX_ALLOCATION/hooks" }), "handoff.repos[0].path"],
+    ["a path with a colon in a folder", withRepo({ path: "libs/core:stream" }), "handoff.repos[0].path"],
+    ["a path through .", withRepo({ path: "libs/./core" }), "handoff.repos[0].path"],
+    ["a path that starts with ./", withRepo({ path: "./core" }), "handoff.repos[0].path"],
+    ["a path that ends with /.", withRepo({ path: "libs/." }), "handoff.repos[0].path"],
+    ["a path with an empty part", withRepo({ path: "libs//core" }), "handoff.repos[0].path"],
     ["an id over 64 characters", { ...valid.handoff, handoff: { ...handoff, id: "a".repeat(65) } }, "handoff.id"],
     ["a short commit hash", withRepo({ commit: "0123456" }), "handoff.repos[0].commit"],
   ])("refuses %s", (_, message, path) => {

@@ -27,10 +27,13 @@ const HandoffId = z
   .max(64)
   .regex(/^[a-z0-9][a-z0-9-]*$/, "lowercase letters, digits and dashes");
 
-// A path segment Windows reads as `.git`: its trailing dots and spaces dropped, in any case, or
-// the 8.3 short name of a folder that starts with `.git`.
-const isGitFolder = (segment: string) => {
-  const name = segment.replace(/[. ]+$/, "").toLowerCase();
+/**
+ * Whether a path segment is one Windows reads as `.git`: the name before any NTFS stream
+ * (`.git::$INDEX_ALLOCATION`), its trailing dots and spaces dropped, in any case, or the 8.3 short
+ * name of a folder that starts with `.git`.
+ */
+export const isGitFolder = (segment: string) => {
+  const name = segment.split(":")[0]!.replace(/[. ]+$/, "").toLowerCase();
   return name === ".git" || /^git~\d+$/.test(name);
 };
 
@@ -38,7 +41,7 @@ const isGitFolder = (segment: string) => {
  * One repo a handoff pushed: its path in the session's folder (`.` for the folder itself), remote,
  * branch and commit. A handoff drives git on the receiver's machine, so the path stays inside the
  * folder, out of any `.git` folder (in any spelling Windows reads as one: `.GIT.`, `.git `, `GIT~1`),
- * and the remote can't name a transport helper such as `ext::`, which runs a command.
+ * with no `:` (an NTFS stream, such as `.git::$INDEX_ALLOCATION`), and the remote can't name a transport helper such as `ext::`, which runs a command.
  */
 export const HandoffRepoSchema = z.object({
   path: z
@@ -47,7 +50,9 @@ export const HandoffRepoSchema = z.object({
     .refine((path) => !/^([\\/]|[A-Za-z]:)/.test(path), "a path relative to the session's folder")
     .refine((path) => !path.split(/[\\/]/).includes(".."), "a path inside the session's folder, with no `..`")
     .refine((path) => !path.startsWith("-"), "a path that doesn't start with `-`, which git would read as an option")
-    .refine((path) => !path.split(/[\\/]/).some(isGitFolder), "a path that isn't in a `.git` folder"),
+    .refine((path) => !path.split(/[\\/]/).some(isGitFolder), "a path that isn't in a `.git` folder")
+    .refine((path) => !path.includes(":"), "a path with no `:`, which Windows reads as a drive or a file's stream")
+    .refine((path) => path === "." || !path.split(/[\\/]/).some((part) => part === "" || part === "." || part === ".."), "`.` itself, or a path of named folders, with no empty, `.` or `..` part"),
   remote: z
     .string()
     .min(1)
