@@ -80,6 +80,13 @@ export const AgentFactSchema = z.object({
   }).nullable(),
   checkout: z.string().optional(),
   branch: z.string().nullable().optional(),
+  // `checkIns` (protocol 0.3.6 on): its recent check-ins on other agents of the same session,
+  // newest last, whatever it is doing now: a message sent to one (talk), or its output or
+  // transcript read (read), each with the other agent's id and when. Absent when there are none.
+  checkIns: z
+    .array(z.object({ with: z.string().min(1), kind: z.enum(["talk", "read"]), since: Time }))
+    .max(20)
+    .optional(),
   extra: Extra,
 });
 

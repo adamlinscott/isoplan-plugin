@@ -16,6 +16,8 @@ export interface Config {
   lightsOffHours: number;
   quietSeconds: number;
   stalledMinutes: number;
+  /** How long an agent's check-in on another (a message sent, its output read) stays in the facts. */
+  checkInSeconds: number;
   touchedWindowMinutes: number;
   touchedTools: string[];
   shellTools: string[];

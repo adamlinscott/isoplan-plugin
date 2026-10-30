@@ -5725,6 +5725,11 @@ const AgentFactSchema = object({
 	}).nullable(),
 	checkout: string().optional(),
 	branch: string().nullable().optional(),
+	checkIns: array(object({
+		with: string().min(1),
+		kind: _enum(["talk", "read"]),
+		since: Time
+	})).max(20).optional(),
 	extra: Extra
 });
 /**
@@ -8211,6 +8216,29 @@ function createClaudeCode(io) {
 		} catch (err) {
 			fail(err);
 		}
+		const known = new Map(agentFiles.map((a) => [a.id.toLowerCase(), a.id]));
+		const spawnNames = new Map([main, ...agentFiles.map((a) => a.t)].flatMap((t) => [...t.spawnNames]));
+		const named = /* @__PURE__ */ new Map();
+		for (const a of agentFiles) {
+			const names = typeof a.meta.toolUseId === "string" ? spawnNames.get(a.meta.toolUseId) ?? [] : [];
+			for (const n of new Set(names.map((x) => x.toLowerCase()))) named.set(n, named.has(n) && named.get(n) !== a.id ? null : a.id);
+		}
+		const toId = (to) => known.get(to.toLowerCase()) ?? named.get(to.toLowerCase()) ?? null;
+		const checkMs = config.checkInSeconds * 1e3;
+		const checkInsOf = (self, t, fallbackMs) => {
+			const list = [];
+			for (const c of t.checks) {
+				const to = toId(c.to);
+				if (!to || agentId(to) === self || !(now - c.at < checkMs)) continue;
+				const item = {
+					with: agentId(to),
+					kind: c.kind,
+					since: iso(c.at, fallbackMs)
+				};
+				if (!list.some((x) => x.with === item.with && x.kind === item.kind && x.since === item.since)) list.push(item);
+			}
+			return list.length ? { checkIns: list.slice(-MAX_REPORTED) } : {};
+		};
 		const results = new Map(main.results);
 		const notes = new Map(main.notes);
 		const spawns = /* @__PURE__ */ new Map();
@@ -8260,6 +8288,7 @@ function createClaudeCode(io) {
 			statusSince: iso(leadWorking ? main.turnAt : main.lastMessageAt, c.ownMtime),
 			lastActive: iso(c.ownMtime),
 			doing: leadWorking ? await doingOf(main, place, c.ownMtime, config) : null,
+			...checkInsOf(lead, main, c.ownMtime),
 			usage: usageOf(main, c.ownMtime)
 		});
 		main.touches = await addFiles(facts.edits, lead, main.touches, [...config.touchedTools, ...config.shellTools], now, config, place);
@@ -8290,6 +8319,7 @@ function createClaudeCode(io) {
 				statusSince: iso(s.since, a.mtimeMs),
 				lastActive: iso(a.mtimeMs),
 				doing: live ? await doingOf(a.t, place, a.mtimeMs, config) : null,
+				...checkInsOf(id, a.t, a.mtimeMs),
 				usage: usageOf(a.t, a.mtimeMs),
 				...worktree ? {
 					checkout: worktree,
@@ -8472,6 +8502,8 @@ function newTranscriptState() {
 		turnAt: NaN,
 		results: /* @__PURE__ */ new Map(),
 		spawns: /* @__PURE__ */ new Map(),
+		spawnNames: /* @__PURE__ */ new Map(),
+		checks: [],
 		notes: /* @__PURE__ */ new Map(),
 		touches: [],
 		reads: [],
@@ -8530,6 +8562,10 @@ function foldLine(st, line, home, isDir) {
 			st.tools++;
 			st.waiting = true;
 			if (c.name === "Agent" && typeof c.id === "string") st.spawns.set(c.id, at);
+			if (SPAWN_TOOLS.has(c.name) && typeof c.id === "string" && c.input && typeof c.input === "object") {
+				const names = [c.input.name, c.input.description].filter((x) => typeof x === "string" && x.trim() !== "");
+				if (names.length) st.spawnNames.set(c.id, names.map((x) => x.trim()));
+			}
 			if (c.name === ASK_TOOL && typeof c.id === "string") st.asks.set(c.id, {
 				at,
 				input: c.input
@@ -8561,6 +8597,11 @@ function foldLine(st, line, home, isDir) {
 				...dir ? { dir } : {},
 				at
 			};
+			for (const check of checkIns(c.name, input, writes)) st.checks.push({
+				...check,
+				at
+			});
+			if (st.checks.length > MAX_CHECKS) st.checks.splice(0, st.checks.length - MAX_CHECKS);
 			const target = input.file_path || input.notebook_path;
 			const targets = typeof target === "string" ? [target] : writes;
 			const reads = typeof target === "string" ? [target] : shell.reads;
@@ -8732,6 +8773,37 @@ function ended(state, at) {
 		since: at,
 		endState: state
 	};
+}
+const SPAWN_TOOLS = /* @__PURE__ */ new Set(["Agent", "Task"]);
+const READ_LIKE = /* @__PURE__ */ new Set([
+	"Read",
+	"Grep",
+	"Glob",
+	"NotebookRead"
+]);
+const MAX_CHECKS = 20;
+const MAX_REPORTED = 5;
+const AGENT_FILES = /[\\/](?:tasks[\\/]([a-z0-9_-]+)\.output|subagents[\\/]agent-([a-z0-9_-]+)\.jsonl)(?![\w.-])/gi;
+const agentsIn = (text) => [...text.matchAll(AGENT_FILES)].map((m) => (m[1] ?? m[2]).toLowerCase());
+function checkIns(name, input, writes) {
+	if (name === "SendMessage") return typeof input.to === "string" && input.to.trim() ? [{
+		to: input.to.trim(),
+		kind: "talk"
+	}] : [];
+	if (name === "TaskOutput") return typeof input.task_id === "string" && input.task_id ? [{
+		to: input.task_id,
+		kind: "read"
+	}] : [];
+	let ids = [];
+	if (READ_LIKE.has(name)) ids = [input.file_path, input.path].flatMap((x) => typeof x === "string" ? agentsIn(x) : []);
+	else if (typeof input.command === "string") {
+		const written = new Set(writes.flatMap(agentsIn));
+		ids = agentsIn(input.command).filter((id) => !written.has(id));
+	}
+	return [...new Set(ids)].map((to) => ({
+		to,
+		kind: "read"
+	}));
 }
 async function doingOf(st, place, fallbackMs, config) {
 	const t = st.lastTool;

@@ -6095,6 +6095,11 @@ const AgentFactSchema = object({
 	}).nullable(),
 	checkout: string().optional(),
 	branch: string().nullable().optional(),
+	checkIns: array(object({
+		with: string().min(1),
+		kind: _enum(["talk", "read"]),
+		since: Time
+	})).max(20).optional(),
 	extra: Extra
 });
 /**
