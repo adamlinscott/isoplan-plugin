@@ -1,12 +1,15 @@
 import fs from "node:fs";
 import path from "node:path";
 import type { Handoff } from "@isoplan/protocol";
-import { expect, test } from "vitest";
+import { expect, test, vi } from "vitest";
 import { tempRoot } from "../data-layer/fixture.js";
 import { nodeIo } from "../data-layer/io.js";
 import { createRunGit, pushHandoff, type RunGit } from "./git.js";
 import { git, remoteAndClone, workspace } from "./fixture.js";
 import { checkoutHere, findClone, findWorkspace, launch, onTheWire, parseSetup, sessionArgv, takeHandoff, trustFolder, trustKey, type Background, type Launch, type TakeOptions } from "./take.js";
+
+// Every test here drives real git, a few dozen spawns each, which is slow on Windows under load.
+vi.setConfig({ testTimeout: 30000 });
 
 const run = createRunGit();
 const SETTINGS = { gitTimeoutSeconds: 30, setupTimeoutMinutes: 15, cloneSearchDays: 30, repoSearchDepth: 3 };
@@ -412,16 +415,29 @@ test("a missing repo is cloned only from https, ssh or host:path, with Git LFS's
   const watched: RunGit = (args, opts) => (args.includes("clone") && envs.push(opts.env), run(args, opts));
   expect((await checkoutHere(watched, plain, t.handoff, folder, 30000, LOCAL)).failures).toEqual([]);
   expect(envs).toEqual([{ GIT_LFS_SKIP_SMUDGE: "1" }, { GIT_LFS_SKIP_SMUDGE: "1" }]);
+  // Taken again, the repos there are switched and reset with LFS's download off too.
+  const moves: [string, Record<string, string> | undefined][] = [];
+  const again: RunGit = (args, opts) => ((args.includes("switch") || args.includes("reset")) && moves.push([args.find((a) => a === "switch" || a === "reset")!, opts.env]), run(args, opts));
+  for (const repo of ["api", "web"]) git(path.join(plain, repo), "switch", "-q", "-c", "elsewhere");
+  expect((await checkoutHere(again, plain, t.handoff, folder, 30000, LOCAL)).failures).toEqual([]);
+  expect(moves.length).toBeGreaterThan(0);
+  for (const [, env] of moves) expect(env).toEqual({ GIT_LFS_SKIP_SMUDGE: "1" });
 }, SLOW);
 
-test("a path Windows reads as .git, in any spelling, is refused", async () => {
+test("a path Windows reads as .git, in any spelling, one with a colon (an NTFS stream), and one with an empty, . or .. part, are refused", async () => {
   const t = await severalHandedOver("w2", { parent: false });
   const plain = path.join(t.root, "plain");
   fs.mkdirSync(plain);
   const [api] = t.handoff.repos;
-  const odd: Handoff = { ...t.handoff, repos: [".GIT./hooks", ".git /hooks", "GIT~1/hooks", "a/.Git. ./b"].map((p) => ({ ...api!, path: p })) };
-  const { failures } = await checkoutHere(run, plain, odd, path.join(t.claudeDir, "isoplan", "handoffs", "w2"), 30000, LOCAL);
-  expect(failures.map((f) => f.output)).toEqual(Array(4).fill(expect.stringContaining("is inside a .git folder")));
+  const at = (paths: string[]): Handoff => ({ ...t.handoff, repos: paths.map((p) => ({ ...api!, path: p })) });
+  const folder = path.join(t.claudeDir, "isoplan", "handoffs", "w2");
+  const outputs = async (paths: string[]) => (await checkoutHere(run, plain, at(paths), folder, 30000, LOCAL)).failures.map((f) => f.output);
+  expect(await outputs([".GIT./hooks", ".git /hooks", "GIT~1/hooks", "a/.Git. ./b"])).toEqual(Array(4).fill(expect.stringContaining("is inside a .git folder")));
+  expect(await outputs(["api:stream", ".git::$INDEX_ALLOCATION/hooks"])).toEqual([
+    expect.stringContaining("has a colon in it"),
+    expect.stringContaining("is inside a .git folder"),
+  ]);
+  expect(await outputs(["./api", "api/.", "a//b", "a/../b"])).toEqual(Array(4).fill(expect.stringContaining("isn't a path of named folders")));
   expect(fs.readdirSync(plain)).toEqual([]);
 }, SLOW);
 

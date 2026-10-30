@@ -1,9 +1,12 @@
 import fs from "node:fs";
 import path from "node:path";
-import { expect, test } from "vitest";
+import { expect, test, vi } from "vitest";
 import { tempRoot } from "../data-layer/fixture.js";
 import { addedLines, createRunGit, gitFailed, handoffNote, HandoffGitError, noPromptEnv, prepare, pushHandoff, remotesOf, sameRemote, untrackedLine, withoutCredentials, type Pushed } from "./git.js";
 import { git, remoteAndClone, workspace } from "./fixture.js";
+
+// Every test here drives real git, a few dozen spawns each, which is slow on Windows under load.
+vi.setConfig({ testTimeout: 30000 });
 
 const run = createRunGit();
 const MS = 30000;
@@ -339,4 +342,46 @@ test("the home folder, or a drive's root, is too wide to hand over from; repos i
   expect(left).toContainEqual({ path: "node_modules", why: "since they are node_modules folders, which aren't looked in" });
   // A dot folder is named when it is a repo itself; what is inside one isn't looked for.
   expect(left.map((l) => l.path)).not.toContain(".cache/tool");
+}, SLOW);
+
+test("only the handoff branch's history is pushed: no tags, even with push.followTags on", async () => {
+  const { remote, clone } = remoteAndClone(tempRoot());
+  git(clone, "config", "push.followTags", "true");
+  git(clone, "commit", "-q", "--allow-empty", "-m", "local");
+  git(clone, "tag", "-a", "v9", "-m", "a release");
+  repoOf(await pushHandoff(run, clone, "t1", MS));
+  expect(refs(remote)).toBe("refs/heads/isoplan/handoff/t1\nrefs/heads/main");
+}, SLOW);
+
+test("a retry, or a later handoff, still hands over a commits-only repo with no <remote>/HEAD: its handoff branches aren't the remote's own work", async () => {
+  const w = workspace(tempRoot(), "sender");
+  const api = path.join(w.dir, "api");
+  git(api, "remote", "set-head", "origin", "-d");
+  git(api, "commit", "-q", "--allow-empty", "-m", "local");
+  expect((await prepare(run, w.dir, MS)).repos.map((r) => r.path)).toEqual([".", "api"]);
+  const first = await pushHandoff(run, w.dir, "r1", MS, { scan });
+  if ("held" in first) throw new Error("held");
+  // The push left origin/isoplan/handoff/r1 in the clone, holding that commit.
+  expect(git(api, "rev-parse", "origin/isoplan/handoff/r1")).toBe(git(api, "rev-parse", "HEAD"));
+  expect((await prepare(run, w.dir, MS)).repos.map((r) => r.path)).toEqual([".", "api"]);
+  // And the scan reads that commit again: what the remote holds on a handoff branch isn't vetted.
+  fs.writeFileSync(path.join(api, "key.js"), `const k = "${FAKE_KEY}";\n`);
+  git(api, "add", "key.js");
+  git(api, "commit", "-q", "-m", "with a key");
+  expect(await pushHandoff(run, w.dir, "r2", MS, { scan })).toMatchObject({ held: ["api/key.js"] });
+  git(api, "push", "-q", "origin", "HEAD:refs/heads/isoplan/handoff/r2");
+  expect(await pushHandoff(run, w.dir, "r2", MS, { scan })).toMatchObject({ held: ["api/key.js"] });
+}, SLOW);
+
+test("a clean repo with no remote isn't mentioned; in a plain folder, files outside every repo are named as not handed over", async () => {
+  const w = workspace(tempRoot(), "lorveil", { parent: false });
+  git(path.join(w.dir, "web"), "remote", "remove", "origin");
+  fs.writeFileSync(path.join(w.dir, "api", "server.js"), "listen(2);\n");
+  fs.writeFileSync(path.join(w.dir, "notes.md"), "plans\n");
+  fs.mkdirSync(path.join(w.dir, "docs"));
+  fs.writeFileSync(path.join(w.dir, "docs", "plan.md"), "more\n");
+  const prepared = await prepare(run, w.dir, MS);
+  expect(prepared.left).toEqual([]);
+  expect(prepared.files).toEqual(["docs/plan.md", "notes.md"]);
+  expect(handoffNote({ branch: "b", from: null, files: prepared.files, at: new Date(), repos: prepared.repos })).toContain("Untracked files, not handed over: `docs/plan.md`, `notes.md`.");
 }, SLOW);

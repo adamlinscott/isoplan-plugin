@@ -5809,18 +5809,23 @@ const Machine = object({ name: string().min(1) });
 const RequestId = string().min(1);
 /** A handoff's id. It names the handoff's branch, `isoplan/handoff/<id>`, so it keeps to safe characters. */
 const HandoffId = string().max(64).regex(/^[a-z0-9][a-z0-9-]*$/, "lowercase letters, digits and dashes");
-const isGitFolder$1 = (segment) => {
-	const name = segment.replace(/[. ]+$/, "").toLowerCase();
+/**
+* Whether a path segment is one Windows reads as `.git`: the name before any NTFS stream
+* (`.git::$INDEX_ALLOCATION`), its trailing dots and spaces dropped, in any case, or the 8.3 short
+* name of a folder that starts with `.git`.
+*/
+const isGitFolder = (segment) => {
+	const name = segment.split(":")[0].replace(/[. ]+$/, "").toLowerCase();
 	return name === ".git" || /^git~\d+$/.test(name);
 };
 /**
 * One repo a handoff pushed: its path in the session's folder (`.` for the folder itself), remote,
 * branch and commit. A handoff drives git on the receiver's machine, so the path stays inside the
 * folder, out of any `.git` folder (in any spelling Windows reads as one: `.GIT.`, `.git `, `GIT~1`),
-* and the remote can't name a transport helper such as `ext::`, which runs a command.
+* with no `:` (an NTFS stream, such as `.git::$INDEX_ALLOCATION`), and the remote can't name a transport helper such as `ext::`, which runs a command.
 */
 const HandoffRepoSchema = object({
-	path: string().min(1).refine((path) => !/^([\\/]|[A-Za-z]:)/.test(path), "a path relative to the session's folder").refine((path) => !path.split(/[\\/]/).includes(".."), "a path inside the session's folder, with no `..`").refine((path) => !path.startsWith("-"), "a path that doesn't start with `-`, which git would read as an option").refine((path) => !path.split(/[\\/]/).some(isGitFolder$1), "a path that isn't in a `.git` folder"),
+	path: string().min(1).refine((path) => !/^([\\/]|[A-Za-z]:)/.test(path), "a path relative to the session's folder").refine((path) => !path.split(/[\\/]/).includes(".."), "a path inside the session's folder, with no `..`").refine((path) => !path.startsWith("-"), "a path that doesn't start with `-`, which git would read as an option").refine((path) => !path.split(/[\\/]/).some(isGitFolder), "a path that isn't in a `.git` folder").refine((path) => !path.includes(":"), "a path with no `:`, which Windows reads as a drive or a file's stream").refine((path) => path === "." || !path.split(/[\\/]/).some((part) => part === "" || part === "." || part === ".."), "`.` itself, or a path of named folders, with no empty, `.` or `..` part"),
 	remote: string().min(1).refine((remote) => !/^[A-Za-z0-9+.-]+::/.test(remote), "a remote with no transport helper (`<transport>::`)").refine((remote) => !remote.startsWith("-"), "a remote that doesn't start with `-`, which git would read as an option"),
 	branch: string().min(1),
 	commit: string().regex(/^([0-9a-f]{40}|[0-9a-f]{64})$/, "a full commit hash")
@@ -8790,13 +8795,14 @@ function gitIn(run, cwd, timeoutMs, repo) {
 * The folders under `root` that hold a repo (a `.git` folder or file), by path from it, at most
 * `depth` folders down; and what wasn't looked in, by why, when it holds a repo itself: a folder
 * whose name starts with a dot, node_modules, a link, or one a level past `depth`, and any folder
-* that couldn't be read.
+* that couldn't be read. With `loose`, the files outside every repo too, by path from `root`.
 */
-async function reposUnder(root, depth) {
+async function reposUnder(root, depth, loose = false) {
 	const found = [];
 	const skipped = [];
+	const files = [];
 	const holdsGit = (sub) => fs.stat(path.join(root, sub, ".git")).then(() => true, () => false);
-	const walk = async (rel, level) => {
+	const walk = async (rel, level, inRepo) => {
 		let entries;
 		try {
 			entries = await fs.readdir(path.join(root, rel), { withFileTypes: true });
@@ -8810,7 +8816,10 @@ async function reposUnder(root, depth) {
 		for (const entry of entries.sort((a, b) => a.name < b.name ? -1 : 1)) {
 			const sub = rel ? `${rel}/${entry.name}` : entry.name;
 			const why = entry.isSymbolicLink() ? WHY.link : !entry.isDirectory() || entry.name === ".git" ? null : entry.name.startsWith(".") ? WHY.dot : entry.name === "node_modules" ? WHY.modules : level >= depth ? WHY.deep : "";
-			if (why === null) continue;
+			if (why === null) {
+				if (loose && !inRepo && !entry.isDirectory()) files.push(sub);
+				continue;
+			}
 			if (why) {
 				if (await holdsGit(sub)) skipped.push({
 					path: sub,
@@ -8818,14 +8827,16 @@ async function reposUnder(root, depth) {
 				});
 				continue;
 			}
-			if (await holdsGit(sub)) found.push(sub);
-			await walk(sub, level + 1);
+			const repo = await holdsGit(sub);
+			if (repo) found.push(sub);
+			await walk(sub, level + 1, inRepo || repo);
 		}
 	};
-	await walk("", 0);
+	await walk("", 0, false);
 	return {
 		found,
-		skipped
+		skipped,
+		files
 	};
 }
 /** The current branch, or null when HEAD is detached. */
@@ -8868,7 +8879,11 @@ async function inspect(run, dir, repo, timeoutMs) {
 	])).code !== 0) return "no-commit";
 	const from = await branchOf(run, dir, timeoutMs, repo);
 	const { remote } = await pushRemote(run, dir, from, timeoutMs, repo);
-	if (!remote) return "no-remote";
+	if (!remote) return (await git([
+		"status",
+		"--porcelain",
+		"--untracked-files=no"
+	])).stdout.trim() ? "no-remote" : null;
 	const found = {
 		path: repo,
 		dir,
@@ -8903,10 +8918,11 @@ async function inspect(run, dir, repo, timeoutMs) {
 		"--count",
 		"HEAD",
 		"--not",
-		...fallback ? [fallback] : [`--remotes=${remote}`, ...upstream ? [upstream] : []]
+		...fallback ? [fallback] : [...remoteOwn(remote), ...upstream ? [upstream] : []]
 	]);
 	return ahead.code !== 0 || Number(ahead.stdout.trim()) > 0 ? found : "unchanged";
 }
+const remoteOwn = (remote) => [`--exclude=${remote}/isoplan/handoff/*`, `--remotes=${remote}`];
 const tooWide = (dir, home) => pathKey(dir) === pathKey(home) || path.parse(path.resolve(dir)).root === path.resolve(dir);
 const slug = (p) => p.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 40).replace(/-+$/, "") || "repo";
 /**
@@ -8923,7 +8939,7 @@ async function prepare(run, cwd, timeoutMs, depth = 3, home = os.homedir()) {
 	const inRepo = top.code === 0;
 	const toplevel = inRepo ? top.stdout.trim() : path.resolve(cwd);
 	if (tooWide(toplevel, home)) throw new HandoffGitError("too-wide", `${toplevel} is the home folder or a drive's root, so repos aren't looked for under it`);
-	const { found, skipped } = await reposUnder(toplevel, depth);
+	const { found, skipped, files: loose } = await reposUnder(toplevel, depth, !inRepo);
 	if (!inRepo && !found.length) throw new HandoffGitError("not-a-repo", `${cwd} isn't in a git repo and has none under it: ${top.stderr.trim()}`);
 	const dirOf = (p) => p === "." ? toplevel : path.join(toplevel, p);
 	const from = inRepo ? await branchOf(run, toplevel, timeoutMs, ".") : null;
@@ -8969,7 +8985,7 @@ async function prepare(run, cwd, timeoutMs, depth = 3, home = os.homedir()) {
 			path: sub,
 			why: WHY[state]
 		});
-		else repos.push(state);
+		else if (state) repos.push(state);
 		if (state !== "unreadable") listedRepos.push(sub);
 	} catch (err) {
 		if (!(err instanceof HandoffGitError)) throw err;
@@ -8993,7 +9009,7 @@ async function prepare(run, cwd, timeoutMs, depth = 3, home = os.homedir()) {
 			suffix
 		};
 	});
-	let files = [];
+	let files = [...loose];
 	for (const p of listedRepos) {
 		const own = await untracked(run, dirOf(p), timeoutMs);
 		if (own === null) {
@@ -9073,8 +9089,14 @@ async function pushHandoff(run, cwd, id, timeoutMs, { scan, pushAnyway = {}, dep
 		const done = pushed.map((p) => p.path);
 		try {
 			const sent = await git([
+				"-c",
+				"push.followTags=false",
+				"-c",
+				"push.recurseSubmodules=no",
 				"push",
 				"--no-verify",
+				"--no-follow-tags",
+				"--recurse-submodules=no",
 				"--porcelain",
 				r.remote,
 				`+${r.commit}:refs/heads/${r.branch}`
@@ -9184,7 +9206,7 @@ async function commitIn(run, repo, id, index, timeoutMs, pushAnyway, scan) {
 		"--format=",
 		commit,
 		"--not",
-		`--remotes=${remote}`
+		...remoteOwn(remote)
 	]));
 	const held = [];
 	for (const [file, text] of lines) if (await scan(text)) held.push(inFolder(file));
@@ -9819,6 +9841,11 @@ async function checkoutIn(run, cwd, repo, branch, folder, timeoutMs) {
 		cwd,
 		timeoutMs
 	});
+	const checkout = (args) => run(args, {
+		cwd,
+		timeoutMs,
+		env: NO_LFS
+	});
 	const remotes = await remotesOf(run, cwd, timeoutMs);
 	const failed = (error, remote = null) => ({
 		error,
@@ -9853,7 +9880,7 @@ async function checkoutIn(run, cwd, repo, branch, folder, timeoutMs) {
 		"-q",
 		`refs/heads/${branch}`
 	])).code !== 0) {
-		const switched = await git([
+		const switched = await checkout([
 			...hooksOff,
 			"switch",
 			"--track",
@@ -9865,13 +9892,13 @@ async function checkoutIn(run, cwd, repo, branch, folder, timeoutMs) {
 	}
 	const extra = await ahead(run, cwd, tip, await takenBefore(folder), `refs/heads/${branch}`, timeoutMs);
 	if (extra !== 0) return failed(`The local branch ${branch} has ${extra ?? "some"} commit(s) that aren't in the handoff as handed over now, so it was left as it is. Merge or rebase them onto ${name}/${branch} yourself.`, name);
-	const switched = await git([
+	const switched = await checkout([
 		...hooksOff,
 		"switch",
 		branch
 	]);
 	if (switched.code !== 0) return failed(`git switch ${branch}: ${switched.stderr}`, name);
-	const moved = await git([
+	const moved = await checkout([
 		...hooksOff,
 		"reset",
 		"-q",
@@ -9898,17 +9925,22 @@ function onTheWire(remote) {
 	return !!scp && scp[1].length > 1 && !remote.startsWith("\\");
 }
 const realpathNative = promisify(realpath.native);
-const isGitFolder = (segment) => {
-	const name = segment.replace(/[. ]+$/, "").toLowerCase();
-	return name === ".git" || /^git~\d+$/.test(name);
-};
+const NO_LFS = { GIT_LFS_SKIP_SMUDGE: "1" };
+function badPath(p) {
+	const parts = p.split(/[\\/]/);
+	if (parts.some(isGitFolder)) return `${p} is inside a .git folder`;
+	if (p.includes(":")) return `${p} has a colon in it, which Windows reads as a drive or a file's stream`;
+	if (path.isAbsolute(p) || parts.some((part) => part === "" || part === "." || part === "..")) return `${p} isn't a path of named folders inside the folder`;
+	return null;
+}
 /**
 * A repo under the folder (#56) on its handoff branch at its path in `base`: switched where a clone
 * of it is there, cloned where there is nothing or an empty folder, from a remote `cloneFrom`
 * allows, with Git LFS's download off (a handoff never carries LFS files). The error, else null.
 */
 async function repoAt(run, base, repo, folder, timeoutMs, cloneFrom) {
-	if (repo.path.split(/[\\/]/).some(isGitFolder)) return `${repo.path} is inside a .git folder, so nothing was checked out there.`;
+	const bad = badPath(repo.path);
+	if (bad) return `${bad}, so nothing was checked out there.`;
 	const target = path.join(base, repo.path);
 	let existing = target;
 	while (!await fs.lstat(existing).then(() => true, () => false)) existing = path.dirname(existing);
@@ -9933,7 +9965,7 @@ async function repoAt(run, base, repo, folder, timeoutMs, cloneFrom) {
 		], {
 			cwd: base,
 			timeoutMs,
-			env: { GIT_LFS_SKIP_SMUDGE: "1" }
+			env: NO_LFS
 		});
 		if (cloned.code !== 0) return `git clone ${repo.remote} ${repo.path} failed${cloned.timedOut ? " (it took too long)" : ""}:\n${cloned.stderr}`;
 		await recordTaken(folder, await resolved(run, target, "HEAD", timeoutMs) ?? repo.commit);
@@ -9980,7 +10012,8 @@ async function worktreeFor(run, clone, remote, branch, id, exempt, timeoutMs) {
 				tip
 			], {
 				cwd: dir,
-				timeoutMs
+				timeoutMs,
+				env: NO_LFS
 			});
 			return moved.code === 0 ? dir : { error: `${dir} couldn't be moved to the handoff as handed over now:\n${moved.stderr}` };
 		}
@@ -10007,7 +10040,8 @@ async function worktreeFor(run, clone, remote, branch, id, exempt, timeoutMs) {
 			`${remote}/${branch}`
 		], {
 			cwd: clone,
-			timeoutMs
+			timeoutMs,
+			env: NO_LFS
 		});
 		return r.code === 0 ? dir : { error: `git worktree add ${dir} failed${r.timedOut ? " (it took too long)" : ""}:\n${r.stderr}` };
 	}

@@ -1,15 +1,17 @@
 // The git side of a handoff (#48), for the runner's brief and the /isoplan:handover command.
 //
 // Sending: the session's tracked changes go in one work-in-progress commit made from the current
-// branch's HEAD, and that commit alone is pushed, to isoplan/handoff/<id> on the remote; no local
+// branch's HEAD, and that commit alone is pushed, to isoplan/handoff/<id> on the remote (with no
+// tags and no submodule commits); no local
 // branch is made. The commit is built in a temporary index (a copy of the real one, then
 // `git add -u`), so the session's work tree, index and branch are never touched: the sender's agent
 // may be working in them. Untracked files aren't committed; the brief names them (`untracked`), and
 // untracked files .gitignore matches are never listed (a file that is tracked goes over, whatever
 // .gitignore says). The current branch and the default branch are never pushed, so a handoff
 // triggers a deploy only if CI builds isoplan/handoff/* too: leave those branches out of it. Every
-// commit the push sends that the remote doesn't have is scanned for secrets first, the lines each
-// adds; on a match nothing is pushed and the file is named, until its owner says to push that exact
+// commit the push sends that the remote doesn't have (its handoff branches aside: an earlier
+// handoff's, or this one's before a retry) is scanned for secrets first, the lines each adds; on a
+// match nothing is pushed and every matching file is named, until its owner says to push that exact
 // commit anyway. Binary files can't be read, so they are named as unchecked. A repo that uses Git
 // LFS is refused: its pointer files would go without the files themselves.
 //
@@ -21,11 +23,14 @@
 // read is named in the note as left out. The folder's own repo always goes. A repo under it goes
 // when it has work its remote's default branch hasn't: uncommitted changes to tracked files, or
 // commits that aren't on it (with no default branch known: on none of the remote's branches, nor
-// its upstream). Each one that goes is handed over by every rule above, on its own, with its own
+// its upstream, and its handoff branches not counted). Each one that goes is handed over by every
+// rule above, on its own, with its own
 // .gitignore, remote and default branch; repos that push to one remote get a branch each there
 // (`isoplan/handoff/<id>--<path>` after the first). All of them are committed and scanned before
 // any is pushed, and every match in every repo is named, so one hold covers them all. A repo under
-// the folder with work but no commit or no remote, or one git can't read, is left out and named.
+// the folder with work but no commit or no remote, or one git can't read, is left out and named;
+// a clean one with no remote is left out unsaid. In a plain folder the files outside every repo
+// are named as not handed over.
 // Git submodules are left out too and named: the commits a submodule's pointer names would need
 // pushing in the submodule's own remote. A push that fails after others went says which went;
 // handing over again with the same id pushes the rest.
@@ -293,13 +298,14 @@ function gitIn(run: RunGit, cwd: string, timeoutMs: number, repo: string) {
  * The folders under `root` that hold a repo (a `.git` folder or file), by path from it, at most
  * `depth` folders down; and what wasn't looked in, by why, when it holds a repo itself: a folder
  * whose name starts with a dot, node_modules, a link, or one a level past `depth`, and any folder
- * that couldn't be read.
+ * that couldn't be read. With `loose`, the files outside every repo too, by path from `root`.
  */
-export async function reposUnder(root: string, depth: number): Promise<{ found: string[]; skipped: Left[] }> {
+export async function reposUnder(root: string, depth: number, loose = false): Promise<{ found: string[]; skipped: Left[]; files: string[] }> {
   const found: string[] = [];
   const skipped: Left[] = [];
+  const files: string[] = [];
   const holdsGit = (sub: string) => fs.stat(path.join(root, sub, ".git")).then(() => true, () => false);
-  const walk = async (rel: string, level: number): Promise<void> => {
+  const walk = async (rel: string, level: number, inRepo: boolean): Promise<void> => {
     let entries;
     try {
       entries = await fs.readdir(path.join(root, rel), { withFileTypes: true });
@@ -310,17 +316,21 @@ export async function reposUnder(root: string, depth: number): Promise<{ found: 
     for (const entry of entries.sort((a, b) => (a.name < b.name ? -1 : 1))) {
       const sub = rel ? `${rel}/${entry.name}` : entry.name;
       const why = entry.isSymbolicLink() ? WHY.link : !entry.isDirectory() || entry.name === ".git" ? null : entry.name.startsWith(".") ? WHY.dot : entry.name === "node_modules" ? WHY.modules : level >= depth ? WHY.deep : "";
-      if (why === null) continue;
+      if (why === null) {
+        if (loose && !inRepo && !entry.isDirectory()) files.push(sub);
+        continue;
+      }
       if (why) {
         if (await holdsGit(sub)) skipped.push({ path: sub, why });
         continue;
       }
-      if (await holdsGit(sub)) found.push(sub);
-      await walk(sub, level + 1);
+      const repo = await holdsGit(sub);
+      if (repo) found.push(sub);
+      await walk(sub, level + 1, inRepo || repo);
     }
   };
-  await walk("", 0);
-  return { found, skipped };
+  await walk("", 0, false);
+  return { found, skipped, files };
 }
 
 /** The current branch, or null when HEAD is detached. */
@@ -341,7 +351,8 @@ async function pushRemote(run: RunGit, dir: string, from: string | null, timeout
 type Found = Omit<PreparedRepo, "suffix">;
 
 // A repo under the folder: what it would go out as, or why it is left. Throws for a git that fails in it.
-async function inspect(run: RunGit, dir: string, repo: string, timeoutMs: number): Promise<Found | keyof typeof WHY> {
+// Null: a repo with no remote and nothing changed, which isn't worth a line in the note.
+async function inspect(run: RunGit, dir: string, repo: string, timeoutMs: number): Promise<Found | keyof typeof WHY | null> {
   const { git, must } = gitIn(run, dir, timeoutMs, repo);
   // A .git git can't read makes git find the repo above it instead.
   const top = await git(["rev-parse", "--show-toplevel"]);
@@ -349,16 +360,19 @@ async function inspect(run: RunGit, dir: string, repo: string, timeoutMs: number
   if ((await git(["rev-parse", "--verify", "-q", "HEAD"])).code !== 0) return "no-commit";
   const from = await branchOf(run, dir, timeoutMs, repo);
   const { remote } = await pushRemote(run, dir, from, timeoutMs, repo);
-  if (!remote) return "no-remote";
+  if (!remote) return (await git(["status", "--porcelain", "--untracked-files=no"])).stdout.trim() ? "no-remote" : null;
   const found = { path: repo, dir, from, remote, url: await must(["remote", "get-url", "--push", remote]) };
   if ((await git(["status", "--porcelain", "--untracked-files=no"])).stdout.trim()) return found;
   // Commits that aren't on the default branch; with none known, on none of the remote's branches or the upstream.
   const fallback = (await git(["symbolic-ref", "-q", `refs/remotes/${remote}/HEAD`])).stdout.trim();
   const upstream = (await git(["rev-parse", "--verify", "-q", "--symbolic-full-name", "@{upstream}"])).stdout.trim();
-  const against = fallback ? [fallback] : [`--remotes=${remote}`, ...(upstream ? [upstream] : [])];
+  const against = fallback ? [fallback] : [...remoteOwn(remote), ...(upstream ? [upstream] : [])];
   const ahead = await git(["rev-list", "--count", "HEAD", "--not", ...against]);
   return ahead.code !== 0 || Number(ahead.stdout.trim()) > 0 ? found : "unchanged";
 }
+
+// The remote's own branches as this repo knows them: not the handoff branches, a retry's or an earlier handoff's.
+const remoteOwn = (remote: string) => [`--exclude=${remote}/isoplan/handoff/*`, `--remotes=${remote}`];
 
 // Whether `dir` is the home folder or a drive's root.
 const tooWide = (dir: string, home: string) => pathKey(dir) === pathKey(home) || path.parse(path.resolve(dir)).root === path.resolve(dir);
@@ -377,7 +391,8 @@ export async function prepare(run: RunGit, cwd: string, timeoutMs: number, depth
   const inRepo = top.code === 0;
   const toplevel = inRepo ? top.stdout.trim() : path.resolve(cwd);
   if (tooWide(toplevel, home)) throw new HandoffGitError("too-wide", `${toplevel} is the home folder or a drive's root, so repos aren't looked for under it`);
-  const { found, skipped } = await reposUnder(toplevel, depth);
+  // In a plain folder, the files outside every repo are named too: none of them is handed over.
+  const { found, skipped, files: loose } = await reposUnder(toplevel, depth, !inRepo);
   if (!inRepo && !found.length) throw new HandoffGitError("not-a-repo", `${cwd} isn't in a git repo and has none under it: ${top.stderr.trim()}`);
   const dirOf = (p: string) => (p === "." ? toplevel : path.join(toplevel, p));
   const from = inRepo ? await branchOf(run, toplevel, timeoutMs, ".") : null;
@@ -403,7 +418,7 @@ export async function prepare(run: RunGit, cwd: string, timeoutMs: number, depth
       }
       const state = await inspect(run, dirOf(sub), sub, timeoutMs);
       if (typeof state === "string") left.push({ path: sub, why: WHY[state] });
-      else repos.push(state);
+      else if (state) repos.push(state);
       if (state !== "unreadable") listedRepos.push(sub);
     } catch (err) {
       if (!(err instanceof HandoffGitError)) throw err;
@@ -423,7 +438,7 @@ export async function prepare(run: RunGit, cwd: string, timeoutMs: number, depth
   });
 
   // Each repo's untracked files by path in the folder, less the repos under it, which git lists as folders.
-  let files: string[] | null = [];
+  let files: string[] | null = [...loose];
   for (const p of listedRepos) {
     const own = await untracked(run, dirOf(p), timeoutMs);
     if (own === null) {
@@ -511,7 +526,8 @@ export async function pushHandoff(run: RunGit, cwd: string, id: string, timeoutM
     const done = pushed.map((p) => p.path);
     try {
       // The sender's pre-push hook doesn't run here: this push is the handoff's, in the background.
-      const sent = await git(["push", "--no-verify", "--porcelain", r.remote, `+${r.commit}:refs/heads/${r.branch}`]);
+      // Only the branch's own history goes: no tags, and no submodule's commits.
+      const sent = await git(["-c", "push.followTags=false", "-c", "push.recurseSubmodules=no", "push", "--no-verify", "--no-follow-tags", "--recurse-submodules=no", "--porcelain", r.remote, `+${r.commit}:refs/heads/${r.branch}`]);
       if (sent.code !== 0) throw new HandoffGitError(/rejected|denied|declined/i.test(sent.stderr + sent.stdout) ? "rejected" : "failed", `git push ${r.remote} ${r.branch} in ${r.dir}: ${(sent.stderr || sent.stdout).trim()}`, r.path, done);
     } catch (err) {
       if (err instanceof HandoffGitError && !err.pushed.length && done.length) throw new HandoffGitError(err.kind, err.detail, err.repo, done);
@@ -562,7 +578,7 @@ async function commitIn(run: RunGit, repo: PreparedRepo, id: string, index: stri
   await lfs(commit);
   if (!scan) return ready(commit);
   // Everything the push sends: each commit the remote doesn't have, with the lines it adds.
-  const patch = await must(["log", "-p", "-U0", "--no-color", "--no-ext-diff", "--no-renames", "--diff-merges=first-parent", "--format=", commit, "--not", `--remotes=${remote}`]);
+  const patch = await must(["log", "-p", "-U0", "--no-color", "--no-ext-diff", "--no-renames", "--diff-merges=first-parent", "--format=", commit, "--not", ...remoteOwn(remote)]);
   const { lines, binary } = addedLines(patch);
   const held: string[] = [];
   for (const [file, text] of lines) if (await scan(text)) held.push(inFolder(file));

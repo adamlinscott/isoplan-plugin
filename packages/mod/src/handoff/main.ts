@@ -34,8 +34,8 @@ import { accountOf, claudePaths, projectOf } from "../data-layer/identity.js";
 import { nodeIo } from "../data-layer/io.js";
 import { fill, loadPrompts } from "../runner/prompts.js";
 import { loadPatterns, scan } from "../runner/scan.js";
-import { createPairing, pairingLockPath, pairingPath, pairingWriteLockPath, postJson, readPairing } from "../data-layer/pairing.js";
-import { openPairedLink, PairingRefused, type CommandPairing } from "./connection.js";
+import { httpUrl, isPlainRemote, pairingPath, postJson, readPairing } from "../data-layer/pairing.js";
+import { NEEDS_PAIRING, openPairedLink, PairingRefused, type CommandPairing } from "./connection.js";
 import { createRunGit, gitFailed, handoffBranch, handoffNote, HandoffGitError, newHandoffId, prepare, pushHandoff, repoBranch, untrackedLine } from "./git.js";
 import { checkoutHere, handoffDir, setupCommand, type TakeSettings } from "./take.js";
 
@@ -95,38 +95,34 @@ async function hello(cwd: string): Promise<HelloMessage> {
   };
 }
 
+// A kept token is used while it has longer than this left, as the data layer's renewal would.
+const TOKEN_LEFT_MS = 5 * 60 * 1000;
+
 /**
- * The office server and this machine's pairing with it (#23), as a command uses it: the token goes
- * in the hello when the machine holds a credential, and is renewed as the data layer would. A
- * command never pairs the machine: it never asks the server to start a pairing, which the session's
- * data layer does, with its link in the status line.
+ * The office server and this machine's pairing with it (#23), as a command uses it: only read. The
+ * kept token goes in the hello while it is current; otherwise the credential is swapped for one for
+ * this command alone (POST <server>/token), which isn't written back. Nothing here takes the
+ * pairing's locks, writes pairing.json or starts a pairing: the session's data layer does those,
+ * with its link in the status line. When a token can't be had, the command says the machine needs
+ * pairing.
  */
-async function office(): Promise<{ server: string; pairing: CommandPairing & { close(): Promise<void> } }> {
+async function office(): Promise<{ server: string; pairing: CommandPairing }> {
   const config = await loadConfig(io, path.join(modDir, "config.json"), path.join(isoplanDir, "config.json"));
   const file = pairingPath(claudeDir);
   // The pairing is the machine's, whichever folder the session is in.
   const account = await accountOf({ readText: (p) => fs.readFile(p, "utf8").catch(() => null), run: io.run }, claudeJson, os.homedir());
-  const pairing = createPairing({
-    file,
-    lock: pairingLockPath(claudeDir),
-    writeLock: pairingWriteLockPath(claudeDir),
-    server: config.server,
-    account,
-    machine: os.hostname(),
-    emit: () => {},
-    allowPlainWs: config.allowPlainWs,
-    post: (url, body) => (new URL(url).pathname.endsWith("/pair") ? Promise.reject(new Error("a command doesn't pair this machine")) : postJson(url, body)),
-  });
   return {
     server: config.server,
     pairing: {
-      async token() {
+      async token(renew) {
         const entry = (await readPairing(file)).accounts[account.id];
         if (!entry?.credential || entry.server !== config.server) return undefined;
-        return (await pairing.token().catch((err: Error) => stop(`This machine's pairing token couldn't be had: ${err.message}`))) ?? undefined;
+        if (!config.allowPlainWs && isPlainRemote(config.server)) throw new PairingRefused(`${config.server} is plain ws:// to another machine, so this machine's pairing isn't sent over it: use wss://, or set "allowPlainWs": true in config.json.`);
+        if (!renew && entry.token && (entry.tokenExpires ?? 0) - TOKEN_LEFT_MS > Date.now()) return entry.token;
+        const answer = await postJson(httpUrl(config.server, "/token"), { credential: entry.credential }).catch(() => null);
+        if (answer?.status === 200 && typeof answer.body.token === "string") return answer.body.token;
+        throw new PairingRefused(NEEDS_PAIRING);
       },
-      refused: (code, sent) => pairing.refused(code, sent),
-      close: () => pairing.close(),
     },
   };
 }
@@ -139,8 +135,6 @@ async function exchange<T extends OfficeServerMessage>(cwd: string, first: Param
   } catch (err) {
     if (err instanceof PairingRefused) stop(`${before}${err.message}`);
     throw err;
-  } finally {
-    await pairing.close();
   }
 }
 
@@ -199,6 +193,8 @@ async function handOverCommand(argv: string[]): Promise<string> {
   // Prepared once: the note names the repos the push then hands over.
   const prepared = await prepare(run, cwd, timeoutMs, s.repoSearchDepth).catch((err: unknown) => stop(err instanceof HandoffGitError ? `Can't hand over from here: ${gitFailed(err)}.` : String(err)));
   const { from, files, repos, left } = prepared;
+  const unknown = Object.keys(pushAnyway).filter((repo) => !repos.some((r) => r.path === repo));
+  if (unknown.length) stop(`--push-anyway names ${unknown.map((r) => (r === "." ? "this folder's own repo" : r)).join(", ")}, which this doesn't hand over (it hands over ${repos.map((r) => r.path).join(", ")}). Nothing was pushed.`);
   const brief = `${written}\n\n${handoffNote({ branch: handoffBranch(id), from, files, at: new Date(), repos, left })}`;
   const patterns = await loadPatterns(path.join(modDir, "secret-patterns.json"), path.join(isoplanDir, "secret-patterns.json"), () => {});
   const matched = scan(brief, patterns);
@@ -225,7 +221,8 @@ async function handOverCommand(argv: string[]): Promise<string> {
     const branch = handoffBranch(id);
     link.send({ type: "hand-over", v: PROTOCOL_VERSION, to, handoff: { id, brief, repos: sent } });
     const answer = await link.next((m): m is HandedOverMessage => m.type === "handed-over" && m.handoff === id, ANSWER_MS);
-    if (answer.type === "error") stop(`${said(answer)}\nThe branch ${branch} is pushed; run hand-over again with the same id once that is fixed.`);
+    const pushedBranches = sent.map((r) => (r.path === "." ? r.branch : `${r.branch} in ${r.path}`)).join(", ");
+    if (answer.type === "error") stop(`${said(answer)}\nPushed: ${pushedBranches}. Run hand-over again with the same id once that is fixed.`);
     const name = (answer as HandedOverMessage).to.name || (answer as HandedOverMessage).to.id;
     if (path.resolve(path.dirname(file)) === path.resolve(outDir(id))) await fs.rm(outDir(id), { recursive: true, force: true }).catch(() => {});
     const inRepos = sent.some((r) => r.path !== ".") ? ` in ${sent.map((r) => (r.branch === branch ? r.path : `${r.path} (as ${r.branch})`)).join(", ")}` : "";

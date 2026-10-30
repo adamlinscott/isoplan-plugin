@@ -51,7 +51,7 @@ import { randomUUID } from "node:crypto";
 import { realpath } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
-import { PROTOCOL_VERSION, type Handoff, type HandoffMessage, type HandoffRepo, type TakenMessage } from "@isoplan/protocol";
+import { isGitFolder, PROTOCOL_VERSION, type Handoff, type HandoffMessage, type HandoffRepo, type TakenMessage } from "@isoplan/protocol";
 import os from "node:os";
 import { promisify } from "node:util";
 import { normalize, pathKey } from "../data-layer/git.js";
@@ -630,6 +630,8 @@ export async function checkoutHere(run: RunGit, cwd: string, handoff: Handoff, f
 // The handoff's branch checked out in the repo at `cwd`, by the shortcut's rules; the error, else null.
 async function checkoutIn(run: RunGit, cwd: string, repo: HandoffRepo, branch: string, folder: string, timeoutMs: number): Promise<{ error: string | null; remote: string | null }> {
   const git = (args: string[]) => run(args, { cwd, timeoutMs });
+  // Checking out downloads no LFS files: a handoff never carries any.
+  const checkout = (args: string[]) => run(args, { cwd, timeoutMs, env: NO_LFS });
   const remotes = await remotesOf(run, cwd, timeoutMs);
   const failed = (error: string, remote: string | null = null) => ({ error, remote });
   if (!remotes) return failed(`${cwd} isn't in a git repo.`);
@@ -648,14 +650,14 @@ async function checkoutIn(run: RunGit, cwd: string, repo: HandoffRepo, branch: s
   };
   const local = await git(["rev-parse", "--verify", "-q", `refs/heads/${branch}`]);
   if (local.code !== 0) {
-    const switched = await git([...hooksOff, "switch", "--track", "-c", branch, `${name}/${branch}`]);
+    const switched = await checkout([...hooksOff, "switch", "--track", "-c", branch, `${name}/${branch}`]);
     return switched.code === 0 ? ok() : failed(`git switch ${branch}: ${switched.stderr}`, name);
   }
   const extra = await ahead(run, cwd, tip, await takenBefore(folder), `refs/heads/${branch}`, timeoutMs);
   if (extra !== 0) return failed(`The local branch ${branch} has ${extra ?? "some"} commit(s) that aren't in the handoff as handed over now, so it was left as it is. Merge or rebase them onto ${name}/${branch} yourself.`, name);
-  const switched = await git([...hooksOff, "switch", branch]);
+  const switched = await checkout([...hooksOff, "switch", branch]);
   if (switched.code !== 0) return failed(`git switch ${branch}: ${switched.stderr}`, name);
-  const moved = await git([...hooksOff, "reset", "-q", "--keep", tip]);
+  const moved = await checkout([...hooksOff, "reset", "-q", "--keep", tip]);
   return moved.code === 0 ? ok() : failed(`${branch} couldn't be moved to the handoff as handed over now:\n${moved.stderr}`, name);
 }
 
@@ -680,11 +682,17 @@ export function onTheWire(remote: string): boolean {
 // The real path, with Windows' short 8.3 names spelled out long.
 const realpathNative = promisify(realpath.native);
 
-// A path segment Windows reads as `.git`: trailing dots and spaces dropped, in any case, or a short 8.3 name.
-const isGitFolder = (segment: string) => {
-  const name = segment.replace(/[. ]+$/, "").toLowerCase();
-  return name === ".git" || /^git~\d+$/.test(name);
-};
+// Git LFS downloads nothing on a checkout of the handoff's: a handoff never carries LFS files.
+const NO_LFS = { GIT_LFS_SKIP_SMUDGE: "1" };
+
+// Why a repo's path in the handoff isn't one to check out at, or null: what the protocol refuses, again here.
+function badPath(p: string): string | null {
+  const parts = p.split(/[\\/]/);
+  if (parts.some(isGitFolder)) return `${p} is inside a .git folder`;
+  if (p.includes(":")) return `${p} has a colon in it, which Windows reads as a drive or a file's stream`;
+  if (path.isAbsolute(p) || parts.some((part) => part === "" || part === "." || part === "..")) return `${p} isn't a path of named folders inside the folder`;
+  return null;
+}
 
 /**
  * A repo under the folder (#56) on its handoff branch at its path in `base`: switched where a clone
@@ -692,7 +700,8 @@ const isGitFolder = (segment: string) => {
  * allows, with Git LFS's download off (a handoff never carries LFS files). The error, else null.
  */
 async function repoAt(run: RunGit, base: string, repo: HandoffRepo, folder: string, timeoutMs: number, cloneFrom: (remote: string) => boolean): Promise<string | null> {
-  if (repo.path.split(/[\\/]/).some(isGitFolder)) return `${repo.path} is inside a .git folder, so nothing was checked out there.`;
+  const bad = badPath(repo.path);
+  if (bad) return `${bad}, so nothing was checked out there.`;
   const target = path.join(base, repo.path);
   // The path stays inside the folder: no link on the way (one the handoff's branch made, say)
   // leads out, and no folder on it is a .git folder by its real, long name.
@@ -707,7 +716,7 @@ async function repoAt(run: RunGit, base: string, repo: HandoffRepo, folder: stri
   if (!st || (await fs.readdir(target)).length === 0) {
     if (!cloneFrom(repo.remote)) return `${repo.path} isn't here, and ${repo.remote} isn't an https, ssh or host:path remote, so it wasn't cloned: a handoff never clones from a local path, a file:// URL or a \\\\server share. Clone it at ${target} yourself, then take the handoff again.`;
     await fs.mkdir(path.dirname(target), { recursive: true });
-    const cloned = await run([...(await noHooks()), "clone", "-q", "--branch", repo.branch, "--", repo.remote, target], { cwd: base, timeoutMs, env: { GIT_LFS_SKIP_SMUDGE: "1" } });
+    const cloned = await run([...(await noHooks()), "clone", "-q", "--branch", repo.branch, "--", repo.remote, target], { cwd: base, timeoutMs, env: NO_LFS });
     if (cloned.code !== 0) return `git clone ${repo.remote} ${repo.path} failed${cloned.timedOut ? " (it took too long)" : ""}:\n${cloned.stderr}`;
     await recordTaken(folder, (await resolved(run, target, "HEAD", timeoutMs)) ?? repo.commit);
     return null;
@@ -735,7 +744,7 @@ async function worktreeFor(run: RunGit, clone: string, remote: string, branch: s
       if (dirty || extra !== 0) {
         return { error: `${dir}, this handoff's worktree from before, has work that isn't in the handoff as handed over now (${dirty ? "uncommitted changes" : `${extra ?? "some"} commit(s)`}), so it was left as it is. Commit and push it, or move it aside, then take the handoff again.` };
       }
-      const moved = await run([...hooksOff, "reset", "-q", "--keep", tip], { cwd: dir, timeoutMs });
+      const moved = await run([...hooksOff, "reset", "-q", "--keep", tip], { cwd: dir, timeoutMs, env: NO_LFS });
       return moved.code === 0 ? dir : { error: `${dir} couldn't be moved to the handoff as handed over now:\n${moved.stderr}` };
     }
     // A local branch of the handoff's name with commits the remote's doesn't have is never reset.
@@ -743,7 +752,7 @@ async function worktreeFor(run: RunGit, clone: string, remote: string, branch: s
       const extra = await ahead(run, clone, tip, exempt, `refs/heads/${branch}`, timeoutMs);
       if (extra !== 0) return { error: `The local branch ${branch} in ${clone} has ${extra ?? "some"} commit(s) that aren't in the handoff as handed over now, so no worktree was made over it. Push or move them, then take the handoff again.` };
     }
-    const r = await run([...hooksOff, "worktree", "add", "--track", "-B", branch, dir, `${remote}/${branch}`], { cwd: clone, timeoutMs });
+    const r = await run([...hooksOff, "worktree", "add", "--track", "-B", branch, dir, `${remote}/${branch}`], { cwd: clone, timeoutMs, env: NO_LFS });
     return r.code === 0 ? dir : { error: `git worktree add ${dir} failed${r.timedOut ? " (it took too long)" : ""}:\n${r.stderr}` };
   }
   return { error: `${base} and the next eight names beside it are taken by other folders` };

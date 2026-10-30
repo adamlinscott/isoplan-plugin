@@ -2,7 +2,7 @@ import type { AddressInfo } from "node:net";
 import { PROTOCOL_VERSION, type HelloMessage, type HandOverReadyMessage, type OfficeServerMessage } from "@isoplan/protocol";
 import { afterEach, expect, test } from "vitest";
 import { WebSocketServer } from "ws";
-import { openPairedLink, PAIRING_REFUSED, PairingRefused, type CommandPairing } from "./connection.js";
+import { NEEDS_PAIRING, openPairedLink, PAIRING_REFUSED, PairingRefused, type CommandPairing } from "./connection.js";
 
 const hello: HelloMessage = {
   type: "hello",
@@ -55,21 +55,22 @@ async function office(answer: (token: unknown) => string | null) {
   return { url: `ws://127.0.0.1:${(wss.address() as AddressInfo).port}/data-layer`, hellos, seen };
 }
 
+// A pairing that hands out `tokens` in turn, and records whether each was asked to renew.
 function pairing(tokens: (string | undefined)[]) {
-  const refused: [string, string | undefined][] = [];
-  const p: CommandPairing = { token: async () => tokens.shift(), refused: async (code, sent) => void refused.push([code, sent]) };
-  return { p, refused };
+  const asked: boolean[] = [];
+  const p: CommandPairing = { token: async (renew) => (asked.push(renew), tokens.shift()) };
+  return { p, asked };
 }
 
 test("the hello carries the machine's token; one refused as token-expired is sent again, renewed, and what it carried is acted on once", async () => {
   const server = await office((token) => (token === OLD ? "token-expired" : null));
-  const { p, refused } = pairing([OLD, NEW]);
+  const { p, asked } = pairing([OLD, NEW]);
   const { link, answer } = await openPairedLink(server.url, hello, p, check, ready, 5000);
   await link.close();
   expect(answer.type).toBe("hand-over-ready");
   expect(server.hellos).toEqual([OLD, NEW]);
   expect(server.seen).toEqual(["hand-over-check"]);
-  expect(refused).toEqual([["token-expired", OLD]]);
+  expect(asked).toEqual([false, true]);
 });
 
 test("with no credential the hello has no token; a server that signs nobody in takes it", async () => {
@@ -79,19 +80,29 @@ test("with no credential the hello has no token; a server that signs nobody in t
   expect(server.hellos).toEqual([undefined]);
 });
 
-test("not-paired, pairing-ended and forged-hello end the command with what to do, and never pair; pairing-ended drops what it sent", async () => {
+test("not-paired, pairing-ended and forged-hello end the command with what to do; a token that can't be had says the machine needs pairing", async () => {
   for (const code of ["not-paired", "pairing-ended", "forged-hello"] as const) {
     const server = await office(() => code);
-    const { p, refused } = pairing([code === "not-paired" ? undefined : OLD]);
+    const { p, asked } = pairing([code === "not-paired" ? undefined : OLD]);
     const failed = await openPairedLink(server.url, hello, p, check, ready, 5000).catch((err: unknown) => err);
     expect(failed, code).toBeInstanceOf(PairingRefused);
     expect((failed as Error).message).toBe(PAIRING_REFUSED[code]);
-    expect(refused).toEqual(code === "pairing-ended" ? [["pairing-ended", OLD]] : []);
+    expect(asked).toEqual([false]);
     expect(server.seen).toEqual([]);
   }
   // A renewed token refused again isn't tried a third time.
   const server = await office(() => "token-expired");
-  const failed = await openPairedLink(server.url, hello, pairing([OLD, NEW, NEW]).p, check, ready, 5000).catch((err: unknown) => err);
-  expect((failed as Error).message).toContain("even renewed");
+  const again = await openPairedLink(server.url, hello, pairing([OLD, NEW, NEW]).p, check, ready, 5000).catch((err: unknown) => err);
+  expect((again as Error).message).toBe(`The office server refused this machine's token, even renewed. ${NEEDS_PAIRING}`);
   expect(server.hellos).toEqual([OLD, NEW]);
+  // token-expired for a hello that carried none isn't retried, and says so.
+  const none = await office(() => "token-expired");
+  const unsent = await openPairedLink(none.url, hello, pairing([undefined, NEW]).p, check, ready, 5000).catch((err: unknown) => err);
+  expect((unsent as Error).message).toContain("though none was sent");
+  expect(none.hellos).toEqual([undefined]);
+  // A pairing whose renewal fails stops before any link opens.
+  const unrenewed: CommandPairing = { token: async () => Promise.reject(new PairingRefused(NEEDS_PAIRING)) };
+  const fresh = await office(() => null);
+  expect(await openPairedLink(fresh.url, hello, unrenewed, check, ready, 5000).catch((err: Error) => err.message)).toBe(NEEDS_PAIRING);
+  expect(fresh.hellos).toEqual([]);
 });

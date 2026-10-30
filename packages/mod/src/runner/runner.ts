@@ -67,9 +67,8 @@ export interface RunnerOptions {
   isDir: (path: string) => Promise<boolean>;
   /** Whether the data layer would report this session, so the server may ask about it. */
   isReported: (session: string, lead: Lead) => Promise<boolean>;
-  /** Pushes the handoff's work and returns its repos (#48); without it, briefs are refused. */
   /**
-   * Pushes the handoff's work and returns its repos (#48), or the file whose added lines matched a
+   * Pushes the handoff's work and returns its repos (#48), or every file whose added lines matched a
    * secret pattern, by path in the session's folder, and the commit held in each repo with one
    * (#56), with nothing pushed, unless `pushAnyway` names those commits. Without it, briefs are refused.
    */

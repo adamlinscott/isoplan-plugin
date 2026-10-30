@@ -3,8 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { execFile, spawn, spawnSync } from "node:child_process";
-import { createHash, randomBytes } from "node:crypto";
-import http from "node:http";
+import { randomBytes } from "node:crypto";
 import { realpath } from "node:fs";
 import { promisify } from "node:util";
 //#region ../../node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/core/util.js
@@ -5809,18 +5808,23 @@ const Machine = object({ name: string().min(1) });
 const RequestId = string().min(1);
 /** A handoff's id. It names the handoff's branch, `isoplan/handoff/<id>`, so it keeps to safe characters. */
 const HandoffId = string().max(64).regex(/^[a-z0-9][a-z0-9-]*$/, "lowercase letters, digits and dashes");
-const isGitFolder$1 = (segment) => {
-	const name = segment.replace(/[. ]+$/, "").toLowerCase();
+/**
+* Whether a path segment is one Windows reads as `.git`: the name before any NTFS stream
+* (`.git::$INDEX_ALLOCATION`), its trailing dots and spaces dropped, in any case, or the 8.3 short
+* name of a folder that starts with `.git`.
+*/
+const isGitFolder = (segment) => {
+	const name = segment.split(":")[0].replace(/[. ]+$/, "").toLowerCase();
 	return name === ".git" || /^git~\d+$/.test(name);
 };
 /**
 * One repo a handoff pushed: its path in the session's folder (`.` for the folder itself), remote,
 * branch and commit. A handoff drives git on the receiver's machine, so the path stays inside the
 * folder, out of any `.git` folder (in any spelling Windows reads as one: `.GIT.`, `.git `, `GIT~1`),
-* and the remote can't name a transport helper such as `ext::`, which runs a command.
+* with no `:` (an NTFS stream, such as `.git::$INDEX_ALLOCATION`), and the remote can't name a transport helper such as `ext::`, which runs a command.
 */
 const HandoffRepoSchema = object({
-	path: string().min(1).refine((path) => !/^([\\/]|[A-Za-z]:)/.test(path), "a path relative to the session's folder").refine((path) => !path.split(/[\\/]/).includes(".."), "a path inside the session's folder, with no `..`").refine((path) => !path.startsWith("-"), "a path that doesn't start with `-`, which git would read as an option").refine((path) => !path.split(/[\\/]/).some(isGitFolder$1), "a path that isn't in a `.git` folder"),
+	path: string().min(1).refine((path) => !/^([\\/]|[A-Za-z]:)/.test(path), "a path relative to the session's folder").refine((path) => !path.split(/[\\/]/).includes(".."), "a path inside the session's folder, with no `..`").refine((path) => !path.startsWith("-"), "a path that doesn't start with `-`, which git would read as an option").refine((path) => !path.split(/[\\/]/).some(isGitFolder), "a path that isn't in a `.git` folder").refine((path) => !path.includes(":"), "a path with no `:`, which Windows reads as a drive or a file's stream").refine((path) => path === "." || !path.split(/[\\/]/).some((part) => part === "" || part === "." || part === ".."), "`.` itself, or a path of named folders, with no empty, `.` or `..` part"),
 	remote: string().min(1).refine((remote) => !/^[A-Za-z0-9+.-]+::/.test(remote), "a remote with no transport helper (`<transport>::`)").refine((remote) => !remote.startsWith("-"), "a remote that doesn't start with `-`, which git would read as an option"),
 	branch: string().min(1),
 	commit: string().regex(/^([0-9a-f]{40}|[0-9a-f]{64})$/, "a full commit hash")
@@ -6531,139 +6535,8 @@ function scan(text, patterns) {
 	return patterns.find((p) => p.regex.test(text))?.name ?? null;
 }
 //#endregion
-//#region src/wake/lock.ts
-async function readText(file) {
-	try {
-		const [text, st] = await Promise.all([fs.readFile(file, "utf8"), fs.stat(file)]);
-		return {
-			text,
-			mtimeMs: st.mtimeMs
-		};
-	} catch {
-		return null;
-	}
-}
-function parseLock(text, mtimeMs) {
-	try {
-		const { pid, until, ...extra } = JSON.parse(text);
-		return {
-			pid: Number.isSafeInteger(pid) && pid > 0 ? pid : null,
-			until: typeof until === "number" ? until : null,
-			mtimeMs,
-			extra
-		};
-	} catch {
-		return null;
-	}
-}
-async function readLock(file) {
-	const r = await readText(file);
-	return r && parseLock(r.text, r.mtimeMs);
-}
-/** The pid the lock names, or null when there is none or it can't be read. */
-async function lockHolder(file) {
-	return (await readLock(file))?.pid ?? null;
-}
-const held = (lock, now, { isAlive = alive, freshMs }) => !!lock && (lock.until !== null && lock.until > now || lock.pid !== null && isAlive(lock.pid) && (freshMs === void 0 || now - lock.mtimeMs < freshMs));
-/**
-* Takes the lock for `pid`; false when it is held (`isHeld`). With `force` (the plugin's data
-* layer) it is taken regardless: a detached one holding it sees that and steps aside. `extra` is
-* written into the lock beside the pid.
-*
-* A new lock is created exclusively, so of two takers at once only one gets it. A stale one is
-* moved aside by rename, which only one taker can do to the same file, and the taker checks that
-* what it moved is the lock it judged stale, by its text and its write time, so a lock its holder
-* refreshed meanwhile isn't taken: one that moved another's lock instead puts it back and loses.
-* With `force` a lock that can't be moved (on Windows a scanner may have it open) is tried again
-* after a short wait, then overwritten, so the plugin's data layer always gets it.
-*/
-async function takeLock(file, pid, isAlive = alive, force = false, now = Date.now(), { freshMs, extra = {} } = {}) {
-	await fs.mkdir(path.dirname(file), { recursive: true });
-	const body = JSON.stringify({
-		pid,
-		...extra
-	});
-	for (let tries = 0; tries < 5; tries++) {
-		if (tries && force) await new Promise((r) => setTimeout(r, 20 * tries));
-		try {
-			await fs.writeFile(file, body, { flag: "wx" });
-			return true;
-		} catch (err) {
-			if (err.code !== "EEXIST") throw err;
-		}
-		const seen = await readText(file);
-		if (!seen) continue;
-		const lock = parseLock(seen.text, seen.mtimeMs);
-		if (!force && lock?.pid !== pid && held(lock, now, {
-			isAlive,
-			freshMs
-		})) return false;
-		const aside = `${file}.${pid}-${Math.random().toString(36).slice(2)}`;
-		try {
-			await fs.rename(file, aside);
-		} catch (err) {
-			if ([
-				"ENOENT",
-				"EPERM",
-				"EBUSY",
-				"EACCES"
-			].includes(err.code ?? "")) continue;
-			throw err;
-		}
-		const moved = await fs.readFile(aside, "utf8").catch(() => null);
-		const movedAt = (await fs.stat(aside).catch(() => null))?.mtimeMs;
-		if (moved !== seen.text || movedAt !== seen.mtimeMs) {
-			await fs.link(aside, file).catch(() => {});
-			await fs.rm(aside, { force: true });
-			if (!force) return false;
-			continue;
-		}
-		await fs.rm(aside, { force: true });
-	}
-	if (!force) return false;
-	await fs.writeFile(file, body);
-	return true;
-}
-/**
-* Marks the lock `pid` holds as fresh; false when another has taken it. A lock briefly missing (a
-* taker moved it aside to look, and is putting it back) is looked at again once, after `retryMs`.
-*/
-async function refreshLock(file, pid, now = Date.now(), retryMs = 250) {
-	let holder = await lockHolder(file);
-	if (holder === null) {
-		await new Promise((r) => setTimeout(r, retryMs));
-		holder = await lockHolder(file);
-	}
-	if (holder !== pid) return false;
-	const t = new Date(now);
-	await fs.utimes(file, t, t);
-	return true;
-}
-/** Removes the lock if it still names `pid`. */
-async function releaseLock(file, pid) {
-	if (await lockHolder(file) === pid) await fs.rm(file, { force: true });
-}
-function alive(pid) {
-	try {
-		process.kill(pid, 0);
-		return true;
-	} catch (err) {
-		return err.code === "EPERM";
-	}
-}
-//#endregion
 //#region src/data-layer/pairing.ts
-/** Renewed this long before it runs out. */
-const RENEW_EARLY_MS = 3e5;
-const PAIRING_REFRESH_MS = 2e4;
-/** pairing.write.lock: free once this old, and waited for at most WRITE_WAIT_MS. */
-const WRITE_FRESH_MS = 1e4;
-const WRITE_WAIT_MS = 1e4;
-/** How often the callback tries to write the credential it got before saying it couldn't. */
-const WRITE_TRIES = 4;
 const pairingPath = (claudeDir) => path.join(claudeDir, "isoplan", "pairing.json");
-const pairingLockPath = (claudeDir) => path.join(claudeDir, "isoplan", "pairing.lock");
-const pairingWriteLockPath = (claudeDir) => path.join(claudeDir, "isoplan", "pairing.write.lock");
 const postJson = async (url, body) => {
 	const response = await fetch(url, {
 		method: "POST",
@@ -6702,302 +6575,6 @@ async function readPairing(file) {
 	} catch {
 		return { accounts: {} };
 	}
-}
-/** Written whole, through a temp file, so a reader never sees half of it; owner-only. */
-async function writePairing(file, value) {
-	await fs.mkdir(path.dirname(file), { recursive: true });
-	const temp = `${file}.${process.pid}.${randomBytes(4).toString("hex")}`;
-	await fs.writeFile(temp, JSON.stringify(value, null, 2) + "\n", { mode: 384 });
-	try {
-		await fs.rename(temp, file);
-	} catch (err) {
-		await fs.rm(temp, { force: true }).catch(() => {});
-		throw err;
-	}
-}
-const queues = /* @__PURE__ */ new Map();
-/** Runs `change` on pairing.json under both locks, and writes what it returns (or nothing, for null). */
-async function locked(file, writeLock, pid, isAlive, change) {
-	const run = async () => {
-		const until = Date.now() + WRITE_WAIT_MS;
-		while (!await takeLock(writeLock, pid, isAlive, false, Date.now(), { freshMs: WRITE_FRESH_MS })) {
-			if (Date.now() > until) throw new Error(`couldn't take ${writeLock} in ${WRITE_WAIT_MS / 1e3} s`);
-			await new Promise((r) => setTimeout(r, 25));
-		}
-		try {
-			const { write, result } = change(await readPairing(file));
-			if (write) await writePairing(file, write);
-			return result;
-		} finally {
-			await releaseLock(writeLock, pid).catch(() => {});
-		}
-	};
-	const next = (queues.get(file) ?? Promise.resolve()).then(run, run);
-	queues.set(file, next.catch(() => {}));
-	return next;
-}
-const page = (worked, text) => `<!doctype html><meta charset="utf-8"><title>Isoplan: ${worked ? "paired" : "not paired"}</title><p style="font:16px system-ui;margin:3em auto;max-width:30em">${text}</p>`;
-const HTML = {
-	"content-type": "text/html; charset=utf-8",
-	connection: "close"
-};
-function createPairing({ file, lock, writeLock, server, account, machine, emit, allowPlainWs = false, post = postJson, now = Date.now, pid = process.pid, isAlive = alive, retryMs = 200 }) {
-	let asked = false;
-	let shown = null;
-	let unreadable = false;
-	let callback = null;
-	const empty = () => ({ server });
-	const entryOf = (all) => {
-		const kept = all.accounts[account.id];
-		return kept && kept.server === server ? kept : empty();
-	};
-	const withEntry = (all, entry) => ({
-		...all,
-		accounts: {
-			...all.accounts,
-			[account.id]: entry
-		}
-	});
-	const mine = async () => entryOf(await readPairing(file));
-	const update = (decide) => locked(file, writeLock, pid, isAlive, (all) => {
-		const { entry, result } = decide(entryOf(all));
-		return {
-			write: entry ? withEntry(all, entry) : null,
-			result
-		};
-	});
-	const drop = ({ credential: _, token: __, tokenExpires: ___, ...rest }) => rest;
-	const show = (waiting) => {
-		if (shown === waiting.url) return;
-		shown = waiting.url;
-		emit({
-			type: "pair",
-			server,
-			url: waiting.url,
-			expires: new Date(waiting.expires).toISOString()
-		});
-	};
-	const plainRefused = () => {
-		if (!allowPlainWs && isPlainRemote(server)) throw new Error(`${server} is plain ws:// to another machine, so this machine's credential isn't sent; use wss://, or set "allowPlainWs": true in config.json`);
-	};
-	async function renew(used) {
-		const answer = await post(httpUrl(server, "/token"), { credential: used });
-		if (answer.status === 200 && typeof answer.body.token === "string") {
-			const token = answer.body.token;
-			const expires = Date.parse(String(answer.body.expires));
-			return update((e) => e.credential === used ? {
-				entry: {
-					...e,
-					token,
-					tokenExpires: Number.isFinite(expires) ? expires : now()
-				},
-				result: token
-			} : {
-				entry: null,
-				result: void 0
-			});
-		}
-		if (answer.status === 401 && answer.body.code === "pairing-ended") {
-			emit({
-				type: "log",
-				text: `the office server says this machine's pairing has ended: ${String(answer.body.error ?? "")}`
-			});
-			asked = true;
-			return update((e) => ({
-				entry: e.credential === used ? drop(e) : null,
-				result: void 0
-			}));
-		}
-		throw new Error(`the office server answered ${answer.status} when renewing this machine's token`);
-	}
-	async function stopAnswering() {
-		if (!callback) return;
-		for (const timer of callback.timers) clearTimeout(timer);
-		callback.server.close();
-		callback = null;
-		await update((e) => ({
-			entry: e.waiting ? (({ waiting: _, ...rest }) => rest)(e) : null,
-			result: void 0
-		})).catch(() => {});
-		await releaseLock(lock, pid).catch(() => {});
-	}
-	async function keep(credential) {
-		for (let i = 0; i < WRITE_TRIES; i++) try {
-			await update((e) => ({
-				entry: (({ waiting: _, ...rest }) => ({
-					...rest,
-					credential
-				}))(e),
-				result: void 0
-			}));
-			return true;
-		} catch (err) {
-			emit({
-				type: "log",
-				text: `couldn't write this machine's credential (try ${i + 1}): ${String(err?.message ?? err)}`
-			});
-			await new Promise((r) => setTimeout(r, retryMs * 2 ** i));
-		}
-		return false;
-	}
-	async function finish(code, verifier, response) {
-		let worked = false;
-		let text = "This machine couldn't be paired: the office server couldn't be reached. Click the link in Claude Code again in a moment.";
-		try {
-			const answer = await post(httpUrl(server, "/pair/token"), {
-				code,
-				verifier
-			});
-			if (answer.status === 200 && typeof answer.body.credential === "string") {
-				worked = await keep(answer.body.credential);
-				text = worked ? "This machine is paired with the office. You can close this tab; Claude Code reports to it within a few seconds." : "The office paired this machine, but its credential couldn't be saved here. Claude Code shows a new link to try again.";
-				emit({
-					type: "log",
-					text: worked ? "this machine is paired with the office server" : "couldn't save this machine's credential; pairing again"
-				});
-			} else {
-				text = "This machine couldn't be paired: the link was used or has expired. Claude Code shows a new one.";
-				emit({
-					type: "log",
-					text: `the office server didn't pair this machine (${answer.status}): ${String(answer.body.error ?? "")}`
-				});
-			}
-		} catch (err) {
-			emit({
-				type: "log",
-				text: `couldn't finish pairing: ${String(err?.message ?? err)}`
-			});
-		}
-		try {
-			response.writeHead(worked ? 200 : 400, HTML).end(page(worked, text));
-		} catch {}
-		await stopAnswering().catch(() => {});
-	}
-	async function startPairing() {
-		const verifier = randomBytes(32).toString("base64url");
-		const challenge = createHash("sha256").update(verifier).digest("base64url");
-		const nonce = randomBytes(16).toString("base64url");
-		let finishing = false;
-		const listener = http.createServer((request, response) => {
-			const url = new URL(request.url ?? "/", "http://127.0.0.1");
-			const code = url.searchParams.get("code");
-			if (request.method !== "GET" || url.pathname !== `/${nonce}` || !code || finishing) {
-				response.writeHead(404, HTML).end(page(false, "Not found."));
-				return;
-			}
-			finishing = true;
-			finish(code, verifier, response);
-		});
-		listener.on("error", () => {});
-		await new Promise((resolve, reject) => listener.once("error", reject).listen(0, "127.0.0.1", () => resolve()));
-		listener.unref();
-		const { port } = listener.address();
-		const refresh = setInterval(() => void refreshLock(lock, pid).catch(() => {}), PAIRING_REFRESH_MS);
-		refresh.unref();
-		callback = {
-			server: listener,
-			timers: [refresh]
-		};
-		try {
-			const machineId = await locked(file, writeLock, pid, isAlive, (all) => {
-				if (all.machine) return {
-					write: null,
-					result: all.machine
-				};
-				const made = randomBytes(16).toString("base64url");
-				return {
-					write: {
-						...all,
-						machine: made
-					},
-					result: made
-				};
-			});
-			const answer = await post(httpUrl(server, "/pair"), {
-				account,
-				machine: {
-					name: machine,
-					id: machineId
-				},
-				callback: `http://127.0.0.1:${port}/${nonce}`,
-				challenge
-			});
-			if (answer.status !== 200 || typeof answer.body.url !== "string") throw new Error(`the office server answered ${answer.status} when asked to pair${answer.body.error ? `: ${String(answer.body.error)}` : ""}`);
-			const waiting = {
-				url: answer.body.url,
-				expires: Date.parse(String(answer.body.expires)) || now()
-			};
-			const expiry = setTimeout(() => void stopAnswering(), Math.max(0, waiting.expires - now()));
-			expiry.unref();
-			callback.timers.push(expiry);
-			await update((e) => ({
-				entry: {
-					...e,
-					waiting
-				},
-				result: void 0
-			}));
-			show(waiting);
-		} catch (err) {
-			await stopAnswering();
-			throw err;
-		}
-	}
-	return {
-		async token() {
-			const entry = await mine();
-			if (entry.token && (entry.tokenExpires ?? 0) - RENEW_EARLY_MS > now()) {
-				plainRefused();
-				return entry.token;
-			}
-			if (entry.credential) {
-				plainRefused();
-				const renewed = await renew(entry.credential);
-				if (renewed) return renewed;
-				const again = await mine();
-				if (again.token && again.token !== entry.token) return again.token;
-			}
-			if (!asked && !entry.waiting) return void 0;
-			if (callback) return null;
-			plainRefused();
-			if (!await takeLock(lock, pid, isAlive, false, Date.now(), { freshMs: 6e4 })) {
-				if (entry.waiting && entry.waiting.expires > now()) show(entry.waiting);
-				return null;
-			}
-			await startPairing();
-			return null;
-		},
-		async refused(code, sent) {
-			if (code !== "token-expired") asked = true;
-			if (code === "not-paired" && sent) {
-				if (!unreadable) emit({
-					type: "log",
-					text: "the office server didn't find this machine's token in its hello; it may be older than pairing. The credential is kept."
-				});
-				unreadable = true;
-				return;
-			}
-			if (!sent) return;
-			await update((e) => {
-				if (e.token !== sent) return {
-					entry: null,
-					result: void 0
-				};
-				if (code === "token-expired") return {
-					entry: {
-						...e,
-						tokenExpires: 0
-					},
-					result: void 0
-				};
-				return {
-					entry: code === "pairing-ended" ? drop(e) : null,
-					result: void 0
-				};
-			});
-		},
-		close: stopAnswering
-	};
 }
 //#endregion
 //#region src/handoff/connection.ts
@@ -7054,10 +6631,12 @@ async function openSideLink(url, hello, timeoutMs) {
 		}
 	};
 }
-/** What a command is told when the office server refuses its hello for this machine's pairing (#23). */
+/** What a command is told when this machine has to be paired (again) before the office takes it (#23). */
+const NEEDS_PAIRING = "This machine needs pairing with the office before it takes this: open Claude Code on this computer to see its \"Pair this machine\" link in the status line, approve it in the office, then run this again.";
+/** What a command is told when the office server refuses its hello for this machine's pairing. */
 const PAIRING_REFUSED = {
-	"not-paired": "This machine isn't paired with the office server, which signs people in, so it refused this. A Claude Code session on this computer shows a \"Pair this machine\" link in its status line: open it here, approve it in the office, then run this again.",
-	"pairing-ended": "This machine's pairing with the office has ended (it was revoked, or it lapsed), so the office server refused this. A Claude Code session on this computer shows a new \"Pair this machine\" link in its status line: approve it in the office, then run this again.",
+	"not-paired": NEEDS_PAIRING,
+	"pairing-ended": `This machine's pairing with the office has ended (it was revoked, or it lapsed). ${NEEDS_PAIRING}`,
 	"forged-hello": "The office server says another paired machine reports this session, so it won't take this from here."
 };
 /** The office server refused the command's hello for this machine's pairing; the message says what to do. */
@@ -7066,12 +6645,11 @@ var PairingRefused = class extends Error {};
 * Opens a side link as this machine's pairing and sends `first`, returning the link and the first
 * answer `wanted` accepts (or the server's error). A hello refused as token-expired is tried once
 * more with a renewed token: the server reads nothing after a hello it refuses, so `first` hadn't
-* been acted on. A refusal for the pairing itself throws PairingRefused; a command never pairs the
-* machine, which the session's data layer does.
+* been acted on. A refusal for the pairing itself throws PairingRefused, saying what to do.
 */
 async function openPairedLink(url, hello, pairing, first, wanted, timeoutMs) {
 	for (let renewed = false;; renewed = true) {
-		const token = await pairing.token();
+		const token = await pairing.token(renewed);
 		const link = await openSideLink(url, token ? {
 			...hello,
 			token
@@ -7090,12 +6668,8 @@ async function openPairedLink(url, hello, pairing, first, wanted, timeoutMs) {
 			answer
 		};
 		await link.close();
-		if (code === "token-expired" && token && !renewed) {
-			await pairing.refused("token-expired", token);
-			continue;
-		}
-		if (code === "pairing-ended") await pairing.refused("pairing-ended", token);
-		throw new PairingRefused(code === "token-expired" ? "The office server refused this machine's token, even renewed: run this again shortly." : PAIRING_REFUSED[code]);
+		if (code === "token-expired" && token && !renewed) continue;
+		throw new PairingRefused(code !== "token-expired" ? PAIRING_REFUSED[code] : token ? `The office server refused this machine's token, even renewed. ${NEEDS_PAIRING}` : `The office server says this machine's token has run out, though none was sent: this machine holds no pairing for it. ${NEEDS_PAIRING}`);
 	}
 }
 new TextEncoder();
@@ -7356,13 +6930,14 @@ function gitIn(run, cwd, timeoutMs, repo) {
 * The folders under `root` that hold a repo (a `.git` folder or file), by path from it, at most
 * `depth` folders down; and what wasn't looked in, by why, when it holds a repo itself: a folder
 * whose name starts with a dot, node_modules, a link, or one a level past `depth`, and any folder
-* that couldn't be read.
+* that couldn't be read. With `loose`, the files outside every repo too, by path from `root`.
 */
-async function reposUnder(root, depth) {
+async function reposUnder(root, depth, loose = false) {
 	const found = [];
 	const skipped = [];
+	const files = [];
 	const holdsGit = (sub) => fs.stat(path.join(root, sub, ".git")).then(() => true, () => false);
-	const walk = async (rel, level) => {
+	const walk = async (rel, level, inRepo) => {
 		let entries;
 		try {
 			entries = await fs.readdir(path.join(root, rel), { withFileTypes: true });
@@ -7376,7 +6951,10 @@ async function reposUnder(root, depth) {
 		for (const entry of entries.sort((a, b) => a.name < b.name ? -1 : 1)) {
 			const sub = rel ? `${rel}/${entry.name}` : entry.name;
 			const why = entry.isSymbolicLink() ? WHY.link : !entry.isDirectory() || entry.name === ".git" ? null : entry.name.startsWith(".") ? WHY.dot : entry.name === "node_modules" ? WHY.modules : level >= depth ? WHY.deep : "";
-			if (why === null) continue;
+			if (why === null) {
+				if (loose && !inRepo && !entry.isDirectory()) files.push(sub);
+				continue;
+			}
 			if (why) {
 				if (await holdsGit(sub)) skipped.push({
 					path: sub,
@@ -7384,14 +6962,16 @@ async function reposUnder(root, depth) {
 				});
 				continue;
 			}
-			if (await holdsGit(sub)) found.push(sub);
-			await walk(sub, level + 1);
+			const repo = await holdsGit(sub);
+			if (repo) found.push(sub);
+			await walk(sub, level + 1, inRepo || repo);
 		}
 	};
-	await walk("", 0);
+	await walk("", 0, false);
 	return {
 		found,
-		skipped
+		skipped,
+		files
 	};
 }
 /** The current branch, or null when HEAD is detached. */
@@ -7434,7 +7014,11 @@ async function inspect(run, dir, repo, timeoutMs) {
 	])).code !== 0) return "no-commit";
 	const from = await branchOf(run, dir, timeoutMs, repo);
 	const { remote } = await pushRemote(run, dir, from, timeoutMs, repo);
-	if (!remote) return "no-remote";
+	if (!remote) return (await git([
+		"status",
+		"--porcelain",
+		"--untracked-files=no"
+	])).stdout.trim() ? "no-remote" : null;
 	const found = {
 		path: repo,
 		dir,
@@ -7469,10 +7053,11 @@ async function inspect(run, dir, repo, timeoutMs) {
 		"--count",
 		"HEAD",
 		"--not",
-		...fallback ? [fallback] : [`--remotes=${remote}`, ...upstream ? [upstream] : []]
+		...fallback ? [fallback] : [...remoteOwn(remote), ...upstream ? [upstream] : []]
 	]);
 	return ahead.code !== 0 || Number(ahead.stdout.trim()) > 0 ? found : "unchanged";
 }
+const remoteOwn = (remote) => [`--exclude=${remote}/isoplan/handoff/*`, `--remotes=${remote}`];
 const tooWide = (dir, home) => pathKey(dir) === pathKey(home) || path.parse(path.resolve(dir)).root === path.resolve(dir);
 const slug = (p) => p.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 40).replace(/-+$/, "") || "repo";
 /**
@@ -7489,7 +7074,7 @@ async function prepare(run, cwd, timeoutMs, depth = 3, home = os.homedir()) {
 	const inRepo = top.code === 0;
 	const toplevel = inRepo ? top.stdout.trim() : path.resolve(cwd);
 	if (tooWide(toplevel, home)) throw new HandoffGitError("too-wide", `${toplevel} is the home folder or a drive's root, so repos aren't looked for under it`);
-	const { found, skipped } = await reposUnder(toplevel, depth);
+	const { found, skipped, files: loose } = await reposUnder(toplevel, depth, !inRepo);
 	if (!inRepo && !found.length) throw new HandoffGitError("not-a-repo", `${cwd} isn't in a git repo and has none under it: ${top.stderr.trim()}`);
 	const dirOf = (p) => p === "." ? toplevel : path.join(toplevel, p);
 	const from = inRepo ? await branchOf(run, toplevel, timeoutMs, ".") : null;
@@ -7535,7 +7120,7 @@ async function prepare(run, cwd, timeoutMs, depth = 3, home = os.homedir()) {
 			path: sub,
 			why: WHY[state]
 		});
-		else repos.push(state);
+		else if (state) repos.push(state);
 		if (state !== "unreadable") listedRepos.push(sub);
 	} catch (err) {
 		if (!(err instanceof HandoffGitError)) throw err;
@@ -7559,7 +7144,7 @@ async function prepare(run, cwd, timeoutMs, depth = 3, home = os.homedir()) {
 			suffix
 		};
 	});
-	let files = [];
+	let files = [...loose];
 	for (const p of listedRepos) {
 		const own = await untracked(run, dirOf(p), timeoutMs);
 		if (own === null) {
@@ -7639,8 +7224,14 @@ async function pushHandoff(run, cwd, id, timeoutMs, { scan, pushAnyway = {}, dep
 		const done = pushed.map((p) => p.path);
 		try {
 			const sent = await git([
+				"-c",
+				"push.followTags=false",
+				"-c",
+				"push.recurseSubmodules=no",
 				"push",
 				"--no-verify",
+				"--no-follow-tags",
+				"--recurse-submodules=no",
 				"--porcelain",
 				r.remote,
 				`+${r.commit}:refs/heads/${r.branch}`
@@ -7750,7 +7341,7 @@ async function commitIn(run, repo, id, index, timeoutMs, pushAnyway, scan) {
 		"--format=",
 		commit,
 		"--not",
-		`--remotes=${remote}`
+		...remoteOwn(remote)
 	]));
 	const held = [];
 	for (const [file, text] of lines) if (await scan(text)) held.push(inFolder(file));
@@ -7959,6 +7550,11 @@ async function checkoutIn(run, cwd, repo, branch, folder, timeoutMs) {
 		cwd,
 		timeoutMs
 	});
+	const checkout = (args) => run(args, {
+		cwd,
+		timeoutMs,
+		env: NO_LFS
+	});
 	const remotes = await remotesOf(run, cwd, timeoutMs);
 	const failed = (error, remote = null) => ({
 		error,
@@ -7993,7 +7589,7 @@ async function checkoutIn(run, cwd, repo, branch, folder, timeoutMs) {
 		"-q",
 		`refs/heads/${branch}`
 	])).code !== 0) {
-		const switched = await git([
+		const switched = await checkout([
 			...hooksOff,
 			"switch",
 			"--track",
@@ -8005,13 +7601,13 @@ async function checkoutIn(run, cwd, repo, branch, folder, timeoutMs) {
 	}
 	const extra = await ahead(run, cwd, tip, await takenBefore(folder), `refs/heads/${branch}`, timeoutMs);
 	if (extra !== 0) return failed(`The local branch ${branch} has ${extra ?? "some"} commit(s) that aren't in the handoff as handed over now, so it was left as it is. Merge or rebase them onto ${name}/${branch} yourself.`, name);
-	const switched = await git([
+	const switched = await checkout([
 		...hooksOff,
 		"switch",
 		branch
 	]);
 	if (switched.code !== 0) return failed(`git switch ${branch}: ${switched.stderr}`, name);
-	const moved = await git([
+	const moved = await checkout([
 		...hooksOff,
 		"reset",
 		"-q",
@@ -8038,17 +7634,22 @@ function onTheWire(remote) {
 	return !!scp && scp[1].length > 1 && !remote.startsWith("\\");
 }
 const realpathNative = promisify(realpath.native);
-const isGitFolder = (segment) => {
-	const name = segment.replace(/[. ]+$/, "").toLowerCase();
-	return name === ".git" || /^git~\d+$/.test(name);
-};
+const NO_LFS = { GIT_LFS_SKIP_SMUDGE: "1" };
+function badPath(p) {
+	const parts = p.split(/[\\/]/);
+	if (parts.some(isGitFolder)) return `${p} is inside a .git folder`;
+	if (p.includes(":")) return `${p} has a colon in it, which Windows reads as a drive or a file's stream`;
+	if (path.isAbsolute(p) || parts.some((part) => part === "" || part === "." || part === "..")) return `${p} isn't a path of named folders inside the folder`;
+	return null;
+}
 /**
 * A repo under the folder (#56) on its handoff branch at its path in `base`: switched where a clone
 * of it is there, cloned where there is nothing or an empty folder, from a remote `cloneFrom`
 * allows, with Git LFS's download off (a handoff never carries LFS files). The error, else null.
 */
 async function repoAt(run, base, repo, folder, timeoutMs, cloneFrom) {
-	if (repo.path.split(/[\\/]/).some(isGitFolder)) return `${repo.path} is inside a .git folder, so nothing was checked out there.`;
+	const bad = badPath(repo.path);
+	if (bad) return `${bad}, so nothing was checked out there.`;
 	const target = path.join(base, repo.path);
 	let existing = target;
 	while (!await fs.lstat(existing).then(() => true, () => false)) existing = path.dirname(existing);
@@ -8073,7 +7674,7 @@ async function repoAt(run, base, repo, folder, timeoutMs, cloneFrom) {
 		], {
 			cwd: base,
 			timeoutMs,
-			env: { GIT_LFS_SKIP_SMUDGE: "1" }
+			env: NO_LFS
 		});
 		if (cloned.code !== 0) return `git clone ${repo.remote} ${repo.path} failed${cloned.timedOut ? " (it took too long)" : ""}:\n${cloned.stderr}`;
 		await recordTaken(folder, await resolved(run, target, "HEAD", timeoutMs) ?? repo.commit);
@@ -8140,11 +7741,14 @@ async function hello(cwd) {
 		project: await projectOf(io.run, where, cwd, machine)
 	};
 }
+const TOKEN_LEFT_MS = 3e5;
 /**
-* The office server and this machine's pairing with it (#23), as a command uses it: the token goes
-* in the hello when the machine holds a credential, and is renewed as the data layer would. A
-* command never pairs the machine: it never asks the server to start a pairing, which the session's
-* data layer does, with its link in the status line.
+* The office server and this machine's pairing with it (#23), as a command uses it: only read. The
+* kept token goes in the hello while it is current; otherwise the credential is swapped for one for
+* this command alone (POST <server>/token), which isn't written back. Nothing here takes the
+* pairing's locks, writes pairing.json or starts a pairing: the session's data layer does those,
+* with its link in the status line. When a token can't be had, the command says the machine needs
+* pairing.
 */
 async function office() {
 	const config = await loadConfig(io, path.join(modDir, "config.json"), path.join(isoplanDir, "config.json"));
@@ -8153,28 +7757,17 @@ async function office() {
 		readText: (p) => fs.readFile(p, "utf8").catch(() => null),
 		run: io.run
 	}, claudeJson, os.homedir());
-	const pairing = createPairing({
-		file,
-		lock: pairingLockPath(claudeDir),
-		writeLock: pairingWriteLockPath(claudeDir),
-		server: config.server,
-		account,
-		machine: os.hostname(),
-		emit: () => {},
-		allowPlainWs: config.allowPlainWs,
-		post: (url, body) => new URL(url).pathname.endsWith("/pair") ? Promise.reject(/* @__PURE__ */ new Error("a command doesn't pair this machine")) : postJson(url, body)
-	});
 	return {
 		server: config.server,
-		pairing: {
-			async token() {
-				const entry = (await readPairing(file)).accounts[account.id];
-				if (!entry?.credential || entry.server !== config.server) return void 0;
-				return await pairing.token().catch((err) => stop(`This machine's pairing token couldn't be had: ${err.message}`)) ?? void 0;
-			},
-			refused: (code, sent) => pairing.refused(code, sent),
-			close: () => pairing.close()
-		}
+		pairing: { async token(renew) {
+			const entry = (await readPairing(file)).accounts[account.id];
+			if (!entry?.credential || entry.server !== config.server) return void 0;
+			if (!config.allowPlainWs && isPlainRemote(config.server)) throw new PairingRefused(`${config.server} is plain ws:// to another machine, so this machine's pairing isn't sent over it: use wss://, or set "allowPlainWs": true in config.json.`);
+			if (!renew && entry.token && (entry.tokenExpires ?? 0) - TOKEN_LEFT_MS > Date.now()) return entry.token;
+			const answer = await postJson(httpUrl(config.server, "/token"), { credential: entry.credential }).catch(() => null);
+			if (answer?.status === 200 && typeof answer.body.token === "string") return answer.body.token;
+			throw new PairingRefused(NEEDS_PAIRING);
+		} }
 	};
 }
 async function exchange(cwd, first, wanted, before = "") {
@@ -8184,8 +7777,6 @@ async function exchange(cwd, first, wanted, before = "") {
 	} catch (err) {
 		if (err instanceof PairingRefused) stop(`${before}${err.message}`);
 		throw err;
-	} finally {
-		await pairing.close();
 	}
 }
 const said = (m) => `The office server says: ${m.message}`;
@@ -8245,6 +7836,8 @@ async function handOverCommand(argv) {
 	const timeoutMs = s.gitTimeoutSeconds * 1e3;
 	const prepared = await prepare(run, cwd, timeoutMs, s.repoSearchDepth).catch((err) => stop(err instanceof HandoffGitError ? `Can't hand over from here: ${gitFailed(err)}.` : String(err)));
 	const { from, files, repos, left } = prepared;
+	const unknown = Object.keys(pushAnyway).filter((repo) => !repos.some((r) => r.path === repo));
+	if (unknown.length) stop(`--push-anyway names ${unknown.map((r) => r === "." ? "this folder's own repo" : r).join(", ")}, which this doesn't hand over (it hands over ${repos.map((r) => r.path).join(", ")}). Nothing was pushed.`);
 	const brief = `${written}\n\n${handoffNote({
 		branch: handoffBranch(id),
 		from,
@@ -8288,7 +7881,8 @@ async function handOverCommand(argv) {
 			}
 		});
 		const answer = await link.next((m) => m.type === "handed-over" && m.handoff === id, ANSWER_MS);
-		if (answer.type === "error") stop(`${said(answer)}\nThe branch ${branch} is pushed; run hand-over again with the same id once that is fixed.`);
+		const pushedBranches = sent.map((r) => r.path === "." ? r.branch : `${r.branch} in ${r.path}`).join(", ");
+		if (answer.type === "error") stop(`${said(answer)}\nPushed: ${pushedBranches}. Run hand-over again with the same id once that is fixed.`);
 		const name = answer.to.name || answer.to.id;
 		if (path.resolve(path.dirname(file)) === path.resolve(outDir(id))) await fs.rm(outDir(id), {
 			recursive: true,
