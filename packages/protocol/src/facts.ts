@@ -11,6 +11,25 @@ const Extra = z.record(z.string(), z.unknown()).optional();
 
 export const SourceSchema = z.enum(["claude-code"]);
 
+/** A project: one code repository, by its id (see projectId) and a short name. */
+export const ProjectSchema = z.object({
+  id: z.string().min(1),
+  name: z.string().min(1),
+});
+
+/**
+ * Where a file or a command lands when it isn't in the session's own project (#74): `project` is
+ * the repo it is in, and `away` is true when that repo is outside the session's folder, so the
+ * agent is working away from home; a repo inside the folder (a workspace above several repos) has
+ * `project` and no `away`. Both absent: the session's own project, as for a peer that predates
+ * them. A data layer sends them only to a server that said it reads them (`welcome`), and only for
+ * a project the server's office holds; anything else stays on the machine.
+ */
+const Elsewhere = {
+  project: ProjectSchema.optional(),
+  away: z.boolean().optional(),
+};
+
 export const SessionFactSchema = z.object({
   id: z.string().min(1),
   source: SourceSchema,
@@ -50,6 +69,7 @@ export const AgentFactSchema = z.object({
       kind: z.enum(["write", "read", "run", "search", "talk"]),
       file: z.string().optional(),
       since: Time,
+      ...Elsewhere,
     })
     .nullable(),
   usage: TokenCounts.extend({
@@ -63,11 +83,15 @@ export const AgentFactSchema = z.object({
   extra: Extra,
 });
 
-/** An edit or a read: `file` is relative to the repo root, with forward slashes. */
+/**
+ * An edit or a read: `file` is relative to its repo's root, with forward slashes. One is known by
+ * its agent, file and project, so one agent's README.md at home and in another repo are two.
+ */
 export const FileFactSchema = z.object({
   agent: z.string().min(1),
   file: z.string().min(1),
   at: Time,
+  ...Elsewhere,
   extra: Extra,
 });
 
@@ -141,10 +165,11 @@ export const FactUpsertSchema = z.object({
   questions: z.array(QuestionFactSchema).optional(),
 });
 
-const FileKey = FileFactSchema.pick({ agent: true, file: true });
+const FileKey = FileFactSchema.pick({ agent: true, file: true, project: true });
 
 /**
- * The keys of records that went away: an agent by its id, an edit or read by agent and file, a
+ * The keys of records that went away: an agent by its id, an edit or read by agent, file and
+ * project (absent for the session's own), a
  * wait by waiter and on, a report by its agent, a question by its id. The session itself goes with
  * the connection.
  */
@@ -158,6 +183,7 @@ export const FactRemoveSchema = z.object({
 });
 
 export type Source = z.infer<typeof SourceSchema>;
+export type Project = z.infer<typeof ProjectSchema>;
 export type SessionFact = z.infer<typeof SessionFactSchema>;
 export type AgentFact = z.infer<typeof AgentFactSchema>;
 export type FileFact = z.infer<typeof FileFactSchema>;

@@ -10,7 +10,8 @@
 // Ids are source-scoped: the session is claude-code:<session id>, its lead claude-code:<session
 // id>:lead, and a subagent claude-code:<agent id>.
 
-import type { AgentFact, Facts, FileFact, QuestionFact } from "@isoplan/protocol";
+import type { AgentFact, Facts, FileFact, Project, QuestionFact } from "@isoplan/protocol";
+import { attributionCache, createAttribution, type Attribution, type Placed } from "./attribution.js";
 import type { Config } from "./config.js";
 import { join, normalize, pathKey, relativeTo, type MaybePromise, type Stat, type Where } from "./git.js";
 import type { DirEntry } from "./io.js";
@@ -59,9 +60,15 @@ const encoder = new TextEncoder();
 export interface SourceIo {
   /** Claude Code's config folder: $CLAUDE_CONFIG_DIR, or ~/.claude. */
   claudeDir: string;
+  /** The person's home folder: `~` in shell commands, and never a workspace, nor any folder above it. */
+  home?: string;
   listDir(dir: string): MaybePromise<DirEntry[]>;
   stat(path: string): MaybePromise<Stat | null>;
   read(path: string, start?: number, end?: number): MaybePromise<string>;
+  /** The path with symlinks resolved; without it, paths are compared as written. */
+  realpath?(path: string): MaybePromise<string>;
+  /** Whether a path is a folder now, asked as a transcript line is read: a copy into one names the file. */
+  isDirSync?(path: string): boolean;
 }
 
 export interface ReadInput {
@@ -73,6 +80,8 @@ export interface ReadInput {
   config: Config;
   /** Places a folder in git (the caller caches it). */
   resolve: (dir: string) => Promise<Where | null>;
+  /** The project a repo is (the caller caches it), for an edit or command that lands in another repo. */
+  projectOf: (where: Where) => MaybePromise<Project>;
 }
 
 export interface SourceRead {
@@ -82,6 +91,10 @@ export interface SourceRead {
   status: string | null;
   /** Transcripts that couldn't be read, counted, with the first error. */
   errors: { count: number; first: string | null };
+  /** The session's folder is a workspace above several repos, so its own project is a local path. */
+  workspace?: boolean;
+  /** The project of each subagent whose worktree is another repo's, by agent id: its checkout goes only where that repo may (forOffice). */
+  checkouts?: Record<string, string>;
 }
 
 /**
@@ -93,10 +106,12 @@ export function createClaudeCode(io: SourceIo) {
   const transcripts = new Map<string, TranscriptState>();
   const metas = new Map<string, { mtimeMs: number; meta: Meta }>();
   const found = new Map<string, string>(); // session id → its transcript, once located
+  const workspaces = new Map<string, { at: number; is: boolean }>(); // folder → whether it is a workspace
+  const places = attributionCache(); // which folders exist and where links lead, across passes
   const searched = new Map<string, number>(); // session id → when every project folder was last searched
   let used = new Set<string>(); // the cache keys this pass has used
 
-  async function read({ sessionId, cwd, now, config, resolve }: ReadInput): Promise<SourceRead> {
+  async function read({ sessionId, cwd, now, config, resolve, projectOf }: ReadInput): Promise<SourceRead> {
     used = new Set();
     const errors = { count: 0, first: null as string | null };
     const fail = (err: unknown) => {
@@ -122,10 +137,25 @@ export function createClaudeCode(io: SourceIo) {
         // drift, just not started.
         return none(main.seen && (!main.parsed || main.messages) ? "transcript format not recognised" : null);
       }
-      const where = await resolve(main.cwd);
+      // The session's own folder is home (#74). One git can't place that holds repos is a workspace:
+      // the session stays in its own room, whichever of its repos it works in.
+      const home = await resolve(cwd);
+      const workspace = !home && (await isWorkspace(cwd, now, config));
+      const where = workspace ? { toplevel: normalize(cwd), commonDir: "", branch: null } : await resolve(main.cwd);
       if (!where) return none(`git could not place ${normalize(main.cwd)}`);
-      const facts = await sessionFacts(c, main, where, now, config, resolve, fail);
-      return { facts, status: null, errors };
+      const place = createAttribution({
+        folder: cwd,
+        where: workspace ? null : (home ?? where),
+        resolve,
+        projectOf,
+        stat: (p) => io.stat(p),
+        realpath: (p) => (io.realpath ? io.realpath(p) : p),
+        cache: places,
+        now,
+      });
+      const checkouts: Record<string, string> = {};
+      const facts = await sessionFacts(c, main, where, workspace, now, config, resolve, place, fail, checkouts);
+      return { facts, status: null, errors, workspace, checkouts };
     } finally {
       for (const cache of [transcripts, metas]) {
         for (const key of cache.keys()) if (!used.has(key)) cache.delete(key);
@@ -204,14 +234,34 @@ export function createClaudeCode(io: SourceIo) {
     return { id: sessionId, path, size: st.size, ownMtime: st.mtimeMs, lastActive, lights: lit ? "on" : "off", agents, subagents: all.length };
   }
 
+  // A folder with a repo directly in it.
+  // A folder the person works in that holds repos: one to `workspaceRepos` repos directly in it.
+  // The home folder and the folders above it never are (~/Projects with dozens of repos is not a
+  // piece of work). The answer is looked up again once gitCacheSeconds have passed.
+  async function isWorkspace(dir: string, now: number, config: Config): Promise<boolean> {
+    if (io.home && (pathKey(dir) === pathKey(io.home) || relativeTo(dir, io.home) !== null)) return false;
+    const key = pathKey(dir);
+    const hit = workspaces.get(key);
+    if (hit && now - hit.at <= config.gitCacheSeconds * 1000) return hit.is;
+    const st = await io.stat(dir);
+    let repos = 0;
+    if (st && st.isDir) for (const e of await io.listDir(dir)) if (e.isDir && (await io.stat(join(dir, `${e.name}/.git`)))) repos++;
+    const is = repos >= 1 && repos <= config.workspaceRepos;
+    workspaces.set(key, { at: now, is });
+    return is;
+  }
+
   async function sessionFacts(
     c: Candidate,
     main: TranscriptState,
     where: Where,
+    workspace: boolean,
     now: number,
     config: Config,
     resolve: ReadInput["resolve"],
+    place: Attribution,
     fail: (err: unknown) => void,
+    checkouts: Record<string, string>,
   ): Promise<Facts> {
     const session = `${SOURCE}:${c.id}`;
     const lead = `${session}:lead`;
@@ -277,11 +327,11 @@ export function createClaudeCode(io: SourceIo) {
       status: leadWorking ? "working" : "idle",
       statusSince: iso(leadWorking ? main.turnAt : main.lastMessageAt, c.ownMtime),
       lastActive: iso(c.ownMtime),
-      doing: leadWorking ? await doingOf(main, resolve, c.ownMtime, config) : null,
+      doing: leadWorking ? await doingOf(main, place, c.ownMtime, config) : null,
       usage: usageOf(main, c.ownMtime),
     });
-    main.touches = await addFiles(facts.edits, lead, main.touches, [...config.touchedTools, ...config.shellTools], now, config, resolve);
-    main.reads = await addFiles(facts.reads, lead, main.reads, [...READ_TOOLS, ...config.shellTools], now, config, resolve);
+    main.touches = await addFiles(facts.edits, lead, main.touches, [...config.touchedTools, ...config.shellTools], now, config, place);
+    main.reads = await addFiles(facts.reads, lead, main.reads, [...READ_TOOLS, ...config.shellTools], now, config, place);
     // The lead's question is open while its turn is: a prompt after it means it was never answered.
     if (main.turnOpen) addQuestions(facts.questions!, lead, main, results, c.ownMtime);
 
@@ -292,7 +342,11 @@ export function createClaudeCode(io: SourceIo) {
       // The worktree trap: a worktree-isolated agent's lines carry the PARENT's gitBranch, so the
       // agent's branch comes from meta.json, or from git at the agent's own folder — never its lines.
       let worktree = typeof a.meta.worktreePath === "string" ? normalize(a.meta.worktreePath) : null;
-      if (!worktree && at && pathKey(at.toplevel) !== pathKey(where.toplevel)) worktree = at.toplevel;
+      // In a workspace, an agent working in one of its repos is not in a worktree.
+      if (!worktree && at && !workspace && pathKey(at.toplevel) !== pathKey(where.toplevel)) worktree = at.toplevel;
+      // A worktree of another repo is that repo's: where it may go is decided with its files.
+      const elsewhere = worktree ? await place.dir(worktree) : null;
+      if (elsewhere?.project) checkouts[id] = elsewhere.project.id;
       const agentBranch = worktree
         ? (typeof a.meta.worktreeBranch === "string" && a.meta.worktreeBranch) || (at && pathKey(at.toplevel) === pathKey(worktree) ? at.branch : null)
         : null;
@@ -317,7 +371,7 @@ export function createClaudeCode(io: SourceIo) {
         status: s.status,
         statusSince: iso(s.since, a.mtimeMs),
         lastActive: iso(a.mtimeMs),
-        doing: live ? await doingOf(a.t, resolve, a.mtimeMs, config) : null,
+        doing: live ? await doingOf(a.t, place, a.mtimeMs, config) : null,
         usage: usageOf(a.t, a.mtimeMs),
         ...(worktree ? { checkout: worktree, branch: agentBranch } : {}),
         extra: { description: a.meta.description ?? null, ...(s.endState ? { endState: s.endState } : {}) },
@@ -329,8 +383,8 @@ export function createClaudeCode(io: SourceIo) {
       if ((s.status === "done" || s.status === "failed") && a.t.lastText !== null) {
         facts.reports.push({ agent: id, at: iso(a.t.lastTextAt, a.mtimeMs), text: a.t.lastText });
       }
-      a.t.touches = await addFiles(facts.edits, id, a.t.touches, [...config.touchedTools, ...config.shellTools], now, config, resolve);
-      a.t.reads = await addFiles(facts.reads, id, a.t.reads, [...READ_TOOLS, ...config.shellTools], now, config, resolve);
+      a.t.touches = await addFiles(facts.edits, id, a.t.touches, [...config.touchedTools, ...config.shellTools], now, config, place);
+      a.t.reads = await addFiles(facts.reads, id, a.t.reads, [...READ_TOOLS, ...config.shellTools], now, config, place);
     }
     return facts;
   }
@@ -377,7 +431,7 @@ export function createClaudeCode(io: SourceIo) {
       lines[0] = st.head + lines[0]; // a tail read starts mid-line
       st.head = null;
     }
-    for (const line of lines) if (line.trim()) foldLine(st, line);
+    for (const line of lines) if (line.trim()) foldLine(st, line, io.home ?? null, io.isDirSync);
     return st;
   }
 
@@ -455,6 +509,8 @@ interface LastTool {
   name: string;
   file: string | null;
   cwd: string | null;
+  /** The folder a shell command's programs last ran in. */
+  dir?: string;
   at: number;
   wrote?: boolean;
 }
@@ -544,20 +600,22 @@ function iso(ms: number, fallback?: number): string {
   return new Date(Number.isFinite(ms) ? ms : fallback!).toISOString();
 }
 
-// Pushes { agent, file, at } to `list` for each file `touches` names by one of `tools`, each made
-// relative to the worktree of the folder that made the call, newest time per file. Outside the
-// worktree: dropped. Returns the touches still inside the window.
-async function addFiles(list: FileFact[], agent: string, touches: Touch[], tools: string[], now: number, config: Config, resolve: ReadInput["resolve"]): Promise<Touch[]> {
+// Pushes { agent, file, at } to `list` for each file `touches` names by one of `tools`: the file
+// relative to the innermost worktree it is in, with that repo when it isn't the session's own
+// (attribution.ts), at its newest time, one per repo and file. In no repo: dropped. Whether it may
+// leave the machine is decided later (forOffice). Returns the touches still inside the window.
+async function addFiles(list: FileFact[], agent: string, touches: Touch[], tools: string[], now: number, config: Config, place: Attribution): Promise<Touch[]> {
   const since = now - config.touchedWindowMinutes * 60000;
   const kept = touches.filter((t) => t.at >= since);
-  const newest = new Map<string, number>();
+  const newest = new Map<string, { placed: Placed; at: number }>();
   for (const t of kept) {
     if (!tools.includes(t.name) || !t.cwd) continue;
-    const where = await resolve(t.cwd);
-    const file = where && relativeTo(where.toplevel, t.path);
-    if (file && !(newest.get(file)! >= t.at)) newest.set(file, t.at);
+    const placed = await place.file(t.path);
+    if (!placed) continue;
+    const key = `${placed.project?.id ?? ""}\n${placed.file}`;
+    if (!((newest.get(key)?.at ?? -Infinity) >= t.at)) newest.set(key, { placed, at: t.at });
   }
-  for (const [file, at] of newest) list.push({ agent, file, at: iso(at) });
+  for (const { placed, at } of newest.values()) list.push({ agent, ...placed, at: iso(at) });
   return kept;
 }
 
@@ -608,7 +666,7 @@ type Line = Record<string, any>;
 
 // Fold one transcript line into the file's running state. Lines that don't parse, or parse to
 // something without a `type`, are skipped.
-function foldLine(st: TranscriptState, line: string): void {
+function foldLine(st: TranscriptState, line: string, home: string | null, isDir?: (path: string) => boolean): void {
   st.seen++;
   let ev: Line;
   try {
@@ -656,10 +714,11 @@ function foldLine(st: TranscriptState, line: string): void {
       // in this line, and shellFiles follows only the ones inside this command.
       const cwd: string | null = ev.cwd || st.cwd;
       // Any tool with a command is read as a shell: read time keeps only the `shellTools`.
-      const shell = typeof input.command === "string" ? shellFiles(input.command, cwd, { powershell: c.name === "PowerShell" }) : { writes: [], reads: [] };
+      const shell = typeof input.command === "string" ? shellFiles(input.command, cwd, { powershell: c.name === "PowerShell", home, isDir }) : { writes: [], reads: [], dirs: [] };
       const writes = shell.writes;
       const file = typeof input.file_path === "string" ? input.file_path : typeof input.notebook_path === "string" ? input.notebook_path : typeof input.path === "string" ? input.path : null;
-      st.lastTool = writes.length ? { name: c.name, file: writes[writes.length - 1]!, cwd, at, wrote: true } : { name: c.name, file, cwd, at };
+      const dir = shell.dirs[shell.dirs.length - 1];
+      st.lastTool = writes.length ? { name: c.name, file: writes[writes.length - 1]!, cwd, at, wrote: true } : { name: c.name, file, cwd, ...(dir ? { dir } : {}), at };
       // Edit and Read paths and shell writes and reads are absolute; they are resolved against this
       // line's cwd at read time, which also keeps only the tools that count.
       const target = input.file_path || input.notebook_path;
@@ -856,18 +915,14 @@ function ended(state: string, at: number): AgentStatus {
   return { status: state === "completed" ? "done" : STOPPED.has(state) ? "stopped" : "failed", since: at, endState: state };
 }
 
-// The agent's last tool call as { kind, file?, since }, the file relative to the worktree it was
-// called from. Outside the worktree the file is dropped, as for edits. A tool with no kind in
-// DOING shows as nothing; a shell tool's write shows as "write".
-async function doingOf(st: TranscriptState, resolve: ReadInput["resolve"], fallbackMs: number, config: Config): Promise<AgentFact["doing"]> {
+// The agent's last tool call as { kind, file?, since }, the file relative to the worktree it is in,
+// with its repo when that isn't the session's, as for edits; in no repo the file is dropped. A
+// shell command with no file names the repo its programs ran in. A tool with no kind in DOING shows
+// as nothing; a shell tool's write shows as "write".
+async function doingOf(st: TranscriptState, place: Attribution, fallbackMs: number, config: Config): Promise<AgentFact["doing"]> {
   const t = st.lastTool;
   const kind = t && (t.wrote && config.shellTools.includes(t.name) ? "write" : Object.hasOwn(DOING, t.name) ? DOING[t.name] : undefined);
   if (!t || !kind) return null;
-  const doing: { kind: typeof kind; file?: string } = { kind };
-  if (t.file && t.cwd) {
-    const where = await resolve(t.cwd);
-    const file = where && relativeTo(where.toplevel, t.file);
-    if (file) doing.file = file;
-  }
-  return { ...doing, since: iso(t.at, fallbackMs) };
+  const placed = t.file && t.cwd ? await place.file(t.file) : t.dir ? await place.dir(t.dir) : null;
+  return { kind, ...placed, since: iso(t.at, fallbackMs) };
 }

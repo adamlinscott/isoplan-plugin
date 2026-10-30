@@ -1,6 +1,7 @@
 // What changed between two sets of one session's facts, as a `changes` message carries it: the
 // records that are new or differ, and the keys of those that went away. Records are keyed as the
-// protocol keys them: an agent by its id, an edit or read by agent and file, a wait by waiter and
+// protocol keys them: an agent by its id, an edit or read by agent, file and project (absent for
+// the session's own, as an older peer sends it), a wait by waiter and
 // on, a report by its agent, a question by its id. The session is one record, sent whole when it
 // changed. Facts without questions have none.
 
@@ -17,9 +18,9 @@ export function diffFacts(before: Facts, after: Facts): { upsert: FactUpsert; re
   if (agents.remove.length) remove.agents = agents.remove.map((a) => a.id);
 
   for (const list of ["edits", "reads"] as const) {
-    const d = diff(before[list], after[list], (f) => key(f.agent, f.file));
+    const d = diff(before[list], after[list], (f) => key(f.agent, f.file, f.project?.id ?? ""));
     if (d.upsert.length) upsert[list] = d.upsert;
-    if (d.remove.length) remove[list] = d.remove.map(({ agent, file }) => ({ agent, file }));
+    if (d.remove.length) remove[list] = d.remove.map(({ agent, file, project }) => ({ agent, file, ...(project ? { project } : {}) }));
   }
 
   const waits = diff(before.waits, after.waits, (w) => key(w.waiter, w.on));

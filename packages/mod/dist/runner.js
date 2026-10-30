@@ -3,9 +3,9 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { realpath, statSync } from "node:fs";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import http from "node:http";
-import { realpath } from "node:fs";
 import { promisify } from "node:util";
 //#region ../../node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/core/util.js
 function getEnumValues(entries) {
@@ -205,7 +205,7 @@ const BIGINT_FORMAT_RANGES = {
 	int64: [/* @__PURE__*/ BigInt("-9223372036854775808"), /* @__PURE__*/ BigInt("9223372036854775807")],
 	uint64: [/* @__PURE__*/ BigInt(0), /* @__PURE__*/ BigInt("18446744073709551615")]
 };
-function pick(schema, mask) {
+function pick$1(schema, mask) {
 	const currDef = schema._zod.def;
 	const checks = currDef.checks;
 	if (checks && checks.length > 0) throw new Error(".pick() cannot be used on object schemas containing refinements");
@@ -5337,7 +5337,7 @@ const ZodObject = /*@__PURE__*/ $constructor("ZodObject", (inst, def) => {
 		return merge(this, other);
 	},
 	pick(mask) {
-		return pick(this, mask);
+		return pick$1(this, mask);
 	},
 	omit(mask) {
 		return omit(this, mask);
@@ -5650,6 +5650,23 @@ const Time = datetime({ offset: true });
 /** Tool-specific detail that views never rely on. */
 const Extra = record(string(), unknown()).optional();
 const SourceSchema = _enum(["claude-code"]);
+/** A project: one code repository, by its id (see projectId) and a short name. */
+const ProjectSchema = object({
+	id: string().min(1),
+	name: string().min(1)
+});
+/**
+* Where a file or a command lands when it isn't in the session's own project (#74): `project` is
+* the repo it is in, and `away` is true when that repo is outside the session's folder, so the
+* agent is working away from home; a repo inside the folder (a workspace above several repos) has
+* `project` and no `away`. Both absent: the session's own project, as for a peer that predates
+* them. A data layer sends them only to a server that said it reads them (`welcome`), and only for
+* a project the server's office holds; anything else stays on the machine.
+*/
+const Elsewhere = {
+	project: ProjectSchema.optional(),
+	away: boolean().optional()
+};
 const SessionFactSchema = object({
 	id: string().min(1),
 	source: SourceSchema,
@@ -5697,7 +5714,8 @@ const AgentFactSchema = object({
 			"talk"
 		]),
 		file: string().optional(),
-		since: Time
+		since: Time,
+		...Elsewhere
 	}).nullable(),
 	usage: TokenCounts.extend({
 		model: string().min(1),
@@ -5709,11 +5727,15 @@ const AgentFactSchema = object({
 	branch: string().nullable().optional(),
 	extra: Extra
 });
-/** An edit or a read: `file` is relative to the repo root, with forward slashes. */
+/**
+* An edit or a read: `file` is relative to its repo's root, with forward slashes. One is known by
+* its agent, file and project, so one agent's README.md at home and in another repo are two.
+*/
 const FileFactSchema = object({
 	agent: string().min(1),
 	file: string().min(1),
 	at: Time,
+	...Elsewhere,
 	extra: Extra
 });
 const WaitFactSchema = object({
@@ -5782,10 +5804,12 @@ const FactUpsertSchema = object({
 });
 const FileKey = FileFactSchema.pick({
 	agent: true,
-	file: true
+	file: true,
+	project: true
 });
 /**
-* The keys of records that went away: an agent by its id, an edit or read by agent and file, a
+* The keys of records that went away: an agent by its id, an edit or read by agent, file and
+* project (absent for the session's own), a
 * wait by waiter and on, a report by its agent, a question by its id. The session itself goes with
 * the connection.
 */
@@ -5802,10 +5826,6 @@ const FactRemoveSchema = object({
 });
 const Version = literal(1);
 const Seq = number().int().nonnegative();
-const ProjectSchema = object({
-	id: string().min(1),
-	name: string().min(1)
-});
 const Account = object({
 	id: string().min(1),
 	name: string()
@@ -6014,6 +6034,19 @@ const ConflictMessageSchema = object({
 	file: string().min(1),
 	text: string().min(1)
 });
+/**
+* Sent after a hello is let in, by a server that reads where an edit or command lands (#74): the
+* projects of the session's office it may report work in, lower-cased: every one with a remote, and
+* of those with none (`local:`), only the hello's own machine's. A data layer reports a file,
+* command or worktree outside the session's own project only for one of these, and one that hasn't
+* had a welcome on its connection keeps them on the machine, as an older server would read them as
+* the session's own.
+*/
+const WelcomeMessageSchema = object({
+	type: literal("welcome"),
+	v: Version,
+	projects: array(string().min(1))
+});
 /** Something the data layer should show. */
 const ErrorMessageSchema = object({
 	type: literal("error"),
@@ -6096,6 +6129,7 @@ const HandOverReadyMessageSchema = object({
 });
 const OfficeServerMessageSchema = discriminatedUnion("type", [
 	RepairMessageSchema,
+	WelcomeMessageSchema,
 	ConflictMessageSchema,
 	ErrorMessageSchema,
 	RequestMessageSchema,
@@ -6293,6 +6327,14 @@ function pathKey(p) {
 function join(base, rel) {
 	return isAbsolute(rel) ? normalize(rel) : normalize(base + "/" + rel);
 }
+function dirname(p) {
+	const n = normalize(p);
+	const i = n.lastIndexOf("/");
+	if (i < 0) return ".";
+	if (i === 0) return "/";
+	if (/^[A-Z]:$/.test(n.slice(0, i))) return n.slice(0, i + 1);
+	return n.slice(0, i);
+}
 /**
 * `p` relative to `root` with forward slashes, or null when `p` is not inside `root`. Windows
 * paths compare case-insensitively; the relative part keeps `p`'s own spelling, so whoever
@@ -6390,6 +6432,14 @@ function nodeIo({ run = runCommand } = {}) {
 				return null;
 			}
 		},
+		realpath: (p) => fs.realpath(p),
+		isDirSync: (p) => {
+			try {
+				return statSync(p).isDirectory();
+			} catch {
+				return false;
+			}
+		},
 		async read(p, start, end) {
 			if (start === void 0 || end === void 0) return fs.readFile(p, "utf8");
 			const fh = await fs.open(p, "r");
@@ -6429,11 +6479,12 @@ function diffFacts(before, after) {
 	if (agents.upsert.length) upsert.agents = agents.upsert;
 	if (agents.remove.length) remove.agents = agents.remove.map((a) => a.id);
 	for (const list of ["edits", "reads"]) {
-		const d = diff(before[list], after[list], (f) => key(f.agent, f.file));
+		const d = diff(before[list], after[list], (f) => key(f.agent, f.file, f.project?.id ?? ""));
 		if (d.upsert.length) upsert[list] = d.upsert;
-		if (d.remove.length) remove[list] = d.remove.map(({ agent, file }) => ({
+		if (d.remove.length) remove[list] = d.remove.map(({ agent, file, project }) => ({
 			agent,
-			file
+			file,
+			...project ? { project } : {}
 		}));
 	}
 	const waits = diff(before.waits, after.waits, (w) => key(w.waiter, w.on));
@@ -6468,7 +6519,7 @@ const same = (a, b) => a !== void 0 && JSON.stringify(a) === JSON.stringify(b);
 const STABLE_MS$1 = 3e4;
 const OUTBOX_MAX = 100;
 const OUTBOX_MAX_AGE_MS = 36e5;
-function createLink({ url, hello, emit, minIntervalMs = 1e3, retryBaseMs = 1e3, retryCapMs = 3e4, notWantedRetryMs = 36e5, takenRetryMs = 36e5, onNotWanted, onPairingEnded, onMessage, pairing, pairPollMs = 5e3, random = Math.random }) {
+function createLink({ url, hello, emit, minIntervalMs = 1e3, retryBaseMs = 1e3, retryCapMs = 3e4, notWantedRetryMs = 36e5, takenRetryMs = 36e5, onNotWanted, onPairingEnded, onMessage, filter = (facts) => facts, pairing, pairPollMs = 5e3, random = Math.random }) {
 	const outbox = [];
 	let latest = null;
 	let socket = null;
@@ -6487,6 +6538,7 @@ function createLink({ url, hello, emit, minIntervalMs = 1e3, retryBaseMs = 1e3, 
 	let refusedFor = null;
 	let isTaken = false;
 	let refusals = 0;
+	let projects = null;
 	let stable = null;
 	function connect() {
 		retry = null;
@@ -6523,6 +6575,7 @@ function createLink({ url, hello, emit, minIntervalMs = 1e3, retryBaseMs = 1e3, 
 			failures = 0;
 			isOpen = true;
 			seq = 0;
+			projects = null;
 			stable = setTimeout(() => refusals = 0, STABLE_MS$1);
 			send(token ? {
 				...hello,
@@ -6553,6 +6606,7 @@ function createLink({ url, hello, emit, minIntervalMs = 1e3, retryBaseMs = 1e3, 
 	function dropped() {
 		socket = null;
 		isOpen = false;
+		projects = null;
 		sent = null;
 		if (pacing) clearTimeout(pacing);
 		pacing = null;
@@ -6612,19 +6666,21 @@ function createLink({ url, hello, emit, minIntervalMs = 1e3, retryBaseMs = 1e3, 
 	}
 	function sendFull() {
 		if (!latest) return;
+		const facts = filter(latest, projects);
 		send({
 			type: "full",
 			v: 1,
 			seq: seq++,
-			facts: latest
+			facts
 		});
-		sent = latest;
+		sent = facts;
 		sentAt = Date.now();
 	}
 	function flush() {
 		pacing = null;
 		if (!isOpen || !latest || !sent) return;
-		const changed = diffFacts(sent, latest);
+		const facts = filter(latest, projects);
+		const changed = diffFacts(sent, facts);
 		if (!changed) return;
 		const wait = sentAt + minIntervalMs - Date.now();
 		if (wait > 0) {
@@ -6637,7 +6693,7 @@ function createLink({ url, hello, emit, minIntervalMs = 1e3, retryBaseMs = 1e3, 
 			seq: seq++,
 			...changed
 		});
-		sent = latest;
+		sent = facts;
 		sentAt = Date.now();
 	}
 	function receive(data) {
@@ -6660,7 +6716,10 @@ function createLink({ url, hello, emit, minIntervalMs = 1e3, retryBaseMs = 1e3, 
 			return;
 		}
 		const message = parsed.message;
-		if (message.type === "repair") {
+		if (message.type === "welcome") {
+			projects = new Set(message.projects.map((p) => p.toLowerCase()));
+			if (!pacing) flush();
+		} else if (message.type === "repair") {
 			if (pacing) clearTimeout(pacing);
 			pacing = null;
 			sendFull();
@@ -6709,6 +6768,7 @@ function createLink({ url, hello, emit, minIntervalMs = 1e3, retryBaseMs = 1e3, 
 				if (outbox.length > OUTBOX_MAX) outbox.shift();
 			}
 		},
+		projects: () => projects,
 		close() {
 			isClosed = true;
 			if (pacing) clearTimeout(pacing);
@@ -7271,51 +7331,263 @@ const isEntry = (e) => {
 	].every((k) => Number.isFinite(o.usage[k]));
 };
 //#endregion
+//#region src/data-layer/attribution.ts
+/** How long what a folder is (there or not, where its links lead) is believed. */
+const CACHE_MS = 1e4;
+/** Keep one for the life of the data layer; an entry older than CACHE_MS is looked up again. */
+const attributionCache = () => ({
+	exists: /* @__PURE__ */ new Map(),
+	real: /* @__PURE__ */ new Map()
+});
+/** One pass's: what folders are is remembered across passes in `cache`. */
+function createAttribution({ folder, where: home, resolve, projectOf, stat, realpath, cache, now }) {
+	const homeProject = home ? Promise.resolve(projectOf(home)) : null;
+	const remember = (map, p, look) => {
+		const key = pathKey(p);
+		const hit = map.get(key);
+		if (hit && now - hit.at <= CACHE_MS) return hit.value;
+		const value = look();
+		map.set(key, {
+			at: now,
+			value
+		});
+		return value;
+	};
+	const realOf = (p) => remember(cache.real, p, () => Promise.resolve(realpath(p)).then(normalize, () => normalize(p)));
+	const isThere = (p) => remember(cache.exists, p, () => Promise.resolve(stat(p)).then((s) => !!s?.isDir, () => false));
+	const homeFolder = realOf(folder);
+	async function locate(path, isDir) {
+		const p = normalize(path);
+		let at = isDir ? p : dirname(p);
+		while (!await isThere(at)) {
+			const up = dirname(at);
+			if (up === at) return {
+				real: p,
+				where: null
+			};
+			at = up;
+		}
+		const realAt = await realOf(at);
+		const rest = p.slice(at.length).replace(/^\/+/, "");
+		const where = await resolve(realAt);
+		return {
+			real: rest ? `${realAt.replace(/\/$/, "")}/${rest}` : realAt,
+			where: where && {
+				...where,
+				toplevel: await realOf(where.toplevel)
+			}
+		};
+	}
+	async function elsewhere(where, real) {
+		if (home && pathKey(where.commonDir) === pathKey(home.commonDir)) return {};
+		const project = await projectOf(where);
+		if (homeProject && (await homeProject).id === project.id) return {};
+		return relativeTo(await homeFolder, real) !== null || pathKey(await homeFolder) === pathKey(real) ? { project } : {
+			project,
+			away: true
+		};
+	}
+	return {
+		async file(path) {
+			const { real: p, where } = await locate(path, false);
+			const file = where && relativeTo(where.toplevel, p);
+			if (where && file) return {
+				file,
+				...await elsewhere(where, p)
+			};
+			const own = !home && relativeTo(await homeFolder, p);
+			return own ? { file: own } : null;
+		},
+		async dir(dir) {
+			const { real: d, where } = await locate(dir, true);
+			if (where) return elsewhere(where, d);
+			return !home && (relativeTo(await homeFolder, d) !== null || pathKey(await homeFolder) === pathKey(d)) ? {} : null;
+		}
+	};
+}
+//#endregion
 //#region src/data-layer/shell-writes.ts
+/** The deepest a shell inside a shell is read, and the longest command read at all. */
+const MAX_DEPTH = 3;
+const MAX_LENGTH = 32768;
 /**
-* { writes, reads }: the absolute paths `command` writes and reads, in order, each once. Relative
-* paths resolve against `cwd`, or against where a `cd` in the command moved to; with no cwd they
-* are skipped. Git Bash's /c/… paths become C:/… when the cwd is a Windows path.
+* { writes, reads, dirs }: the absolute paths `command` writes and reads, and the folders its
+* programs run in, in order, each once. Relative paths resolve against `cwd`, or against where a
+* `cd` in the command moved to; with no cwd they are skipped.
 */
-function shellFiles(command, cwd, { powershell = false } = {}) {
+function shellFiles(command, cwd, { powershell = false, cmd = false, home = null, isDir = () => false, depth = 0 } = {}) {
+	const shell = cmd ? "cmd" : powershell ? "powershell" : "bash";
 	const win = Boolean(cwd) && isWindowsPath(cwd);
 	let dir = cwd ? normalize(cwd) : null;
 	const pushed = [];
-	const writes = [];
-	const reads = [];
-	const keep = (out, w) => {
-		const p = place(w, dir, win);
-		if (p && !out.includes(p)) out.push(p);
+	const found = {
+		writes: /* @__PURE__ */ new Set(),
+		reads: /* @__PURE__ */ new Set(),
+		dirs: /* @__PURE__ */ new Set()
 	};
-	for (const s of segments(tokens(command, powershell))) {
-		for (const w of s.writes) keep(writes, w);
+	if (command.length > MAX_LENGTH) return {
+		writes: [],
+		reads: [],
+		dirs: []
+	};
+	const at = (w) => place(w, dir, win, home);
+	const keep = (set, p) => {
+		if (p) set.add(p);
+	};
+	const ctx = { isDir: (w) => !!at(w) && isDir(at(w)) };
+	for (const s of segments(tokens(command, shell))) {
+		for (const w of s.writes) keep(found.writes, at(w));
 		let words = s.words;
-		if (!powershell) while (words.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(words[0].text)) words = words.slice(1);
+		if (shell === "bash") while (words.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(words[0].text)) words = words.slice(1);
 		if (!words.length || words[0].unsafe) continue;
-		const name = base(words[0].text).toLowerCase().replace(/\.exe$/, "");
-		const args = words.slice(1);
+		const name = base(words[0].text).toLowerCase().replace(/\.(exe|cmd|bat)$/, "");
+		const switches = shell === "cmd" ? words.slice(1).filter((w) => /^\/[a-z?](:\S*)?$/i.test(w.text)) : [];
+		const args = shell === "cmd" ? words.slice(1).filter((w) => !switches.includes(w)) : words.slice(1);
+		const inner = nested(name, words.slice(1), command);
+		if (inner) {
+			if (depth >= MAX_DEPTH) continue;
+			const got = shellFiles(inner.text, dir, {
+				...inner.as,
+				home,
+				isDir,
+				depth: depth + 1
+			});
+			for (const k of [
+				"writes",
+				"reads",
+				"dirs"
+			]) for (const p of got[k]) found[k].add(p);
+			continue;
+		}
 		if (CD.has(name)) {
-			const { named, positional } = psArgs(args);
-			const to = named.path || named.literalpath || positional[0];
+			const { named, positional } = shell === "powershell" ? psArgs(args) : {
+				named: {},
+				positional: shell === "bash" ? posix(args).positional : args
+			};
+			const to = named.path || named.literalpath || (shell === "cmd" && positional.length > 1 ? {
+				text: positional.map((w) => w.text).join(" "),
+				unsafe: positional.some((w) => w.unsafe)
+			} : positional[0]);
 			if (name === "pushd" || name === "push-location") pushed.push(dir);
-			dir = to && to !== true && to.text !== "-" ? place(to, dir, win) : null;
+			const next = to && to !== true && to.text !== "-" ? at(to) : null;
+			if (!(shell === "cmd" && name !== "pushd" && next && dir && /^[A-Z]:/.test(next) && next.slice(0, 2) !== dir.slice(0, 2) && !switches.some((w) => /^\/d$/i.test(w.text)))) dir = next;
 			continue;
 		}
 		if (name === "popd" || name === "pop-location") {
 			dir = pushed.length ? pushed.pop() : null;
 			continue;
 		}
-		const writer = Object.hasOwn(WRITERS, name) ? WRITERS[name] : void 0;
-		if (writer) for (const w of writer(args)) keep(writes, w);
-		const reader = powershell && Object.hasOwn(PS_READERS, name) && PS_READERS[name] || (Object.hasOwn(READERS, name) ? READERS[name] : void 0);
+		keep(found.dirs, runsIn(name, args, dir, (w, from) => place(w, from, win, home)));
+		const writer = pick(shell, name, CMD_WRITERS, PS_WRITERS, WRITERS);
+		if (writer) for (const w of writer(args, ctx)) keep(found.writes, at(w));
+		const reader = pick(shell, name, CMD_READERS, PS_READERS, READERS);
 		if (reader) {
-			for (const r of reader(args)) if (r.text !== "-") keep(reads, r);
+			for (const r of reader(args, ctx)) if (r.text !== "-") keep(found.reads, at(r));
 		}
 	}
 	return {
-		writes,
-		reads
+		writes: [...found.writes],
+		reads: [...found.reads],
+		dirs: [...found.dirs]
 	};
+}
+function pick(shell, name, cmd, ps, common) {
+	const own = shell === "cmd" ? cmd : shell === "powershell" ? ps : null;
+	if (own && Object.hasOwn(own, name)) return own[name];
+	if (shell === "cmd") return void 0;
+	return Object.hasOwn(common, name) ? common[name] : void 0;
+}
+function nested(name, args, src) {
+	const rest = (from) => {
+		const words = args.slice(from);
+		if (from < 0 || !words.length) return null;
+		if (words.length === 1) return words[0].unsafe ? null : words[0].text;
+		const [first, last] = [words[0], words[words.length - 1]];
+		if (first.start === void 0 || last.end === void 0) return null;
+		return src.slice(first.start, last.end);
+	};
+	const flagAt = (test) => {
+		for (let i = 0; i < args.length; i++) {
+			const t = args[i].text;
+			if (t === "--") return -1;
+			if (test(t)) return i;
+			if (!/^[-/]/.test(t)) return -1;
+		}
+		return -1;
+	};
+	if (name === "cmd") {
+		const i = flagAt((t) => /^\/[ck]$/i.test(t));
+		let text = i < 0 ? null : rest(i + 1);
+		if (text && args.length - i - 1 > 1 && /^".*"$/s.test(text)) text = text.slice(1, -1);
+		return text ? {
+			text,
+			as: { cmd: true }
+		} : null;
+	}
+	if (name === "powershell" || name === "pwsh") {
+		const i = flagAt((t) => /^-(c|command|com|comm|comma|comman)$/i.test(t));
+		const text = i < 0 ? null : rest(i + 1);
+		return text ? {
+			text,
+			as: { powershell: true }
+		} : null;
+	}
+	if (name === "bash" || name === "sh" || name === "zsh") {
+		const i = flagAt((t) => /^-[a-z]*c[a-z]*$/.test(t));
+		const w = i >= 0 ? args[i + 1] : void 0;
+		return w && !w.unsafe ? {
+			text: w.text,
+			as: {}
+		} : null;
+	}
+	return null;
+}
+function runsIn(name, args, dir, at) {
+	const flag = (names) => {
+		let hit = null;
+		for (let i = 0; i < args.length; i++) {
+			const t = args[i].text;
+			if (t === "--") break;
+			const eq = /^(--?[A-Za-z-]+)=(.*)$/.exec(t);
+			if (eq && names.includes(eq[1])) hit = {
+				text: eq[2],
+				unsafe: args[i].unsafe
+			};
+			else if (names.includes(t) && args[i + 1]) hit = args[++i];
+		}
+		return hit;
+	};
+	if (name === "git") return gitDir(args, dir, at);
+	const to = name === "npm" ? flag(["--prefix", "-C"]) : name === "pnpm" ? flag(["-C", "--dir"]) : name === "yarn" ? flag(["--cwd"]) : name === "make" || name === "gmake" ? flag(["-C", "--directory"]) : null;
+	return to ? at(to, dir) : dir;
+}
+function gitDir(args, dir, at) {
+	let here = dir;
+	let tree = null;
+	let gitDirAt = null;
+	for (let i = 0; i < args.length; i++) {
+		const t = args[i].text;
+		const eq = /^(--git-dir|--work-tree)=(.*)$/.exec(t);
+		const value = (w) => w ? at(w, here) : null;
+		if (t === "--") break;
+		if (t === "-C" && args[i + 1]) {
+			here = at(args[++i], here);
+			if (!here) return null;
+		} else if (eq) eq[1] === "--git-dir" ? gitDirAt = value({
+			text: eq[2],
+			unsafe: args[i].unsafe
+		}) : tree = value({
+			text: eq[2],
+			unsafe: args[i].unsafe
+		});
+		else if (t === "--git-dir") gitDirAt = value(args[++i]);
+		else if (t === "--work-tree") tree = value(args[++i]);
+		else if (t === "-c" || t === "--namespace") i++;
+		else if (!t.startsWith("-")) break;
+	}
+	if (tree) return tree;
+	if (gitDirAt) return /\/\.git$/i.test(gitDirAt) ? gitDirAt.slice(0, -5) || "/" : gitDirAt;
+	return here;
 }
 const CD = /* @__PURE__ */ new Set([
 	"cd",
@@ -7334,14 +7606,14 @@ const WRITERS = {
 	]).positional,
 	sed: (args) => sedFiles(args).written,
 	perl: (args) => sedFiles(args).written,
-	cp: (args) => copyTarget(args, ["-S"]),
-	mv: (args) => copyTarget(args, ["-S"]),
-	install: (args) => copyTarget(args, [
+	cp: (args, ctx) => copyTarget(args, ["-S"], ctx),
+	mv: (args, ctx) => copyTarget(args, ["-S"], ctx),
+	install: (args, ctx) => copyTarget(args, [
 		"-m",
 		"-o",
 		"-g",
 		"-S"
-	]),
+	], ctx),
 	"set-content": (args) => one(psArgs(args), ["path", "literalpath"]),
 	"add-content": (args) => one(psArgs(args), ["path", "literalpath"]),
 	"out-file": (args) => one(psArgs(args), [
@@ -7349,8 +7621,49 @@ const WRITERS = {
 		"literalpath",
 		"path"
 	]),
-	"new-item": newItem
+	"new-item": newItem,
+	rm: (args, ctx) => {
+		const { flags, positional } = posix(args);
+		return flags.some((f) => /^-[a-zA-Z]*[rR]/.test(f) || f === "--recursive") ? [] : positional.filter((w) => !ctx.isDir(w));
+	}
 };
+const copyItem = (args, ctx) => {
+	const { named, positional } = psArgs(args);
+	const dest = named.destination && named.destination !== true ? named.destination : positional.length >= 2 ? positional[positional.length - 1] : null;
+	const from = [named.path, named.literalpath].find((v) => !!v && v !== true);
+	const sources = from ? [from] : dest === named.destination ? positional : positional.slice(0, -1);
+	return dest ? into(dest, sources, ctx) : [];
+};
+const removeItem = (args, ctx) => {
+	const { named, positional } = psArgs(args);
+	if (named.recurse) return [];
+	const hit = [named.path, named.literalpath].find((v) => !!v && v !== true);
+	return (hit ? [hit] : positional).filter((w) => !ctx.isDir(w));
+};
+const PS_WRITERS = {
+	"copy-item": copyItem,
+	cpi: copyItem,
+	copy: copyItem,
+	cp: copyItem,
+	"move-item": copyItem,
+	mi: copyItem,
+	move: copyItem,
+	mv: copyItem,
+	"remove-item": removeItem,
+	ri: removeItem,
+	rm: removeItem,
+	del: removeItem,
+	erase: removeItem
+};
+const lastOf = (args, ctx) => args.length >= 2 ? into(args[args.length - 1], args.slice(0, -1), ctx) : [];
+const CMD_WRITERS = {
+	copy: lastOf,
+	xcopy: lastOf,
+	move: lastOf,
+	del: (args, ctx) => args.filter((w) => !ctx.isDir(w)),
+	erase: (args, ctx) => args.filter((w) => !ctx.isDir(w))
+};
+const CMD_READERS = { type: (args) => args };
 const READERS = {
 	cat: (args) => posix(args).positional,
 	head: (args) => posix(args, ["-n", "-c"]).positional,
@@ -7422,15 +7735,16 @@ function sedFiles(args) {
 		read: files
 	};
 }
-function copyTarget(args, valued) {
+function copyTarget(args, valued, ctx) {
 	const { flags, positional } = posix(args, valued);
 	if (flags.some((f) => f === "-d" || f === "-t" || f.startsWith("--target-directory") || f === "--directory")) return [];
 	if (positional.length < 2) return [];
-	const target = positional[positional.length - 1];
-	const sources = positional.slice(0, -1);
-	if (sources.length === 1 && !/[\\/]$/.test(target.text) && target.text !== "." && target.text !== "..") return [target];
+	return into(positional[positional.length - 1], positional.slice(0, -1), ctx);
+}
+function into(target, sources, ctx) {
+	if (!(sources.length !== 1 || /[\\/]$/.test(target.text) || target.text === "." || target.text === ".." || ctx.isDir(target))) return [target];
 	return sources.map((s) => ({
-		text: target.text + "/" + base(s.text),
+		text: target.text.replace(/[\\/]+$/, "") + "/" + base(s.text),
 		unsafe: target.unsafe || s.unsafe
 	}));
 }
@@ -7446,7 +7760,9 @@ const PS_SWITCHES = /* @__PURE__ */ new Set([
 	"verbose",
 	"debug",
 	"raw",
-	"wait"
+	"wait",
+	"recurse",
+	"container"
 ]);
 function psArgs(args) {
 	const named = Object.create(null);
@@ -7482,9 +7798,12 @@ function newItem(args) {
 		unsafe: path.unsafe || name.unsafe
 	} : name];
 }
-function place(w, dir, win) {
-	if (!w || w.unsafe || !w.text || w.text.startsWith("~") || w.text.startsWith("/dev/") || /^nul$/i.test(w.text)) return null;
-	const p = win ? w.text.replace(/^\/([a-zA-Z])(?=\/|$)/, (_, d) => d.toUpperCase() + ":") : w.text;
+function place(w, dir, win, home = null) {
+	if (!w || w.unsafe || !w.text || w.text.startsWith("/dev/") || /^(nul|\$null)$/i.test(w.text)) return null;
+	const tilde = /^~(?=[\\/]|$)/.test(w.text);
+	if (w.text.startsWith("~") && !(tilde && home)) return null;
+	const text = tilde ? normalize(home) + w.text.slice(1) : w.text;
+	const p = win ? text.replace(/^\/([a-zA-Z])(?=\/|$)/, (_, d) => d.toUpperCase() + ":") : text;
 	if (isAbsolute(p)) return normalize(p);
 	return dir ? join(dir, p) : null;
 }
@@ -7512,29 +7831,37 @@ function segments(toks) {
 	out.push(cur);
 	return out.filter((s) => s.words.length || s.writes.length);
 }
-function tokens(src, ps) {
+function tokens(src, shell) {
+	const ps = shell === "powershell";
+	const cmd = shell === "cmd";
 	const out = [];
 	const heredocs = [];
 	let word = null;
 	let i = 0;
+	let begin = 0;
 	const add = (s, unsafe = false) => {
 		word = word || {
 			text: "",
-			unsafe: false
+			unsafe: false,
+			start: begin
 		};
 		word.text += s;
 		if (unsafe) word.unsafe = true;
 	};
 	const flush = () => {
-		if (word) out.push(word);
+		if (word) out.push({
+			...word,
+			end: i
+		});
 		word = null;
 	};
 	const op = (o) => {
 		flush();
 		out.push({ op: o });
 	};
-	const escape = ps ? "`" : "\\";
+	const escape = ps ? "`" : cmd ? "^" : "\\";
 	while (i < src.length) {
+		if (!word) begin = i;
 		const ch = src[i];
 		if (ch === "\n") {
 			op(";");
@@ -7543,7 +7870,7 @@ function tokens(src, ps) {
 		} else if (ch === " " || ch === "	" || ch === "\r") {
 			flush();
 			i++;
-		} else if (ch === "#" && !word) while (i < src.length && src[i] !== "\n") i++;
+		} else if (ch === "#" && !word && !cmd) while (i < src.length && src[i] !== "\n") i++;
 		else if (ch === escape) {
 			if (src[i + 1] !== "\n") add(src[i + 1] || "");
 			i += 2;
@@ -7553,7 +7880,7 @@ function tokens(src, ps) {
 			const stop = end < 0 ? src.length : end;
 			add(src.slice(i + 2, stop), q === "\"" && src.slice(i + 2, stop).includes("$"));
 			i = end < 0 ? src.length : end + 3;
-		} else if (ch === "'") {
+		} else if (ch === "'" && !cmd) {
 			let j = i + 1;
 			let text = "";
 			for (;;) {
@@ -7574,7 +7901,7 @@ function tokens(src, ps) {
 		} else if (ch === "\"") {
 			let j = i + 1;
 			while (j < src.length && src[j] !== "\"") {
-				if (src[j] === escape && j + 1 < src.length) {
+				if (src[j] === escape && !cmd && j + 1 < src.length) {
 					const n = src[j + 1];
 					if (ps || "$`\"\\\n".includes(n)) {
 						if (n !== "\n") add(n);
@@ -7582,13 +7909,13 @@ function tokens(src, ps) {
 						continue;
 					}
 				}
-				if (src[j] === "$" || !ps && src[j] === "`") add(src[j], true);
+				if (cmd ? src[j] === "%" : src[j] === "$" || !ps && src[j] === "`") add(src[j], true);
 				else add(src[j]);
 				j++;
 			}
 			add("");
 			i = j + 1;
-		} else if (ch === "$" || ch === "*" || ch === "?" || !ps && ch === "`") {
+		} else if ((cmd ? ch === "%" : ch === "$" || !ps && ch === "`") || ch === "*" || ch === "?") {
 			add(ch, true);
 			i++;
 		} else if (ch === ";" || ch === "(" || ch === ")") {
@@ -7621,7 +7948,7 @@ function tokens(src, ps) {
 			}
 		} else if (ch === "<") {
 			flush();
-			if (!ps && src[i + 1] === "<" && src[i + 2] !== "<") {
+			if (shell === "bash" && src[i + 1] === "<" && src[i + 2] !== "<") {
 				i += 2;
 				const strip = src[i] === "-";
 				if (strip) i++;
@@ -7703,9 +8030,11 @@ function createClaudeCode(io) {
 	const transcripts = /* @__PURE__ */ new Map();
 	const metas = /* @__PURE__ */ new Map();
 	const found = /* @__PURE__ */ new Map();
+	const workspaces = /* @__PURE__ */ new Map();
+	const places = attributionCache();
 	const searched = /* @__PURE__ */ new Map();
 	let used = /* @__PURE__ */ new Set();
-	async function read({ sessionId, cwd, now, config, resolve }) {
+	async function read({ sessionId, cwd, now, config, resolve, projectOf }) {
 		used = /* @__PURE__ */ new Set();
 		const errors = {
 			count: 0,
@@ -7732,12 +8061,31 @@ function createClaudeCode(io) {
 		try {
 			if (leftOut(main, c, config)) return none();
 			if (!main.cwd) return none(main.seen && (!main.parsed || main.messages) ? "transcript format not recognised" : null);
-			const where = await resolve(main.cwd);
+			const home = await resolve(cwd);
+			const workspace = !home && await isWorkspace(cwd, now, config);
+			const where = workspace ? {
+				toplevel: normalize(cwd),
+				commonDir: "",
+				branch: null
+			} : await resolve(main.cwd);
 			if (!where) return none(`git could not place ${normalize(main.cwd)}`);
+			const place = createAttribution({
+				folder: cwd,
+				where: workspace ? null : home ?? where,
+				resolve,
+				projectOf,
+				stat: (p) => io.stat(p),
+				realpath: (p) => io.realpath ? io.realpath(p) : p,
+				cache: places,
+				now
+			});
+			const checkouts = {};
 			return {
-				facts: await sessionFacts(c, main, where, now, config, resolve, fail),
+				facts: await sessionFacts(c, main, where, workspace, now, config, resolve, place, fail, checkouts),
 				status: null,
-				errors
+				errors,
+				workspace,
+				checkouts
 			};
 		} finally {
 			for (const cache of [transcripts, metas]) for (const key of cache.keys()) if (!used.has(key)) cache.delete(key);
@@ -7812,7 +8160,24 @@ function createClaudeCode(io) {
 			subagents: all.length
 		};
 	}
-	async function sessionFacts(c, main, where, now, config, resolve, fail) {
+	async function isWorkspace(dir, now, config) {
+		if (io.home && (pathKey(dir) === pathKey(io.home) || relativeTo(dir, io.home) !== null)) return false;
+		const key = pathKey(dir);
+		const hit = workspaces.get(key);
+		if (hit && now - hit.at <= config.gitCacheSeconds * 1e3) return hit.is;
+		const st = await io.stat(dir);
+		let repos = 0;
+		if (st && st.isDir) {
+			for (const e of await io.listDir(dir)) if (e.isDir && await io.stat(join(dir, `${e.name}/.git`))) repos++;
+		}
+		const is = repos >= 1 && repos <= config.workspaceRepos;
+		workspaces.set(key, {
+			at: now,
+			is
+		});
+		return is;
+	}
+	async function sessionFacts(c, main, where, workspace, now, config, resolve, place, fail, checkouts) {
 		const session = `${SOURCE}:${c.id}`;
 		const lead = `${session}:lead`;
 		const agentFiles = [];
@@ -7873,18 +8238,20 @@ function createClaudeCode(io) {
 			status: leadWorking ? "working" : "idle",
 			statusSince: iso(leadWorking ? main.turnAt : main.lastMessageAt, c.ownMtime),
 			lastActive: iso(c.ownMtime),
-			doing: leadWorking ? await doingOf(main, resolve, c.ownMtime, config) : null,
+			doing: leadWorking ? await doingOf(main, place, c.ownMtime, config) : null,
 			usage: usageOf(main, c.ownMtime)
 		});
-		main.touches = await addFiles(facts.edits, lead, main.touches, [...config.touchedTools, ...config.shellTools], now, config, resolve);
-		main.reads = await addFiles(facts.reads, lead, main.reads, [...READ_TOOLS, ...config.shellTools], now, config, resolve);
+		main.touches = await addFiles(facts.edits, lead, main.touches, [...config.touchedTools, ...config.shellTools], now, config, place);
+		main.reads = await addFiles(facts.reads, lead, main.reads, [...READ_TOOLS, ...config.shellTools], now, config, place);
 		if (main.turnOpen) addQuestions(facts.questions, lead, main, results, c.ownMtime);
 		for (const a of agentFiles) {
 			const id = agentId(a.id);
 			const type = typeof a.meta.agentType === "string" && a.meta.agentType ? a.meta.agentType : null;
 			const at = a.t.cwd ? await resolve(a.t.cwd) : null;
 			let worktree = typeof a.meta.worktreePath === "string" ? normalize(a.meta.worktreePath) : null;
-			if (!worktree && at && pathKey(at.toplevel) !== pathKey(where.toplevel)) worktree = at.toplevel;
+			if (!worktree && at && !workspace && pathKey(at.toplevel) !== pathKey(where.toplevel)) worktree = at.toplevel;
+			const elsewhere = worktree ? await place.dir(worktree) : null;
+			if (elsewhere?.project) checkouts[id] = elsewhere.project.id;
 			const agentBranch = worktree ? typeof a.meta.worktreeBranch === "string" && a.meta.worktreeBranch || (at && pathKey(at.toplevel) === pathKey(worktree) ? at.branch : null) : null;
 			const spawn = typeof a.meta.toolUseId === "string" ? spawns.get(a.meta.toolUseId) : void 0;
 			let startedBy = spawn ? spawn.by : typeof a.meta.parentAgentId === "string" ? agentId(a.meta.parentAgentId) : lead;
@@ -7901,7 +8268,7 @@ function createClaudeCode(io) {
 				status: s.status,
 				statusSince: iso(s.since, a.mtimeMs),
 				lastActive: iso(a.mtimeMs),
-				doing: live ? await doingOf(a.t, resolve, a.mtimeMs, config) : null,
+				doing: live ? await doingOf(a.t, place, a.mtimeMs, config) : null,
 				usage: usageOf(a.t, a.mtimeMs),
 				...worktree ? {
 					checkout: worktree,
@@ -7923,8 +8290,8 @@ function createClaudeCode(io) {
 				at: iso(a.t.lastTextAt, a.mtimeMs),
 				text: a.t.lastText
 			});
-			a.t.touches = await addFiles(facts.edits, id, a.t.touches, [...config.touchedTools, ...config.shellTools], now, config, resolve);
-			a.t.reads = await addFiles(facts.reads, id, a.t.reads, [...READ_TOOLS, ...config.shellTools], now, config, resolve);
+			a.t.touches = await addFiles(facts.edits, id, a.t.touches, [...config.touchedTools, ...config.shellTools], now, config, place);
+			a.t.reads = await addFiles(facts.reads, id, a.t.reads, [...READ_TOOLS, ...config.shellTools], now, config, place);
 		}
 		return facts;
 	}
@@ -7965,7 +8332,7 @@ function createClaudeCode(io) {
 			lines[0] = st.head + lines[0];
 			st.head = null;
 		}
-		for (const line of lines) if (line.trim()) foldLine(st, line);
+		for (const line of lines) if (line.trim()) foldLine(st, line, io.home ?? null, io.isDirSync);
 		return st;
 	}
 	async function sumUsage(path, st, chunk) {
@@ -8027,19 +8394,23 @@ const message = (err) => String(err && err.message || err);
 function iso(ms, fallback) {
 	return new Date(Number.isFinite(ms) ? ms : fallback).toISOString();
 }
-async function addFiles(list, agent, touches, tools, now, config, resolve) {
+async function addFiles(list, agent, touches, tools, now, config, place) {
 	const since = now - config.touchedWindowMinutes * 6e4;
 	const kept = touches.filter((t) => t.at >= since);
 	const newest = /* @__PURE__ */ new Map();
 	for (const t of kept) {
 		if (!tools.includes(t.name) || !t.cwd) continue;
-		const where = await resolve(t.cwd);
-		const file = where && relativeTo(where.toplevel, t.path);
-		if (file && !(newest.get(file) >= t.at)) newest.set(file, t.at);
+		const placed = await place.file(t.path);
+		if (!placed) continue;
+		const key = `${placed.project?.id ?? ""}\n${placed.file}`;
+		if (!((newest.get(key)?.at ?? -Infinity) >= t.at)) newest.set(key, {
+			placed,
+			at: t.at
+		});
 	}
-	for (const [file, at] of newest) list.push({
+	for (const { placed, at } of newest.values()) list.push({
 		agent,
-		file,
+		...placed,
 		at: iso(at)
 	});
 	return kept;
@@ -8094,7 +8465,7 @@ const MESSAGE_TYPES = /* @__PURE__ */ new Set([
 	"attachment",
 	"system"
 ]);
-function foldLine(st, line) {
+function foldLine(st, line, home, isDir) {
 	st.seen++;
 	let ev;
 	try {
@@ -8137,12 +8508,18 @@ function foldLine(st, line) {
 			});
 			const input = c.input || {};
 			const cwd = ev.cwd || st.cwd;
-			const shell = typeof input.command === "string" ? shellFiles(input.command, cwd, { powershell: c.name === "PowerShell" }) : {
+			const shell = typeof input.command === "string" ? shellFiles(input.command, cwd, {
+				powershell: c.name === "PowerShell",
+				home,
+				isDir
+			}) : {
 				writes: [],
-				reads: []
+				reads: [],
+				dirs: []
 			};
 			const writes = shell.writes;
 			const file = typeof input.file_path === "string" ? input.file_path : typeof input.notebook_path === "string" ? input.notebook_path : typeof input.path === "string" ? input.path : null;
+			const dir = shell.dirs[shell.dirs.length - 1];
 			st.lastTool = writes.length ? {
 				name: c.name,
 				file: writes[writes.length - 1],
@@ -8153,6 +8530,7 @@ function foldLine(st, line) {
 				name: c.name,
 				file,
 				cwd,
+				...dir ? { dir } : {},
 				at
 			};
 			const target = input.file_path || input.notebook_path;
@@ -8327,18 +8705,13 @@ function ended(state, at) {
 		endState: state
 	};
 }
-async function doingOf(st, resolve, fallbackMs, config) {
+async function doingOf(st, place, fallbackMs, config) {
 	const t = st.lastTool;
 	const kind = t && (t.wrote && config.shellTools.includes(t.name) ? "write" : Object.hasOwn(DOING, t.name) ? DOING[t.name] : void 0);
 	if (!t || !kind) return null;
-	const doing = { kind };
-	if (t.file && t.cwd) {
-		const where = await resolve(t.cwd);
-		const file = where && relativeTo(where.toplevel, t.file);
-		if (file) doing.file = file;
-	}
 	return {
-		...doing,
+		kind,
+		...t.file && t.cwd ? await place.file(t.file) : t.dir ? await place.dir(t.dir) : null,
 		since: iso(t.at, fallbackMs)
 	};
 }

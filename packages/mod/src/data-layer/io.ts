@@ -2,6 +2,7 @@
 // runner.
 
 import { execFile } from "node:child_process";
+import { statSync } from "node:fs";
 import fs from "node:fs/promises";
 import type { RunResult, Stat } from "./git.js";
 
@@ -17,6 +18,10 @@ export interface NodeIo {
   stat(path: string): Promise<Stat | null>;
   /** The text of bytes [start, end), or the whole file when both are omitted. */
   read(path: string, start?: number, end?: number): Promise<string>;
+  /** The path with symlinks resolved; it rejects when the path doesn't exist. */
+  realpath(path: string): Promise<string>;
+  /** Whether the path is a folder now. */
+  isDirSync(path: string): boolean;
 }
 
 export function nodeIo({ run = runCommand }: { run?: NodeIo["run"] } = {}): NodeIo {
@@ -35,6 +40,14 @@ export function nodeIo({ run = runCommand }: { run?: NodeIo["run"] } = {}): Node
         return { isDir: s.isDirectory(), mtimeMs: s.mtimeMs, size: s.size };
       } catch {
         return null;
+      }
+    },
+    realpath: (p) => fs.realpath(p),
+    isDirSync: (p) => {
+      try {
+        return statSync(p).isDirectory();
+      } catch {
+        return false;
       }
     },
     async read(p, start, end) {

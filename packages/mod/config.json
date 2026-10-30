@@ -12,5 +12,6 @@
   "helperPrompts": ["Generate a short git branch name"],
   "streamSeconds": 1,
   "tailBytes": 1048576,
-  "gitCacheSeconds": 60
+  "gitCacheSeconds": 60,
+  "workspaceRepos": 12
 }

@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { FactRemoveSchema, FactsSchema, FactUpsertSchema, SourceSchema } from "./facts.js";
+import { FactRemoveSchema, FactsSchema, FactUpsertSchema, ProjectSchema, SourceSchema } from "./facts.js";
 
 /**
  * The protocol version every message carries as `v`. Adding optional fields doesn't change it;
@@ -9,11 +9,6 @@ export const PROTOCOL_VERSION = 1;
 
 const Version = z.literal(PROTOCOL_VERSION);
 const Seq = z.number().int().nonnegative();
-
-export const ProjectSchema = z.object({
-  id: z.string().min(1),
-  name: z.string().min(1),
-});
 
 const Account = z.object({ id: z.string().min(1), name: z.string() });
 const Machine = z.object({ name: z.string().min(1) });
@@ -288,6 +283,20 @@ export const ConflictMessageSchema = z.object({
   text: z.string().min(1),
 });
 
+/**
+ * Sent after a hello is let in, by a server that reads where an edit or command lands (#74): the
+ * projects of the session's office it may report work in, lower-cased: every one with a remote, and
+ * of those with none (`local:`), only the hello's own machine's. A data layer reports a file,
+ * command or worktree outside the session's own project only for one of these, and one that hasn't
+ * had a welcome on its connection keeps them on the machine, as an older server would read them as
+ * the session's own.
+ */
+export const WelcomeMessageSchema = z.object({
+  type: z.literal("welcome"),
+  v: Version,
+  projects: z.array(z.string().min(1)),
+});
+
 /** Something the data layer should show. */
 export const ErrorMessageSchema = z.object({
   type: z.literal("error"),
@@ -428,6 +437,7 @@ export const AskRightsMessageSchema = z.object({
 
 export const OfficeServerMessageSchema = z.discriminatedUnion("type", [
   RepairMessageSchema,
+  WelcomeMessageSchema,
   ConflictMessageSchema,
   ErrorMessageSchema,
   RequestMessageSchema,
@@ -440,7 +450,6 @@ export const OfficeServerMessageSchema = z.discriminatedUnion("type", [
   AskRightsMessageSchema,
 ]);
 
-export type Project = z.infer<typeof ProjectSchema>;
 export type HandoffRepo = z.infer<typeof HandoffRepoSchema>;
 export type Handoff = z.infer<typeof HandoffSchema>;
 export type HelloMessage = z.infer<typeof HelloMessageSchema>;
@@ -470,6 +479,7 @@ export type AskedMessage = z.infer<typeof AskedMessageSchema>;
 export type AskedAckMessage = z.infer<typeof AskedAckMessageSchema>;
 export type AskRightsMessage = z.infer<typeof AskRightsMessageSchema>;
 export type OfficeServerMessage = z.infer<typeof OfficeServerMessageSchema>;
+export type WelcomeMessage = z.infer<typeof WelcomeMessageSchema>;
 
 /**
  * A parsed message, or why it was refused: `unsupported-version` when it carries a protocol

@@ -1,4 +1,4 @@
-import type { Project } from "./messages.js";
+import type { Project } from "./facts.js";
 
 /**
  * A project's id and name. With a git remote the id is `host/owner/repo` (any deeper path kept, as

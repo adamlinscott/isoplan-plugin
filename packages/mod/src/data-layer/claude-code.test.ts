@@ -17,6 +17,12 @@ function office() {
 }
 
 const agentsOf = async (home: string, id: string) => byId((await factsOf(home, id)).agents);
+// The project the fixture's projectOf gives a repo with no remote, as a data layer on "test-machine" would.
+const caseless = process.platform === "win32" || process.platform === "darwin";
+const localProject = (dir: string) => {
+  const id = `local:test-machine/${normalize(dir)}`;
+  return { id: caseless ? id.toLowerCase() : id, name: path.basename(dir) };
+};
 
 test("reads only its own session: skips bad lines; title falls back to branch", async () => {
   const { home, main, wt } = office();
@@ -340,7 +346,7 @@ test("waits: a working or stalled agent owes its starter an answer, since its sp
   ]);
 });
 
-test("doing: the last tool call's kind, shown while working or stalled; a file outside the checkout is dropped", async () => {
+test("doing: the last tool call's kind, shown while working or stalled; a file in another repo names that repo", async () => {
   const { home, main, other } = office();
   session(home, "s", [line.user(main, "x")]);
   const tools: Record<string, [string, Record<string, unknown>]> = {
@@ -355,7 +361,7 @@ test("doing: the last tool call's kind, shown while working or stalled; a file o
   const a = await agentsOf(home, "s");
   expect(Object.fromEntries(Object.keys(tools).map((id) => [id, a[id]!.doing && a[id]!.doing.kind]))).toEqual({ w: "write", r: "read", b: "run", g: "search", t: "talk", o: null });
   expect(a.w!.doing!.file).toBe("w.md");
-  expect(a.r!.doing).toEqual({ kind: "read", since: at(5) });
+  expect(a.r!.doing).toEqual({ kind: "read", file: "r.md", project: localProject(other), away: true, since: at(5) });
 });
 
 test("usage: the newest reply's model and context; token totals summed once per reply, with the 1h cache writes and the replies over 100k apart; a made-up line is no reply", async () => {
@@ -544,6 +550,7 @@ test("edits: Edit/Write/NotebookEdit in the window, per agent with the newest ti
     { agent: cc("s:lead"), file: "Lib/A.mjs", at: at(60) },
     { agent: cc("s:lead"), file: "b.md", at: at(60) },
     { agent: cc("s:lead"), file: "n.ipynb", at: at(60) },
+    { agent: cc("s:lead"), file: "outside.md", project: localProject(other), away: true, at: at(60) },
     { agent: cc("w"), file: "src/c.mjs", at: at(30) },
   ]);
 });
@@ -714,4 +721,165 @@ test("lead: the runner finds a session by name and reads its folder, open turn, 
   const long = session(home, "long", [{ type: "system", subtype: "compact_boundary", timestamp: at(100) }, ...Array.from({ length: 50 }, (_, i) => line.text(main, "x".repeat(100), 90 - i))]);
   expect(fs.statSync(long).size).toBeGreaterThan(2000);
   expect(await source.lead("long", NOW, { ...config, tailBytes: 1000 })).toMatchObject({ compacted: true });
+});
+
+// #74: which repo each edit, read and command lands in. Home is the session's folder.
+test("attribution, paths: an edit or read in another repo names that repo and is away; one in a folder not made yet is placed by its nearest folder", async () => {
+  const { home, main, other } = office();
+  session(home, "s", [
+    line.tool(main, "Edit", { file_path: path.join(other, "src", "api.ts") }, 60),
+    line.tool(main, "Write", { file_path: path.join(other, "src", "new", "deep", "x.ts") }, 50),
+    line.tool(main, "Read", { file_path: path.join(other, "README.md") }, 40),
+    line.tool(main, "Edit", { file_path: path.join(main, "a.ts") }, 30),
+  ]);
+  const f = (await sourceIn(home)("s", main)).facts!;
+  const away = { project: localProject(other), away: true };
+  expect(f.edits).toEqual([
+    { agent: cc("s:lead"), file: "src/api.ts", ...away, at: at(60) },
+    { agent: cc("s:lead"), file: "src/new/deep/x.ts", ...away, at: at(50) },
+    { agent: cc("s:lead"), file: "a.ts", at: at(30) },
+  ]);
+  expect(f.reads).toEqual([{ agent: cc("s:lead"), file: "README.md", ...away, at: at(40) }]);
+});
+
+test("attribution, cd: a shell command that cds into another repo writes there, and a command run there is doing work there", async () => {
+  const { home, main, other } = office();
+  const o = normalize(other);
+  session(home, "s", [line.user(main, "x")]);
+  agent(home, "s", "w", { agentType: "worker" }, [line.tool(main, "Bash", { command: `cd "${o}" && echo x >> notes.md` }, 5)], { age: 5 });
+  agent(home, "s", "t", { agentType: "worker" }, [line.tool(main, "Bash", { command: `cd "${o}" && npm test` }, 5)], { age: 5 });
+  agent(home, "s", "h", { agentType: "worker" }, [line.tool(main, "Bash", { command: "npm test" }, 5)], { age: 5 });
+  const f = (await sourceIn(home)("s", main)).facts!;
+  const a = byId(f.agents);
+  const away = { project: localProject(other), away: true };
+  expect(f.edits).toEqual([{ agent: cc("w"), file: "notes.md", ...away, at: at(5) }]);
+  expect([a.w!.doing, a.t!.doing, a.h!.doing]).toEqual([
+    { kind: "write", file: "notes.md", ...away, since: at(5) },
+    { kind: "run", ...away, since: at(5) },
+    { kind: "run", since: at(5) },
+  ]);
+});
+
+test("attribution, git -C: a git command pointed at another repo is doing work there", async () => {
+  const { home, main, other } = office();
+  session(home, "s", [line.user(main, "x")]);
+  agent(home, "s", "g", { agentType: "worker" }, [line.tool(main, "PowerShell", { command: `git -C "${other}" commit -m "Use v2 tokens"` }, 5)], { age: 5 });
+  agent(home, "s", "m", { agentType: "worker" }, [line.tool(main, "Bash", { command: `git -C "${normalize(main)}" status` }, 5)], { age: 5 });
+  const a = byId((await sourceIn(home)("s", main)).facts!.agents);
+  expect(a.g!.doing).toEqual({ kind: "run", project: localProject(other), away: true, since: at(5) });
+  expect(a.m!.doing).toEqual({ kind: "run", since: at(5) });
+});
+
+test("attribution, worktrees: an edit in a worktree of another repo is that repo's; one in a worktree of the session's own repo is home", async () => {
+  const { root, home, main, wt, other } = office();
+  const otherWt = gitWorktree(other, path.join(root, "orca", "other-wt"), "other-wt", "feat/tokens");
+  session(home, "s", [
+    line.tool(main, "Edit", { file_path: path.join(otherWt, "src", "tokens.ts") }, 60),
+    line.tool(main, "Edit", { file_path: path.join(wt, "src", "own.ts") }, 50),
+  ]);
+  expect((await sourceIn(home)("s", main)).facts!.edits).toEqual([
+    { agent: cc("s:lead"), file: "src/tokens.ts", project: localProject(other), away: true, at: at(60) },
+    { agent: cc("s:lead"), file: "src/own.ts", at: at(50) },
+  ]);
+});
+
+test("attribution, workspace: a session in a folder holding repos reports, each file named by its repo and none away; a repo outside it is away", async () => {
+  const { root, home, other } = office();
+  const ws = path.join(root, "lorveil");
+  const api = gitRepo(path.join(ws, "api"));
+  const web = gitRepo(path.join(ws, "web"));
+  session(home, "s", [
+    line.tool(ws, "Edit", { file_path: path.join(api, "src", "invoices.ts") }, 60),
+    line.tool(ws, "Edit", { file_path: path.join(web, "src", "Invoices.vue") }, 50),
+    line.tool(ws, "Write", { file_path: path.join(ws, "notes.md") }, 40),
+    line.tool(ws, "Edit", { file_path: path.join(other, "x.ts") }, 30),
+  ]);
+  agent(home, "s", "w", { agentType: "worker" }, [line.tool(api, "Bash", { command: "npm test" }, 5)], { age: 5 });
+  const f = (await sourceIn(home)("s", ws)).facts!;
+  expect(f.session.checkout).toBe(normalize(ws));
+  expect(f.edits).toEqual([
+    { agent: cc("s:lead"), file: "src/invoices.ts", project: localProject(api), at: at(60) },
+    { agent: cc("s:lead"), file: "src/Invoices.vue", project: localProject(web), at: at(50) },
+    { agent: cc("s:lead"), file: "notes.md", at: at(40) },
+    { agent: cc("s:lead"), file: "x.ts", project: localProject(other), away: true, at: at(30) },
+  ]);
+  // Working in one of its repos, an agent is not in a worktree, and is home.
+  const w = byId(f.agents).w!;
+  expect([w.checkout, w.doing]).toEqual([undefined, { kind: "run", project: localProject(api), since: at(5) }]);
+  // A plain folder with no repos in it is still not placed.
+  const plain = path.join(root, "plain");
+  fs.mkdirSync(plain);
+  session(home, "p", [line.user(plain, "x")]);
+  expect((await sourceIn(home)("p", plain)).facts).toBe(null);
+});
+
+test("attribution, nested repos: a file is credited to the innermost repo it is in, whatever folder the call came from", async () => {
+  const { home, main, other } = office();
+  const inner = gitRepo(path.join(main, "vendor", "inner"));
+  session(home, "s", [
+    line.tool(main, "Edit", { file_path: path.join(inner, "lib.ts") }, 60),
+    line.tool(other, "Edit", { file_path: path.join(inner, "lib2.ts") }, 50),
+    line.tool(inner, "Edit", { file_path: path.join(main, "top.ts") }, 40),
+  ]);
+  expect((await sourceIn(home)("s", main)).facts!.edits).toEqual([
+    { agent: cc("s:lead"), file: "lib.ts", project: localProject(inner), at: at(60) },
+    { agent: cc("s:lead"), file: "lib2.ts", project: localProject(inner), at: at(50) },
+    { agent: cc("s:lead"), file: "top.ts", at: at(40) },
+  ]);
+});
+
+test("attribution, symlinks: a path through a link is compared with the repo's real folder", async () => {
+  const { root, home, main, other } = office();
+  const link = path.join(root, "linked-other");
+  fs.symlinkSync(other, link, "junction");
+  session(home, "s", [line.tool(main, "Edit", { file_path: path.join(link, "src", "x.ts") }, 30)]);
+  expect((await sourceIn(home)("s", main)).facts!.edits).toEqual([{ agent: cc("s:lead"), file: "src/x.ts", project: localProject(other), away: true, at: at(30) }]);
+});
+
+test("attribution, a second clone with the session's remote is the session's own project, not another repo", async () => {
+  const { root, home, main, other } = office();
+  const clone = gitRepo(path.join(root, "clone-of-repo"));
+  const remotes: Record<string, string> = { [normalize(main)]: "github.com/team/app", [normalize(clone)]: "github.com/team/app", [normalize(other)]: "github.com/team/api" };
+  const byRemote = (where: { toplevel: string }) => ({ id: remotes[normalize(where.toplevel)]!, name: path.basename(where.toplevel) });
+  session(home, "s", [line.tool(main, "Edit", { file_path: path.join(clone, "a.ts") }, 40), line.tool(main, "Edit", { file_path: path.join(other, "a.ts") }, 30)]);
+  expect((await sourceIn(home, { projectOf: byRemote })("s", main)).facts!.edits).toEqual([
+    { agent: cc("s:lead"), file: "a.ts", at: at(40) },
+    { agent: cc("s:lead"), file: "a.ts", project: { id: "github.com/team/api", name: "other" }, away: true, at: at(30) },
+  ]);
+});
+
+test("attribution, workspace: never the home folder or one above it, nor a folder with more repos than workspaceRepos; its listing is kept a while", async () => {
+  const { root, home } = office();
+  const ws = path.join(root, "work", "lorveil");
+  for (const r of ["api", "web"]) gitRepo(path.join(ws, r));
+  session(home, "s", [line.user(ws, "x")]);
+  // The folder is the person's home, or above it.
+  expect((await sourceIn(home, { home: ws })("s", ws)).facts).toBe(null);
+  expect((await sourceIn(home, { home: path.join(ws, "api") })("s", ws)).facts).toBe(null);
+  // Too many repos to be one piece of work.
+  expect((await sourceIn(home, { config: { workspaceRepos: 1 } })("s", ws)).facts).toBe(null);
+  const listed: string[] = [];
+  const base = nodeIo({ run: null });
+  const read = sourceIn(home, { io: { listDir: (dir) => (listed.push(normalize(dir)), base.listDir(dir)) } });
+  expect((await read("s", ws)).workspace).toBe(true);
+  await read("s", ws);
+  expect(listed.filter((d) => d === normalize(ws))).toHaveLength(1);
+});
+
+test.skipIf(!caseless)("attribution, letter case: a local repo reached in another spelling is the same project, where the file system ignores case", async () => {
+  const { home, main, other } = office();
+  session(home, "s", [line.tool(main, "Edit", { file_path: path.join(other, "a.ts") }, 40), line.tool(main, "Edit", { file_path: path.join(other.toUpperCase(), "b.ts") }, 30)]);
+  const edits = (await sourceIn(home)("s", main)).facts!.edits;
+  expect(edits.map((e) => e.project!.id)).toEqual([localProject(other).id, localProject(other).id]);
+});
+
+test("attribution, checkouts: a subagent working in a worktree of another repo is named, so its checkout goes only where that repo may", async () => {
+  const { root, home, main, other } = office();
+  const otherWt = gitWorktree(other, path.join(root, "orca", "other-wt2"), "other-wt2", "feat/x");
+  session(home, "s", [line.user(main, "x")]);
+  agent(home, "s", "w", { agentType: "worker", worktreePath: otherWt, worktreeBranch: "feat/x" }, [line.tool(otherWt, "Read", { file_path: path.join(otherWt, "a.ts") }, 5)], { age: 5 });
+  agent(home, "s", "h", { agentType: "worker" }, [line.tool(main, "Read", { file_path: path.join(main, "a.ts") }, 5)], { age: 5 });
+  const read = await sourceIn(home)("s", main);
+  expect(read.checkouts).toEqual({ [cc("w")]: localProject(other).id });
+  expect(byId(read.facts!.agents).w).toMatchObject({ checkout: normalize(otherWt), branch: "feat/x" });
 });

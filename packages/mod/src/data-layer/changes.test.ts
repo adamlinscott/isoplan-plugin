@@ -53,3 +53,11 @@ test("changes: a question is upserted when new or changed, and removed by its id
   expect(diffFacts(two, { ...base, questions: [] })).toEqual({ upsert: {}, remove: { questions: ["toolu_1", "toolu_2"] } });
   expect(diffFacts(one, base)).toEqual({ upsert: {}, remove: { questions: ["toolu_1"] } });
 });
+
+test("changes: the same path at home and in another repo is two records, kept apart and removed by project", () => {
+  const web = { id: "github.com/team/web", name: "web" };
+  const both: Facts = { ...base, edits: [{ agent: lead, file: "a.md", at }, { agent: lead, file: "a.md", at, project: web, away: true }] };
+  expect(diffFacts(both, structuredClone(both))).toBe(null);
+  expect(diffFacts(both, { ...both, edits: [both.edits[0]!] })).toEqual({ upsert: {}, remove: { edits: [{ agent: lead, file: "a.md", project: web }] } });
+  expect(diffFacts(both, { ...both, edits: [both.edits[1]!] })).toEqual({ upsert: {}, remove: { edits: [{ agent: lead, file: "a.md" }] } });
+});

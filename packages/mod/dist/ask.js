@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { execFile } from "node:child_process";
+import { statSync } from "node:fs";
 import { createHash, randomBytes } from "node:crypto";
 import http from "node:http";
 //#region ../../node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/core/util.js
@@ -5648,6 +5649,23 @@ const Time = datetime({ offset: true });
 /** Tool-specific detail that views never rely on. */
 const Extra = record(string(), unknown()).optional();
 const SourceSchema = _enum(["claude-code"]);
+/** A project: one code repository, by its id (see projectId) and a short name. */
+const ProjectSchema = object({
+	id: string().min(1),
+	name: string().min(1)
+});
+/**
+* Where a file or a command lands when it isn't in the session's own project (#74): `project` is
+* the repo it is in, and `away` is true when that repo is outside the session's folder, so the
+* agent is working away from home; a repo inside the folder (a workspace above several repos) has
+* `project` and no `away`. Both absent: the session's own project, as for a peer that predates
+* them. A data layer sends them only to a server that said it reads them (`welcome`), and only for
+* a project the server's office holds; anything else stays on the machine.
+*/
+const Elsewhere = {
+	project: ProjectSchema.optional(),
+	away: boolean().optional()
+};
 const SessionFactSchema = object({
 	id: string().min(1),
 	source: SourceSchema,
@@ -5695,7 +5713,8 @@ const AgentFactSchema = object({
 			"talk"
 		]),
 		file: string().optional(),
-		since: Time
+		since: Time,
+		...Elsewhere
 	}).nullable(),
 	usage: TokenCounts.extend({
 		model: string().min(1),
@@ -5707,11 +5726,15 @@ const AgentFactSchema = object({
 	branch: string().nullable().optional(),
 	extra: Extra
 });
-/** An edit or a read: `file` is relative to the repo root, with forward slashes. */
+/**
+* An edit or a read: `file` is relative to its repo's root, with forward slashes. One is known by
+* its agent, file and project, so one agent's README.md at home and in another repo are two.
+*/
 const FileFactSchema = object({
 	agent: string().min(1),
 	file: string().min(1),
 	at: Time,
+	...Elsewhere,
 	extra: Extra
 });
 const WaitFactSchema = object({
@@ -5780,10 +5803,12 @@ const FactUpsertSchema = object({
 });
 const FileKey = FileFactSchema.pick({
 	agent: true,
-	file: true
+	file: true,
+	project: true
 });
 /**
-* The keys of records that went away: an agent by its id, an edit or read by agent and file, a
+* The keys of records that went away: an agent by its id, an edit or read by agent, file and
+* project (absent for the session's own), a
 * wait by waiter and on, a report by its agent, a question by its id. The session itself goes with
 * the connection.
 */
@@ -5800,10 +5825,6 @@ const FactRemoveSchema = object({
 });
 const Version = literal(1);
 const Seq = number().int().nonnegative();
-const ProjectSchema = object({
-	id: string().min(1),
-	name: string().min(1)
-});
 const Account = object({
 	id: string().min(1),
 	name: string()
@@ -6050,6 +6071,19 @@ const ConflictMessageSchema = object({
 	file: string().min(1),
 	text: string().min(1)
 });
+/**
+* Sent after a hello is let in, by a server that reads where an edit or command lands (#74): the
+* projects of the session's office it may report work in, lower-cased: every one with a remote, and
+* of those with none (`local:`), only the hello's own machine's. A data layer reports a file,
+* command or worktree outside the session's own project only for one of these, and one that hasn't
+* had a welcome on its connection keeps them on the machine, as an older server would read them as
+* the session's own.
+*/
+const WelcomeMessageSchema = object({
+	type: literal("welcome"),
+	v: Version,
+	projects: array(string().min(1))
+});
 /** Something the data layer should show. */
 const ErrorMessageSchema = object({
 	type: literal("error"),
@@ -6132,6 +6166,7 @@ const HandOverReadyMessageSchema = object({
 });
 const OfficeServerMessageSchema = discriminatedUnion("type", [
 	RepairMessageSchema,
+	WelcomeMessageSchema,
 	ConflictMessageSchema,
 	ErrorMessageSchema,
 	RequestMessageSchema,
@@ -6472,9 +6507,11 @@ async function accountOf(io, claudeJson, cwd) {
 /**
 * The project the session's folder belongs to: its git remote's, or for a repo with no usable
 * remote, the main checkout's folder on this machine (so every worktree of one repo is one
-* project). A folder git can't place is its own local project.
+* project). A folder git can't place is its own local project. On a file system that ignores case
+* (Windows, macOS) a local project's id is lower-cased, so one folder reached in two spellings is
+* one project, in the hello and in every edit alike.
 */
-async function projectOf(run, where, cwd, machine) {
+async function projectOf(run, where, cwd, machine, caseless = process.platform === "win32" || process.platform === "darwin") {
 	let remote = null;
 	if (run && where) {
 		const r = await Promise.resolve(run([
@@ -6486,10 +6523,14 @@ async function projectOf(run, where, cwd, machine) {
 		if (r && r.code === 0 && r.stdout.trim()) remote = r.stdout.trim();
 	}
 	const root = !where ? normalize(cwd) : /\/\.git$/.test(where.commonDir) ? dirname(where.commonDir) : where.toplevel;
-	return projectId(remote, {
+	const project = projectId(remote, {
 		machine,
 		root
 	});
+	return caseless && project.id.startsWith("local:") ? {
+		...project,
+		id: project.id.toLowerCase()
+	} : project;
 }
 function parseJson(text) {
 	try {
@@ -6527,6 +6568,14 @@ function nodeIo({ run = runCommand } = {}) {
 				};
 			} catch {
 				return null;
+			}
+		},
+		realpath: (p) => fs.realpath(p),
+		isDirSync: (p) => {
+			try {
+				return statSync(p).isDirectory();
+			} catch {
+				return false;
 			}
 		},
 		async read(p, start, end) {

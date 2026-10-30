@@ -3,6 +3,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import fs from "node:fs/promises";
 import { promisify } from "node:util";
+import { statSync } from "node:fs";
 //#region src/data-layer/config.ts
 async function loadConfig(io, defaultsPath, userPath) {
 	const config = await loadSettings(io, defaultsPath, userPath);
@@ -79,6 +80,14 @@ function nodeIo({ run = runCommand } = {}) {
 				};
 			} catch {
 				return null;
+			}
+		},
+		realpath: (p) => fs.realpath(p),
+		isDirSync: (p) => {
+			try {
+				return statSync(p).isDirectory();
+			} catch {
+				return false;
 			}
 		},
 		async read(p, start, end) {

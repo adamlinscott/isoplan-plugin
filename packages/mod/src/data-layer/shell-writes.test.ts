@@ -1,4 +1,4 @@
-import { expect, test } from "vitest";
+import { describe, expect, test } from "vitest";
 import { shellFiles, type ShellOptions } from "./shell-writes.js";
 
 const shellWrites = (command: string, cwd: string | null, opts?: ShellOptions) => shellFiles(command, cwd, opts).writes;
@@ -64,7 +64,7 @@ test("PowerShell: Set-Content, Add-Content, Out-File and New-Item -ItemType File
     ["(Get-Content d.txt) | Set-Content -LiteralPath:'d.txt'", ["C:/r/d.txt"]],
     ["New-Item -ItemType File -Path docs -Name e.md -Force", ["C:/r/docs/e.md"]],
     ["New-Item -ItemType Directory f", []],
-    ["Get-ChildItem > list.txt; Remove-Item x 2> $null; Write-Output y > $null", ["C:/r/list.txt"]],
+    ["Get-ChildItem > list.txt; Remove-Item x 2> $null; Write-Output y > $null", ["C:/r/list.txt", "C:/r/x"]],
   ];
   for (const [command, writes] of cases) expect(shellWrites(command, "C:\\r", { powershell: true }), command).toEqual(writes);
 });
@@ -98,5 +98,124 @@ test("reads: cat, head, tail, less, more, sed without -i and Get-Content, file a
   expect(reads('cat "$F" *.md ~/x.md; cd lib && tail -n 3 e.md')).toEqual(["/r/lib/e.md"]);
   expect(reads("type f.md")).toEqual([]);
   expect(reads("Get-Content -Raw g.md; gc -Path h.md -TotalCount 5; type i.md; cat j.md", { powershell: true })).toEqual(["/r/g.md", "/r/h.md", "/r/i.md", "/r/j.md"]);
-  expect(shellFiles("cat a.md > b.md", "/r")).toEqual({ writes: ["/r/b.md"], reads: ["/r/a.md"] });
+  expect(shellFiles("cat a.md > b.md", "/r")).toEqual({ writes: ["/r/b.md"], reads: ["/r/a.md"], dirs: ["/r"] });
+});
+
+test("dirs: the folders a command's programs run in, after a cd, and git -C's, so a command in another repo can be placed", () => {
+  const dirs = (command: string, opts?: ShellOptions) => shellFiles(command, "/w/backend", opts).dirs;
+  expect(dirs("npm test")).toEqual(["/w/backend"]);
+  expect(dirs("cd ../frontend && npm test")).toEqual(["/w/frontend"]);
+  expect(dirs("git -C ../frontend status && git -C /w/infra -C sub log --oneline")).toEqual(["/w/frontend", "/w/infra/sub"]);
+  expect(dirs('git -c core.pager=cat -C "../front end" diff')).toEqual(["/w/front end"]);
+  // A cd alone runs nothing there; a folder it can't place drops what follows.
+  expect(dirs("cd ../frontend")).toEqual([]);
+  expect(dirs('cd "$X" && npm test')).toEqual([]);
+  expect(dirs("Set-Location ../frontend; npm test", { powershell: true })).toEqual(["/w/frontend"]);
+});
+
+// #74: long chained commands that edit files outside the session's folder, in each shell, with
+// Windows and POSIX paths.
+describe("raw terminal commands across repos", () => {
+  const files = (command: string, cwd: string, opts: ShellOptions = {}) => {
+    const { writes, dirs } = shellFiles(command, cwd, opts);
+    return { writes, dirs };
+  };
+
+  test("bash and zsh, POSIX paths: cd, ~, redirects, tee, sed -i, cp, mv, rm in one chain", () => {
+    const cmd = "cd ../frontend && echo x >> notes.md; sed -i 's/a/b/' src/a.ts | tee -a ~/log/run.txt && cp src/a.ts /srv/web/b.ts && mv old.ts new.ts; rm -f dist/x.js";
+    expect(files(cmd, "/Users/a/backend", { home: "/Users/a" })).toEqual({
+      writes: ["/Users/a/frontend/notes.md", "/Users/a/frontend/src/a.ts", "/Users/a/log/run.txt", "/srv/web/b.ts", "/Users/a/frontend/new.ts", "/Users/a/frontend/dist/x.js"],
+      dirs: ["/Users/a/frontend"],
+    });
+    // zsh -c and bash -lc are read as Bash; pushd and popd come back.
+    expect(files(`zsh -c "pushd ~/web && echo x > a.md; popd; touch b.md"`, "/Users/a/backend", { home: "/Users/a" }).writes).toEqual(["/Users/a/web/a.md", "/Users/a/backend/b.md"]);
+    expect(files(`bash -lc 'cd /srv/api && rm a.ts'`, "/home/b/x").writes).toEqual(["/srv/api/a.ts"]);
+  });
+
+  test("bash on Windows (Git Bash): /c/ paths, backslash-free Windows paths and ~", () => {
+    const cmd = "cd /c/w/frontend && printf 'x' > src/a.ts && cp src/a.ts C:/w/web/b.ts; rm ~/tmp/c.txt";
+    expect(files(cmd, "C:\\w\\backend", { home: "C:\\Users\\a" }).writes).toEqual(["C:/w/frontend/src/a.ts", "C:/w/web/b.ts", "C:/Users/a/tmp/c.txt"]);
+  });
+
+  test("PowerShell on Windows: Set-Location, Out-File, Set-Content, Add-Content, Copy-Item, Move-Item, Remove-Item, New-Item", () => {
+    const cmd =
+      "Set-Location ..\\frontend; 'x' | Out-File -FilePath notes.md; Set-Content src\\a.ts 'y'; Add-Content -Path ~\\log.txt 'z'; Copy-Item a.ts -Destination ..\\web\\b.ts; Move-Item c.ts d.ts; Remove-Item -Force dist\\e.js; New-Item -ItemType File f.md";
+    expect(files(cmd, "C:\\w\\backend", { powershell: true, home: "C:\\Users\\a" })).toEqual({
+      writes: ["C:/w/frontend/notes.md", "C:/w/frontend/src/a.ts", "C:/Users/a/log.txt", "C:/w/web/b.ts", "C:/w/frontend/d.ts", "C:/w/frontend/dist/e.js", "C:/w/frontend/f.md"],
+      dirs: ["C:/w/frontend"],
+    });
+    expect(files('powershell -Command "Push-Location C:\\w\\api; del old.ts; Pop-Location; ri x.ts"', "C:\\w\\backend").writes).toEqual(["C:/w/api/old.ts", "C:/w/backend/x.ts"]);
+  });
+
+  test("PowerShell on a Mac (pwsh): POSIX paths, ~, Push-Location and aliases", () => {
+    const cmd = "Push-Location ~/frontend; cp a.ts ../web/b.ts; rm -Force c.ts; Pop-Location; 'x' > notes.md";
+    expect(files(`pwsh -c "${cmd}"`, "/Users/a/backend", { home: "/Users/a" }).writes).toEqual(["/Users/a/web/b.ts", "/Users/a/frontend/c.ts", "/Users/a/backend/notes.md"]);
+  });
+
+  test("cmd: cd /d, pushd, redirects, copy, xcopy, move, del, and %VAR% skipped", () => {
+    const cmd = 'cmd /c "cd /d C:\\w\\frontend && echo hi > notes.txt && copy /y a.txt ..\\web\\b.txt & move c.txt d.txt & del /q old.txt & echo %X% > %OUT%"';
+    expect(files(cmd, "C:\\w\\backend")).toEqual({
+      writes: ["C:/w/frontend/notes.txt", "C:/w/web/b.txt", "C:/w/frontend/d.txt", "C:/w/frontend/old.txt"],
+      dirs: ["C:/w/frontend"],
+    });
+    expect(files("pushd D:\\repos\\api && xcopy src dist\\ /s && popd && type x.txt", "C:\\w\\backend", { cmd: true })).toEqual({ writes: ["D:/repos/api/dist/src"], dirs: ["D:/repos/api", "C:/w/backend"] });
+    // cmd through PowerShell, and cd with a spaced path left unquoted.
+    expect(files('cmd.exe /c "cd /d C:\\My Repos\\web && echo x > a.md"', "C:\\w\\backend", { powershell: true }).writes).toEqual(["C:/My Repos/web/a.md"]);
+  });
+
+  test("the folders programs are pointed at: git -C, --git-dir, --work-tree, npm --prefix, pnpm -C and --dir, yarn --cwd, make -C", () => {
+    const dirs = (command: string, cwd = "/w/backend") => shellFiles(command, cwd).dirs;
+    expect(dirs("git -C ../frontend commit -m x")).toEqual(["/w/frontend"]);
+    expect(dirs("git --git-dir=/w/web/.git log; git --git-dir /w/api/.git --work-tree /w/api-wt status")).toEqual(["/w/web", "/w/api-wt"]);
+    expect(dirs("npm --prefix ../frontend test && pnpm -C /w/web build && pnpm --dir=../api lint")).toEqual(["/w/frontend", "/w/web", "/w/api"]);
+    expect(dirs("yarn --cwd ../site build; make -C ../native all; make --directory=/w/c")).toEqual(["/w/site", "/w/native", "/w/c"]);
+    expect(dirs("git -C 'C:\\w\\frontend' diff && npm --prefix '..\\web' test", "C:\\w\\backend")).toEqual(["C:/w/frontend", "C:/w/web"]);
+    expect(dirs("npm test")).toEqual(["/w/backend"]);
+  });
+});
+
+describe("nested shells and the edges of parsing", () => {
+  const writes = (command: string, cwd: string, opts: ShellOptions = {}) => shellFiles(command, cwd, opts).writes;
+
+  test("a nested shell's command keeps its quoting: paths with spaces and operators inside quotes, in cmd, PowerShell and bash", () => {
+    // cmd /c, from Bash: the quoted line is cmd's own, with a spaced path and && inside quotes.
+    expect(writes(`cmd /c "cd /d \\"C:\\My Repos\\web\\" && echo a ^&^& b > \\"out file.txt\\""`, "C:\\w\\backend")).toEqual(["C:/My Repos/web/out file.txt"]);
+    // cmd /c with the rest of the line as typed, from PowerShell.
+    expect(writes(`cmd /c cd /d "C:\\My Repos\\web" & echo x > "a & b.txt"`, "C:\\w\\backend", { powershell: true })).toEqual(["C:/w/backend/a & b.txt"]);
+    // powershell -Command, from Bash: a single-quoted spaced path and a ; inside quotes stay whole.
+    expect(writes(`powershell -Command "Set-Location 'C:\\My Repos\\api'; Set-Content 'a; b.txt' 'x'"`, "C:\\w\\backend")).toEqual(["C:/My Repos/api/a; b.txt"]);
+    // bash -c, from PowerShell, POSIX paths with spaces.
+    expect(writes(`bash -c "cd '/Users/a/my repos/web' && echo x > 'a && b.md'"`, "/Users/a/backend", { powershell: true })).toEqual(["/Users/a/my repos/web/a && b.md"]);
+  });
+
+  test("nesting is read three shells deep at most, and an overlong command not at all", () => {
+    expect(writes(`bash -c "bash -c 'bash -c \\"echo x > deep.md\\"'"`, "/r")).toEqual(["/r/deep.md"]);
+    expect(writes(`bash -c "bash -c 'bash -c \\"bash -c echo\\\\ x\\\\ \\\\>\\\\ deeper.md\\"'"`, "/r")).toEqual([]);
+    expect(writes(`echo x > a.md; ${"true; ".repeat(8000)}`, "/r")).toEqual([]);
+  });
+
+  test("a script's own -c is not a shell's, and flag scans stop at --", () => {
+    expect(writes("bash script.sh -c 'echo x > a.md'", "/r")).toEqual([]);
+    expect(shellFiles("npm -- --prefix ../web test", "/w/backend").dirs).toEqual(["/w/backend"]);
+    expect(shellFiles("git -- -C ../web status", "/w/backend").dirs).toEqual(["/w/backend"]);
+  });
+
+  test("an unsafe git -C leaves where git works unknown", () => {
+    expect(shellFiles("git -C $X status", "/w/backend").dirs).toEqual([]);
+  });
+
+  test("deleting a folder is not an edit; a copy into a folder lands under the source's name", () => {
+    const folders = new Set(["/w/web/dist", "C:/w/web/dist"]);
+    const isDir = (p: string) => folders.has(p);
+    expect(writes("rm -rf build; rm -r -f ../web/dist; rm old.ts ../web/dist", "/w/backend", { isDir })).toEqual(["/w/backend/old.ts"]);
+    expect(writes("cp a.ts ../web/dist && mv b.ts ../web/dist/", "/w/backend", { isDir })).toEqual(["/w/web/dist/a.ts", "/w/web/dist/b.ts"]);
+    expect(writes("Remove-Item -Recurse old; Remove-Item ..\\web\\dist; Copy-Item a.ts ..\\web\\dist; Copy-Item -Path b.ts -Destination ..\\web\\out\\", "C:\\w\\backend", { powershell: true, isDir })).toEqual([
+      "C:/w/web/dist/a.ts",
+      "C:/w/web/out/b.ts",
+    ]);
+  });
+
+  test("cmd: cd to another drive without /d stays where it is", () => {
+    expect(shellFiles("cd D:\\x && echo a > a.txt && cd /d D:\\x && echo b > b.txt", "C:\\w\\backend", { cmd: true }).writes).toEqual(["C:/w/backend/a.txt", "D:/x/b.txt"]);
+  });
 });

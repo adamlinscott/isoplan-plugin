@@ -39,16 +39,19 @@ export async function accountOf(io: IdentityIo, claudeJson: string, cwd: string)
 /**
  * The project the session's folder belongs to: its git remote's, or for a repo with no usable
  * remote, the main checkout's folder on this machine (so every worktree of one repo is one
- * project). A folder git can't place is its own local project.
+ * project). A folder git can't place is its own local project. On a file system that ignores case
+ * (Windows, macOS) a local project's id is lower-cased, so one folder reached in two spellings is
+ * one project, in the hello and in every edit alike.
  */
-export async function projectOf(run: Run | null, where: Where | null, cwd: string, machine: string): Promise<Project> {
+export async function projectOf(run: Run | null, where: Where | null, cwd: string, machine: string, caseless = process.platform === "win32" || process.platform === "darwin"): Promise<Project> {
   let remote: string | null = null;
   if (run && where) {
     const r = await Promise.resolve(run(["git", "remote", "get-url", "origin"], { cwd: where.toplevel })).catch(() => null);
     if (r && r.code === 0 && r.stdout.trim()) remote = r.stdout.trim();
   }
   const root = !where ? normalize(cwd) : /\/\.git$/.test(where.commonDir) ? dirname(where.commonDir) : where.toplevel;
-  return projectId(remote, { machine, root });
+  const project = projectId(remote, { machine, root });
+  return caseless && project.id.startsWith("local:") ? { ...project, id: project.id.toLowerCase() } : project;
 }
 
 function parseJson(text: string | null): unknown {

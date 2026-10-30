@@ -49,10 +49,11 @@ import { startRunner } from "../runner/start.js";
 import { recentSessions } from "../sweep/find.js";
 import { backfill } from "../wake/backfill.js";
 import { alive, HOLD_OFF_MS, holdOff, lockHolder, lockPath, releaseLock, takeLock } from "../wake/lock.js";
+import { forOffice } from "./attribution.js";
 import { createClaudeCode } from "./claude-code.js";
 import { loadConfig, type Config } from "./config.js";
 import { detachedStop } from "./detached.js";
-import { createGit } from "./git.js";
+import { createGit, pathKey, type Where } from "./git.js";
 import { accountOf, claudePaths, projectOf } from "./identity.js";
 import { nodeIo } from "./io.js";
 import { createLink, type Link } from "./link.js";
@@ -97,7 +98,10 @@ async function main(argv: string[]): Promise<number> {
 
   const io = nodeIo();
   const git = createGit(io);
-  const source = createClaudeCode({ ...io, claudeDir });
+  // The project of each repo an edit or command lands in, by its common dir, looked up again as
+  // git's answers are (#74).
+  const projects = new Map<string, { at: number; project: ReturnType<typeof projectOf> }>();
+  const source = createClaudeCode({ ...io, claudeDir, home: os.homedir() });
 
   // Ends when stdout can no longer be written, or the parent is gone (checked each pass). On POSIX
   // an orphan is re-parented, so a changed ppid means gone even if the old pid is reused. Detached,
@@ -207,6 +211,8 @@ async function main(argv: string[]): Promise<number> {
   };
   // What goes to the link: the reports the scan holds held, and the questions checked and marked.
   const outgoing = (facts: Facts, patterns: Pattern[] | null) => prepareQuestions(hold.apply(facts, patterns), patterns, waiting, patternLog);
+  // The project of each subagent working in a worktree of another repo, from the latest read.
+  let checkouts: Record<string, string> = {};
 
   do {
     const now = Date.now();
@@ -216,7 +222,15 @@ async function main(argv: string[]): Promise<number> {
     config = await loadConfig(io, defaultsPath, userConfigPath).catch(() => config);
     const gitOpts = { now, maxAgeMs: config.gitCacheSeconds * 1000 };
     const resolve = (dir: string) => git.resolve(dir, gitOpts);
-    const read = await source.read({ sessionId, cwd, now, config, resolve }).catch((err: unknown) => ({
+    const projectOfRepo = (where: Where) => {
+      const key = pathKey(where.commonDir);
+      const hit = projects.get(key);
+      if (hit && now - hit.at <= gitOpts.maxAgeMs) return hit.project;
+      const project = projectOf(io.run, where, where.toplevel, machine);
+      projects.set(key, { at: now, project });
+      return project;
+    };
+    const read = await source.read({ sessionId, cwd, now, config, resolve, projectOf: projectOfRepo }).catch((err: unknown) => ({
       facts: null,
       status: String((err as Error)?.message ?? err),
       errors: { count: 0, first: null },
@@ -255,6 +269,8 @@ async function main(argv: string[]): Promise<number> {
     }
     const facts: Facts = read.facts.session.titleFrom === "branch" && title?.title ? { ...read.facts, session: { ...read.facts.session, title: title.title } } : read.facts;
 
+    checkouts = read.checkouts ?? {};
+
     if (!link) {
       const where = await resolve(cwd);
       const readText = (p: string) => fs.readFile(p, "utf8").catch(() => null);
@@ -275,6 +291,9 @@ async function main(argv: string[]): Promise<number> {
           allowPlainWs: config.allowPlainWs,
         }),
         onNotWanted: () => (isUnwanted = detached),
+        // Another repo's files, commands and checkouts go only to a server that welcomed them, and
+        // only for its office's repos; the link applies this at every send, on every connection.
+        filter: (f, projects) => forOffice(f, projects, checkouts),
         // The owner released a withheld report: it goes to the link now, not on the next pass.
         // The owner answered a question from the floor: it goes to the hooks module.
         onMessage: (message) => {
