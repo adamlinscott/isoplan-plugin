@@ -5919,7 +5919,9 @@ const ReplyMessageSchema = discriminatedUnion("kind", [
 		type: literal("reply"),
 		v: Version,
 		id: RequestId,
-		kind: literal("owner-answer")
+		kind: literal("owner-answer"),
+		closed: literal(true).optional(),
+		late: literal(true).optional()
 	})
 ]);
 /**

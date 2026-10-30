@@ -17,7 +17,8 @@
 //   floor answer: the dialog was on screen while the hook waited, closed once it answered, and the
 //     question resolved to "Alpha".
 //   multi-select, Alpha and Beta picked in the dialog: answers {"Which ones?":"Alpha, Beta"}, the
-//     labels in option order joined with ", ". The floor sends the same.
+//     labels in option order joined with ", "; with "Zeta" typed under "Type something" as well,
+//     {"Which ones?":"Alpha, Zeta"}, the words after the labels. The floor sends the same.
 
 import fs from "node:fs";
 import { createRequire } from "node:module";
@@ -45,7 +46,8 @@ for (const dir of [config, project, path.join(mod, ".claude-plugin"), path.join(
 fs.writeFileSync(path.join(config, ".claude.json"), JSON.stringify({ hasCompletedOnboarding: true, theme: "dark", projects: { [project.replace(/\\/g, "/")]: { hasTrustDialogAccepted: true, hasCompletedProjectOnboarding: true } } }));
 fs.writeFileSync(path.join(mod, ".claude-plugin", "plugin.json"), JSON.stringify({ name: "isoplan-probe", version: "0.0.0", description: "Asks a question through Claude Code's own dialog" }));
 fs.writeFileSync(path.join(mod, "hooks", "hooks.json"), JSON.stringify({ modules: ["./register.ts"] }));
-// /probe-floor: the hook answers after 3 s, as the floor would. /probe-multi: the dialog answers.
+// /probe-floor: the hook answers after 3 s, as the floor would. /probe-multi and /probe-other: the
+// dialog answers a multi-select, picked labels alone and with words of the owner's own.
 fs.writeFileSync(
   path.join(mod, "hooks", "register.ts"),
   `const LOG = ${JSON.stringify(log)};
@@ -54,15 +56,15 @@ let mode = "";
 const note = ($: any, key: string, value: unknown) => { said[key] = value; void $.fs.write(LOG, JSON.stringify(said)).catch(() => {}); };
 export const register = (on: any) => {
   on("session.start", async ($: any, e: any, next: any) => {
-    for (const name of ["probe-floor", "probe-multi"]) await $.command.register({ name, description: name });
+    for (const name of ["probe-floor", "probe-multi", "probe-other"]) await $.command.register({ name, description: name });
     return next(e);
   });
   on("command.run", async ($: any, e: any, next: any) => {
-    if (e.command !== "probe-floor" && e.command !== "probe-multi") return next(e);
+    if (!["probe-floor", "probe-multi", "probe-other"].includes(e.command)) return next(e);
     mode = e.command;
-    const options = mode === "probe-multi" ? { options: ["Alpha", "Beta", "Gamma"], multiSelect: true } : ["Alpha", "Beta"];
+    const options = mode !== "probe-floor" ? { options: ["Alpha", "Beta", "Gamma"], multiSelect: true } : ["Alpha", "Beta"];
     try {
-      note($, mode + ":asked", await $.ui.ask(mode === "probe-multi" ? "Which ones?" : "Which one?", options));
+      note($, mode + ":asked", await $.ui.ask(mode !== "probe-floor" ? "Which ones?" : "Which one?", options));
     } catch (err: any) {
       note($, mode + ":asked", "rejected: " + String((err && err.message) || err));
     }
@@ -71,9 +73,9 @@ export const register = (on: any) => {
   on("tool.call", { tool: "AskUserQuestion" }, async ($: any, e: any, next: any) => {
     const ran = next(e);
     ran.catch(() => {});
-    if (mode === "probe-multi") {
+    if (mode !== "probe-floor") {
       const r = await ran;
-      note($, "probe-multi:result", r.result);
+      note($, mode + ":result", r.result);
       return r;
     }
     const first = await Promise.race([ran.then(() => "dialog"), $.clock.sleep(3000).then(() => "floor")]);
@@ -132,6 +134,15 @@ try {
   const result = said()["probe-multi:result"];
   check("a multi-select answer is the picked labels joined with \", \"", result?.answers?.["Which ones?"] === "Alpha, Beta", JSON.stringify(result?.answers ?? null));
   if (!result) console.log(plain(screen.slice(-3000)));
+
+  // Multi-select with words of the owner's own: Alpha, then "Zeta" typed under "Type something".
+  await type(["/probe-other", "\r"]);
+  await sleep(1500);
+  await type([" ", "\x1b[B", "\x1b[B", "\x1b[B", "Zeta", "\x1b[B", "\r", "\r"]);
+  await sleep(1500);
+  const other = said()["probe-other:result"];
+  check("with words of their own, those come after the labels, joined the same way", other?.answers?.["Which ones?"] === "Alpha, Zeta", JSON.stringify(other?.answers ?? null));
+  if (!other) console.log(plain(screen.slice(-3000)));
 } finally {
   term.kill();
   await sleep(500);

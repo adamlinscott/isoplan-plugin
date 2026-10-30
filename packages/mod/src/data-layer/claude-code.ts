@@ -508,16 +508,24 @@ interface TranscriptState {
 const agentId = (id: string) => `${SOURCE}:${id}`;
 
 // Pushes each question `t` asked that has no result yet, as the protocol shapes it. A call whose
-// input doesn't have that shape (the tool's input is the model's to write) is left out.
+// input doesn't have that shape (the tool's input is the model's to write) is left out. One of which
+// a question or option was left out (no text, no label) is marked `incomplete`: an answer from the
+// floor would not cover all of it, so it is answered in the terminal.
 function addQuestions(list: QuestionFact[], agent: string, t: TranscriptState, results: Map<string, ToolResult>, mtimeMs: number): void {
   for (const [id, ask] of t.asks) {
     if (results.has(id)) continue;
     const asked = (ask.input as { questions?: unknown } | null)?.questions;
     if (!Array.isArray(asked)) continue;
     const questions: QuestionFact["questions"] = [];
+    let incomplete = false;
     for (const q of asked as Line[]) {
-      if (!q || typeof q.question !== "string" || !q.question) continue;
-      const options = Array.isArray(q.options) ? (q.options as Line[]).filter((o) => o && typeof o.label === "string" && o.label) : [];
+      if (!q || typeof q.question !== "string" || !q.question) {
+        incomplete = true;
+        continue;
+      }
+      const given: Line[] = Array.isArray(q.options) ? q.options : [];
+      const options = given.filter((o) => o && typeof o.label === "string" && o.label);
+      if (options.length !== given.length) incomplete = true;
       questions.push({
         question: q.question,
         header: typeof q.header === "string" ? q.header : "",
@@ -525,7 +533,7 @@ function addQuestions(list: QuestionFact[], agent: string, t: TranscriptState, r
         multiSelect: q.multiSelect === true,
       });
     }
-    if (questions.length) list.push({ id, agent, at: iso(ask.at, mtimeMs), questions });
+    if (questions.length) list.push({ id, agent, at: iso(ask.at, mtimeMs), questions, ...(incomplete ? { extra: { incomplete: true } } : {}) });
   }
 }
 

@@ -1,7 +1,7 @@
 import { PROTOCOL_VERSION, type Facts, type QuestionFact } from "@isoplan/protocol";
 import { expect, test } from "vitest";
 import type { DataLayerLine } from "../lines.js";
-import { prepareQuestions, relayOwnerAnswer, WITHHELD_QUESTION } from "./owner-answers.js";
+import { lateTake, prepareQuestions, relayOwnerAnswer, WITHHELD_QUESTION } from "./owner-answers.js";
 
 const v = PROTOCOL_VERSION;
 const at = "2026-10-20T09:00:00.000Z";
@@ -30,13 +30,13 @@ function relay(texts: (string | null)[], { after = 2, detached = false, given = 
   return { lines, sent: relayOwnerAnswer(request, { detached, facts: sent, file, emit: (l) => void lines.push(l), take, sleep: async () => {}, waitMs: 1000 }) };
 }
 const refused = async (r: ReturnType<typeof relay>) => {
-  const sent = await r.sent;
-  return sent.type === "refusal" && sent.reason === "unavailable" ? sent.detail : null;
+  const { message } = await r.sent;
+  return message.type === "refusal" && message.reason === "unavailable" ? message.detail : null;
 };
 
 test("owner answer: passed to the hooks module, and a reply once it ended that question's call; another question's word is passed over", async () => {
   const { lines, sent } = relay([JSON.stringify({ question: "toolu_9", taken: true }), JSON.stringify({ question: "toolu_1", taken: true })]);
-  expect(await sent).toEqual({ type: "reply", v, id: "r1", kind: "owner-answer" });
+  expect(await sent).toEqual({ message: { type: "reply", v, id: "r1", kind: "owner-answer" }, gaveUp: false });
   expect(lines).toEqual([{ type: "owner-answer", question: "toolu_1", answers: { "Which branch?": "main" }, file }]);
 });
 
@@ -54,8 +54,20 @@ test("owner answer: refused when the terminal answered first, when the hooks mod
   expect(wakeOnly.lines).toEqual([]);
 });
 
-test("owner answer: a question that closed while the hooks module never said is a reply: the agent got an answer", async () => {
-  expect(await relay([], { given: [facts, { ...facts, questions: [] }] }).sent).toEqual({ type: "reply", v, id: "r1", kind: "owner-answer" });
+test("owner answer: with no word from the hooks module, a question that has closed since gets a closed reply, and either way its word is still looked for", async () => {
+  expect(await relay([], { given: [facts, { ...facts, questions: [] }] }).sent).toEqual({ message: { type: "reply", v, id: "r1", kind: "owner-answer", closed: true }, gaveUp: true });
+  expect((await relay([]).sent).gaveUp).toBe(true);
+  expect((await relay([JSON.stringify({ question: "toolu_1", taken: false })]).sent).gaveUp).toBe(false);
+});
+
+test("a late word: the hooks module's take, or its no, once it comes; nothing when it never does", async () => {
+  const later = (texts: (string | null)[]) => {
+    let looks = 0;
+    return lateTake("toolu_1", file, async () => (++looks > 3 ? (texts.shift() ?? null) : null), { sleep: async () => {}, ms: 1000 });
+  };
+  expect(await later([JSON.stringify({ question: "toolu_1", taken: true })])).toBe(true);
+  expect(await later([JSON.stringify({ question: "toolu_9", taken: true }), JSON.stringify({ question: "toolu_1", taken: false })])).toBe(false);
+  expect(await later([])).toBeNull();
 });
 
 test("questions as sent: answerable only while their wait is marked; one the secret check matches, or every one while the patterns can't be read, goes as a placeholder", () => {
@@ -71,4 +83,7 @@ test("questions as sent: answerable only while their wait is marked; one the sec
   const inOption: Facts = { ...facts, questions: [{ ...asked("toolu_4", "Which key?"), questions: [{ question: "Which key?", header: "", options: [{ label: "This one", description: sk }], multiSelect: false }] }] };
   expect(prepareQuestions(inOption, patterns, new Set(["toolu_4"]), () => {}).questions![0]).toMatchObject({ withheld: true });
   expect(prepareQuestions(open, null, new Set(["toolu_1"]), () => {}).questions!.every((q) => q.withheld && !q.answerable)).toBe(true);
+  // One the source took only in part is never answerable: an answer wouldn't cover all of it.
+  const partial: Facts = { ...facts, questions: [asked("toolu_5", "Which branch?", { extra: { incomplete: true } })] };
+  expect(prepareQuestions(partial, patterns, new Set(["toolu_5"]), () => {}).questions![0]!.answerable).toBeUndefined();
 });

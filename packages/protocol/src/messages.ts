@@ -136,8 +136,11 @@ export const ReplyMessageSchema = z.discriminatedUnion("kind", [
   // `fallback`: the fork couldn't write the brief, so `brief` is only the runner's note of what was
   // pushed, and the server writes the rest from the room's feed. The branch is pushed either way.
   z.object({ type: z.literal("reply"), v: Version, id: RequestId, kind: z.literal("write-brief"), handoff: HandoffSchema, fallback: z.literal(true).optional() }),
-  // The owner's answer reached the question that was waiting for it.
-  z.object({ type: z.literal("reply"), v: Version, id: RequestId, kind: z.literal("owner-answer") }),
+  // The owner's answer reached the question that was waiting for it. `closed`: the session never said
+  // whether it took the answer, but the question has closed, by this answer or the terminal's. `late`:
+  // it took the answer after this request was refused for taking too long, so this reply follows that
+  // refusal, with the same id.
+  z.object({ type: z.literal("reply"), v: Version, id: RequestId, kind: z.literal("owner-answer"), closed: z.literal(true).optional(), late: z.literal(true).optional() }),
 ]);
 
 /**

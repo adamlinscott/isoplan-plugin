@@ -172,7 +172,7 @@ test("lead: never stalls — an open turn quiet past stalledMinutes is idle sinc
   expect([l.status, l.statusSince, l.doing]).toEqual(["idle", at(650), null]);
 });
 
-test("questions: an AskUserQuestion with no result is open while the turn is; its result, an interruption or a new prompt closes it", async () => {
+test("questions: an AskUserQuestion with no result is open while the turn is, marked incomplete when part of it is left out; its result, an interruption or a new prompt closes it", async () => {
   const { home, main } = office();
   const prompt = line.user(main, "fix the bug", 60);
   const options = [{ label: "main", description: "Straight to main." }, { label: "A new branch" }];
@@ -182,7 +182,7 @@ test("questions: an AskUserQuestion with no result is open while the turn is; it
 
   session(home, "s", [prompt, asked]);
   expect(await questions()).toEqual([
-    { id: "toolu_1", agent: cc("s:lead"), at: at(30), questions: [{ question: "Which branch?", header: "Branch", options: [options[0], { label: "A new branch", description: "" }], multiSelect: false }] },
+    { id: "toolu_1", agent: cc("s:lead"), at: at(30), questions: [{ question: "Which branch?", header: "Branch", options: [options[0], { label: "A new branch", description: "" }], multiSelect: false }], extra: { incomplete: true } },
   ]);
   // An input the model wrote in another shape is no question.
   session(home, "s", [prompt, ask("toolu_2", "Which branch?")]);

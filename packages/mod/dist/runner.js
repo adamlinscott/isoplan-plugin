@@ -5917,7 +5917,9 @@ discriminatedUnion("type", [
 			type: literal("reply"),
 			v: Version,
 			id: RequestId,
-			kind: literal("owner-answer")
+			kind: literal("owner-answer"),
+			closed: literal(true).optional(),
+			late: literal(true).optional()
 		})
 	]),
 	discriminatedUnion("reason", [
@@ -7993,9 +7995,15 @@ function addQuestions(list, agent, t, results, mtimeMs) {
 		const asked = ask.input?.questions;
 		if (!Array.isArray(asked)) continue;
 		const questions = [];
+		let incomplete = false;
 		for (const q of asked) {
-			if (!q || typeof q.question !== "string" || !q.question) continue;
-			const options = Array.isArray(q.options) ? q.options.filter((o) => o && typeof o.label === "string" && o.label) : [];
+			if (!q || typeof q.question !== "string" || !q.question) {
+				incomplete = true;
+				continue;
+			}
+			const given = Array.isArray(q.options) ? q.options : [];
+			const options = given.filter((o) => o && typeof o.label === "string" && o.label);
+			if (options.length !== given.length) incomplete = true;
 			questions.push({
 				question: q.question,
 				header: typeof q.header === "string" ? q.header : "",
@@ -8010,7 +8018,8 @@ function addQuestions(list, agent, t, results, mtimeMs) {
 			id,
 			agent,
 			at: iso(ask.at, mtimeMs),
-			questions
+			questions,
+			...incomplete ? { extra: { incomplete: true } } : {}
 		});
 	}
 }

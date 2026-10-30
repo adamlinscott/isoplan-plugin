@@ -56,7 +56,7 @@ import { createGit } from "./git.js";
 import { accountOf, claudePaths, projectOf } from "./identity.js";
 import { nodeIo } from "./io.js";
 import { createLink, type Link } from "./link.js";
-import { prepareQuestions, relayOwnerAnswer } from "./owner-answers.js";
+import { lateTake, prepareQuestions, relayOwnerAnswer } from "./owner-answers.js";
 import { createPairing, pairingLockPath, pairingPath, pairingWriteLockPath } from "./pairing.js";
 import { openReportHold } from "./reports.js";
 import { cleanTitle, nextTitle, TITLE_SYSTEM, type TitleCache } from "./titles.js";
@@ -282,9 +282,17 @@ async function main(argv: string[]): Promise<number> {
             const file = path.join(answersDir, `${randomUUID()}.json`);
             void fs
               .mkdir(answersDir, { recursive: true })
-              .then(() => relayOwnerAnswer(message, { detached, facts: () => sent, file, emit, take: takeFile }))
-              .then((answer) => link?.send(answer))
-              // A word that came too late is left over: it goes.
+              .then(async () => {
+                const relayed = await relayOwnerAnswer(message, { detached, facts: () => sent, file, emit, take: takeFile });
+                link?.send(relayed.message);
+                if (!relayed.gaveUp) return;
+                // The hooks module's word may still come: a take that does follows as a late reply.
+                const late = await lateTake(message.question, file, takeFile);
+                if (late === null) return;
+                emit({ type: "log", text: `the hooks module said late that it ${late ? "took" : "didn't take"} the owner's answer to ${message.question}` });
+                if (late) link?.send({ type: "reply", v: PROTOCOL_VERSION, id: message.id, kind: "owner-answer", late: true });
+              })
+              // A word that came later still, or not at all, is left over: it goes.
               .finally(() => fs.rm(file, { force: true }).catch(() => {}))
               .catch((err: unknown) => emit({ type: "log", text: `couldn't pass the owner's answer on: ${String((err as Error)?.message ?? err)}` }));
             return;

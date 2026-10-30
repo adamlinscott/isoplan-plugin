@@ -5915,7 +5915,9 @@ discriminatedUnion("type", [
 			type: literal("reply"),
 			v: Version,
 			id: RequestId,
-			kind: literal("owner-answer")
+			kind: literal("owner-answer"),
+			closed: literal(true).optional(),
+			late: literal(true).optional()
 		})
 	]),
 	discriminatedUnion("reason", [
@@ -7932,9 +7934,15 @@ function addQuestions(list, agent, t, results, mtimeMs) {
 		const asked = ask.input?.questions;
 		if (!Array.isArray(asked)) continue;
 		const questions = [];
+		let incomplete = false;
 		for (const q of asked) {
-			if (!q || typeof q.question !== "string" || !q.question) continue;
-			const options = Array.isArray(q.options) ? q.options.filter((o) => o && typeof o.label === "string" && o.label) : [];
+			if (!q || typeof q.question !== "string" || !q.question) {
+				incomplete = true;
+				continue;
+			}
+			const given = Array.isArray(q.options) ? q.options : [];
+			const options = given.filter((o) => o && typeof o.label === "string" && o.label);
+			if (options.length !== given.length) incomplete = true;
 			questions.push({
 				question: q.question,
 				header: typeof q.header === "string" ? q.header : "",
@@ -7949,7 +7957,8 @@ function addQuestions(list, agent, t, results, mtimeMs) {
 			id,
 			agent,
 			at: iso(ask.at, mtimeMs),
-			questions
+			questions,
+			...incomplete ? { extra: { incomplete: true } } : {}
 		});
 	}
 }
@@ -8589,12 +8598,13 @@ function createLink({ url, hello, emit, minIntervalMs = 1e3, retryBaseMs = 1e3, 
 //#region src/data-layer/owner-answers.ts
 const TAKEN_WAIT_MS = 1e4;
 const POLL_MS = 100;
+const LATE_MS = 6e4;
 /** What a withheld question says in place of its text. */
 const WITHHELD_QUESTION = "Held for its owner to check: the secret check found what may be a secret in this question, so it is answered in the terminal.";
 /**
 * The facts with their questions as they are sent: each one the scan matches, or every one while
 * `patterns` is null, as a placeholder marked `withheld`; each other one `answerable` while `waiting`
-* holds its id.
+* holds its id, unless the source left part of it out.
 */
 function prepareQuestions(facts, patterns, waiting, log) {
 	if (!facts.questions?.length) return facts;
@@ -8619,7 +8629,7 @@ function prepareQuestions(facts, patterns, waiting, log) {
 				withheld: true
 			};
 		}
-		return waiting.has(q.id) ? {
+		return waiting.has(q.id) && !q.extra?.incomplete ? {
 			...q,
 			answerable: true
 		} : q;
@@ -8629,21 +8639,22 @@ function prepareQuestions(facts, patterns, waiting, log) {
 		questions
 	};
 }
-/** What to send back for the request: a reply once the answer ended the question's call, or a refusal saying why not. */
+/**
+* A reply only once the hooks module says the answer ended the question's call; a refusal saying why
+* not otherwise. With no word from it in `waitMs`, a question that has closed since gets a `closed`
+* reply, which says only that it has an answer, the floor's or the terminal's.
+*/
 async function relayOwnerAnswer(request, { detached, facts, file, emit, take, sleep = wait, waitMs = TAKEN_WAIT_MS }) {
-	const refuse = (detail) => ({
-		type: "refusal",
-		v: 1,
-		id: request.id,
-		reason: "unavailable",
-		detail
+	const refuse = (detail, gaveUp = false) => ({
+		message: {
+			type: "refusal",
+			v: 1,
+			id: request.id,
+			reason: "unavailable",
+			detail
+		},
+		gaveUp
 	});
-	const reply = {
-		type: "reply",
-		v: 1,
-		id: request.id,
-		kind: "owner-answer"
-	};
 	const open = () => facts()?.questions?.find((q) => q.id === request.question);
 	if (detached) return refuse("This session is seen only through Isoplan's wake hook, so its question can only be answered in its terminal.");
 	const question = open();
@@ -8657,18 +8668,51 @@ async function relayOwnerAnswer(request, { detached, facts, file, emit, take, sl
 	});
 	for (let waited = 0; waited < waitMs; waited += POLL_MS) {
 		await sleep(POLL_MS);
-		const text = await take(file);
-		if (text === null) continue;
-		let taken = {};
-		try {
-			taken = JSON.parse(text);
-		} catch {}
-		if (taken.question !== request.question) continue;
-		if (taken.taken === true) return reply;
+		const taken = await takenFrom(take, file, request.question);
+		if (taken === null) continue;
+		if (taken) return {
+			message: {
+				type: "reply",
+				v: 1,
+				id: request.id,
+				kind: "owner-answer"
+			},
+			gaveUp: false
+		};
 		return refuse("The question was answered in the terminal first.");
 	}
-	if (!open()) return reply;
-	return refuse("Claude Code didn't take the answer in time: answer it in the terminal.");
+	if (!open()) return {
+		message: {
+			type: "reply",
+			v: 1,
+			id: request.id,
+			kind: "owner-answer",
+			closed: true
+		},
+		gaveUp: true
+	};
+	return refuse("Claude Code didn't take the answer in time: answer it in the terminal.", true);
+}
+/**
+* After a request gave up: whether the hooks module still says, within `ms`, that it took the answer
+* (true), that it didn't (false), or nothing at all (null).
+*/
+async function lateTake(question, file, take, { sleep = wait, ms = LATE_MS } = {}) {
+	for (let waited = 0; waited < ms; waited += POLL_MS) {
+		await sleep(POLL_MS);
+		const taken = await takenFrom(take, file, question);
+		if (taken !== null) return taken;
+	}
+	return null;
+}
+async function takenFrom(take, file, question) {
+	const text = await take(file);
+	if (text === null) return null;
+	let taken = {};
+	try {
+		taken = JSON.parse(text);
+	} catch {}
+	return taken.question === question ? taken.taken === true : null;
 }
 const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 //#endregion
@@ -9429,13 +9473,30 @@ async function main(argv) {
 				onMessage: (message) => {
 					if (message.type === "request" && message.kind === "owner-answer") {
 						const file = path.join(answersDir, `${randomUUID()}.json`);
-						fs.mkdir(answersDir, { recursive: true }).then(() => relayOwnerAnswer(message, {
-							detached,
-							facts: () => sent,
-							file,
-							emit,
-							take: takeFile
-						})).then((answer) => link?.send(answer)).finally(() => fs.rm(file, { force: true }).catch(() => {})).catch((err) => emit({
+						fs.mkdir(answersDir, { recursive: true }).then(async () => {
+							const relayed = await relayOwnerAnswer(message, {
+								detached,
+								facts: () => sent,
+								file,
+								emit,
+								take: takeFile
+							});
+							link?.send(relayed.message);
+							if (!relayed.gaveUp) return;
+							const late = await lateTake(message.question, file, takeFile);
+							if (late === null) return;
+							emit({
+								type: "log",
+								text: `the hooks module said late that it ${late ? "took" : "didn't take"} the owner's answer to ${message.question}`
+							});
+							if (late) link?.send({
+								type: "reply",
+								v: 1,
+								id: message.id,
+								kind: "owner-answer",
+								late: true
+							});
+						}).finally(() => fs.rm(file, { force: true }).catch(() => {})).catch((err) => emit({
 							type: "log",
 							text: `couldn't pass the owner's answer on: ${String(err?.message ?? err)}`
 						}));
