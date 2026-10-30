@@ -5713,6 +5713,7 @@ const AgentFactSchema = object({
 			"talk"
 		]),
 		file: string().optional(),
+		with: string().min(1).optional(),
 		since: Time,
 		...Elsewhere
 	}).nullable(),
@@ -8167,6 +8168,7 @@ function createClaudeCode(io) {
 		} catch (err) {
 			fail(err);
 		}
+		const known = new Set(agentFiles.map((a) => a.id));
 		const results = new Map(main.results);
 		const notes = new Map(main.notes);
 		const spawns = /* @__PURE__ */ new Map();
@@ -8215,7 +8217,7 @@ function createClaudeCode(io) {
 			status: leadWorking ? "working" : "idle",
 			statusSince: iso(leadWorking ? main.turnAt : main.lastMessageAt, c.ownMtime),
 			lastActive: iso(c.ownMtime),
-			doing: leadWorking ? await doingOf(main, place, c.ownMtime, config) : null,
+			doing: leadWorking ? await doingOf(main, place, c.ownMtime, config, known) : null,
 			usage: usageOf(main, c.ownMtime)
 		});
 		main.touches = await addFiles(facts.edits, lead, main.touches, [...config.touchedTools, ...config.shellTools], now, config, place);
@@ -8245,7 +8247,7 @@ function createClaudeCode(io) {
 				status: s.status,
 				statusSince: iso(s.since, a.mtimeMs),
 				lastActive: iso(a.mtimeMs),
-				doing: live ? await doingOf(a.t, place, a.mtimeMs, config) : null,
+				doing: live ? await doingOf(a.t, place, a.mtimeMs, config, known) : null,
 				usage: usageOf(a.t, a.mtimeMs),
 				...worktree ? {
 					checkout: worktree,
@@ -8517,6 +8519,8 @@ function foldLine(st, line, home, isDir) {
 				...dir ? { dir } : {},
 				at
 			};
+			const check = checkIn(c.name, input);
+			if (check) st.lastTool.check = check;
 			const target = input.file_path || input.notebook_path;
 			const targets = typeof target === "string" ? [target] : writes;
 			const reads = typeof target === "string" ? [target] : shell.reads;
@@ -8689,8 +8693,30 @@ function ended(state, at) {
 		endState: state
 	};
 }
-async function doingOf(st, place, fallbackMs, config) {
+const OUTPUT_FILE = /[\\/]tasks[\\/]([A-Za-z0-9_-]+)\.output\b/;
+function checkIn(name, input) {
+	if (name === "SendMessage") return typeof input.to === "string" && input.to ? {
+		agent: input.to,
+		kind: "talk"
+	} : null;
+	if (name === "TaskOutput") return typeof input.task_id === "string" && input.task_id ? {
+		agent: input.task_id,
+		kind: "read"
+	} : null;
+	const text = typeof input.file_path === "string" ? input.file_path : typeof input.command === "string" ? input.command : null;
+	const m = text ? OUTPUT_FILE.exec(text) : null;
+	return m ? {
+		agent: m[1],
+		kind: "read"
+	} : null;
+}
+async function doingOf(st, place, fallbackMs, config, known) {
 	const t = st.lastTool;
+	if (t?.check && known.has(t.check.agent)) return {
+		kind: t.check.kind,
+		with: agentId(t.check.agent),
+		since: iso(t.at, fallbackMs)
+	};
 	const kind = t && (t.wrote && config.shellTools.includes(t.name) ? "write" : Object.hasOwn(DOING, t.name) ? DOING[t.name] : void 0);
 	if (!t || !kind) return null;
 	return {

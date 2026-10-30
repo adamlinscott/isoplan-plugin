@@ -5713,6 +5713,7 @@ const AgentFactSchema = object({
 			"talk"
 		]),
 		file: string().optional(),
+		with: string().min(1).optional(),
 		since: Time,
 		...Elsewhere
 	}).nullable(),

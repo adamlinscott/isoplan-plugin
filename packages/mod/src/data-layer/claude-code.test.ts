@@ -381,6 +381,29 @@ test("doing: the last tool call's kind, shown while working or stalled; a file i
   expect(a.r!.doing).toEqual({ kind: "read", file: "r.md", project: localProject(other), away: true, since: at(5) });
 });
 
+test("doing: a check-in on one of the session's agents names it: a message sent to it, or its output read", async () => {
+  const { home, main } = office();
+  session(home, "s", [line.user(main, "x")]);
+  const out = path.join(home, "tmp", "tasks", "B.output");
+  const tools: Record<string, [string, Record<string, unknown>]> = {
+    m: ["SendMessage", { to: "B", message: "How far along?" }],
+    r: ["Read", { file_path: out }],
+    t: ["PowerShell", { command: `Get-Content "${out}" -Tail 20` }],
+    o: ["TaskOutput", { task_id: "B" }],
+    x: ["SendMessage", { to: "nobody", message: "Hello?" }],
+  };
+  agent(home, "s", "B", { agentType: "worker" }, [line.tool(main, "Grep", { pattern: "x" }, 5)], { age: 5 });
+  for (const [id, [name, input]] of Object.entries(tools)) agent(home, "s", id, { agentType: "worker" }, [line.tool(main, name, input, 5)], { age: 5 });
+  const a = await agentsOf(home, "s");
+  expect(Object.fromEntries(Object.keys(tools).map((id) => [id, a[id]!.doing]))).toEqual({
+    m: { kind: "talk", with: cc("B"), since: at(5) },
+    r: { kind: "read", with: cc("B"), since: at(5) },
+    t: { kind: "read", with: cc("B"), since: at(5) },
+    o: { kind: "read", with: cc("B"), since: at(5) },
+    x: { kind: "talk", since: at(5) },
+  });
+});
+
 test("usage: the newest reply's model and context; token totals summed once per reply, with the 1h cache writes and the replies over 100k apart; a made-up line is no reply", async () => {
   const { home, main } = office();
   const u = (input: number, read: number, written: number, output: number, oneHour?: number) => ({

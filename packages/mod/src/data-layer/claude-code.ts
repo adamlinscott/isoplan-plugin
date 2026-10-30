@@ -276,6 +276,8 @@ export function createClaudeCode(io: SourceIo) {
         fail(err);
       }
     }
+    // The session's agents, by file id: the ones a check-in may name.
+    const known = new Set(agentFiles.map((a) => a.id));
 
     // Done signals and spawns can sit in the session's own transcript or, for an agent's own
     // agents, in that agent's transcript, so look in all of them. A spawn keeps which file made it.
@@ -329,7 +331,7 @@ export function createClaudeCode(io: SourceIo) {
       status: leadWorking ? "working" : "idle",
       statusSince: iso(leadWorking ? main.turnAt : main.lastMessageAt, c.ownMtime),
       lastActive: iso(c.ownMtime),
-      doing: leadWorking ? await doingOf(main, place, c.ownMtime, config) : null,
+      doing: leadWorking ? await doingOf(main, place, c.ownMtime, config, known) : null,
       usage: usageOf(main, c.ownMtime),
     });
     main.touches = await addFiles(facts.edits, lead, main.touches, [...config.touchedTools, ...config.shellTools], now, config, place);
@@ -373,7 +375,7 @@ export function createClaudeCode(io: SourceIo) {
         status: s.status,
         statusSince: iso(s.since, a.mtimeMs),
         lastActive: iso(a.mtimeMs),
-        doing: live ? await doingOf(a.t, place, a.mtimeMs, config) : null,
+        doing: live ? await doingOf(a.t, place, a.mtimeMs, config, known) : null,
         usage: usageOf(a.t, a.mtimeMs),
         ...(worktree ? { checkout: worktree, branch: agentBranch } : {}),
         extra: { description: a.meta.description ?? null, ...(s.endState ? { endState: s.endState } : {}) },
@@ -521,6 +523,8 @@ interface LastTool {
   dir?: string;
   at: number;
   wrote?: boolean;
+  /** A check-in on another agent, by its file id: a message sent to it, or its output read. */
+  check?: { agent: string; kind: "talk" | "read" };
 }
 
 type ToolResult = { launched: true; at?: number } | { status: string; at: number; launched?: undefined };
@@ -727,6 +731,8 @@ function foldLine(st: TranscriptState, line: string, home: string | null, isDir?
       const file = typeof input.file_path === "string" ? input.file_path : typeof input.notebook_path === "string" ? input.notebook_path : typeof input.path === "string" ? input.path : null;
       const dir = shell.dirs[shell.dirs.length - 1];
       st.lastTool = writes.length ? { name: c.name, file: writes[writes.length - 1]!, cwd, at, wrote: true } : { name: c.name, file, cwd, ...(dir ? { dir } : {}), at };
+      const check = checkIn(c.name, input);
+      if (check) st.lastTool.check = check;
       // Edit and Read paths and shell writes and reads are absolute; they are resolved against this
       // line's cwd at read time, which also keeps only the tools that count.
       const target = input.file_path || input.notebook_path;
@@ -923,12 +929,27 @@ function ended(state: string, at: number): AgentStatus {
   return { status: state === "completed" ? "done" : STOPPED.has(state) ? "stopped" : "failed", since: at, endState: state };
 }
 
+// Background agents' output files: <tasks folder>/<agent id>.output.
+const OUTPUT_FILE = /[\\/]tasks[\\/]([A-Za-z0-9_-]+)\.output\b/;
+
+// A tool call that checks in on another agent: SendMessage to it, or reading its output, by the
+// Read tool, a shell command or TaskOutput. The agent by its file id; null for anything else.
+function checkIn(name: string, input: Record<string, unknown>): LastTool["check"] | null {
+  if (name === "SendMessage") return typeof input.to === "string" && input.to ? { agent: input.to, kind: "talk" } : null;
+  if (name === "TaskOutput") return typeof input.task_id === "string" && input.task_id ? { agent: input.task_id, kind: "read" } : null;
+  const text = typeof input.file_path === "string" ? input.file_path : typeof input.command === "string" ? input.command : null;
+  const m = text ? OUTPUT_FILE.exec(text) : null;
+  return m ? { agent: m[1]!, kind: "read" } : null;
+}
+
 // The agent's last tool call as { kind, file?, since }, the file relative to the worktree it is in,
 // with its repo when that isn't the session's, as for edits; in no repo the file is dropped. A
 // shell command with no file names the repo its programs ran in. A tool with no kind in DOING shows
-// as nothing; a shell tool's write shows as "write".
-async function doingOf(st: TranscriptState, place: Attribution, fallbackMs: number, config: Config): Promise<AgentFact["doing"]> {
+// as nothing; a shell tool's write shows as "write". A check-in on one of the session's agents
+// (`known`, by file id) is { kind: talk or read, with: that agent, since } (protocol 0.3.6).
+async function doingOf(st: TranscriptState, place: Attribution, fallbackMs: number, config: Config, known: ReadonlySet<string>): Promise<AgentFact["doing"]> {
   const t = st.lastTool;
+  if (t?.check && known.has(t.check.agent)) return { kind: t.check.kind, with: agentId(t.check.agent), since: iso(t.at, fallbackMs) };
   const kind = t && (t.wrote && config.shellTools.includes(t.name) ? "write" : Object.hasOwn(DOING, t.name) ? DOING[t.name] : undefined);
   if (!t || !kind) return null;
   const placed = t.file && t.cwd ? await place.file(t.file) : t.dir ? await place.dir(t.dir) : null;

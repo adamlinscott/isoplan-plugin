@@ -1,6 +1,6 @@
 {
   "name": "@isoplan/protocol",
-  "version": "0.3.5",
+  "version": "0.3.6",
   "description": "The wire protocol between Isoplan's Claude Code plugin and an office server: message and fact types, with zod parsers.",
   "license": "MIT",
   "repository": {
