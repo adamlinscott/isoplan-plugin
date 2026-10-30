@@ -54,6 +54,17 @@ test("changes: a question is upserted when new or changed, and removed by its id
   expect(diffFacts(one, base)).toEqual({ upsert: {}, remove: { questions: ["toolu_1"] } });
 });
 
+test("changes: given whether each was answered, a removed question says it was answered or abandoned", () => {
+  const asked = (id: string) => ({ id, agent: lead, at, questions: [{ question: "Ship it?", header: "", options: [], multiSelect: false }] });
+  const open: Facts = { ...base, questions: [asked("toolu_1"), asked("toolu_2"), asked("toolu_3")] };
+  const answered = (id: string) => id === "toolu_1";
+  expect(diffFacts(open, { ...open, questions: [asked("toolu_3")] }, answered)).toEqual({
+    upsert: {},
+    remove: { questions: ["toolu_1", "toolu_2"], questionOutcomes: { toolu_1: "answered", toolu_2: "abandoned" } },
+  });
+  expect(diffFacts(open, structuredClone(open), answered)).toBe(null);
+});
+
 test("changes: the same path at home and in another repo is two records, kept apart and removed by project", () => {
   const web = { id: "github.com/team/web", name: "web" };
   const both: Facts = { ...base, edits: [{ agent: lead, file: "a.md", at }, { agent: lead, file: "a.md", at, project: web, away: true }] };

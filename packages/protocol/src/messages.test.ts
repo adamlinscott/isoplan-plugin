@@ -325,6 +325,13 @@ test("a taken message parses with a failed clone of a repo under the folder", ()
   expect(parseDataLayerMessage(taken)).toEqual({ ok: true, message: taken });
 });
 
+test("a withheld commit's refusal parses with how many files it held, and not with none", () => {
+  const refusal = { ...valid["refusal withheld commit"], file: "config/a, b.ts, config/c.ts", held: 2 };
+  expect(parseDataLayerMessage(refusal)).toEqual({ ok: true, message: refusal });
+  expect(parseDataLayerMessage({ ...refusal, held: 0 })).toMatchObject({ ok: false, kind: "invalid" });
+  expect(parseDataLayerMessage({ ...refusal, held: 1.5 })).toMatchObject({ ok: false, kind: "invalid" });
+});
+
 test("a question parses with answerable or withheld, and not with either false", () => {
   const [question] = facts.questions!;
   expect(parseDataLayerMessage({ ...valid.full, facts: { ...facts, questions: [{ ...question, answerable: true }] } })).toMatchObject({ ok: true });
@@ -411,6 +418,12 @@ describe("changes", () => {
       },
     };
     expect(parseDataLayerMessage(message)).toEqual({ ok: true, message });
+  });
+
+  test("says how each removed question ended, answered or abandoned, and nothing else", () => {
+    const message = { ...valid.changes, remove: { questions: ["toolu_00", "toolu_01"], questionOutcomes: { toolu_00: "answered", toolu_01: "abandoned" } } };
+    expect(parseDataLayerMessage(message)).toEqual({ ok: true, message });
+    expect(parseDataLayerMessage({ ...message, remove: { questions: ["toolu_00"], questionOutcomes: { toolu_00: "timed-out" } } })).toMatchObject({ ok: false, kind: "invalid" });
   });
 
   test("rejects a removal key with a part missing", () => {

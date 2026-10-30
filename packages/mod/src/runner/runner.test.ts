@@ -208,18 +208,18 @@ test("runner: a commit with a possible secret holds the push, naming the file; t
   const t = await setup({
     push: async (_s, _l, _h, pushAnyway) => (
       pushes.push(pushAnyway),
-      !pushAnyway ? { held: ["config/dev.ts", "config/prod.ts"], commits: { ".": "c".repeat(40) } as Record<string, string>, unchecked: ["logo.png"] } : !pushAnyway.api ? { held: ["api/.env.example"], commits: { api: "d".repeat(40) } as Record<string, string>, unchecked: [] } : repos
+      !pushAnyway ? { held: ["config/dev.ts", "config/a, b.ts"], commits: { ".": "c".repeat(40) } as Record<string, string>, unchecked: ["logo.png"] } : !pushAnyway.api ? { held: ["api/.env.example"], commits: { api: "d".repeat(40) } as Record<string, string>, unchecked: [] } : repos
     ),
   });
   t.runner.take(brief("b1"));
   await t.asked(1);
   t.asks[0]!.settle(ok("Goal: ship."));
   await t.runner.settled();
-  expect(t.sent).toEqual([{ type: "refusal", v: PROTOCOL_VERSION, id: "b1", reason: "withheld", file: "config/dev.ts, config/prod.ts", unchecked: ["logo.png"] }]);
+  expect(t.sent).toEqual([{ type: "refusal", v: PROTOCOL_VERSION, id: "b1", reason: "withheld", file: "config/dev.ts, config/a, b.ts", held: 2, unchecked: ["logo.png"] }]);
   expect(t.logs.join("\n")).not.toContain("AWS");
   t.runner.take({ type: "release", v: PROTOCOL_VERSION, id: "b1" });
   await t.sentN(2);
-  expect(t.sent[1]).toEqual({ type: "refusal", v: PROTOCOL_VERSION, id: "b1", reason: "withheld", file: "api/.env.example" });
+  expect(t.sent[1]).toEqual({ type: "refusal", v: PROTOCOL_VERSION, id: "b1", reason: "withheld", file: "api/.env.example", held: 1 });
   t.runner.take({ type: "release", v: PROTOCOL_VERSION, id: "b1" });
   await t.sentN(3);
   expect(pushes).toEqual([null, { ".": "c".repeat(40) }, { ".": "c".repeat(40), api: "d".repeat(40) }]);

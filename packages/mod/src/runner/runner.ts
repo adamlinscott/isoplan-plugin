@@ -230,7 +230,7 @@ export function createRunner({ answerer, ledger, settings, prompts, scan, send, 
         log(`withheld the handoff's commits ${Object.values(commits).join(", ")} for ${id} in ${room}: the lines they add to ${file} match a secret pattern`);
         // Released, every held commit goes as it was, with any released before (#56).
         hold(id, () => pushAndReply({ ...pushAnyway, ...commits }));
-        return { type: "refusal", v: PROTOCOL_VERSION, id, reason: "withheld", file, ...(unchecked.length ? { unchecked } : {}) };
+        return { type: "refusal", v: PROTOCOL_VERSION, id, reason: "withheld", file, held: files.length, ...(unchecked.length ? { unchecked } : {}) };
       }
       return { type: "reply", v: PROTOCOL_VERSION, id, kind: "write-brief", handoff: { id: (request as Extract<Ask, { kind: "write-brief" }>).handoff, brief: body, repos: pushed }, ...(isFallback ? { fallback: true as const } : {}), ...(cap ? { cap } : {}) };
     };

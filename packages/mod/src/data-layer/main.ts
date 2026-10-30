@@ -213,6 +213,8 @@ async function main(argv: string[]): Promise<number> {
   const outgoing = (facts: Facts, patterns: Pattern[] | null) => prepareQuestions(hold.apply(facts, patterns), patterns, waiting, patternLog);
   // The project of each subagent working in a worktree of another repo, from the latest read.
   let checkouts: Record<string, string> = {};
+  // Whether a question got an answer, from the latest read, so one that closed says how.
+  let answered = (_id: string) => false;
 
   do {
     const now = Date.now();
@@ -270,6 +272,7 @@ async function main(argv: string[]): Promise<number> {
     const facts: Facts = read.facts.session.titleFrom === "branch" && title?.title ? { ...read.facts, session: { ...read.facts.session, title: title.title } } : read.facts;
 
     checkouts = read.checkouts ?? {};
+    answered = read.answered ?? answered;
 
     if (!link) {
       const where = await resolve(cwd);
@@ -294,6 +297,7 @@ async function main(argv: string[]): Promise<number> {
         // Another repo's files, commands and checkouts go only to a server that welcomed them, and
         // only for its office's repos; the link applies this at every send, on every connection.
         filter: (f, projects) => forOffice(f, projects, checkouts),
+        answered: (id) => answered(id),
         // The owner released a withheld report: it goes to the link now, not on the next pass.
         // The owner answered a question from the floor: it goes to the hooks module.
         onMessage: (message) => {

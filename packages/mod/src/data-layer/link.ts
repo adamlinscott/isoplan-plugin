@@ -78,6 +78,8 @@ export interface LinkOptions {
    * one): applied at every send, so a reconnect's full goes by the new connection's welcome (#74).
    */
   filter?: (facts: Facts, projects: ReadonlySet<string> | null) => Facts;
+  /** Whether a question got an answer, so a removed one says it was answered or abandoned. */
+  answered?: (question: string) => boolean;
   /** Where the hello's token comes from, for a server that signs people in. */
   pairing?: Pairing;
   /** How often a link waiting for its code to be approved asks again. */
@@ -117,6 +119,7 @@ export function createLink({
   onPairingEnded,
   onMessage,
   filter = (facts) => facts,
+  answered,
   pairing,
   pairPollMs = 5000,
   random = Math.random,
@@ -259,7 +262,7 @@ export function createLink({
     pacing = null;
     if (!isOpen || !latest || !sent) return;
     const facts = filter(latest, projects);
-    const changed = diffFacts(sent, facts);
+    const changed = diffFacts(sent, facts, answered);
     if (!changed) return;
     const wait = sentAt + minIntervalMs - Date.now();
     if (wait > 0) {

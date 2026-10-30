@@ -171,7 +171,9 @@ const FileKey = FileFactSchema.pick({ agent: true, file: true, project: true });
  * The keys of records that went away: an agent by its id, an edit or read by agent, file and
  * project (absent for the session's own), a
  * wait by waiter and on, a report by its agent, a question by its id. The session itself goes with
- * the connection.
+ * the connection. `questionOutcomes`: how each question in `questions` ended, by its id: `answered`,
+ * in the terminal or from the floor, or `abandoned`, with no answer (interrupted, or a new prompt
+ * came first). Absent, or without a question's id, from a peer that doesn't say (protocol 0.3.5 on).
  */
 export const FactRemoveSchema = z.object({
   agents: z.array(z.string().min(1)).optional(),
@@ -180,6 +182,7 @@ export const FactRemoveSchema = z.object({
   waits: z.array(WaitFactSchema.pick({ waiter: true, on: true })).optional(),
   reports: z.array(z.string().min(1)).optional(),
   questions: z.array(z.string().min(1)).optional(),
+  questionOutcomes: z.record(z.string().min(1), z.enum(["answered", "abandoned"])).optional(),
 });
 
 export type Source = z.infer<typeof SourceSchema>;

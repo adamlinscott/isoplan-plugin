@@ -5811,7 +5811,9 @@ const FileKey = FileFactSchema.pick({
 * The keys of records that went away: an agent by its id, an edit or read by agent, file and
 * project (absent for the session's own), a
 * wait by waiter and on, a report by its agent, a question by its id. The session itself goes with
-* the connection.
+* the connection. `questionOutcomes`: how each question in `questions` ended, by its id: `answered`,
+* in the terminal or from the floor, or `abandoned`, with no answer (interrupted, or a new prompt
+* came first). Absent, or without a question's id, from a peer that doesn't say (protocol 0.3.5 on).
 */
 const FactRemoveSchema = object({
 	agents: array(string().min(1)).optional(),
@@ -5822,7 +5824,8 @@ const FactRemoveSchema = object({
 		on: true
 	})).optional(),
 	reports: array(string().min(1)).optional(),
-	questions: array(string().min(1)).optional()
+	questions: array(string().min(1)).optional(),
+	questionOutcomes: record(string().min(1), _enum(["answered", "abandoned"])).optional()
 });
 const Version = literal(1);
 const Seq = number().int().nonnegative();
@@ -5971,6 +5974,7 @@ discriminatedUnion("type", [
 			id: RequestId,
 			reason: literal("withheld"),
 			file: string().min(1).optional(),
+			held: number().int().positive().optional(),
 			unchecked: array(string().min(1)).optional()
 		}),
 		object({
@@ -6483,7 +6487,7 @@ function runCommand([cmd, ...args], { cwd }) {
 //#endregion
 //#region src/data-layer/changes.ts
 /** null when nothing changed. */
-function diffFacts(before, after) {
+function diffFacts(before, after, answered) {
 	const upsert = {};
 	const remove = {};
 	if (!same(before.session, after.session)) upsert.session = after.session;
@@ -6510,7 +6514,10 @@ function diffFacts(before, after) {
 	if (reports.remove.length) remove.reports = reports.remove.map((r) => r.agent);
 	const questions = diff(before.questions ?? [], after.questions ?? [], (q) => q.id);
 	if (questions.upsert.length) upsert.questions = questions.upsert;
-	if (questions.remove.length) remove.questions = questions.remove.map((q) => q.id);
+	if (questions.remove.length) {
+		remove.questions = questions.remove.map((q) => q.id);
+		if (answered) remove.questionOutcomes = Object.fromEntries(remove.questions.map((id) => [id, answered(id) ? "answered" : "abandoned"]));
+	}
 	return Object.keys(upsert).length || Object.keys(remove).length ? {
 		upsert,
 		remove
@@ -6531,7 +6538,7 @@ const same = (a, b) => a !== void 0 && JSON.stringify(a) === JSON.stringify(b);
 const STABLE_MS$1 = 3e4;
 const OUTBOX_MAX = 100;
 const OUTBOX_MAX_AGE_MS = 36e5;
-function createLink({ url, hello, emit, minIntervalMs = 1e3, retryBaseMs = 1e3, retryCapMs = 3e4, notWantedRetryMs = 36e5, takenRetryMs = 36e5, onNotWanted, onPairingEnded, onMessage, filter = (facts) => facts, pairing, pairPollMs = 5e3, random = Math.random }) {
+function createLink({ url, hello, emit, minIntervalMs = 1e3, retryBaseMs = 1e3, retryCapMs = 3e4, notWantedRetryMs = 36e5, takenRetryMs = 36e5, onNotWanted, onPairingEnded, onMessage, filter = (facts) => facts, answered, pairing, pairPollMs = 5e3, random = Math.random }) {
 	const outbox = [];
 	let latest = null;
 	let socket = null;
@@ -6692,7 +6699,7 @@ function createLink({ url, hello, emit, minIntervalMs = 1e3, retryBaseMs = 1e3, 
 		pacing = null;
 		if (!isOpen || !latest || !sent) return;
 		const facts = filter(latest, projects);
-		const changed = diffFacts(sent, facts);
+		const changed = diffFacts(sent, facts, answered);
 		if (!changed) return;
 		const wait = sentAt + minIntervalMs - Date.now();
 		if (wait > 0) {
@@ -8092,12 +8099,14 @@ function createClaudeCode(io) {
 				now
 			});
 			const checkouts = {};
+			const { facts, answered } = await sessionFacts(c, main, where, workspace, now, config, resolve, place, fail, checkouts);
 			return {
-				facts: await sessionFacts(c, main, where, workspace, now, config, resolve, place, fail, checkouts),
+				facts,
 				status: null,
 				errors,
 				workspace,
-				checkouts
+				checkouts,
+				answered
 			};
 		} finally {
 			for (const cache of [transcripts, metas]) for (const key of cache.keys()) if (!used.has(key)) cache.delete(key);
@@ -8305,7 +8314,14 @@ function createClaudeCode(io) {
 			a.t.touches = await addFiles(facts.edits, id, a.t.touches, [...config.touchedTools, ...config.shellTools], now, config, place);
 			a.t.reads = await addFiles(facts.reads, id, a.t.reads, [...READ_TOOLS, ...config.shellTools], now, config, place);
 		}
-		return facts;
+		const answered = (id) => {
+			const r = results.get(id);
+			return !!r && !r.launched && r.status === "completed";
+		};
+		return {
+			facts,
+			answered
+		};
 	}
 	async function readMeta(p) {
 		used.add(p);
@@ -10692,6 +10708,7 @@ function createRunner({ answerer, ledger, settings, prompts, scan, send, log, is
 					id,
 					reason: "withheld",
 					file,
+					held: files.length,
 					...unchecked.length ? { unchecked } : {}
 				};
 			}

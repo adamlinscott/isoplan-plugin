@@ -159,6 +159,7 @@ export const RefusalMessageSchema = z.discriminatedUnion("reason", [
   // `file`: what was withheld is the handoff's commit, whose added lines in that file matched (the
   // pattern itself stays on the machine); without it, the brief or answer. With several matches, or
   // several repos (#56), it names every such file by its path in the session's folder, joined by ", ".
+  // `held`: how many files `file` names, as a path may itself hold ", " (protocol 0.3.5 on).
   // `unchecked`: files the commit adds that the scan can't read (binary), named so the owner knows.
   z.object({
     type: z.literal("refusal"),
@@ -166,6 +167,7 @@ export const RefusalMessageSchema = z.discriminatedUnion("reason", [
     id: RequestId,
     reason: z.literal("withheld"),
     file: z.string().min(1).optional(),
+    held: z.number().int().positive().optional(),
     unchecked: z.array(z.string().min(1)).optional(),
   }),
   z.object({ type: z.literal("refusal"), v: Version, id: RequestId, reason: z.literal("unavailable"), detail: z.string().min(1) }),
