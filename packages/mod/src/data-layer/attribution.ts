@@ -9,8 +9,9 @@
 // too), and remembers the answer. Paths are compared after symlinks are resolved, as git reports
 // its top level resolved.
 //
-// What is worked out here never leaves the machine by itself: `forOffice` keeps a file or command
-// in another repo only when the server's office holds that repo and the server said it reads them.
+// What is worked out here never leaves the machine by itself: `forOffice` keeps a file, command or
+// subagent's checkout in another repo only when the server's office holds that repo and the server
+// said it reads them.
 
 import type { Facts, Project } from "@isoplan/protocol";
 import { dirname, normalize, pathKey, relativeTo, type MaybePromise, type Stat, type Where } from "./git.js";
@@ -32,7 +33,21 @@ export interface AttributionInput {
   stat: (path: string) => MaybePromise<Stat | null>;
   /** The path with symlinks resolved; the path itself when it can't be. */
   realpath: (path: string) => MaybePromise<string>;
+  /** Which folders exist and where links lead, kept across passes (attributionCache). */
+  cache: AttributionCache;
+  now: number;
 }
+
+/** How long what a folder is (there or not, where its links lead) is believed. */
+const CACHE_MS = 10_000;
+
+export interface AttributionCache {
+  exists: Map<string, { at: number; value: Promise<boolean> }>;
+  real: Map<string, { at: number; value: Promise<string> }>;
+}
+
+/** Keep one for the life of the data layer; an entry older than CACHE_MS is looked up again. */
+export const attributionCache = (): AttributionCache => ({ exists: new Map(), real: new Map() });
 
 export interface Attribution {
   /** The file at absolute `path`; null when it is in no repo and not in a workspace. */
@@ -41,23 +56,19 @@ export interface Attribution {
   dir(dir: string): Promise<Omit<Placed, "file"> | null>;
 }
 
-/** Keep the object for one pass: it remembers which folders exist and where symlinks lead. */
-export function createAttribution({ folder, where: home, resolve, projectOf, stat, realpath }: AttributionInput): Attribution {
+/** One pass's: what folders are is remembered across passes in `cache`. */
+export function createAttribution({ folder, where: home, resolve, projectOf, stat, realpath, cache, now }: AttributionInput): Attribution {
   const homeProject = home ? Promise.resolve(projectOf(home)) : null;
-  const real = new Map<string, Promise<string>>();
-  const realOf = (p: string) => {
+  const remember = <T>(map: Map<string, { at: number; value: Promise<T> }>, p: string, look: () => Promise<T>): Promise<T> => {
     const key = pathKey(p);
-    let r = real.get(key);
-    if (!r) real.set(key, (r = Promise.resolve(realpath(p)).then(normalize, () => normalize(p))));
-    return r;
+    const hit = map.get(key);
+    if (hit && now - hit.at <= CACHE_MS) return hit.value;
+    const value = look();
+    map.set(key, { at: now, value });
+    return value;
   };
-  const exists = new Map<string, Promise<boolean>>();
-  const isThere = (p: string) => {
-    const key = pathKey(p);
-    let e = exists.get(key);
-    if (!e) exists.set(key, (e = Promise.resolve(stat(p)).then((s) => !!s?.isDir, () => false)));
-    return e;
-  };
+  const realOf = (p: string) => remember(cache.real, p, () => Promise.resolve(realpath(p)).then(normalize, () => normalize(p)));
+  const isThere = (p: string) => remember(cache.exists, p, () => Promise.resolve(stat(p)).then((s) => !!s?.isDir, () => false));
   const homeFolder = realOf(folder);
 
   // `path`'s nearest folder that exists (`path` itself when it is one), with symlinks resolved and
@@ -102,16 +113,26 @@ export function createAttribution({ folder, where: home, resolve, projectOf, sta
 }
 
 /**
- * The facts as they may leave the machine: a file or command in another repo only when `projects`,
- * the office's from the server's welcome, holds that repo. Without a welcome (an older server, or
- * none yet on this connection) none of them leave.
+ * The facts as they may leave the machine: a file, command or subagent's checkout in another repo
+ * only when `projects`, the office's from the server's welcome, holds that repo. Without a welcome
+ * (an older server, or none yet on this connection) none of them leave. `checkouts` names the
+ * project of each subagent whose worktree is another repo's, by agent id.
  */
-export function forOffice(facts: Facts, projects: ReadonlySet<string> | null): Facts {
-  const ok = (p: Project | undefined) => !p || (projects !== null && projects.has(p.id.toLowerCase()));
+export function forOffice(facts: Facts, projects: ReadonlySet<string> | null, checkouts: Readonly<Record<string, string>> = {}): Facts {
+  const held = (id: string) => projects !== null && projects.has(id.toLowerCase());
+  const ok = (p: Project | undefined) => !p || held(p.id);
   const files = (list: Facts["edits"]) => (list.every((f) => ok(f.project)) ? list : list.filter((f) => ok(f.project)));
   return {
     ...facts,
-    agents: facts.agents.map((a) => (a.doing && !ok(a.doing.project) ? { ...a, doing: { kind: a.doing.kind, since: a.doing.since } } : a)),
+    agents: facts.agents.map((a) => {
+      let out = a.doing && !ok(a.doing.project) ? { ...a, doing: { kind: a.doing.kind, since: a.doing.since } } : a;
+      const elsewhere = Object.hasOwn(checkouts, a.id) ? checkouts[a.id]! : null;
+      if (elsewhere !== null && !held(elsewhere) && (out.checkout !== undefined || out.branch !== undefined)) {
+        const { checkout: _c, branch: _b, ...rest } = out;
+        out = rest;
+      }
+      return out;
+    }),
     edits: files(facts.edits),
     reads: files(facts.reads),
   };

@@ -3,6 +3,7 @@ import { PROTOCOL_VERSION, type Facts, type HelloMessage, type RunnerHelloMessag
 import { afterEach, expect, test } from "vitest";
 import { WebSocketServer, type WebSocket as ServerSocket } from "ws";
 import type { DataLayerLine } from "../lines.js";
+import { forOffice } from "./attribution.js";
 import { createLink, type Link, type LinkOptions, type ServerAsk } from "./link.js";
 import type { Refusal } from "./pairing.js";
 
@@ -332,18 +333,22 @@ test("link: a token that runs out on a link that stayed up is renewed and the li
   expect(lines.some((x) => x.type === "status" && x.state === "disconnected")).toBe(false);
 });
 
-test("link: a welcome says which projects the office holds, until the connection drops; none before it", async () => {
+test("link: another repo's edits go only after this connection's welcome, and a reconnect's full goes by the new connection's", async () => {
   const s = await server();
-  const seen: string[][] = [];
-  const { link: l } = link(s.url, { minIntervalMs: 0, onWelcome: (p) => seen.push(p) });
-  l.update(facts("active"));
+  const web = { id: "github.com/team/web", name: "web" };
+  const filter = (f: Facts, projects: ReadonlySet<string> | null) => forOffice(f, projects);
+  const { link: l } = link(s.url, { minIntervalMs: 0, filter });
+  const away = { ...facts("active", ["a.md"]), edits: [{ agent: "claude-code:s:lead", file: "a.md", at: "2026-10-20T09:00:00.000Z" }, { agent: "claude-code:s:lead", file: "x.ts", at: "2026-10-20T09:00:00.000Z", project: web, away: true }] };
+  l.update(away);
   await until(() => s.got.length === 2);
-  expect(l.projects()).toBe(null);
-  s.sockets[0]!.send(JSON.stringify({ type: "welcome", v: PROTOCOL_VERSION, projects: ["github.com/team/app", "github.com/team/web"] }));
-  await until(() => l.projects() !== null);
-  expect([...l.projects()!]).toEqual(["github.com/team/app", "github.com/team/web"]);
-  expect(seen).toEqual([["github.com/team/app", "github.com/team/web"]]);
+  const edits = (m: { [key: string]: unknown }) => ((m.facts ?? m.upsert) as Facts).edits?.map((e) => e.file);
+  expect([l.projects(), edits(s.got[1]!)]).toEqual([null, ["a.md"]]);
+  s.sockets[0]!.send(JSON.stringify({ type: "welcome", v: PROTOCOL_VERSION, projects: ["GitHub.com/team/web"] }));
+  await until(() => s.got.length === 3);
+  expect([[...l.projects()!], s.got[2]!.type, edits(s.got[2]!)]).toEqual([["github.com/team/web"], "changes", ["x.ts"]]);
+  // A new connection has had no welcome: its full keeps the other repo's edit on the machine.
   s.sockets[0]!.close();
-  await until(() => l.projects() === null);
+  await until(() => s.got.filter((m) => m.type === "full").length === 2);
+  expect([l.projects(), edits(s.got.filter((m) => m.type === "full")[1]!)]).toEqual([null, ["a.md"]]);
   l.close();
 });

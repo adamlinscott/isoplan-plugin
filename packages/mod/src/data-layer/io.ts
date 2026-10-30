@@ -2,6 +2,7 @@
 // runner.
 
 import { execFile } from "node:child_process";
+import { statSync } from "node:fs";
 import fs from "node:fs/promises";
 import type { RunResult, Stat } from "./git.js";
 
@@ -19,6 +20,8 @@ export interface NodeIo {
   read(path: string, start?: number, end?: number): Promise<string>;
   /** The path with symlinks resolved; it rejects when the path doesn't exist. */
   realpath(path: string): Promise<string>;
+  /** Whether the path is a folder now. */
+  isDirSync(path: string): boolean;
 }
 
 export function nodeIo({ run = runCommand }: { run?: NodeIo["run"] } = {}): NodeIo {
@@ -40,6 +43,13 @@ export function nodeIo({ run = runCommand }: { run?: NodeIo["run"] } = {}): Node
       }
     },
     realpath: (p) => fs.realpath(p),
+    isDirSync: (p) => {
+      try {
+        return statSync(p).isDirectory();
+      } catch {
+        return false;
+      }
+    },
     async read(p, start, end) {
       if (start === undefined || end === undefined) return fs.readFile(p, "utf8");
       const fh = await fs.open(p, "r");

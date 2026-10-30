@@ -18,7 +18,11 @@ function office() {
 
 const agentsOf = async (home: string, id: string) => byId((await factsOf(home, id)).agents);
 // The project the fixture's projectOf gives a repo with no remote, as a data layer on "test-machine" would.
-const localProject = (dir: string) => ({ id: `local:test-machine/${normalize(dir)}`, name: path.basename(dir) });
+const caseless = process.platform === "win32" || process.platform === "darwin";
+const localProject = (dir: string) => {
+  const id = `local:test-machine/${normalize(dir)}`;
+  return { id: caseless ? id.toLowerCase() : id, name: path.basename(dir) };
+};
 
 test("reads only its own session: skips bad lines; title falls back to branch", async () => {
   const { home, main, wt } = office();
@@ -860,4 +864,22 @@ test("attribution, workspace: never the home folder or one above it, nor a folde
   expect((await read("s", ws)).workspace).toBe(true);
   await read("s", ws);
   expect(listed.filter((d) => d === normalize(ws))).toHaveLength(1);
+});
+
+test.skipIf(!caseless)("attribution, letter case: a local repo reached in another spelling is the same project, where the file system ignores case", async () => {
+  const { home, main, other } = office();
+  session(home, "s", [line.tool(main, "Edit", { file_path: path.join(other, "a.ts") }, 40), line.tool(main, "Edit", { file_path: path.join(other.toUpperCase(), "b.ts") }, 30)]);
+  const edits = (await sourceIn(home)("s", main)).facts!.edits;
+  expect(edits.map((e) => e.project!.id)).toEqual([localProject(other).id, localProject(other).id]);
+});
+
+test("attribution, checkouts: a subagent working in a worktree of another repo is named, so its checkout goes only where that repo may", async () => {
+  const { root, home, main, other } = office();
+  const otherWt = gitWorktree(other, path.join(root, "orca", "other-wt2"), "other-wt2", "feat/x");
+  session(home, "s", [line.user(main, "x")]);
+  agent(home, "s", "w", { agentType: "worker", worktreePath: otherWt, worktreeBranch: "feat/x" }, [line.tool(otherWt, "Read", { file_path: path.join(otherWt, "a.ts") }, 5)], { age: 5 });
+  agent(home, "s", "h", { agentType: "worker" }, [line.tool(main, "Read", { file_path: path.join(main, "a.ts") }, 5)], { age: 5 });
+  const read = await sourceIn(home)("s", main);
+  expect(read.checkouts).toEqual({ [cc("w")]: localProject(other).id });
+  expect(byId(read.facts!.agents).w).toMatchObject({ checkout: normalize(otherWt), branch: "feat/x" });
 });

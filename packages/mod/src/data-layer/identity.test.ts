@@ -44,6 +44,9 @@ test("Claude's folder and .claude.json: in $CLAUDE_CONFIG_DIR when it is set, el
 test("project: the remote names it; without one, the main checkout's folder on this machine", async () => {
   const where = { toplevel: "C:/w/repo-wt", commonDir: "C:/w/repo/.git", branch: "x" };
   expect(await projectOf(git({ "remote get-url origin": "git@github.com:Adam/Isoplan.git" }), where, "C:/w/repo-wt", "sevengill")).toEqual({ id: "github.com/adam/isoplan", name: "Isoplan" });
-  expect(await projectOf(git({}), where, "C:/w/repo-wt", "sevengill")).toEqual({ id: "local:sevengill/C:/w/repo", name: "repo" });
-  expect(await projectOf(null, null, "C:\\w\\loose", "sevengill")).toEqual({ id: "local:sevengill/C:/w/loose", name: "loose" });
+  expect(await projectOf(git({}), where, "C:/w/repo-wt", "sevengill", false)).toEqual({ id: "local:sevengill/C:/w/repo", name: "repo" });
+  expect(await projectOf(null, null, "C:\\w\\loose", "sevengill", false)).toEqual({ id: "local:sevengill/C:/w/loose", name: "loose" });
+  // Where the file system ignores case, a local project is one whatever spelling reached it.
+  expect(await projectOf(null, null, "C:\\W\\Loose", "Sevengill", true)).toEqual({ id: "local:sevengill/c:/w/loose", name: "Loose" });
+  expect(await projectOf(git({ "remote get-url origin": "git@github.com:Adam/Isoplan.git" }), where, "C:/w/repo-wt", "sevengill", true)).toEqual({ id: "github.com/adam/isoplan", name: "Isoplan" });
 });

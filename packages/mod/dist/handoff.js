@@ -3,8 +3,8 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { execFile, spawn, spawnSync } from "node:child_process";
+import { realpath, statSync } from "node:fs";
 import { randomBytes } from "node:crypto";
-import { realpath } from "node:fs";
 import { promisify } from "node:util";
 //#region ../../node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/core/util.js
 function getEnumValues(entries) {
@@ -6035,9 +6035,11 @@ const ConflictMessageSchema = object({
 });
 /**
 * Sent after a hello is let in, by a server that reads where an edit or command lands (#74): the
-* projects the office holds, so the data layer may report a file or command in one of them that is
-* outside the session's own project. A data layer that hasn't had one keeps such files on the
-* machine, as an older server would read them as the session's own.
+* projects of the session's office it may report work in, lower-cased: every one with a remote, and
+* of those with none (`local:`), only the hello's own machine's. A data layer reports a file,
+* command or worktree outside the session's own project only for one of these, and one that hasn't
+* had a welcome on its connection keeps them on the machine, as an older server would read them as
+* the session's own.
 */
 const WelcomeMessageSchema = object({
 	type: literal("welcome"),
@@ -6467,9 +6469,11 @@ async function accountOf(io, claudeJson, cwd) {
 /**
 * The project the session's folder belongs to: its git remote's, or for a repo with no usable
 * remote, the main checkout's folder on this machine (so every worktree of one repo is one
-* project). A folder git can't place is its own local project.
+* project). A folder git can't place is its own local project. On a file system that ignores case
+* (Windows, macOS) a local project's id is lower-cased, so one folder reached in two spellings is
+* one project, in the hello and in every edit alike.
 */
-async function projectOf(run, where, cwd, machine) {
+async function projectOf(run, where, cwd, machine, caseless = process.platform === "win32" || process.platform === "darwin") {
 	let remote = null;
 	if (run && where) {
 		const r = await Promise.resolve(run([
@@ -6481,10 +6485,14 @@ async function projectOf(run, where, cwd, machine) {
 		if (r && r.code === 0 && r.stdout.trim()) remote = r.stdout.trim();
 	}
 	const root = !where ? normalize(cwd) : /\/\.git$/.test(where.commonDir) ? dirname(where.commonDir) : where.toplevel;
-	return projectId(remote, {
+	const project = projectId(remote, {
 		machine,
 		root
 	});
+	return caseless && project.id.startsWith("local:") ? {
+		...project,
+		id: project.id.toLowerCase()
+	} : project;
 }
 function parseJson(text) {
 	try {
@@ -6525,6 +6533,13 @@ function nodeIo({ run = runCommand } = {}) {
 			}
 		},
 		realpath: (p) => fs.realpath(p),
+		isDirSync: (p) => {
+			try {
+				return statSync(p).isDirectory();
+			} catch {
+				return false;
+			}
+		},
 		async read(p, start, end) {
 			if (start === void 0 || end === void 0) return fs.readFile(p, "utf8");
 			const fh = await fs.open(p, "r");

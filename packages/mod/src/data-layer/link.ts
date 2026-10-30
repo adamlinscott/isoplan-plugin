@@ -73,8 +73,11 @@ export interface LinkOptions {
   onPairingEnded?: () => void;
   /** Takes the server's requests, releases and handoffs; without it they are logged as not handled. */
   onMessage?: (message: ServerAsk) => void;
-  /** The server's welcome: the projects its office holds (#74). */
-  onWelcome?: (projects: string[]) => void;
+  /**
+   * What of the facts may go on this connection, given the projects its welcome named (null before
+   * one): applied at every send, so a reconnect's full goes by the new connection's welcome (#74).
+   */
+  filter?: (facts: Facts, projects: ReadonlySet<string> | null) => Facts;
   /** Where the hello's token comes from, for a server that signs people in. */
   pairing?: Pairing;
   /** How often a link waiting for its code to be approved asks again. */
@@ -113,7 +116,7 @@ export function createLink({
   onNotWanted,
   onPairingEnded,
   onMessage,
-  onWelcome,
+  filter = (facts) => facts,
   pairing,
   pairPollMs = 5000,
   random = Math.random,
@@ -246,15 +249,17 @@ export function createLink({
 
   function sendFull() {
     if (!latest) return;
-    send({ type: "full", v: PROTOCOL_VERSION, seq: seq++, facts: latest });
-    sent = latest;
+    const facts = filter(latest, projects);
+    send({ type: "full", v: PROTOCOL_VERSION, seq: seq++, facts });
+    sent = facts;
     sentAt = Date.now();
   }
 
   function flush() {
     pacing = null;
     if (!isOpen || !latest || !sent) return;
-    const changed = diffFacts(sent, latest);
+    const facts = filter(latest, projects);
+    const changed = diffFacts(sent, facts);
     if (!changed) return;
     const wait = sentAt + minIntervalMs - Date.now();
     if (wait > 0) {
@@ -262,7 +267,7 @@ export function createLink({
       return;
     }
     send({ type: "changes", v: PROTOCOL_VERSION, seq: seq++, ...changed });
-    sent = latest;
+    sent = facts;
     sentAt = Date.now();
   }
 
@@ -281,8 +286,9 @@ export function createLink({
     }
     const message = parsed.message;
     if (message.type === "welcome") {
-      projects = new Set(message.projects);
-      onWelcome?.(message.projects);
+      // What it allows goes now, not on the next update.
+      projects = new Set(message.projects.map((p) => p.toLowerCase()));
+      if (!pacing) flush();
     } else if (message.type === "repair") {
       if (pacing) clearTimeout(pacing);
       pacing = null;

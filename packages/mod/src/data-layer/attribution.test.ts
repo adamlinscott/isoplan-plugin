@@ -30,3 +30,13 @@ test("forOffice: another repo's files and commands leave only for a project the 
   expect(before.edits).toEqual([facts.edits[0]]);
   expect(before.agents.map((a) => a.doing)).toEqual([{ kind: "write", since: at }, { kind: "run", since: at }]);
 });
+
+test("forOffice: a subagent's checkout in another repo goes only where that repo's files may", () => {
+  const withCheckout: Facts = { ...facts, agents: facts.agents.map((a) => (a.id === "w" ? { ...a, checkout: "C:/w/web-wt", branch: "feat/x" } : a)) };
+  const checkouts = { w: "github.com/team/web" };
+  expect(forOffice(withCheckout, new Set(["github.com/team/web"]), checkouts).agents[1]).toMatchObject({ checkout: "C:/w/web-wt", branch: "feat/x" });
+  const hidden = forOffice(withCheckout, null, checkouts).agents[1]!;
+  expect(["checkout" in hidden, "branch" in hidden]).toEqual([false, false]);
+  // The session's own worktrees aren't named, and go as before.
+  expect(forOffice(withCheckout, null, {}).agents[1]).toMatchObject({ checkout: "C:/w/web-wt" });
+});

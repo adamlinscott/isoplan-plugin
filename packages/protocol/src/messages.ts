@@ -285,9 +285,11 @@ export const ConflictMessageSchema = z.object({
 
 /**
  * Sent after a hello is let in, by a server that reads where an edit or command lands (#74): the
- * projects the office holds, so the data layer may report a file or command in one of them that is
- * outside the session's own project. A data layer that hasn't had one keeps such files on the
- * machine, as an older server would read them as the session's own.
+ * projects of the session's office it may report work in, lower-cased: every one with a remote, and
+ * of those with none (`local:`), only the hello's own machine's. A data layer reports a file,
+ * command or worktree outside the session's own project only for one of these, and one that hasn't
+ * had a welcome on its connection keeps them on the machine, as an older server would read them as
+ * the session's own.
  */
 export const WelcomeMessageSchema = z.object({
   type: z.literal("welcome"),

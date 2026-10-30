@@ -11,7 +11,7 @@
 // id>:lead, and a subagent claude-code:<agent id>.
 
 import type { AgentFact, Facts, FileFact, Project, QuestionFact } from "@isoplan/protocol";
-import { createAttribution, type Attribution, type Placed } from "./attribution.js";
+import { attributionCache, createAttribution, type Attribution, type Placed } from "./attribution.js";
 import type { Config } from "./config.js";
 import { join, normalize, pathKey, relativeTo, type MaybePromise, type Stat, type Where } from "./git.js";
 import type { DirEntry } from "./io.js";
@@ -67,6 +67,8 @@ export interface SourceIo {
   read(path: string, start?: number, end?: number): MaybePromise<string>;
   /** The path with symlinks resolved; without it, paths are compared as written. */
   realpath?(path: string): MaybePromise<string>;
+  /** Whether a path is a folder now, asked as a transcript line is read: a copy into one names the file. */
+  isDirSync?(path: string): boolean;
 }
 
 export interface ReadInput {
@@ -91,6 +93,8 @@ export interface SourceRead {
   errors: { count: number; first: string | null };
   /** The session's folder is a workspace above several repos, so its own project is a local path. */
   workspace?: boolean;
+  /** The project of each subagent whose worktree is another repo's, by agent id: its checkout goes only where that repo may (forOffice). */
+  checkouts?: Record<string, string>;
 }
 
 /**
@@ -103,6 +107,7 @@ export function createClaudeCode(io: SourceIo) {
   const metas = new Map<string, { mtimeMs: number; meta: Meta }>();
   const found = new Map<string, string>(); // session id → its transcript, once located
   const workspaces = new Map<string, { at: number; is: boolean }>(); // folder → whether it is a workspace
+  const places = attributionCache(); // which folders exist and where links lead, across passes
   const searched = new Map<string, number>(); // session id → when every project folder was last searched
   let used = new Set<string>(); // the cache keys this pass has used
 
@@ -145,9 +150,12 @@ export function createClaudeCode(io: SourceIo) {
         projectOf,
         stat: (p) => io.stat(p),
         realpath: (p) => (io.realpath ? io.realpath(p) : p),
+        cache: places,
+        now,
       });
-      const facts = await sessionFacts(c, main, where, workspace, now, config, resolve, place, fail);
-      return { facts, status: null, errors, workspace };
+      const checkouts: Record<string, string> = {};
+      const facts = await sessionFacts(c, main, where, workspace, now, config, resolve, place, fail, checkouts);
+      return { facts, status: null, errors, workspace, checkouts };
     } finally {
       for (const cache of [transcripts, metas]) {
         for (const key of cache.keys()) if (!used.has(key)) cache.delete(key);
@@ -253,6 +261,7 @@ export function createClaudeCode(io: SourceIo) {
     resolve: ReadInput["resolve"],
     place: Attribution,
     fail: (err: unknown) => void,
+    checkouts: Record<string, string>,
   ): Promise<Facts> {
     const session = `${SOURCE}:${c.id}`;
     const lead = `${session}:lead`;
@@ -335,6 +344,9 @@ export function createClaudeCode(io: SourceIo) {
       let worktree = typeof a.meta.worktreePath === "string" ? normalize(a.meta.worktreePath) : null;
       // In a workspace, an agent working in one of its repos is not in a worktree.
       if (!worktree && at && !workspace && pathKey(at.toplevel) !== pathKey(where.toplevel)) worktree = at.toplevel;
+      // A worktree of another repo is that repo's: where it may go is decided with its files.
+      const elsewhere = worktree ? await place.dir(worktree) : null;
+      if (elsewhere?.project) checkouts[id] = elsewhere.project.id;
       const agentBranch = worktree
         ? (typeof a.meta.worktreeBranch === "string" && a.meta.worktreeBranch) || (at && pathKey(at.toplevel) === pathKey(worktree) ? at.branch : null)
         : null;
@@ -419,7 +431,7 @@ export function createClaudeCode(io: SourceIo) {
       lines[0] = st.head + lines[0]; // a tail read starts mid-line
       st.head = null;
     }
-    for (const line of lines) if (line.trim()) foldLine(st, line, io.home ?? null);
+    for (const line of lines) if (line.trim()) foldLine(st, line, io.home ?? null, io.isDirSync);
     return st;
   }
 
@@ -654,7 +666,7 @@ type Line = Record<string, any>;
 
 // Fold one transcript line into the file's running state. Lines that don't parse, or parse to
 // something without a `type`, are skipped.
-function foldLine(st: TranscriptState, line: string, home: string | null): void {
+function foldLine(st: TranscriptState, line: string, home: string | null, isDir?: (path: string) => boolean): void {
   st.seen++;
   let ev: Line;
   try {
@@ -702,7 +714,7 @@ function foldLine(st: TranscriptState, line: string, home: string | null): void 
       // in this line, and shellFiles follows only the ones inside this command.
       const cwd: string | null = ev.cwd || st.cwd;
       // Any tool with a command is read as a shell: read time keeps only the `shellTools`.
-      const shell = typeof input.command === "string" ? shellFiles(input.command, cwd, { powershell: c.name === "PowerShell", home }) : { writes: [], reads: [], dirs: [] };
+      const shell = typeof input.command === "string" ? shellFiles(input.command, cwd, { powershell: c.name === "PowerShell", home, isDir }) : { writes: [], reads: [], dirs: [] };
       const writes = shell.writes;
       const file = typeof input.file_path === "string" ? input.file_path : typeof input.notebook_path === "string" ? input.notebook_path : typeof input.path === "string" ? input.path : null;
       const dir = shell.dirs[shell.dirs.length - 1];

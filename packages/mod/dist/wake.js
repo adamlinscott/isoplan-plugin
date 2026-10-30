@@ -3,6 +3,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import fs from "node:fs/promises";
 import { promisify } from "node:util";
+import { statSync } from "node:fs";
 //#region src/data-layer/config.ts
 async function loadConfig(io, defaultsPath, userPath) {
 	const config = await loadSettings(io, defaultsPath, userPath);
@@ -82,6 +83,13 @@ function nodeIo({ run = runCommand } = {}) {
 			}
 		},
 		realpath: (p) => fs.realpath(p),
+		isDirSync: (p) => {
+			try {
+				return statSync(p).isDirectory();
+			} catch {
+				return false;
+			}
+		},
 		async read(p, start, end) {
 			if (start === void 0 || end === void 0) return fs.readFile(p, "utf8");
 			const fh = await fs.open(p, "r");
@@ -505,14 +513,12 @@ const WRITTEN = [
 	"live",
 	"logs",
 	"titles",
-	"released",
-	"office-projects.json"
+	"released"
 ];
 const SESSION_TRACES = [
 	"live",
 	"titles",
-	"released",
-	"office-projects.json"
+	"released"
 ];
 /**
 * Takes out everything install and the plugin put in place, in this order: the running runner;
