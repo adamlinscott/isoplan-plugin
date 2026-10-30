@@ -95,6 +95,8 @@ export interface SourceRead {
   workspace?: boolean;
   /** The project of each subagent whose worktree is another repo's, by agent id: its checkout goes only where that repo may (forOffice). */
   checkouts?: Record<string, string>;
+  /** Whether the call with this id has a result that isn't an error: for a question, that it was answered. */
+  answered?: (id: string) => boolean;
 }
 
 /**
@@ -154,8 +156,8 @@ export function createClaudeCode(io: SourceIo) {
         now,
       });
       const checkouts: Record<string, string> = {};
-      const facts = await sessionFacts(c, main, where, workspace, now, config, resolve, place, fail, checkouts);
-      return { facts, status: null, errors, workspace, checkouts };
+      const { facts, answered } = await sessionFacts(c, main, where, workspace, now, config, resolve, place, fail, checkouts);
+      return { facts, status: null, errors, workspace, checkouts, answered };
     } finally {
       for (const cache of [transcripts, metas]) {
         for (const key of cache.keys()) if (!used.has(key)) cache.delete(key);
@@ -262,7 +264,7 @@ export function createClaudeCode(io: SourceIo) {
     place: Attribution,
     fail: (err: unknown) => void,
     checkouts: Record<string, string>,
-  ): Promise<Facts> {
+  ): Promise<{ facts: Facts; answered: (id: string) => boolean }> {
     const session = `${SOURCE}:${c.id}`;
     const lead = `${session}:lead`;
     const agentFiles: (AgentFile & { t: TranscriptState; meta: Meta })[] = [];
@@ -386,7 +388,13 @@ export function createClaudeCode(io: SourceIo) {
       a.t.touches = await addFiles(facts.edits, id, a.t.touches, [...config.touchedTools, ...config.shellTools], now, config, place);
       a.t.reads = await addFiles(facts.reads, id, a.t.reads, [...READ_TOOLS, ...config.shellTools], now, config, place);
     }
-    return facts;
+    // A question no longer open was answered if its call has a result that isn't an error; an
+    // interruption is an error, and a prompt that came first left it with no result at all.
+    const answered = (id: string) => {
+      const r = results.get(id);
+      return !!r && !r.launched && r.status === "completed";
+    };
+    return { facts, answered };
   }
 
   async function readMeta(p: string): Promise<Meta> {

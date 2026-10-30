@@ -3,12 +3,13 @@
 // protocol keys them: an agent by its id, an edit or read by agent, file and project (absent for
 // the session's own, as an older peer sends it), a wait by waiter and
 // on, a report by its agent, a question by its id. The session is one record, sent whole when it
-// changed. Facts without questions have none.
+// changed. Facts without questions have none. Given `answered`, each removed question says how it
+// ended: answered, or abandoned with no answer.
 
 import type { FactRemove, Facts, FactUpsert } from "@isoplan/protocol";
 
 /** null when nothing changed. */
-export function diffFacts(before: Facts, after: Facts): { upsert: FactUpsert; remove: FactRemove } | null {
+export function diffFacts(before: Facts, after: Facts, answered?: (question: string) => boolean): { upsert: FactUpsert; remove: FactRemove } | null {
   const upsert: FactUpsert = {};
   const remove: FactRemove = {};
   if (!same(before.session, after.session)) upsert.session = after.session;
@@ -33,7 +34,10 @@ export function diffFacts(before: Facts, after: Facts): { upsert: FactUpsert; re
 
   const questions = diff(before.questions ?? [], after.questions ?? [], (q) => q.id);
   if (questions.upsert.length) upsert.questions = questions.upsert;
-  if (questions.remove.length) remove.questions = questions.remove.map((q) => q.id);
+  if (questions.remove.length) {
+    remove.questions = questions.remove.map((q) => q.id);
+    if (answered) remove.questionOutcomes = Object.fromEntries(remove.questions.map((id) => [id, answered(id) ? "answered" : "abandoned"]));
+  }
 
   return Object.keys(upsert).length || Object.keys(remove).length ? { upsert, remove } : null;
 }

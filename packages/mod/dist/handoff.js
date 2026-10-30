@@ -5810,7 +5810,9 @@ const FileKey = FileFactSchema.pick({
 * The keys of records that went away: an agent by its id, an edit or read by agent, file and
 * project (absent for the session's own), a
 * wait by waiter and on, a report by its agent, a question by its id. The session itself goes with
-* the connection.
+* the connection. `questionOutcomes`: how each question in `questions` ended, by its id: `answered`,
+* in the terminal or from the floor, or `abandoned`, with no answer (interrupted, or a new prompt
+* came first). Absent, or without a question's id, from a peer that doesn't say (protocol 0.3.5 on).
 */
 const FactRemoveSchema = object({
 	agents: array(string().min(1)).optional(),
@@ -5821,7 +5823,8 @@ const FactRemoveSchema = object({
 		on: true
 	})).optional(),
 	reports: array(string().min(1)).optional(),
-	questions: array(string().min(1)).optional()
+	questions: array(string().min(1)).optional(),
+	questionOutcomes: record(string().min(1), _enum(["answered", "abandoned"])).optional()
 });
 const Version = literal(1);
 const Seq = number().int().nonnegative();
@@ -5970,6 +5973,7 @@ discriminatedUnion("type", [
 			id: RequestId,
 			reason: literal("withheld"),
 			file: string().min(1).optional(),
+			held: number().int().positive().optional(),
 			unchecked: array(string().min(1)).optional()
 		}),
 		object({

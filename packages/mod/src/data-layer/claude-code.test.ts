@@ -202,6 +202,23 @@ test("questions: an AskUserQuestion with no result is open while the turn is, ma
   expect(await questions()).toEqual([]);
 });
 
+test("questions: one with a result that isn't an error was answered; an interrupted one, or one a prompt came before, was not", async () => {
+  const { home, main } = office();
+  const prompt = line.user(main, "fix the bug", 60);
+  const ask = (id: string, age: number) => ({ ...line.tool(main, "AskUserQuestion", {}, age), message: { role: "assistant", content: [{ type: "tool_use", id, name: "AskUserQuestion", input: { questions: [{ question: "Ship it?" }] } }] } });
+  session(home, "s", [
+    prompt,
+    ask("toolu_1", 50),
+    line.result(main, "toolu_1", { answers: { "Ship it?": "Yes" } }, 45),
+    ask("toolu_2", 40),
+    line.result(main, "toolu_2", null, 35, true),
+    ask("toolu_3", 30),
+    line.user(main, "never mind", 20),
+  ]);
+  const { answered } = await sourceIn(home)("s");
+  expect(["toolu_1", "toolu_2", "toolu_3"].map((id) => answered!(id))).toEqual([true, false, false]);
+});
+
 test("foreground agent: working until the parent's tool_result says completed, then done with a report", async () => {
   const { home, main } = office();
   const lines = [line.spawn(main, "tu-fg1", { subagent_type: "researcher" }, 100)];
