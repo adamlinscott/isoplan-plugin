@@ -302,6 +302,17 @@ describe("handoff", () => {
     ["another transport helper", withRepo({ remote: "fd::17" }), "handoff.repos[0].remote"],
     ["a branch that isn't the handoff's", withRepo({ branch: "main" }), "handoff.repos[0].branch"],
     ["another handoff's branch", withRepo({ branch: "isoplan/handoff/other" }), "handoff.repos[0].branch"],
+    ["a repo's own branch with no slug", withRepo({ branch: "isoplan/handoff/h7k2--" }), "handoff.repos[0].branch"],
+    ["a repo's own branch with capitals", withRepo({ branch: "isoplan/handoff/h7k2--Api" }), "handoff.repos[0].branch"],
+    ["a path into .git", withRepo({ path: "libs/.git/hooks" }), "handoff.repos[0].path"],
+    ["a path into .git as Windows also reads it", withRepo({ path: "libs/.GIT. /hooks" }), "handoff.repos[0].path"],
+    ["a path into .git by its short name", withRepo({ path: "libs\\GIT~1\\hooks" }), "handoff.repos[0].path"],
+    ["a path into .git by an NTFS stream", withRepo({ path: ".git::$INDEX_ALLOCATION/hooks" }), "handoff.repos[0].path"],
+    ["a path with a colon in a folder", withRepo({ path: "libs/core:stream" }), "handoff.repos[0].path"],
+    ["a path through .", withRepo({ path: "libs/./core" }), "handoff.repos[0].path"],
+    ["a path that starts with ./", withRepo({ path: "./core" }), "handoff.repos[0].path"],
+    ["a path that ends with /.", withRepo({ path: "libs/." }), "handoff.repos[0].path"],
+    ["a path with an empty part", withRepo({ path: "libs//core" }), "handoff.repos[0].path"],
     ["an id over 64 characters", { ...valid.handoff, handoff: { ...handoff, id: "a".repeat(65) } }, "handoff.id"],
     ["a short commit hash", withRepo({ commit: "0123456" }), "handoff.repos[0].commit"],
   ])("refuses %s", (_, message, path) => {
@@ -320,6 +331,8 @@ describe("handoff", () => {
     ["a file remote", { remote: "file:///C:/remotes/isoplan.git" }],
     ["a local bare remote", { remote: "C:\\remotes\\isoplan.git" }],
     ["a SHA-256 commit", { commit: "0123456789abcdef".repeat(4) }],
+    ["a repo's own branch, for repos sharing a remote", { branch: "isoplan/handoff/h7k2--libs-core" }],
+    ["a folder whose name starts with .git", { path: "libs/.github-actions" }],
   ])("accepts %s", (_, change) => {
     const message = withRepo(change);
     expect(parseOfficeServerMessage(message)).toEqual({ ok: true, message });

@@ -18,7 +18,20 @@
 //    on Windows, /bin/sh on a Mac) in the worktree, hidden, with ISOPLAN_HANDOFF_ID and
 //    ISOPLAN_HANDOFF_BRANCH set, under its timeout. Its output goes to setup.log in the handoff's
 //    folder.
-// 4. Claude Code in the worktree, under the session id the server chose, so that session alone may
+// 4. The repos under the session's folder (#56), each at its path in the worktree, parents first.
+//    One there already (the setup script's clone, say) with the handoff's remote is fetched and
+//    switched to the handoff's branch, by the shortcut's rules below: never over uncommitted changes
+//    to tracked files or commits of the receiver's own. Where there is none, or only an empty
+//    folder, it is cloned from the recorded remote on that branch, only when that is an https, ssh
+//    or host:path remote (never a local path, file:// or a \server share), with Git LFS's download
+//    off. A path through a link, or into a .git folder by any name Windows gives one, is refused.
+//    The setup script runs before this, so it sees only the repos it clones itself. One that fails is reported with its path, and the rest go on.
+//    A handoff from a folder that isn't a repo itself (a plain folder above several) has no
+//    worktree to make: its folder is a new plain folder, <workspace>-handoff-<id>, beside the
+//    receiver's own workspace, which is the most recent session folder holding a clone of one of
+//    its repos at that repo's path. There is no repo there to read isoplan.json from, so no setup
+//    script runs.
+// 5. Claude Code in the worktree, under the session id the server chose, so that session alone may
 //    join the room, told to read the brief, which is in brief.md in the handoff's folder
 //    (<claude dir>/isoplan/handoffs/<id>/). As the receiver chose on the floor, and only as they
 //    said: a handoff that doesn't say is refused.
@@ -30,15 +43,17 @@
 //      confirmed through `claude agents --json`; the receiver opens it with `claude attach`, and a
 //      harness that shows the repo's worktrees (Orca, for example) finds the worktree.
 //
-// A failed setup script doesn't stop the rest: the session still opens, and the step is reported
+// A failed setup script or repo checkout doesn't stop the rest: the session still opens, and the step is reported
 // with the end of its output. Output leaves the machine only after the secret scan.
 
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import { realpath } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
-import { PROTOCOL_VERSION, type Handoff, type HandoffMessage, type HandoffRepo, type TakenMessage } from "@isoplan/protocol";
+import { isGitFolder, PROTOCOL_VERSION, type Handoff, type HandoffMessage, type HandoffRepo, type TakenMessage } from "@isoplan/protocol";
 import os from "node:os";
+import { promisify } from "node:util";
 import { normalize, pathKey } from "../data-layer/git.js";
 import type { NodeIo } from "../data-layer/io.js";
 import { claudeCommand } from "../runner/claude-binary.js";
@@ -97,6 +112,8 @@ export interface TakeOptions {
   confirmMs?: number;
   now?: () => number;
   newSession?: () => string;
+  /** Which remotes a missing repo under the folder may be cloned from: by default `onTheWire`. */
+  cloneFrom?: (remote: string) => boolean;
 }
 
 /** The handoff's folder on this machine: its brief, launcher and setup log. */
@@ -106,6 +123,59 @@ const tail = (text: string) => (text.length > OUTPUT_TAIL ? "…" + text.slice(-
 
 /** The main checkout of a clone of `remote` on this machine, the most recently used first, and that remote's name there; null with none. */
 export async function findClone(io: NodeIo, run: RunGit, projectsDir: string, remote: string, since: number, timeoutMs: number): Promise<{ dir: string; remote: string } | null> {
+  const tried = new Set<string>();
+  for (const cwd of await recentFolders(io, projectsDir, since)) {
+    const where = await run(["rev-parse", "--path-format=absolute", "--show-toplevel", "--git-common-dir"], { cwd, timeoutMs });
+    if (where.code !== 0) continue;
+    const [toplevel, commonDir] = where.stdout.split(/\r?\n/).map((s) => s.trim());
+    if (!toplevel || !commonDir) continue;
+    const main = normalize(commonDir).endsWith("/.git") ? path.dirname(commonDir) : toplevel;
+    if (tried.has(pathKey(main))) continue;
+    tried.add(pathKey(main));
+    const match = (await remotesOf(run, main, timeoutMs))?.find((r) => r.urls.some((url) => sameRemote(url, remote)));
+    if (match) return { dir: path.resolve(main), remote: match.name };
+  }
+  return null;
+}
+
+/**
+ * The receiver's own folder for a handoff from a folder that isn't a repo (#56): the most recently
+ * used session folder with a clone of one of `repos` at that repo's path in it, or the folder above
+ * a session's repo that is one of them; null with none.
+ */
+export async function findWorkspace(io: NodeIo, run: RunGit, projectsDir: string, repos: HandoffRepo[], since: number, timeoutMs: number): Promise<string | null> {
+  const tried = new Set<string>();
+  const holds = async (folder: string) => {
+    for (const repo of repos) {
+      const dir = path.join(folder, repo.path);
+      const top = await run(["rev-parse", "--show-toplevel"], { cwd: dir, timeoutMs });
+      if (top.code !== 0 || pathKey(top.stdout.trim()) !== pathKey(dir)) continue;
+      if ((await remotesOf(run, dir, timeoutMs))?.some((r) => r.urls.some((url) => sameRemote(url, repo.remote)))) return true;
+    }
+    return false;
+  };
+  for (const cwd of await recentFolders(io, projectsDir, since)) {
+    const top = await run(["rev-parse", "--show-toplevel"], { cwd, timeoutMs });
+    const candidates = [cwd];
+    // A session in one of the repos: the folder its path in the handoff says is above it.
+    if (top.code === 0) {
+      const at = top.stdout.trim();
+      for (const repo of repos) {
+        const above = aboveOf(at, repo.path);
+        if (pathKey(path.join(above, repo.path)) === pathKey(at)) candidates.push(above);
+      }
+    }
+    for (const folder of candidates) {
+      if (tried.has(pathKey(folder))) continue;
+      tried.add(pathKey(folder));
+      if (await holds(folder)) return path.resolve(folder);
+    }
+  }
+  return null;
+}
+
+// The folders the machine's Claude Code sessions since `since` ran in, the most recent first, each once.
+async function recentFolders(io: NodeIo, projectsDir: string, since: number): Promise<string[]> {
   const transcripts: { cwd: string; at: number }[] = [];
   for (const dir of await io.listDir(projectsDir)) {
     if (!dir.isDir) continue;
@@ -119,22 +189,14 @@ export async function findClone(io: NodeIo, run: RunGit, projectsDir: string, re
     }
   }
   transcripts.sort((a, b) => b.at - a.at);
-  const tried = new Set<string>();
+  const out: string[] = [];
+  const seen = new Set<string>();
   for (const { cwd } of transcripts) {
-    if (tried.has(pathKey(cwd))) continue;
-    tried.add(pathKey(cwd));
-    if (!(await io.stat(cwd))?.isDir) continue;
-    const where = await run(["rev-parse", "--path-format=absolute", "--show-toplevel", "--git-common-dir"], { cwd, timeoutMs });
-    if (where.code !== 0) continue;
-    const [toplevel, commonDir] = where.stdout.split(/\r?\n/).map((s) => s.trim());
-    if (!toplevel || !commonDir) continue;
-    const main = normalize(commonDir).endsWith("/.git") ? path.dirname(commonDir) : toplevel;
-    if (tried.has(`main:${pathKey(main)}`)) continue;
-    tried.add(`main:${pathKey(main)}`);
-    const match = (await remotesOf(run, main, timeoutMs))?.find((r) => r.urls.some((url) => sameRemote(url, remote)));
-    if (match) return { dir: path.resolve(main), remote: match.name };
+    if (seen.has(pathKey(cwd))) continue;
+    seen.add(pathKey(cwd));
+    if ((await io.stat(cwd))?.isDir) out.push(cwd);
   }
-  return null;
+  return out;
 }
 
 // The folder a transcript's first lines name.
@@ -323,11 +385,12 @@ export async function trustFolder(claudeJson: string, dir: string, platform: Nod
 }
 
 /** The first thing the new session is told. */
-export function takePrompt(id: string, brief: string, setupLog: string | null): string {
+export function takePrompt(id: string, brief: string, setupLog: string | null, failedRepos: string[] = []): string {
   return [
     `Isoplan handoff ${id}: you are taking this work over.`,
     `Read its brief in ${brief} first.`,
     ...(setupLog ? [`The worktree's setup script failed; the end of its output is in ${setupLog}.`] : []),
+    ...(failedRepos.length ? [`These repos in this folder couldn't be put on the handoff's branch, so check them first: ${failedRepos.join(", ")}.`] : []),
     "Then say where things stand and what you would do next, and wait for me before changing anything.",
   ].join(" ");
 }
@@ -367,9 +430,9 @@ export async function takeHandoff(message: Pick<HandoffMessage, "handoff" | "mod
   const headless = message.mode === "headless";
   const failures: Failure[] = [];
   const done = (session?: string): TakenMessage => ({ type: "taken", v: PROTOCOL_VERSION, handoff: handoff.id, ...(session ? { session } : {}), failures });
-  const fail = async (step: Failure["step"], output: string) => {
+  const fail = async (step: Failure["step"], output: string, repo?: string) => {
     const matched = await o.scan(output);
-    failures.push({ step, output: matched ? `The end of its output is withheld here: it matches a secret pattern. It is on ${o.machine}.` : tail(output) });
+    failures.push({ step, ...(repo ? { repo } : {}), output: matched ? `The end of its output is withheld here: it matches a secret pattern. It is on ${o.machine}.` : tail(output) });
   };
   // A window opens only when the receiver asked for a terminal: a handoff that doesn't say is refused.
   if (message.mode !== "terminal" && message.mode !== "headless") {
@@ -379,44 +442,61 @@ export async function takeHandoff(message: Pick<HandoffMessage, "handoff" | "mod
   try {
     const s = await o.settings();
     const timeoutMs = s.gitTimeoutSeconds * 1000;
-    const branch = handoffBranch(handoff.id);
-    // #56 adds the sub-repos; here the session's own repo is the one at the folder itself.
-    const repo: HandoffRepo = handoff.repos.find((r) => r.path === ".") ?? handoff.repos[0]!;
+    const repo = handoff.repos.find((r) => r.path === ".");
+    const branch = repo?.branch ?? handoffBranch(handoff.id);
+    const subs = byDepth(handoff.repos.filter((r) => r.path !== "."));
     const now = (o.now ?? Date.now)();
-
-    const clone = await findClone(o.io, o.run, path.join(o.claudeDir, "projects"), repo.remote, now - s.cloneSearchDays * 86400000, timeoutMs);
-    if (!clone) {
-      await fail("worktree", `No clone of ${repo.remote} was found on ${o.machine}: none of its Claude Code sessions from the last ${s.cloneSearchDays} days ran in one. Open Claude Code once in your clone of the repo, then take the handoff again, or copy its prompt into a session there.`);
-      return done();
-    }
-    const git = (args: string[], cwd: string) => o.run(args, { cwd, timeoutMs });
+    const since = now - s.cloneSearchDays * 86400000;
+    const projects = path.join(o.claudeDir, "projects");
     const folder = handoffDir(o.claudeDir, handoff.id);
-    const exempt = await takenBefore(folder);
-    const fetched = await git(["fetch", clone.remote, `+refs/heads/${branch}:refs/remotes/${clone.remote}/${branch}`], clone.dir);
-    if (fetched.code !== 0) {
-      await fail("worktree", `git fetch ${clone.remote} ${branch} in ${clone.dir} failed${fetched.timedOut ? " (it took too long)" : ""}:\n${fetched.stderr}`);
-      return done();
+
+    let dir: string;
+    let clone: { dir: string; remote: string } | null = null;
+    if (repo) {
+      clone = await findClone(o.io, o.run, projects, repo.remote, since, timeoutMs);
+      if (!clone) {
+        await fail("worktree", `No clone of ${repo.remote} was found on ${o.machine}: none of its Claude Code sessions from the last ${s.cloneSearchDays} days ran in one. Open Claude Code once in your clone of the repo, then take the handoff again, or copy its prompt into a session there.`);
+        return done();
+      }
+      const fetched = await o.run(["fetch", clone.remote, `+refs/heads/${branch}:refs/remotes/${clone.remote}/${branch}`], { cwd: clone.dir, timeoutMs });
+      if (fetched.code !== 0) {
+        await fail("worktree", `git fetch ${clone.remote} ${branch} in ${clone.dir} failed${fetched.timedOut ? " (it took too long)" : ""}:\n${fetched.stderr}`);
+        return done();
+      }
+      const made = await worktreeFor(o.run, clone.dir, clone.remote, branch, handoff.id, await takenBefore(folder), timeoutMs);
+      if (typeof made !== "string") {
+        await fail("worktree", made.error);
+        return done();
+      }
+      dir = made;
+      await recordTaken(folder, (await resolved(o.run, dir, "HEAD", timeoutMs)) ?? repo.commit);
+    } else {
+      // A handoff from a plain folder above its repos: a plain folder beside the receiver's own.
+      const workspace = await findWorkspace(o.io, o.run, projects, subs, since, timeoutMs);
+      if (!workspace) {
+        await fail("worktree", `No folder holding a clone of ${subs.map((r) => r.remote).join(" or ")} at its path in the handoff (${subs.map((r) => r.path).join(", ")}) was found on ${o.machine}: none of its Claude Code sessions from the last ${s.cloneSearchDays} days ran in one. Open Claude Code once in your folder of these repos, then take the handoff again, or copy its prompt into a session there.`);
+        return done();
+      }
+      const own = `-handoff-${handoff.id}`;
+      dir = path.basename(workspace).endsWith(own) ? workspace : `${workspace}${own}`;
+      await fs.mkdir(dir, { recursive: true });
     }
-    const dir = await worktreeFor(o.run, clone.dir, clone.remote, branch, handoff.id, exempt, timeoutMs);
-    if (typeof dir !== "string") {
-      await fail("worktree", dir.error);
-      return done();
-    }
-    await recordTaken(folder, (await resolved(o.run, dir, "HEAD", timeoutMs)) ?? repo.commit);
     await fs.mkdir(folder, { recursive: true });
     const briefFile = path.join(folder, "brief.md");
     await fs.writeFile(briefFile, handoff.brief + "\n");
     const env = forkEnv(o.env);
 
-    // A new session is spawned, so the setup script always runs.
+    // A new session is spawned, so the setup script always runs, when there is a repo to read it from.
     let setupLog: string | null = null;
-    const config = await readSetupFile(o.run, clone, timeoutMs);
-    if (config.problem) await fail("setup", config.problem);
     let setup: WorktreeSetup | null = null;
-    try {
-      setup = config.text === null ? null : parseSetup(config.text, o.platform, s.setupTimeoutMinutes * 60000);
-    } catch (err) {
-      await fail("setup", `${REPO_CONFIG} couldn't be read: ${(err as Error).message}`);
+    if (clone) {
+      const config = await readSetupFile(o.run, clone, timeoutMs);
+      if (config.problem) await fail("setup", config.problem);
+      try {
+        setup = config.text === null ? null : parseSetup(config.text, o.platform, s.setupTimeoutMinutes * 60000);
+      } catch (err) {
+        await fail("setup", `${REPO_CONFIG} couldn't be read: ${(err as Error).message}`);
+      }
     }
     if (setup) {
       o.log(`handoff ${handoff.id}: running the worktree setup script in ${dir}`);
@@ -428,6 +508,15 @@ export async function takeHandoff(message: Pick<HandoffMessage, "handoff" | "mod
       }
     }
 
+    // The repos under the folder, after setup, which may have cloned some of them on main.
+    const failedRepos: string[] = [];
+    for (const sub of subs) {
+      const error = await repoAt(o.run, dir, sub, folder, timeoutMs, o.cloneFrom ?? onTheWire);
+      if (!error) continue;
+      failedRepos.push(sub.path);
+      await fail("checkout", error, sub.path);
+    }
+
     const bin = await o.claude();
     if (!bin) {
       await fail("open", "The claude binary wasn't found on this machine: run the plugin's install script, or set its path in ~/.claude/isoplan/claude-binary.json.");
@@ -435,7 +524,7 @@ export async function takeHandoff(message: Pick<HandoffMessage, "handoff" | "mod
     }
     const id = message.session ?? (o.newSession ?? randomUUID)();
     const name = `Isoplan handoff ${handoff.id}`;
-    const argv = sessionArgv(bin, { prompt: takePrompt(handoff.id, briefFile, setupLog), session: id, name, folder, headless });
+    const argv = sessionArgv(bin, { prompt: takePrompt(handoff.id, briefFile, setupLog, failedRepos), session: id, name, folder, headless });
     if (headless) {
       try {
         // The floor told the receiver: this trusts the worktree, so its settings, hooks and scripts run.
@@ -502,15 +591,49 @@ async function resolved(run: RunGit, cwd: string, ref: string, timeoutMs: number
  * changes to tracked files is left as it is, rather than carrying them over. A local branch of that
  * name moves to the fetched tip, unless it has commits that are neither in the tip nor ones this
  * machine took of the handoff before (recorded in `folder`), which would be lost: then it is left as
- * it is. No setup script runs: the person, or their harness, set up this folder. Returns the failed
- * steps, each with the end of git's output, and the remote's name there.
+ * it is. The repos under the folder (#56) follow, each at its path in the folder, cloned where
+ * missing, as on the floor; they are left alone when the folder's own repo fails. The folder is the
+ * session's repo's top, or the session's folder for a handoff from a plain folder; a session in one
+ * of the handoff's repos under the folder works from the folder above it, and a plain folder's
+ * handoff isn't taken inside some other repo. No setup script runs: the person, or their harness,
+ * set up this folder. Returns the failed steps, each with the end of git's output and the repo it
+ * was in when that is one under the folder, and the folder's own repo's remote name.
  */
-export async function checkoutHere(run: RunGit, cwd: string, handoff: Handoff, folder: string, timeoutMs: number): Promise<{ failures: Failure[]; remote: string | null }> {
-  const repo = handoff.repos.find((r) => r.path === ".") ?? handoff.repos[0]!;
-  const branch = handoffBranch(handoff.id);
+export async function checkoutHere(run: RunGit, cwd: string, handoff: Handoff, folder: string, timeoutMs: number, { cloneFrom = onTheWire }: { cloneFrom?: (remote: string) => boolean } = {}): Promise<{ failures: Failure[]; remote: string | null; dir: string }> {
+  const repo = handoff.repos.find((r) => r.path === ".");
+  const subs = byDepth(handoff.repos.filter((r) => r.path !== "."));
+  const refused = (output: string, remote: string | null = null) => ({ failures: [{ step: "checkout" as const, output: tail(output) }], remote, dir: at ?? cwd });
+  const top = await run(["rev-parse", "--show-toplevel"], { cwd, timeoutMs });
+  const at = top.code === 0 ? top.stdout.trim() : null;
+  let inside: HandoffRepo | undefined;
+  for (const sub of at ? subs : []) {
+    if (pathKey(path.join(aboveOf(at!, sub.path), sub.path)) !== pathKey(at!)) continue;
+    if ((await remotesOf(run, at!, timeoutMs))?.some((r) => r.urls.some((url) => sameRemote(url, sub.remote)))) inside = sub;
+  }
+  const base = inside ? aboveOf(at!, inside.path) : (at ?? cwd);
+  let remote: string | null = null;
+  if (repo) {
+    const own = at ? await checkoutIn(run, base, repo, repo.branch, folder, timeoutMs) : { error: `${cwd} isn't in a git repo.`, remote: null };
+    if (own.error) return refused(own.error, own.remote);
+    remote = own.remote;
+  } else if (at && !inside) {
+    return refused(`${cwd} is inside the repo at ${at}, which isn't one of this handoff's repos (${subs.map((r) => r.path).join(", ")}), so nothing was cloned into it. Take it from the folder that holds them, or an empty one.`);
+  }
+  const failures: Failure[] = [];
+  for (const sub of subs) {
+    const error = await repoAt(run, base, sub, folder, timeoutMs, cloneFrom);
+    if (error) failures.push({ step: "checkout", repo: sub.path, output: tail(error) });
+  }
+  return { failures, remote, dir: base };
+}
+
+// The handoff's branch checked out in the repo at `cwd`, by the shortcut's rules; the error, else null.
+async function checkoutIn(run: RunGit, cwd: string, repo: HandoffRepo, branch: string, folder: string, timeoutMs: number): Promise<{ error: string | null; remote: string | null }> {
   const git = (args: string[]) => run(args, { cwd, timeoutMs });
+  // Checking out downloads no LFS files: a handoff never carries any.
+  const checkout = (args: string[]) => run(args, { cwd, timeoutMs, env: NO_LFS });
   const remotes = await remotesOf(run, cwd, timeoutMs);
-  const failed = (output: string, remote: string | null = null) => ({ failures: [{ step: "checkout" as const, output: tail(output) }], remote });
+  const failed = (error: string, remote: string | null = null) => ({ error, remote });
   if (!remotes) return failed(`${cwd} isn't in a git repo.`);
   const name = remotes.find((r) => r.urls.some((url) => sameRemote(url, repo.remote)))?.name;
   if (!name) return failed(`No remote of the repo in ${cwd} is ${repo.remote}, the repo the handoff was pushed to.`);
@@ -523,19 +646,84 @@ export async function checkoutHere(run: RunGit, cwd: string, handoff: Handoff, f
   const hooksOff = await noHooks();
   const ok = async () => {
     await recordTaken(folder, (await resolved(run, cwd, "HEAD", timeoutMs)) ?? repo.commit);
-    return { failures: [], remote: name };
+    return { error: null, remote: name };
   };
   const local = await git(["rev-parse", "--verify", "-q", `refs/heads/${branch}`]);
   if (local.code !== 0) {
-    const switched = await git([...hooksOff, "switch", "--track", "-c", branch, `${name}/${branch}`]);
+    const switched = await checkout([...hooksOff, "switch", "--track", "-c", branch, `${name}/${branch}`]);
     return switched.code === 0 ? ok() : failed(`git switch ${branch}: ${switched.stderr}`, name);
   }
   const extra = await ahead(run, cwd, tip, await takenBefore(folder), `refs/heads/${branch}`, timeoutMs);
   if (extra !== 0) return failed(`The local branch ${branch} has ${extra ?? "some"} commit(s) that aren't in the handoff as handed over now, so it was left as it is. Merge or rebase them onto ${name}/${branch} yourself.`, name);
-  const switched = await git([...hooksOff, "switch", branch]);
+  const switched = await checkout([...hooksOff, "switch", branch]);
   if (switched.code !== 0) return failed(`git switch ${branch}: ${switched.stderr}`, name);
-  const moved = await git([...hooksOff, "reset", "-q", "--keep", tip]);
+  const moved = await checkout([...hooksOff, "reset", "-q", "--keep", tip]);
   return moved.code === 0 ? ok() : failed(`${branch} couldn't be moved to the handoff as handed over now:\n${moved.stderr}`, name);
+}
+
+// Repos parents first, so one under another is checked out after it.
+const byDepth = (repos: HandoffRepo[]) => [...repos].sort((a, b) => a.path.split("/").length - b.path.split("/").length);
+
+// The folder above a repo at `at` whose path in that folder is `p`.
+const aboveOf = (at: string, p: string) => path.resolve(at, ...p.split("/").map(() => ".."));
+
+/**
+ * Whether a missing repo may be cloned from `remote`: https, ssh or scp-style (host:path) only, so
+ * a handoff never points git at a local path, a file:// URL or a \\server share on this machine.
+ */
+export function onTheWire(remote: string): boolean {
+  const url = /^([a-z][a-z0-9+.-]*):\/\//i.exec(remote);
+  if (url) return ["https", "ssh", "git+ssh", "ssh+git"].includes(url[1]!.toLowerCase());
+  // scp-style: a colon before any slash, after more than a drive letter.
+  const scp = /^([^/\\]*):/.exec(remote);
+  return !!scp && scp[1]!.length > 1 && !remote.startsWith("\\");
+}
+
+// The real path, with Windows' short 8.3 names spelled out long.
+const realpathNative = promisify(realpath.native);
+
+// Git LFS downloads nothing on a checkout of the handoff's: a handoff never carries LFS files.
+const NO_LFS = { GIT_LFS_SKIP_SMUDGE: "1" };
+
+// Why a repo's path in the handoff isn't one to check out at, or null: what the protocol refuses, again here.
+function badPath(p: string): string | null {
+  const parts = p.split(/[\\/]/);
+  if (parts.some(isGitFolder)) return `${p} is inside a .git folder`;
+  if (p.includes(":")) return `${p} has a colon in it, which Windows reads as a drive or a file's stream`;
+  if (path.isAbsolute(p) || parts.some((part) => part === "" || part === "." || part === "..")) return `${p} isn't a path of named folders inside the folder`;
+  return null;
+}
+
+/**
+ * A repo under the folder (#56) on its handoff branch at its path in `base`: switched where a clone
+ * of it is there, cloned where there is nothing or an empty folder, from a remote `cloneFrom`
+ * allows, with Git LFS's download off (a handoff never carries LFS files). The error, else null.
+ */
+async function repoAt(run: RunGit, base: string, repo: HandoffRepo, folder: string, timeoutMs: number, cloneFrom: (remote: string) => boolean): Promise<string | null> {
+  const bad = badPath(repo.path);
+  if (bad) return `${bad}, so nothing was checked out there.`;
+  const target = path.join(base, repo.path);
+  // The path stays inside the folder: no link on the way (one the handoff's branch made, say)
+  // leads out, and no folder on it is a .git folder by its real, long name.
+  let existing = target;
+  while (!(await fs.lstat(existing).then(() => true, () => false))) existing = path.dirname(existing);
+  const realBase = await realpathNative(base);
+  const real = await realpathNative(existing);
+  if (pathKey(real) !== pathKey(path.join(realBase, path.relative(base, existing)))) return `${target} leads outside ${base} through a link, so nothing was checked out there.`;
+  if (path.relative(realBase, real).split(/[\\/]/).some(isGitFolder)) return `${repo.path} is inside a .git folder, so nothing was checked out there.`;
+  const st = await fs.lstat(target).catch(() => null);
+  if (st && !st.isDirectory()) return `${target} is there already and isn't a folder, so ${repo.remote} wasn't cloned there.`;
+  if (!st || (await fs.readdir(target)).length === 0) {
+    if (!cloneFrom(repo.remote)) return `${repo.path} isn't here, and ${repo.remote} isn't an https, ssh or host:path remote, so it wasn't cloned: a handoff never clones from a local path, a file:// URL or a \\\\server share. Clone it at ${target} yourself, then take the handoff again.`;
+    await fs.mkdir(path.dirname(target), { recursive: true });
+    const cloned = await run([...(await noHooks()), "clone", "-q", "--branch", repo.branch, "--", repo.remote, target], { cwd: base, timeoutMs, env: NO_LFS });
+    if (cloned.code !== 0) return `git clone ${repo.remote} ${repo.path} failed${cloned.timedOut ? " (it took too long)" : ""}:\n${cloned.stderr}`;
+    await recordTaken(folder, (await resolved(run, target, "HEAD", timeoutMs)) ?? repo.commit);
+    return null;
+  }
+  const top = await run(["rev-parse", "--show-toplevel"], { cwd: target, timeoutMs });
+  if (top.code !== 0 || pathKey(top.stdout.trim()) !== pathKey(target)) return `${target} is there already and isn't a repo of its own, so ${repo.remote} wasn't cloned into it.`;
+  return (await checkoutIn(run, target, repo, repo.branch, folder, timeoutMs)).error;
 }
 
 // The worktree for the handoff: one already made on its branch, moved to the new tip when nothing
@@ -556,7 +744,7 @@ async function worktreeFor(run: RunGit, clone: string, remote: string, branch: s
       if (dirty || extra !== 0) {
         return { error: `${dir}, this handoff's worktree from before, has work that isn't in the handoff as handed over now (${dirty ? "uncommitted changes" : `${extra ?? "some"} commit(s)`}), so it was left as it is. Commit and push it, or move it aside, then take the handoff again.` };
       }
-      const moved = await run([...hooksOff, "reset", "-q", "--keep", tip], { cwd: dir, timeoutMs });
+      const moved = await run([...hooksOff, "reset", "-q", "--keep", tip], { cwd: dir, timeoutMs, env: NO_LFS });
       return moved.code === 0 ? dir : { error: `${dir} couldn't be moved to the handoff as handed over now:\n${moved.stderr}` };
     }
     // A local branch of the handoff's name with commits the remote's doesn't have is never reset.
@@ -564,7 +752,7 @@ async function worktreeFor(run: RunGit, clone: string, remote: string, branch: s
       const extra = await ahead(run, clone, tip, exempt, `refs/heads/${branch}`, timeoutMs);
       if (extra !== 0) return { error: `The local branch ${branch} in ${clone} has ${extra ?? "some"} commit(s) that aren't in the handoff as handed over now, so no worktree was made over it. Push or move them, then take the handoff again.` };
     }
-    const r = await run([...hooksOff, "worktree", "add", "--track", "-B", branch, dir, `${remote}/${branch}`], { cwd: clone, timeoutMs });
+    const r = await run([...hooksOff, "worktree", "add", "--track", "-B", branch, dir, `${remote}/${branch}`], { cwd: clone, timeoutMs, env: NO_LFS });
     return r.code === 0 ? dir : { error: `git worktree add ${dir} failed${r.timedOut ? " (it took too long)" : ""}:\n${r.stderr}` };
   }
   return { error: `${base} and the next eight names beside it are taken by other folders` };

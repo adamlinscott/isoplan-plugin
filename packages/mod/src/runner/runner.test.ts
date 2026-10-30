@@ -191,27 +191,36 @@ test("runner: a brief the fork can't write still goes, marked fallback, with the
   expect(rejected.sent).toEqual([{ type: "refusal", v: PROTOCOL_VERSION, id: "b3", reason: "unavailable", detail: "the remote rejected the handoff's branch" }]);
 });
 
-test("runner: a commit with a possible secret holds the push, naming the file; the owner's release pushes that exact commit", async () => {
-  const repos: HandoffRepo[] = [{ path: ".", remote: "origin", branch: "isoplan/handoff/h-1", commit: "c".repeat(40) }];
-  const pushes: (string | null)[] = [];
+test("runner: a commit with a possible secret holds the push, naming the file; the owner's release pushes that exact commit, and one held after it in another repo keeps it", async () => {
+  const repos: HandoffRepo[] = [
+    { path: ".", remote: "origin", branch: "isoplan/handoff/h-1", commit: "c".repeat(40) },
+    { path: "api", remote: "api-origin", branch: "isoplan/handoff/h-1", commit: "d".repeat(40) },
+  ];
+  const pushes: (Record<string, string> | null)[] = [];
   const t = await setup({
-    push: async (_s, _l, _h, pushAnyway) => (pushes.push(pushAnyway), pushAnyway ? repos : { held: "config/dev.ts", commit: "c".repeat(40), unchecked: ["logo.png"] }),
+    push: async (_s, _l, _h, pushAnyway) => (
+      pushes.push(pushAnyway),
+      !pushAnyway ? { held: ["config/dev.ts", "config/prod.ts"], commits: { ".": "c".repeat(40) } as Record<string, string>, unchecked: ["logo.png"] } : !pushAnyway.api ? { held: ["api/.env.example"], commits: { api: "d".repeat(40) } as Record<string, string>, unchecked: [] } : repos
+    ),
   });
   t.runner.take(brief("b1"));
   await t.asked(1);
   t.asks[0]!.settle(ok("Goal: ship."));
   await t.runner.settled();
-  expect(t.sent).toEqual([{ type: "refusal", v: PROTOCOL_VERSION, id: "b1", reason: "withheld", file: "config/dev.ts", unchecked: ["logo.png"] }]);
+  expect(t.sent).toEqual([{ type: "refusal", v: PROTOCOL_VERSION, id: "b1", reason: "withheld", file: "config/dev.ts, config/prod.ts", unchecked: ["logo.png"] }]);
   expect(t.logs.join("\n")).not.toContain("AWS");
   t.runner.take({ type: "release", v: PROTOCOL_VERSION, id: "b1" });
   await t.sentN(2);
-  expect(pushes).toEqual([null, "c".repeat(40)]);
-  expect(t.sent[1]).toEqual({ type: "reply", v: PROTOCOL_VERSION, id: "b1", kind: "write-brief", handoff: { id: "h-1", brief: "Goal: ship.", repos } });
+  expect(t.sent[1]).toEqual({ type: "refusal", v: PROTOCOL_VERSION, id: "b1", reason: "withheld", file: "api/.env.example" });
+  t.runner.take({ type: "release", v: PROTOCOL_VERSION, id: "b1" });
+  await t.sentN(3);
+  expect(pushes).toEqual([null, { ".": "c".repeat(40) }, { ".": "c".repeat(40), api: "d".repeat(40) }]);
+  expect(t.sent[2]).toEqual({ type: "reply", v: PROTOCOL_VERSION, id: "b1", kind: "write-brief", handoff: { id: "h-1", brief: "Goal: ship.", repos } });
 });
 
 test("runner: a drop ends a request: what is held goes, and one still being written neither pushes nor sends", async () => {
-  const pushes: (string | null)[] = [];
-  const t = await setup({ push: async (_s, _l, _h, pushAnyway) => (pushes.push(pushAnyway), { held: "a.ts", commit: "c".repeat(40), unchecked: [] }) });
+  const pushes: (Record<string, string> | null)[] = [];
+  const t = await setup({ push: async (_s, _l, _h, pushAnyway) => (pushes.push(pushAnyway), { held: ["a.ts"], commits: { ".": "c".repeat(40) }, unchecked: [] }) });
   t.runner.take(brief("b1"));
   await t.asked(1);
   t.asks[0]!.settle(ok("Goal: ship."));

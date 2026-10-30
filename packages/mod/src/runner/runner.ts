@@ -26,7 +26,7 @@
 // reached), the reply still goes, marked `fallback`, with the note alone, and the server writes the
 // rest from the room's feed. Its branch is pushed (`push`) only once the brief has cleared the scan
 // or been released. The push scans what it would send: on a match nothing is pushed, the refusal is
-// `withheld` naming the file (never the pattern) and the files it couldn't read, and the owner's
+// `withheld` naming the files, in every repo (never the pattern), and the files it couldn't read, and the owner's
 // release pushes that exact commit anyway. A push that fails is refused `unavailable` with the
 // reason. Without `push` a write-brief is refused before the fork runs. A `drop` ends a request: what
 // is held for it goes, and one still running neither pushes nor sends. A handoff to take goes to
@@ -67,12 +67,12 @@ export interface RunnerOptions {
   isDir: (path: string) => Promise<boolean>;
   /** Whether the data layer would report this session, so the server may ask about it. */
   isReported: (session: string, lead: Lead) => Promise<boolean>;
-  /** Pushes the handoff's work and returns its repos (#48); without it, briefs are refused. */
   /**
-   * Pushes the handoff's work and returns its repos (#48), or the file whose added lines matched a
-   * secret pattern, with nothing pushed, unless `pushAnyway`. Without it, briefs are refused.
+   * Pushes the handoff's work and returns its repos (#48), or every file whose added lines matched a
+   * secret pattern, by path in the session's folder, and the commit held in each repo with one
+   * (#56), with nothing pushed, unless `pushAnyway` names those commits. Without it, briefs are refused.
    */
-  push?: (session: string, lead: Lead, handoff: string, pushAnyway: string | null) => Promise<HandoffRepo[] | { held: string; commit: string; unchecked: string[] }>;
+  push?: (session: string, lead: Lead, handoff: string, pushAnyway: Record<string, string> | null) => Promise<HandoffRepo[] | { held: string[]; commits: Record<string, string>; unchecked: string[] }>;
   /** The untracked files the brief names (null when unknown), and the note it ends with (#48). Throws PushFailed when there is no repo to push. */
   prepareBrief?: (lead: Lead, handoff: string) => Promise<{ files: string[] | null; note: string }>;
   /** Takes a handoff on this machine (#48); without it, handoffs are logged as not handled. */
@@ -206,9 +206,9 @@ export function createRunner({ answerer, ledger, settings, prompts, scan, send, 
     }
 
     // The brief's push, held in turn when its commit adds a possible secret; released, it pushes anyway.
-    const pushAndReply = async (pushAnyway: string | null): Promise<Outgoing> => {
+    const pushAndReply = async (pushAnyway: Record<string, string> | null): Promise<Outgoing> => {
       if (dropping.has(id)) return unavailable(id, "the handoff was cancelled, so nothing was pushed");
-      let pushed: HandoffRepo[] | { held: string; commit: string; unchecked: string[] };
+      let pushed: HandoffRepo[] | { held: string[]; commits: Record<string, string>; unchecked: string[] };
       try {
         pushed = await push!(session, lead, (request as Extract<Ask, { kind: "write-brief" }>).handoff, pushAnyway);
       } catch (err) {
@@ -216,9 +216,11 @@ export function createRunner({ answerer, ledger, settings, prompts, scan, send, 
         return unavailable(id, err instanceof PushFailed ? err.message : "the handoff's branch couldn't be pushed");
       }
       if (!Array.isArray(pushed)) {
-        const { held: file, commit, unchecked } = pushed;
-        log(`withheld the handoff's commit ${commit} for ${id} in ${room}: the lines it adds to ${file} match a secret pattern`);
-        hold(id, () => pushAndReply(commit));
+        const { held: files, commits, unchecked } = pushed;
+        const file = files.join(", ");
+        log(`withheld the handoff's commits ${Object.values(commits).join(", ")} for ${id} in ${room}: the lines they add to ${file} match a secret pattern`);
+        // Released, every held commit goes as it was, with any released before (#56).
+        hold(id, () => pushAndReply({ ...pushAnyway, ...commits }));
         return { type: "refusal", v: PROTOCOL_VERSION, id, reason: "withheld", file, ...(unchecked.length ? { unchecked } : {}) };
       }
       return { type: "reply", v: PROTOCOL_VERSION, id, kind: "write-brief", handoff: { id: (request as Extract<Ask, { kind: "write-brief" }>).handoff, brief: body, repos: pushed }, ...(isFallback ? { fallback: true as const } : {}) };

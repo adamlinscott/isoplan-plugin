@@ -1,9 +1,12 @@
 import fs from "node:fs";
 import path from "node:path";
-import { expect, test } from "vitest";
+import { expect, test, vi } from "vitest";
 import { tempRoot } from "../data-layer/fixture.js";
-import { addedLines, createRunGit, handoffNote, HandoffGitError, noPromptEnv, prepare, pushHandoff, remotesOf, sameRemote, untrackedLine, withoutCredentials, type Pushed } from "./git.js";
-import { git, remoteAndClone } from "./fixture.js";
+import { addedLines, createRunGit, gitFailed, handoffNote, HandoffGitError, noPromptEnv, prepare, pushHandoff, remotesOf, sameRemote, untrackedLine, withoutCredentials, type Pushed } from "./git.js";
+import { git, remoteAndClone, workspace } from "./fixture.js";
+
+// Every test here drives real git, a few dozen spawns each, which is slow on Windows under load.
+vi.setConfig({ testTimeout: 30000 });
 
 const run = createRunGit();
 const MS = 30000;
@@ -11,8 +14,8 @@ const MS = 30000;
 const FAKE_KEY = "AKIA" + "IOSFODNN7EXAMPLE";
 const scan = async (text: string) => (text.includes(FAKE_KEY) ? "AWS access key id" : null);
 const repoOf = (p: Pushed) => {
-  if (!("repo" in p)) throw new Error(`held: ${p.held}`);
-  return p.repo;
+  if ("held" in p) throw new Error(`held: ${p.held}`);
+  return p.repos[0]!;
 };
 
 test("a dirty tree: tracked changes go to the handoff's branch alone; the tree, index and branch stay as they were, and no local branch is made", async () => {
@@ -55,12 +58,13 @@ test("a possible secret in what the push sends holds it, naming the file and wha
   fs.writeFileSync(path.join(clone, "logo.png"), Buffer.from([0x89, 0x50, 0x4e, 0x47, 0, 0, 0, 1, 2, 3]));
   git(clone, "add", "config/dev.ts", "logo.png");
   const held = await pushHandoff(run, clone, "h1", MS, { scan });
-  expect(held).toEqual({ held: "config/dev.ts", commit: expect.stringMatching(/^[0-9a-f]{40}$/), unchecked: ["logo.png"] });
+  expect(held).toEqual({ held: ["config/dev.ts"], commits: { ".": expect.stringMatching(/^[0-9a-f]{40}$/) }, unchecked: ["logo.png"] });
+  const commit = (held as { commits: Record<string, string> }).commits["."]!;
   expect(git(remote, "for-each-ref", "--format=%(refname)")).toBe("refs/heads/main");
   // The tree changes after the hold; pushing anyway still sends the commit that was held.
   fs.writeFileSync(path.join(clone, "config", "dev.ts"), "export const key = 'fixed';\n");
-  const pushed = repoOf(await pushHandoff(run, clone, "h1", MS, { scan, pushAnyway: (held as { commit: string }).commit }));
-  expect(pushed.commit).toBe((held as { commit: string }).commit);
+  const pushed = repoOf(await pushHandoff(run, clone, "h1", MS, { scan, pushAnyway: { ".": commit } }));
+  expect(pushed.commit).toBe(commit);
   expect(git(remote, "show", `isoplan/handoff/h1:config/dev.ts`)).toContain(FAKE_KEY);
 });
 
@@ -69,7 +73,7 @@ test("a clean tree still scans the commits the remote doesn't have", async () =>
   fs.writeFileSync(path.join(clone, "local.ts"), `export const key = "${FAKE_KEY}";\n`);
   git(clone, "add", "local.ts");
   git(clone, "commit", "-q", "-m", "a local commit");
-  expect(await pushHandoff(run, clone, "h1", MS, { scan })).toMatchObject({ held: "local.ts" });
+  expect(await pushHandoff(run, clone, "h1", MS, { scan })).toMatchObject({ held: ["local.ts"] });
   expect(git(remote, "for-each-ref", "--format=%(refname)")).toBe("refs/heads/main");
 });
 
@@ -168,3 +172,216 @@ test("the note and the request name untracked files, capped, and say when they a
   git(clone, "config", "remote.origin.pushurl", "git@github.com:team/app.git");
   expect(await remotesOf(run, clone, MS)).toEqual([{ name: "origin", urls: [remote, "git@github.com:team/app.git"] }]);
 });
+
+// Several repos (#56). Each test drives a dozen git commands per repo, so they get longer.
+const SLOW = 60000;
+const refs = (remote: string) => git(remote, "for-each-ref", "--format=%(refname)");
+
+test("several repos: the parent always goes, and of the repos under it only those with work, each with its own .gitignore, to its own remote; no default branch is pushed", async () => {
+  const w = workspace(tempRoot(), "sender");
+  const api = path.join(w.dir, "api");
+  const web = path.join(w.dir, "web");
+  git(api, "switch", "-q", "-c", "feat/auth");
+  fs.writeFileSync(path.join(api, "server.js"), "listen(2);\n");
+  fs.writeFileSync(path.join(api, "notes.md"), "todo\n");
+  fs.writeFileSync(path.join(api, ".env"), "SECRET=1\n");
+  const mains = Object.values(w.remotes).map((r) => git(r, "rev-parse", "main"));
+
+  const prepared = await prepare(run, w.dir, MS);
+  expect(prepared.repos.map((r) => [r.path, r.from])).toEqual([[".", "main"], ["api", "feat/auth"]]);
+  expect(prepared.files).toEqual(["api/notes.md"]);
+  expect(prepared.left).toEqual([{ path: "web", why: expect.stringContaining("no work") }]);
+  const note = handoffNote({ branch: "isoplan/handoff/m1", from: prepared.from, files: prepared.files, at: new Date("2026-10-29T16:05:00Z"), repos: prepared.repos, left: prepared.left });
+  expect(note).toContain("in each of these repos, by their paths in the session's folder, with each one's tracked changes in a work-in-progress commit: `.` (made from main), `api` (made from feat/auth).");
+  expect(note).toContain("Not handed over, since they have no work that isn't on their remote's default branch: `web`.");
+  expect(note).not.toContain(".env");
+
+  const pushed = await pushHandoff(run, w.dir, "m1", MS, { scan });
+  if ("held" in pushed) throw new Error("held");
+  expect(pushed.repos).toEqual([
+    { path: ".", remote: w.remotes.parent, branch: "isoplan/handoff/m1", commit: git(w.dir, "rev-parse", "HEAD") },
+    { path: "api", remote: w.remotes.api, branch: "isoplan/handoff/m1", commit: expect.stringMatching(/^[0-9a-f]{40}$/) },
+  ]);
+  expect(git(w.remotes.api, "show", "isoplan/handoff/m1:server.js")).toBe("listen(2);");
+  expect(git(w.remotes.api, "ls-tree", "--name-only", "isoplan/handoff/m1")).toBe(".gitignore\nserver.js");
+  expect(refs(w.remotes.web)).toBe("refs/heads/main");
+  expect(git(api, "branch", "--show-current")).toBe("feat/auth");
+  expect(Object.values(w.remotes).map((r) => git(r, "rev-parse", "main"))).toEqual(mains);
+
+  // A commit that isn't on the default branch is work too, with a clean tree.
+  fs.writeFileSync(path.join(web, "index.html"), "<p>2</p>\n");
+  git(web, "commit", "-q", "-am", "local");
+  expect((await prepare(run, w.dir, MS)).repos.map((r) => r.path)).toEqual([".", "api", "web"]);
+}, SLOW);
+
+test("several repos: every possible secret in every repo holds every push, each named by its path in the folder; pushing anyway takes each repo's held commit", async () => {
+  const w = workspace(tempRoot(), "sender");
+  fs.writeFileSync(path.join(w.dir, "api", "server.js"), `const key = "${FAKE_KEY}";\n`);
+  fs.writeFileSync(path.join(w.dir, "api", "other.js"), `const also = "${FAKE_KEY}";\n`);
+  git(path.join(w.dir, "api"), "add", "other.js");
+  fs.writeFileSync(path.join(w.dir, "web", "index.html"), `<p>${FAKE_KEY}</p>\n`);
+  const held = await pushHandoff(run, w.dir, "m2", MS, { scan });
+  expect(held).toEqual({ held: ["api/other.js", "api/server.js", "web/index.html"], commits: { api: expect.stringMatching(/^[0-9a-f]{40}$/), web: expect.stringMatching(/^[0-9a-f]{40}$/) }, unchecked: [] });
+  for (const remote of Object.values(w.remotes)) expect(refs(remote)).toBe("refs/heads/main");
+  const { commits } = held as { commits: Record<string, string> };
+  const pushed = await pushHandoff(run, w.dir, "m2", MS, { scan, pushAnyway: commits });
+  if ("held" in pushed) throw new Error("held");
+  expect(pushed.repos.map((r) => r.path)).toEqual([".", "api", "web"]);
+  expect(git(w.remotes.api, "rev-parse", "isoplan/handoff/m2")).toBe(commits.api);
+}, SLOW);
+
+test("a plain folder above the repos: only those with work go; none with work, or none at all, is refused; submodules, and repos too deep, aren't handed over", async () => {
+  const root = tempRoot();
+  const w = workspace(root, "lorveil", { parent: false });
+  const web = path.join(w.dir, "web");
+  await expect(pushHandoff(run, w.dir, "m3", MS)).rejects.toMatchObject({ kind: "no-work" });
+  // web gets a submodule, committed and pushed, so web itself has no work.
+  git(web, "-c", "protocol.file.allow=always", "submodule", "add", "-q", w.remotes.api, "vendor/api");
+  git(web, "commit", "-q", "-m", "vendor");
+  git(web, "push", "-q", "origin", "main");
+  fs.writeFileSync(path.join(w.dir, "api", "server.js"), "listen(3);\n");
+  // One repo four folders down, past the default depth.
+  const deep = path.join(w.dir, "a", "b", "c", "deep");
+  git(root, "clone", "-q", w.remotes.web, deep);
+  const prepared = await prepare(run, w.dir, MS);
+  expect(prepared).toMatchObject({ toplevel: path.resolve(w.dir), from: null });
+  expect(prepared.repos.map((r) => r.path)).toEqual(["api"]);
+  expect(prepared.left).toEqual([
+    { path: "a/b/c/deep", why: "since they are deeper than repoSearchDepth" },
+    { path: "web", why: expect.stringContaining("no work") },
+    { path: "web/vendor/api", why: "since they are git submodules, which a handoff doesn't carry" },
+  ]);
+  expect((await prepare(run, w.dir, MS, 5)).left).toContainEqual({ path: "a/b/c/deep", why: expect.stringContaining("no work") });
+  const pushed = await pushHandoff(run, w.dir, "m3", MS);
+  expect(pushed).toEqual({ repos: [{ path: "api", remote: w.remotes.api, branch: "isoplan/handoff/m3", commit: expect.any(String) }] });
+  expect(refs(w.remotes.web)).toBe("refs/heads/main");
+
+  const empty = path.join(root, "empty");
+  fs.mkdirSync(empty);
+  await expect(pushHandoff(run, empty, "m4", MS)).rejects.toMatchObject({ kind: "not-a-repo" });
+}, SLOW);
+
+test("a repo under the folder with work but no remote is left out and named; one that uses Git LFS refuses the handoff, naming the repo", async () => {
+  const w = workspace(tempRoot(), "sender");
+  const api = path.join(w.dir, "api");
+  const web = path.join(w.dir, "web");
+  git(web, "remote", "remove", "origin");
+  fs.writeFileSync(path.join(web, "index.html"), "<p>2</p>\n");
+  expect((await prepare(run, w.dir, MS)).left).toContainEqual({ path: "web", why: "since they have no remote to push to" });
+  fs.writeFileSync(path.join(api, ".gitattributes"), "*.psd filter=lfs diff=lfs merge=lfs -text\n");
+  git(api, "add", ".gitattributes");
+  const failed = await pushHandoff(run, w.dir, "m5", MS).catch((err: unknown) => err);
+  expect(failed).toMatchObject({ kind: "lfs", repo: "api" });
+  expect(gitFailed(failed as HandoffGitError)).toBe("a repo in the session's folder uses Git LFS, whose files a handoff can't push yet (in api)");
+  for (const remote of [w.remotes.parent, w.remotes.api]) expect(refs(remote)).toBe("refs/heads/main");
+}, SLOW);
+
+test("repos that push to one remote get a branch each there, and nothing overwrites another", async () => {
+  const w = workspace(tempRoot(), "sender");
+  git(path.join(w.dir, "web"), "remote", "set-url", "origin", w.remotes.api);
+  git(path.join(w.dir, "web"), "fetch", "-q", "origin");
+  fs.writeFileSync(path.join(w.dir, "api", "server.js"), "listen(2);\n");
+  fs.writeFileSync(path.join(w.dir, "web", "index.html"), "<p>2</p>\n");
+  const prepared = await prepare(run, w.dir, MS);
+  expect(prepared.repos.map((r) => [r.path, r.suffix])).toEqual([[".", null], ["api", null], ["web", "web"]]);
+  expect(handoffNote({ branch: "isoplan/handoff/s1", from: null, files: [], at: new Date(), repos: prepared.repos })).toContain("`web` (made from main, on isoplan/handoff/s1--web, since it pushes to the same remote as a repo before it)");
+  const pushed = await pushHandoff(run, w.dir, "s1", MS, { prepared });
+  if ("held" in pushed) throw new Error("held");
+  expect(pushed.repos.map((r) => [r.path, r.branch])).toEqual([[".", "isoplan/handoff/s1"], ["api", "isoplan/handoff/s1"], ["web", "isoplan/handoff/s1--web"]]);
+  expect(git(w.remotes.api, "show", "isoplan/handoff/s1:server.js")).toBe("listen(2);");
+  expect(git(w.remotes.api, "show", "isoplan/handoff/s1--web:index.html")).toBe("<p>2</p>");
+}, SLOW);
+
+test("a push that fails after others went says which went, and handing over again with the same id pushes the rest", async () => {
+  const root = tempRoot();
+  const w = workspace(root, "sender");
+  const web = path.join(w.dir, "web");
+  fs.writeFileSync(path.join(w.dir, "api", "server.js"), "listen(2);\n");
+  fs.writeFileSync(path.join(web, "index.html"), "<p>2</p>\n");
+  git(web, "config", "remote.origin.pushurl", path.join(root, "gone.git"));
+  const failed = await pushHandoff(run, w.dir, "p1", MS).catch((err: unknown) => err);
+  expect(failed).toMatchObject({ kind: "failed", repo: "web", pushed: [".", "api"] });
+  expect(gitFailed(failed as HandoffGitError)).toBe("git couldn't push the handoff's branch (in web); the branch was pushed already in ., api, and handing it over again with the same id pushes the rest");
+  git(web, "config", "--unset", "remote.origin.pushurl");
+  const again = await pushHandoff(run, w.dir, "p1", MS);
+  if ("held" in again) throw new Error("held");
+  expect(git(w.remotes.web, "show", "isoplan/handoff/p1:index.html")).toBe("<p>2</p>");
+}, SLOW);
+
+test("a repo under the folder git can't read is left out with why, and the rest still go; a clean repo with no default branch known goes only with commits no remote branch has", async () => {
+  const w = workspace(tempRoot(), "sender");
+  const web = path.join(w.dir, "web");
+  fs.writeFileSync(path.join(w.dir, "api", "server.js"), "listen(2);\n");
+  fs.writeFileSync(path.join(web, ".git", "HEAD"), "not a ref\n");
+  fs.mkdirSync(path.join(w.dir, "ghost", ".git"), { recursive: true });
+  const prepared = await prepare(run, w.dir, MS);
+  expect(prepared.repos.map((r) => r.path)).toEqual([".", "api"]);
+  expect(prepared.left).toEqual([
+    { path: "ghost", why: "since git couldn't read them" },
+    { path: "web", why: "since git couldn't read them" },
+  ]);
+
+  const v = workspace(tempRoot(), "sender");
+  const api = path.join(v.dir, "api");
+  git(api, "remote", "set-head", "origin", "-d");
+  expect((await prepare(run, v.dir, MS)).left).toContainEqual({ path: "api", why: expect.stringContaining("no work") });
+  git(api, "commit", "-q", "--allow-empty", "-m", "local");
+  expect((await prepare(run, v.dir, MS)).repos.map((r) => r.path)).toEqual([".", "api"]);
+}, SLOW);
+
+test("the home folder, or a drive's root, is too wide to hand over from; repos in dot folders, node_modules and links are named, not looked in", async () => {
+  const root = tempRoot();
+  const w = workspace(root, "lorveil", { parent: false });
+  await expect(prepare(run, w.dir, MS, 3, w.dir)).rejects.toMatchObject({ kind: "too-wide" });
+  await expect(prepare(run, path.parse(w.dir).root, MS, 1, w.dir)).rejects.toMatchObject({ kind: "too-wide" });
+  for (const hidden of [".cache/tool", "node_modules"]) git(root, "clone", "-q", w.remotes.api, path.join(w.dir, hidden));
+  fs.symlinkSync(path.join(w.dir, "api"), path.join(w.dir, "linked"), "junction");
+  fs.writeFileSync(path.join(w.dir, "api", "server.js"), "listen(2);\n");
+  const { left } = await prepare(run, w.dir, MS);
+  expect(left).toContainEqual({ path: "linked", why: "since they are reached through a link, which isn't followed" });
+  expect(left).toContainEqual({ path: "node_modules", why: "since they are node_modules folders, which aren't looked in" });
+  // A dot folder is named when it is a repo itself; what is inside one isn't looked for.
+  expect(left.map((l) => l.path)).not.toContain(".cache/tool");
+}, SLOW);
+
+test("only the handoff branch's history is pushed: no tags, even with push.followTags on", async () => {
+  const { remote, clone } = remoteAndClone(tempRoot());
+  git(clone, "config", "push.followTags", "true");
+  git(clone, "commit", "-q", "--allow-empty", "-m", "local");
+  git(clone, "tag", "-a", "v9", "-m", "a release");
+  repoOf(await pushHandoff(run, clone, "t1", MS));
+  expect(refs(remote)).toBe("refs/heads/isoplan/handoff/t1\nrefs/heads/main");
+}, SLOW);
+
+test("a retry, or a later handoff, still hands over a commits-only repo with no <remote>/HEAD: its handoff branches aren't the remote's own work", async () => {
+  const w = workspace(tempRoot(), "sender");
+  const api = path.join(w.dir, "api");
+  git(api, "remote", "set-head", "origin", "-d");
+  git(api, "commit", "-q", "--allow-empty", "-m", "local");
+  expect((await prepare(run, w.dir, MS)).repos.map((r) => r.path)).toEqual([".", "api"]);
+  const first = await pushHandoff(run, w.dir, "r1", MS, { scan });
+  if ("held" in first) throw new Error("held");
+  // The push left origin/isoplan/handoff/r1 in the clone, holding that commit.
+  expect(git(api, "rev-parse", "origin/isoplan/handoff/r1")).toBe(git(api, "rev-parse", "HEAD"));
+  expect((await prepare(run, w.dir, MS)).repos.map((r) => r.path)).toEqual([".", "api"]);
+  // And the scan reads that commit again: what the remote holds on a handoff branch isn't vetted.
+  fs.writeFileSync(path.join(api, "key.js"), `const k = "${FAKE_KEY}";\n`);
+  git(api, "add", "key.js");
+  git(api, "commit", "-q", "-m", "with a key");
+  expect(await pushHandoff(run, w.dir, "r2", MS, { scan })).toMatchObject({ held: ["api/key.js"] });
+  git(api, "push", "-q", "origin", "HEAD:refs/heads/isoplan/handoff/r2");
+  expect(await pushHandoff(run, w.dir, "r2", MS, { scan })).toMatchObject({ held: ["api/key.js"] });
+}, SLOW);
+
+test("a clean repo with no remote isn't mentioned; in a plain folder, files outside every repo are named as not handed over", async () => {
+  const w = workspace(tempRoot(), "lorveil", { parent: false });
+  git(path.join(w.dir, "web"), "remote", "remove", "origin");
+  fs.writeFileSync(path.join(w.dir, "api", "server.js"), "listen(2);\n");
+  fs.writeFileSync(path.join(w.dir, "notes.md"), "plans\n");
+  fs.mkdirSync(path.join(w.dir, "docs"));
+  fs.writeFileSync(path.join(w.dir, "docs", "plan.md"), "more\n");
+  const prepared = await prepare(run, w.dir, MS);
+  expect(prepared.left).toEqual([]);
+  expect(prepared.files).toEqual(["docs/plan.md", "notes.md"]);
+  expect(handoffNote({ branch: "b", from: null, files: prepared.files, at: new Date(), repos: prepared.repos })).toContain("Untracked files, not handed over: `docs/plan.md`, `notes.md`.");
+}, SLOW);

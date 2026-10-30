@@ -5808,31 +5808,46 @@ const RequestId = string().min(1);
 /** A handoff's id. It names the handoff's branch, `isoplan/handoff/<id>`, so it keeps to safe characters. */
 const HandoffId = string().max(64).regex(/^[a-z0-9][a-z0-9-]*$/, "lowercase letters, digits and dashes");
 /**
+* Whether a path segment is one Windows reads as `.git`: the name before any NTFS stream
+* (`.git::$INDEX_ALLOCATION`), its trailing dots and spaces dropped, in any case, or the 8.3 short
+* name of a folder that starts with `.git`.
+*/
+const isGitFolder = (segment) => {
+	const name = segment.split(":")[0].replace(/[. ]+$/, "").toLowerCase();
+	return name === ".git" || /^git~\d+$/.test(name);
+};
+/**
 * One repo a handoff pushed: its path in the session's folder (`.` for the folder itself), remote,
 * branch and commit. A handoff drives git on the receiver's machine, so the path stays inside the
-* folder and the remote can't name a transport helper such as `ext::`, which runs a command.
+* folder, out of any `.git` folder (in any spelling Windows reads as one: `.GIT.`, `.git `, `GIT~1`),
+* with no `:` (an NTFS stream, such as `.git::$INDEX_ALLOCATION`), and the remote can't name a transport helper such as `ext::`, which runs a command.
 */
 const HandoffRepoSchema = object({
-	path: string().min(1).refine((path) => !/^([\\/]|[A-Za-z]:)/.test(path), "a path relative to the session's folder").refine((path) => !path.split(/[\\/]/).includes(".."), "a path inside the session's folder, with no `..`").refine((path) => !path.startsWith("-"), "a path that doesn't start with `-`, which git would read as an option"),
+	path: string().min(1).refine((path) => !/^([\\/]|[A-Za-z]:)/.test(path), "a path relative to the session's folder").refine((path) => !path.split(/[\\/]/).includes(".."), "a path inside the session's folder, with no `..`").refine((path) => !path.startsWith("-"), "a path that doesn't start with `-`, which git would read as an option").refine((path) => !path.split(/[\\/]/).some(isGitFolder), "a path that isn't in a `.git` folder").refine((path) => !path.includes(":"), "a path with no `:`, which Windows reads as a drive or a file's stream").refine((path) => path === "." || !path.split(/[\\/]/).some((part) => part === "" || part === "." || part === ".."), "`.` itself, or a path of named folders, with no empty, `.` or `..` part"),
 	remote: string().min(1).refine((remote) => !/^[A-Za-z0-9+.-]+::/.test(remote), "a remote with no transport helper (`<transport>::`)").refine((remote) => !remote.startsWith("-"), "a remote that doesn't start with `-`, which git would read as an option"),
 	branch: string().min(1),
 	commit: string().regex(/^([0-9a-f]{40}|[0-9a-f]{64})$/, "a full commit hash")
 });
-/** What the receiver gets: the brief, and every repo pushed for it, each on the handoff's own branch. */
+/**
+* What the receiver gets: the brief, and every repo pushed for it, each on the handoff's own branch,
+* `isoplan/handoff/<id>`. Repos that push to the same remote can't share one, so each after the
+* first has `isoplan/handoff/<id>--<its path, as lowercase letters, digits and dashes>`.
+*/
 const HandoffSchema = object({
 	id: HandoffId,
 	brief: string().min(1),
 	repos: array(HandoffRepoSchema).min(1)
 }).superRefine((handoff, context) => {
 	handoff.repos.forEach((repo, i) => {
-		if (repo.branch !== `isoplan/handoff/${handoff.id}`) context.addIssue({
+		const own = `isoplan/handoff/${handoff.id}`;
+		if (repo.branch !== own && !(repo.branch.startsWith(`${own}--`) && /^[a-z0-9]+(-[a-z0-9]+)*$/.test(repo.branch.slice(own.length + 2)))) context.addIssue({
 			code: "custom",
 			path: [
 				"repos",
 				i,
 				"branch"
 			],
-			message: `the handoff's branch, isoplan/handoff/${handoff.id}`
+			message: `the handoff's branch, isoplan/handoff/${handoff.id} or isoplan/handoff/${handoff.id}--<slug>`
 		});
 	});
 });
