@@ -52,7 +52,7 @@ import { alive, HOLD_OFF_MS, holdOff, lockHolder, lockPath, releaseLock, takeLoc
 import { createClaudeCode } from "./claude-code.js";
 import { loadConfig, type Config } from "./config.js";
 import { detachedStop } from "./detached.js";
-import { createGit } from "./git.js";
+import { createGit, pathKey, type Where } from "./git.js";
 import { accountOf, claudePaths, projectOf } from "./identity.js";
 import { nodeIo } from "./io.js";
 import { createLink, type Link } from "./link.js";
@@ -97,6 +97,9 @@ async function main(argv: string[]): Promise<number> {
 
   const io = nodeIo();
   const git = createGit(io);
+  // The project of each repo an edit or command lands in, by its common dir, looked up again as
+  // git's answers are (#74).
+  const projects = new Map<string, { at: number; project: ReturnType<typeof projectOf> }>();
   const source = createClaudeCode({ ...io, claudeDir });
 
   // Ends when stdout can no longer be written, or the parent is gone (checked each pass). On POSIX
@@ -216,7 +219,15 @@ async function main(argv: string[]): Promise<number> {
     config = await loadConfig(io, defaultsPath, userConfigPath).catch(() => config);
     const gitOpts = { now, maxAgeMs: config.gitCacheSeconds * 1000 };
     const resolve = (dir: string) => git.resolve(dir, gitOpts);
-    const read = await source.read({ sessionId, cwd, now, config, resolve }).catch((err: unknown) => ({
+    const projectOfRepo = (where: Where) => {
+      const key = pathKey(where.commonDir);
+      const hit = projects.get(key);
+      if (hit && now - hit.at <= gitOpts.maxAgeMs) return hit.project;
+      const project = projectOf(io.run, where, where.toplevel, machine);
+      projects.set(key, { at: now, project });
+      return project;
+    };
+    const read = await source.read({ sessionId, cwd, now, config, resolve, projectOf: projectOfRepo }).catch((err: unknown) => ({
       facts: null,
       status: String((err as Error)?.message ?? err),
       errors: { count: 0, first: null },

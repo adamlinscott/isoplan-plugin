@@ -98,5 +98,17 @@ test("reads: cat, head, tail, less, more, sed without -i and Get-Content, file a
   expect(reads('cat "$F" *.md ~/x.md; cd lib && tail -n 3 e.md')).toEqual(["/r/lib/e.md"]);
   expect(reads("type f.md")).toEqual([]);
   expect(reads("Get-Content -Raw g.md; gc -Path h.md -TotalCount 5; type i.md; cat j.md", { powershell: true })).toEqual(["/r/g.md", "/r/h.md", "/r/i.md", "/r/j.md"]);
-  expect(shellFiles("cat a.md > b.md", "/r")).toEqual({ writes: ["/r/b.md"], reads: ["/r/a.md"] });
+  expect(shellFiles("cat a.md > b.md", "/r")).toEqual({ writes: ["/r/b.md"], reads: ["/r/a.md"], dirs: ["/r"] });
+});
+
+test("dirs: the folders a command's programs run in, after a cd, and git -C's, so a command in another repo can be placed", () => {
+  const dirs = (command: string, opts?: ShellOptions) => shellFiles(command, "/w/backend", opts).dirs;
+  expect(dirs("npm test")).toEqual(["/w/backend"]);
+  expect(dirs("cd ../frontend && npm test")).toEqual(["/w/frontend"]);
+  expect(dirs("git -C ../frontend status && git -C /w/infra -C sub log --oneline")).toEqual(["/w/frontend", "/w/infra/sub"]);
+  expect(dirs('git -c core.pager=cat -C "../front end" diff')).toEqual(["/w/front end"]);
+  // A cd alone runs nothing there; a folder it can't place drops what follows.
+  expect(dirs("cd ../frontend")).toEqual([]);
+  expect(dirs('cd "$X" && npm test')).toEqual([]);
+  expect(dirs("Set-Location ../frontend; npm test", { powershell: true })).toEqual(["/w/frontend"]);
 });

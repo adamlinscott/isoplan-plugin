@@ -320,6 +320,15 @@ test("a question parses with answerable or withheld, and not with either false",
   expect(parseDataLayerMessage({ ...valid.full, facts: { ...facts, questions: [{ ...question, answerable: false }] } })).toMatchObject({ ok: false, kind: "invalid" });
 });
 
+test("an edit, a read or a command in another repo carries that repo, and whether it is away from home", () => {
+  const frontend = { id: "github.com/team/frontend", name: "frontend" };
+  const edit = { agent: worker.id, file: "src/api.ts", at, project: frontend, away: true };
+  const doing = { kind: "run" as const, since: at, project: frontend, away: true };
+  const away = { ...facts, agents: [lead, { ...worker, doing }], edits: [edit], reads: [{ ...edit, away: undefined }] };
+  expect(parseDataLayerMessage({ ...valid.full, facts: away })).toEqual({ ok: true, message: { ...valid.full, facts: away } });
+  expect(parseDataLayerMessage({ ...valid.full, facts: { ...facts, edits: [{ ...edit, project: { id: "", name: "x" } }] } })).toMatchObject({ ok: false, kind: "invalid" });
+});
+
 describe("handoff", () => {
   const [repo] = handoff.repos;
   const withRepo = (change: object) => ({ ...valid.handoff, handoff: { ...handoff, repos: [{ ...repo, ...change }] } });

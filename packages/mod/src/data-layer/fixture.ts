@@ -8,6 +8,7 @@ import { afterAll } from "vitest";
 import { createClaudeCode, type SourceRead } from "./claude-code.js";
 import type { Config } from "./config.js";
 import { createGit } from "./git.js";
+import { projectOf } from "./identity.js";
 import { nodeIo, type NodeIo } from "./io.js";
 
 /** The mod's own folder, which holds config.json. */
@@ -134,7 +135,7 @@ export function sourceIn(home: string, opts: SourceOptions = {}) {
   return (sessionId: string, cwd = path.join(home, "elsewhere")): Promise<SourceRead> => {
     const now = (opts.now ?? (() => NOW))();
     const config = { ...defaults, ...opts.config };
-    return source.read({ sessionId, cwd, now, config, resolve: (dir) => git.resolve(dir, { now, maxAgeMs: config.gitCacheSeconds * 1000 }) });
+    return source.read({ sessionId, cwd, now, config, resolve: (dir) => git.resolve(dir, { now, maxAgeMs: config.gitCacheSeconds * 1000 }), projectOf: (where) => projectOf(null, where, where.toplevel, "test-machine") });
   };
 }
 

@@ -11,6 +11,23 @@ const Extra = z.record(z.string(), z.unknown()).optional();
 
 export const SourceSchema = z.enum(["claude-code"]);
 
+/** A project: one code repository, by its id (see projectId) and a short name. */
+export const ProjectSchema = z.object({
+  id: z.string().min(1),
+  name: z.string().min(1),
+});
+
+/**
+ * Where a file or a command lands when it isn't the session's own project (#74): `project` is the
+ * repo it is in, and `away` is true when that repo is outside the session's folder, so the agent is
+ * working away from home. A repo inside the folder (a workspace folder holding several repos) has
+ * `project` and no `away`. Both absent: the session's own project.
+ */
+const Elsewhere = {
+  project: ProjectSchema.optional(),
+  away: z.boolean().optional(),
+};
+
 export const SessionFactSchema = z.object({
   id: z.string().min(1),
   source: SourceSchema,
@@ -50,6 +67,7 @@ export const AgentFactSchema = z.object({
       kind: z.enum(["write", "read", "run", "search", "talk"]),
       file: z.string().optional(),
       since: Time,
+      ...Elsewhere,
     })
     .nullable(),
   usage: TokenCounts.extend({
@@ -63,11 +81,12 @@ export const AgentFactSchema = z.object({
   extra: Extra,
 });
 
-/** An edit or a read: `file` is relative to the repo root, with forward slashes. */
+/** An edit or a read: `file` is relative to its repo's root, with forward slashes. */
 export const FileFactSchema = z.object({
   agent: z.string().min(1),
   file: z.string().min(1),
   at: Time,
+  ...Elsewhere,
   extra: Extra,
 });
 
@@ -158,6 +177,7 @@ export const FactRemoveSchema = z.object({
 });
 
 export type Source = z.infer<typeof SourceSchema>;
+export type Project = z.infer<typeof ProjectSchema>;
 export type SessionFact = z.infer<typeof SessionFactSchema>;
 export type AgentFact = z.infer<typeof AgentFactSchema>;
 export type FileFact = z.infer<typeof FileFactSchema>;

@@ -5649,6 +5649,21 @@ const Time = datetime({ offset: true });
 /** Tool-specific detail that views never rely on. */
 const Extra = record(string(), unknown()).optional();
 const SourceSchema = _enum(["claude-code"]);
+/** A project: one code repository, by its id (see projectId) and a short name. */
+const ProjectSchema = object({
+	id: string().min(1),
+	name: string().min(1)
+});
+/**
+* Where a file or a command lands when it isn't the session's own project (#74): `project` is the
+* repo it is in, and `away` is true when that repo is outside the session's folder, so the agent is
+* working away from home. A repo inside the folder (a workspace folder holding several repos) has
+* `project` and no `away`. Both absent: the session's own project.
+*/
+const Elsewhere = {
+	project: ProjectSchema.optional(),
+	away: boolean().optional()
+};
 const SessionFactSchema = object({
 	id: string().min(1),
 	source: SourceSchema,
@@ -5696,7 +5711,8 @@ const AgentFactSchema = object({
 			"talk"
 		]),
 		file: string().optional(),
-		since: Time
+		since: Time,
+		...Elsewhere
 	}).nullable(),
 	usage: TokenCounts.extend({
 		model: string().min(1),
@@ -5708,11 +5724,12 @@ const AgentFactSchema = object({
 	branch: string().nullable().optional(),
 	extra: Extra
 });
-/** An edit or a read: `file` is relative to the repo root, with forward slashes. */
+/** An edit or a read: `file` is relative to its repo's root, with forward slashes. */
 const FileFactSchema = object({
 	agent: string().min(1),
 	file: string().min(1),
 	at: Time,
+	...Elsewhere,
 	extra: Extra
 });
 const WaitFactSchema = object({
@@ -5801,10 +5818,6 @@ const FactRemoveSchema = object({
 });
 const Version = literal(1);
 const Seq = number().int().nonnegative();
-const ProjectSchema = object({
-	id: string().min(1),
-	name: string().min(1)
-});
 const Account = object({
 	id: string().min(1),
 	name: string()

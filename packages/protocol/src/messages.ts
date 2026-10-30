@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { FactRemoveSchema, FactsSchema, FactUpsertSchema, SourceSchema } from "./facts.js";
+import { FactRemoveSchema, FactsSchema, FactUpsertSchema, ProjectSchema, SourceSchema } from "./facts.js";
 
 /**
  * The protocol version every message carries as `v`. Adding optional fields doesn't change it;
@@ -9,11 +9,6 @@ export const PROTOCOL_VERSION = 1;
 
 const Version = z.literal(PROTOCOL_VERSION);
 const Seq = z.number().int().nonnegative();
-
-export const ProjectSchema = z.object({
-  id: z.string().min(1),
-  name: z.string().min(1),
-});
 
 const Account = z.object({ id: z.string().min(1), name: z.string() });
 const Machine = z.object({ name: z.string().min(1) });
@@ -440,7 +435,6 @@ export const OfficeServerMessageSchema = z.discriminatedUnion("type", [
   AskRightsMessageSchema,
 ]);
 
-export type Project = z.infer<typeof ProjectSchema>;
 export type HandoffRepo = z.infer<typeof HandoffRepoSchema>;
 export type Handoff = z.infer<typeof HandoffSchema>;
 export type HelloMessage = z.infer<typeof HelloMessageSchema>;

@@ -7,7 +7,9 @@
 //
 // Within one command it follows the folder: cd, pushd and popd, and PowerShell's Set-Location,
 // sl, chdir, Push-Location and Pop-Location. Across commands it doesn't need to: the folder a
-// command starts in is the transcript line's cwd (see claude-code.ts).
+// command starts in is the transcript line's cwd (see claude-code.ts). It also names the folders
+// the command's programs run in, after any cd, and `git -C <dir>`'s, so a command run in another
+// repo can be placed there (#74).
 //
 // What counts as a write:
 //   >  >>              to a file (not 2>, >&, &>, /dev/null or $null); heredocs are skipped over
@@ -43,16 +45,18 @@ export interface ShellOptions {
 }
 
 /**
- * { writes, reads }: the absolute paths `command` writes and reads, in order, each once. Relative
- * paths resolve against `cwd`, or against where a `cd` in the command moved to; with no cwd they
- * are skipped. Git Bash's /c/… paths become C:/… when the cwd is a Windows path.
+ * { writes, reads, dirs }: the absolute paths `command` writes and reads, and the folders its
+ * programs run in, in order, each once. Relative paths resolve against `cwd`, or against where a
+ * `cd` in the command moved to; with no cwd they are skipped. Git Bash's /c/… paths become C:/…
+ * when the cwd is a Windows path.
  */
-export function shellFiles(command: string, cwd: string | null, { powershell = false }: ShellOptions = {}): { writes: string[]; reads: string[] } {
+export function shellFiles(command: string, cwd: string | null, { powershell = false }: ShellOptions = {}): { writes: string[]; reads: string[]; dirs: string[] } {
   const win = Boolean(cwd) && isWindowsPath(cwd!);
   let dir = cwd ? normalize(cwd) : null;
   const pushed: (string | null)[] = []; // the folders pushd left, for popd
   const writes: string[] = [];
   const reads: string[] = [];
+  const dirs: string[] = [];
   const keep = (out: string[], w: Word) => {
     const p = place(w, dir, win);
     if (p && !out.includes(p)) out.push(p);
@@ -75,12 +79,26 @@ export function shellFiles(command: string, cwd: string | null, { powershell = f
       dir = pushed.length ? pushed.pop()! : null;
       continue;
     }
+    const runsIn = name === "git" ? gitDir(args, dir, win) : dir;
+    if (runsIn && !dirs.includes(runsIn)) dirs.push(runsIn);
     const writer = Object.hasOwn(WRITERS, name) ? WRITERS[name] : undefined;
     if (writer) for (const w of writer(args)) keep(writes, w);
     const reader = (powershell && Object.hasOwn(PS_READERS, name) && PS_READERS[name]) || (Object.hasOwn(READERS, name) ? READERS[name] : undefined);
     if (reader) for (const r of reader(args)) if (r.text !== "-") keep(reads, r);
   }
-  return { writes, reads };
+  return { writes, reads, dirs };
+}
+
+// The folder git runs in: each `-C <dir>` before the subcommand moves it, relative to the last.
+function gitDir(args: Word[], dir: string | null, win: boolean): string | null {
+  let at = dir;
+  for (let i = 0; i < args.length; i++) {
+    const t = args[i]!.text;
+    if (t === "-C" && args[i + 1]) at = place(args[++i]!, at, win);
+    else if (["-c", "--git-dir", "--work-tree", "--namespace"].includes(t)) i++;
+    else if (!t.startsWith("-")) break;
+  }
+  return at;
 }
 
 // The commands that move the folder relative paths resolve against: Bash's and PowerShell's names.

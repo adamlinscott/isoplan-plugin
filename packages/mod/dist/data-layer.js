@@ -5648,6 +5648,21 @@ const Time = datetime({ offset: true });
 /** Tool-specific detail that views never rely on. */
 const Extra = record(string(), unknown()).optional();
 const SourceSchema = _enum(["claude-code"]);
+/** A project: one code repository, by its id (see projectId) and a short name. */
+const ProjectSchema = object({
+	id: string().min(1),
+	name: string().min(1)
+});
+/**
+* Where a file or a command lands when it isn't the session's own project (#74): `project` is the
+* repo it is in, and `away` is true when that repo is outside the session's folder, so the agent is
+* working away from home. A repo inside the folder (a workspace folder holding several repos) has
+* `project` and no `away`. Both absent: the session's own project.
+*/
+const Elsewhere = {
+	project: ProjectSchema.optional(),
+	away: boolean().optional()
+};
 const SessionFactSchema = object({
 	id: string().min(1),
 	source: SourceSchema,
@@ -5695,7 +5710,8 @@ const AgentFactSchema = object({
 			"talk"
 		]),
 		file: string().optional(),
-		since: Time
+		since: Time,
+		...Elsewhere
 	}).nullable(),
 	usage: TokenCounts.extend({
 		model: string().min(1),
@@ -5707,11 +5723,12 @@ const AgentFactSchema = object({
 	branch: string().nullable().optional(),
 	extra: Extra
 });
-/** An edit or a read: `file` is relative to the repo root, with forward slashes. */
+/** An edit or a read: `file` is relative to its repo's root, with forward slashes. */
 const FileFactSchema = object({
 	agent: string().min(1),
 	file: string().min(1),
 	at: Time,
+	...Elsewhere,
 	extra: Extra
 });
 const WaitFactSchema = object({
@@ -5800,10 +5817,6 @@ const FactRemoveSchema = object({
 });
 const Version = literal(1);
 const Seq = number().int().nonnegative();
-const ProjectSchema = object({
-	id: string().min(1),
-	name: string().min(1)
-});
 const Account = object({
 	id: string().min(1),
 	name: string()
@@ -7210,11 +7223,54 @@ async function backfill(found, { claudeDir, dataLayer, spawn, isAlive = alive, p
 	return started;
 }
 //#endregion
+//#region src/data-layer/attribution.ts
+function createAttribution({ folder, where: home, resolve, projectOf }) {
+	const homeProject = home ? Promise.resolve(projectOf(home)) : null;
+	async function elsewhere(where, path) {
+		if (home && pathKey(where.commonDir) === pathKey(home.commonDir)) return {};
+		const project = await projectOf(where);
+		if (homeProject && (await homeProject).id === project.id) return {};
+		return relativeTo(folder, path) === null && pathKey(folder) !== pathKey(path) ? {
+			project,
+			away: true
+		} : { project };
+	}
+	async function repoOf(dir) {
+		for (let at = normalize(dir);;) {
+			const where = await resolve(at);
+			if (where) return where;
+			const up = dirname(at);
+			if (up === at) return null;
+			at = up;
+		}
+	}
+	return {
+		async file(path, cwd) {
+			const p = normalize(path);
+			const own = cwd ? await resolve(cwd) : null;
+			const where = own && relativeTo(own.toplevel, p) ? own : await repoOf(dirname(p));
+			const file = where && relativeTo(where.toplevel, p);
+			if (where && file) return {
+				file,
+				...await elsewhere(where, p)
+			};
+			const inFolder = !home && relativeTo(folder, p);
+			return inFolder ? { file: inFolder } : null;
+		},
+		async dir(dir) {
+			const where = await repoOf(dir);
+			if (where) return elsewhere(where, normalize(dir));
+			return !home && (relativeTo(folder, dir) !== null || pathKey(folder) === pathKey(dir)) ? {} : null;
+		}
+	};
+}
+//#endregion
 //#region src/data-layer/shell-writes.ts
 /**
-* { writes, reads }: the absolute paths `command` writes and reads, in order, each once. Relative
-* paths resolve against `cwd`, or against where a `cd` in the command moved to; with no cwd they
-* are skipped. Git Bash's /c/… paths become C:/… when the cwd is a Windows path.
+* { writes, reads, dirs }: the absolute paths `command` writes and reads, and the folders its
+* programs run in, in order, each once. Relative paths resolve against `cwd`, or against where a
+* `cd` in the command moved to; with no cwd they are skipped. Git Bash's /c/… paths become C:/…
+* when the cwd is a Windows path.
 */
 function shellFiles(command, cwd, { powershell = false } = {}) {
 	const win = Boolean(cwd) && isWindowsPath(cwd);
@@ -7222,6 +7278,7 @@ function shellFiles(command, cwd, { powershell = false } = {}) {
 	const pushed = [];
 	const writes = [];
 	const reads = [];
+	const dirs = [];
 	const keep = (out, w) => {
 		const p = place(w, dir, win);
 		if (p && !out.includes(p)) out.push(p);
@@ -7244,6 +7301,8 @@ function shellFiles(command, cwd, { powershell = false } = {}) {
 			dir = pushed.length ? pushed.pop() : null;
 			continue;
 		}
+		const runsIn = name === "git" ? gitDir(args, dir, win) : dir;
+		if (runsIn && !dirs.includes(runsIn)) dirs.push(runsIn);
 		const writer = Object.hasOwn(WRITERS, name) ? WRITERS[name] : void 0;
 		if (writer) for (const w of writer(args)) keep(writes, w);
 		const reader = powershell && Object.hasOwn(PS_READERS, name) && PS_READERS[name] || (Object.hasOwn(READERS, name) ? READERS[name] : void 0);
@@ -7253,8 +7312,24 @@ function shellFiles(command, cwd, { powershell = false } = {}) {
 	}
 	return {
 		writes,
-		reads
+		reads,
+		dirs
 	};
+}
+function gitDir(args, dir, win) {
+	let at = dir;
+	for (let i = 0; i < args.length; i++) {
+		const t = args[i].text;
+		if (t === "-C" && args[i + 1]) at = place(args[++i], at, win);
+		else if ([
+			"-c",
+			"--git-dir",
+			"--work-tree",
+			"--namespace"
+		].includes(t)) i++;
+		else if (!t.startsWith("-")) break;
+	}
+	return at;
 }
 const CD = /* @__PURE__ */ new Set([
 	"cd",
@@ -7644,7 +7719,7 @@ function createClaudeCode(io) {
 	const found = /* @__PURE__ */ new Map();
 	const searched = /* @__PURE__ */ new Map();
 	let used = /* @__PURE__ */ new Set();
-	async function read({ sessionId, cwd, now, config, resolve }) {
+	async function read({ sessionId, cwd, now, config, resolve, projectOf }) {
 		used = /* @__PURE__ */ new Set();
 		const errors = {
 			count: 0,
@@ -7671,10 +7746,22 @@ function createClaudeCode(io) {
 		try {
 			if (leftOut(main, c, config)) return none();
 			if (!main.cwd) return none(main.seen && (!main.parsed || main.messages) ? "transcript format not recognised" : null);
-			const where = await resolve(main.cwd);
+			const home = await resolve(cwd);
+			const workspace = !home && await isWorkspace(cwd);
+			const where = workspace ? {
+				toplevel: normalize(cwd),
+				commonDir: "",
+				branch: null
+			} : await resolve(main.cwd);
 			if (!where) return none(`git could not place ${normalize(main.cwd)}`);
+			const place = createAttribution({
+				folder: cwd,
+				where: workspace ? null : home ?? where,
+				resolve,
+				projectOf
+			});
 			return {
-				facts: await sessionFacts(c, main, where, now, config, resolve, fail),
+				facts: await sessionFacts(c, main, where, workspace, now, config, resolve, place, fail),
 				status: null,
 				errors
 			};
@@ -7751,7 +7838,13 @@ function createClaudeCode(io) {
 			subagents: all.length
 		};
 	}
-	async function sessionFacts(c, main, where, now, config, resolve, fail) {
+	async function isWorkspace(dir) {
+		const st = await io.stat(dir);
+		if (!st || !st.isDir) return false;
+		for (const e of await io.listDir(dir)) if (e.isDir && await io.stat(join(dir, `${e.name}/.git`))) return true;
+		return false;
+	}
+	async function sessionFacts(c, main, where, workspace, now, config, resolve, place, fail) {
 		const session = `${SOURCE}:${c.id}`;
 		const lead = `${session}:lead`;
 		const agentFiles = [];
@@ -7812,18 +7905,18 @@ function createClaudeCode(io) {
 			status: leadWorking ? "working" : "idle",
 			statusSince: iso(leadWorking ? main.turnAt : main.lastMessageAt, c.ownMtime),
 			lastActive: iso(c.ownMtime),
-			doing: leadWorking ? await doingOf(main, resolve, c.ownMtime, config) : null,
+			doing: leadWorking ? await doingOf(main, place, c.ownMtime, config) : null,
 			usage: usageOf(main, c.ownMtime)
 		});
-		main.touches = await addFiles(facts.edits, lead, main.touches, [...config.touchedTools, ...config.shellTools], now, config, resolve);
-		main.reads = await addFiles(facts.reads, lead, main.reads, [...READ_TOOLS, ...config.shellTools], now, config, resolve);
+		main.touches = await addFiles(facts.edits, lead, main.touches, [...config.touchedTools, ...config.shellTools], now, config, place);
+		main.reads = await addFiles(facts.reads, lead, main.reads, [...READ_TOOLS, ...config.shellTools], now, config, place);
 		if (main.turnOpen) addQuestions(facts.questions, lead, main, results, c.ownMtime);
 		for (const a of agentFiles) {
 			const id = agentId(a.id);
 			const type = typeof a.meta.agentType === "string" && a.meta.agentType ? a.meta.agentType : null;
 			const at = a.t.cwd ? await resolve(a.t.cwd) : null;
 			let worktree = typeof a.meta.worktreePath === "string" ? normalize(a.meta.worktreePath) : null;
-			if (!worktree && at && pathKey(at.toplevel) !== pathKey(where.toplevel)) worktree = at.toplevel;
+			if (!worktree && at && !workspace && pathKey(at.toplevel) !== pathKey(where.toplevel)) worktree = at.toplevel;
 			const agentBranch = worktree ? typeof a.meta.worktreeBranch === "string" && a.meta.worktreeBranch || (at && pathKey(at.toplevel) === pathKey(worktree) ? at.branch : null) : null;
 			const spawn = typeof a.meta.toolUseId === "string" ? spawns.get(a.meta.toolUseId) : void 0;
 			let startedBy = spawn ? spawn.by : typeof a.meta.parentAgentId === "string" ? agentId(a.meta.parentAgentId) : lead;
@@ -7840,7 +7933,7 @@ function createClaudeCode(io) {
 				status: s.status,
 				statusSince: iso(s.since, a.mtimeMs),
 				lastActive: iso(a.mtimeMs),
-				doing: live ? await doingOf(a.t, resolve, a.mtimeMs, config) : null,
+				doing: live ? await doingOf(a.t, place, a.mtimeMs, config) : null,
 				usage: usageOf(a.t, a.mtimeMs),
 				...worktree ? {
 					checkout: worktree,
@@ -7862,8 +7955,8 @@ function createClaudeCode(io) {
 				at: iso(a.t.lastTextAt, a.mtimeMs),
 				text: a.t.lastText
 			});
-			a.t.touches = await addFiles(facts.edits, id, a.t.touches, [...config.touchedTools, ...config.shellTools], now, config, resolve);
-			a.t.reads = await addFiles(facts.reads, id, a.t.reads, [...READ_TOOLS, ...config.shellTools], now, config, resolve);
+			a.t.touches = await addFiles(facts.edits, id, a.t.touches, [...config.touchedTools, ...config.shellTools], now, config, place);
+			a.t.reads = await addFiles(facts.reads, id, a.t.reads, [...READ_TOOLS, ...config.shellTools], now, config, place);
 		}
 		return facts;
 	}
@@ -7966,19 +8059,23 @@ const message = (err) => String(err && err.message || err);
 function iso(ms, fallback) {
 	return new Date(Number.isFinite(ms) ? ms : fallback).toISOString();
 }
-async function addFiles(list, agent, touches, tools, now, config, resolve) {
+async function addFiles(list, agent, touches, tools, now, config, place) {
 	const since = now - config.touchedWindowMinutes * 6e4;
 	const kept = touches.filter((t) => t.at >= since);
 	const newest = /* @__PURE__ */ new Map();
 	for (const t of kept) {
 		if (!tools.includes(t.name) || !t.cwd) continue;
-		const where = await resolve(t.cwd);
-		const file = where && relativeTo(where.toplevel, t.path);
-		if (file && !(newest.get(file) >= t.at)) newest.set(file, t.at);
+		const placed = await place.file(t.path, t.cwd);
+		if (!placed) continue;
+		const key = `${placed.project?.id ?? ""}\n${placed.file}`;
+		if (!((newest.get(key)?.at ?? -Infinity) >= t.at)) newest.set(key, {
+			placed,
+			at: t.at
+		});
 	}
-	for (const [file, at] of newest) list.push({
+	for (const { placed, at } of newest.values()) list.push({
 		agent,
-		file,
+		...placed,
 		at: iso(at)
 	});
 	return kept;
@@ -8078,10 +8175,12 @@ function foldLine(st, line) {
 			const cwd = ev.cwd || st.cwd;
 			const shell = typeof input.command === "string" ? shellFiles(input.command, cwd, { powershell: c.name === "PowerShell" }) : {
 				writes: [],
-				reads: []
+				reads: [],
+				dirs: []
 			};
 			const writes = shell.writes;
 			const file = typeof input.file_path === "string" ? input.file_path : typeof input.notebook_path === "string" ? input.notebook_path : typeof input.path === "string" ? input.path : null;
+			const dir = shell.dirs[shell.dirs.length - 1];
 			st.lastTool = writes.length ? {
 				name: c.name,
 				file: writes[writes.length - 1],
@@ -8092,6 +8191,7 @@ function foldLine(st, line) {
 				name: c.name,
 				file,
 				cwd,
+				...dir ? { dir } : {},
 				at
 			};
 			const target = input.file_path || input.notebook_path;
@@ -8266,18 +8366,13 @@ function ended(state, at) {
 		endState: state
 	};
 }
-async function doingOf(st, resolve, fallbackMs, config) {
+async function doingOf(st, place, fallbackMs, config) {
 	const t = st.lastTool;
 	const kind = t && (t.wrote && config.shellTools.includes(t.name) ? "write" : Object.hasOwn(DOING, t.name) ? DOING[t.name] : void 0);
 	if (!t || !kind) return null;
-	const doing = { kind };
-	if (t.file && t.cwd) {
-		const where = await resolve(t.cwd);
-		const file = where && relativeTo(where.toplevel, t.file);
-		if (file) doing.file = file;
-	}
 	return {
-		...doing,
+		kind,
+		...t.file && t.cwd ? await place.file(t.file, t.cwd) : t.dir ? await place.dir(t.dir) : null,
 		since: iso(t.at, fallbackMs)
 	};
 }
@@ -9217,6 +9312,7 @@ async function main(argv) {
 	const machine = os.hostname();
 	const io = nodeIo();
 	const git = createGit(io);
+	const projects = /* @__PURE__ */ new Map();
 	const source = createClaudeCode({
 		...io,
 		claudeDir
@@ -9375,12 +9471,24 @@ async function main(argv) {
 			maxAgeMs: config.gitCacheSeconds * 1e3
 		};
 		const resolve = (dir) => git.resolve(dir, gitOpts);
+		const projectOfRepo = (where) => {
+			const key = pathKey(where.commonDir);
+			const hit = projects.get(key);
+			if (hit && now - hit.at <= gitOpts.maxAgeMs) return hit.project;
+			const project = projectOf(io.run, where, where.toplevel, machine);
+			projects.set(key, {
+				at: now,
+				project
+			});
+			return project;
+		};
 		const read = await source.read({
 			sessionId,
 			cwd,
 			now,
 			config,
-			resolve
+			resolve,
+			projectOf: projectOfRepo
 		}).catch((err) => ({
 			facts: null,
 			status: String(err?.message ?? err),
