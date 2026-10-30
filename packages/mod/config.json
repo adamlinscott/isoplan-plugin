@@ -6,6 +6,7 @@
   "lightsOffHours": 24,
   "quietSeconds": 60,
   "stalledMinutes": 5,
+  "checkInSeconds": 60,
   "touchedWindowMinutes": 30,
   "touchedTools": ["Edit", "Write", "NotebookEdit"],
   "shellTools": ["Bash", "PowerShell"],

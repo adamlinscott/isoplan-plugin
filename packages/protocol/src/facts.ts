@@ -68,9 +68,6 @@ export const AgentFactSchema = z.object({
     .object({
       kind: z.enum(["write", "read", "run", "search", "talk"]),
       file: z.string().optional(),
-      // `with` (protocol 0.3.6 on): the agent of the same session it is checking in on, by its id:
-      // a message sent to it (kind talk), or its output read (kind read).
-      with: z.string().min(1).optional(),
       since: Time,
       ...Elsewhere,
     })
@@ -83,6 +80,13 @@ export const AgentFactSchema = z.object({
   }).nullable(),
   checkout: z.string().optional(),
   branch: z.string().nullable().optional(),
+  // `checkIns` (protocol 0.3.6 on): its recent check-ins on other agents of the same session,
+  // newest last, whatever it is doing now: a message sent to one (talk), or its output or
+  // transcript read (read), each with the other agent's id and when. Absent when there are none.
+  checkIns: z
+    .array(z.object({ with: z.string().min(1), kind: z.enum(["talk", "read"]), since: Time }))
+    .max(20)
+    .optional(),
   extra: Extra,
 });
 

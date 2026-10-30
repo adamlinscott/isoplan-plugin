@@ -5849,7 +5849,6 @@ const AgentFactSchema = object({
 			"talk"
 		]),
 		file: string().optional(),
-		with: string().min(1).optional(),
 		since: Time,
 		...Elsewhere
 	}).nullable(),
@@ -5861,6 +5860,11 @@ const AgentFactSchema = object({
 	}).nullable(),
 	checkout: string().optional(),
 	branch: string().nullable().optional(),
+	checkIns: array(object({
+		with: string().min(1),
+		kind: _enum(["talk", "read"]),
+		since: Time
+	})).max(20).optional(),
 	extra: Extra
 });
 /**

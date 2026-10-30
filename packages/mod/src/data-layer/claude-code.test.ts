@@ -381,29 +381,72 @@ test("doing: the last tool call's kind, shown while working or stalled; a file i
   expect(a.r!.doing).toEqual({ kind: "read", file: "r.md", project: localProject(other), away: true, since: at(5) });
 });
 
-test("doing: a check-in on one of the session's agents names it: a message sent to it, or its output read", async () => {
+test("check-ins: a message sent to another agent, by id or by the name its spawn gave it, or its output or transcript read, in any case; newest last, after the turn ends too", async () => {
   const { home, main } = office();
-  session(home, "s", [line.user(main, "x")]);
-  const out = path.join(home, "tmp", "tasks", "B.output");
-  const tools: Record<string, [string, Record<string, unknown>]> = {
-    m: ["SendMessage", { to: "B", message: "How far along?" }],
-    r: ["Read", { file_path: out }],
-    t: ["PowerShell", { command: `Get-Content "${out}" -Tail 20` }],
-    o: ["TaskOutput", { task_id: "B" }],
-    x: ["SendMessage", { to: "nobody", message: "Hello?" }],
-  };
-  agent(home, "s", "B", { agentType: "worker" }, [line.tool(main, "Grep", { pattern: "x" }, 5)], { age: 5 });
-  for (const [id, [name, input]] of Object.entries(tools)) agent(home, "s", id, { agentType: "worker" }, [line.tool(main, name, input, 5)], { age: 5 });
+  const tasks = path.join(home, "tmp", "tasks");
+  const subagents = path.join(home, ".claude", "projects", "proj", "s", "subagents");
+  session(home, "s", [line.spawn(main, "tu-b", { name: "builder", description: "Build the export" }, 200), line.spawn(main, "tu-c", { description: "Review it" }, 200), line.user(main, "x", 150), line.notify("A", "completed", 14)]);
+  agent(home, "s", "B", { agentType: "worker", toolUseId: "tu-b" }, [line.tool(main, "Grep", { pattern: "x" }, 5)], { age: 5 });
+  agent(home, "s", "C", { agentType: "reviewer", toolUseId: "tu-c" }, [line.tool(main, "Grep", { pattern: "x" }, 5)], { age: 5 });
+  const lines = (name: string, input: Record<string, unknown>, age: number) => line.tool(main, name, input, age);
+  agent(home, "s", "A", { agentType: "worker" }, [
+    lines("SendMessage", { to: "B", message: "How far along?" }, 50),
+    lines("PowerShell", { command: `Get-Content "${path.join(tasks, "B.output")}" -Tail 5; Get-Content "${path.join(tasks, "C.output")}"` }, 35),
+    lines("TaskOutput", { task_id: "C" }, 30),
+    lines("SendMessage", { to: "Builder", message: "And now?" }, 25),
+    lines("SendMessage", { to: "review it", message: "Ready?" }, 20),
+    line.text(main, "All checked.", 15),
+  ], { age: 15 });
+  agent(home, "s", "D", { agentType: "scout" }, [
+    lines("Read", { file_path: path.join(tasks, "c.OUTPUT") }, 12),
+    lines("Grep", { pattern: "error", path: path.join(subagents, "agent-B.jsonl") }, 10),
+  ], { age: 10 });
   const a = await agentsOf(home, "s");
-  expect(Object.fromEntries(Object.keys(tools).map((id) => [id, a[id]!.doing]))).toEqual({
-    m: { kind: "talk", with: cc("B"), since: at(5) },
-    r: { kind: "read", with: cc("B"), since: at(5) },
-    t: { kind: "read", with: cc("B"), since: at(5) },
-    o: { kind: "read", with: cc("B"), since: at(5) },
-    x: { kind: "talk", since: at(5) },
-  });
+  expect(a.A!.status).not.toBe("working");
+  // The newest five, two by name.
+  expect(a.A!.checkIns).toEqual([
+    { with: cc("B"), kind: "read", since: at(35) },
+    { with: cc("C"), kind: "read", since: at(35) },
+    { with: cc("C"), kind: "read", since: at(30) },
+    { with: cc("B"), kind: "talk", since: at(25) },
+    { with: cc("C"), kind: "talk", since: at(20) },
+  ]);
+  expect(a.D!.checkIns).toEqual([
+    { with: cc("C"), kind: "read", since: at(12) },
+    { with: cc("B"), kind: "read", since: at(10) },
+  ]);
+  expect(a.B!.checkIns).toBeUndefined();
 });
 
+test("check-ins: none for a write to an output file, a shell writing it, a background shell's output, an unknown name, an older one, or a file that only looks like one", async () => {
+  const { home, main } = office();
+  const tasks = path.join(home, "tmp", "tasks");
+  session(home, "s", [line.user(main, "x", 150)]);
+  agent(home, "s", "B", { agentType: "worker" }, [line.tool(main, "Grep", { pattern: "x" }, 5)], { age: 5 });
+  agent(home, "s", "A", { agentType: "worker" }, [
+    line.tool(main, "SendMessage", { to: "B", message: "Long ago" }, 120),
+    line.tool(main, "Write", { file_path: path.join(tasks, "B.output"), content: "x" }, 30),
+    line.tool(main, "Edit", { file_path: path.join(tasks, "B.output"), old_string: "x", new_string: "y" }, 29),
+    line.tool(main, "Bash", { command: `echo hi > "${path.join(tasks, "B.output").replace(/\\/g, "/")}"` }, 28),
+    line.tool(main, "Read", { file_path: path.join(tasks, "bshell1.output") }, 27),
+    line.tool(main, "SendMessage", { to: "nobody", message: "Hello?" }, 26),
+    line.tool(main, "Read", { file_path: path.join(tasks, "B.output.bak") }, 25),
+    line.tool(main, "Read", { file_path: path.join(main, "B.output") }, 24),
+  ], { age: 5 });
+  const a = await agentsOf(home, "s");
+  expect(a.A!.checkIns).toBeUndefined();
+});
+
+test("check-ins: a command that writes a repo file keeps that as what it is doing, with its read of an output file as a check-in", async () => {
+  const { home, main } = office();
+  const out = path.join(home, "tmp", "tasks", "B.output").replace(/\\/g, "/");
+  session(home, "s", [line.user(main, "x", 150)]);
+  agent(home, "s", "B", { agentType: "worker" }, [line.tool(main, "Grep", { pattern: "x" }, 5)], { age: 5 });
+  agent(home, "s", "A", { agentType: "worker" }, [line.tool(main, "Bash", { command: `tail -5 "${out}" > notes.md` }, 5)], { age: 5 });
+  const a = await agentsOf(home, "s");
+  expect(a.A!.doing).toMatchObject({ kind: "write", file: "notes.md" });
+  expect(a.A!.checkIns).toEqual([{ with: cc("B"), kind: "read", since: at(5) }]);
+});
 test("usage: the newest reply's model and context; token totals summed once per reply, with the 1h cache writes and the replies over 100k apart; a made-up line is no reply", async () => {
   const { home, main } = office();
   const u = (input: number, read: number, written: number, output: number, oneHour?: number) => ({

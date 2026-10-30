@@ -276,8 +276,29 @@ export function createClaudeCode(io: SourceIo) {
         fail(err);
       }
     }
-    // The session's agents, by file id: the ones a check-in may name.
-    const known = new Set(agentFiles.map((a) => a.id));
+    // The session's agents, by file id (any case), and by the names their spawning calls gave
+    // them: what a check-in may name. A name two agents share names neither.
+    const known = new Map(agentFiles.map((a) => [a.id.toLowerCase(), a.id]));
+    const spawnNames = new Map([main, ...agentFiles.map((a) => a.t)].flatMap((t) => [...t.spawnNames]));
+    const named = new Map<string, string | null>();
+    for (const a of agentFiles) {
+      const names = typeof a.meta.toolUseId === "string" ? (spawnNames.get(a.meta.toolUseId) ?? []) : [];
+      for (const n of new Set(names.map((x) => x.toLowerCase()))) named.set(n, named.has(n) && named.get(n) !== a.id ? null : a.id);
+    }
+    const toId = (to: string) => known.get(to.toLowerCase()) ?? named.get(to.toLowerCase()) ?? null;
+    // An agent's recent check-ins on another of the session's agents, newest last, whatever it is
+    // doing now (protocol 0.3.6); none is left out of the facts.
+    const checkMs = config.checkInSeconds * 1000;
+    const checkInsOf = (self: string, t: TranscriptState, fallbackMs: number): { checkIns?: NonNullable<AgentFact["checkIns"]> } => {
+      const list: NonNullable<AgentFact["checkIns"]> = [];
+      for (const c of t.checks) {
+        const to = toId(c.to);
+        if (!to || agentId(to) === self || !(now - c.at < checkMs)) continue;
+        const item = { with: agentId(to), kind: c.kind, since: iso(c.at, fallbackMs) };
+        if (!list.some((x) => x.with === item.with && x.kind === item.kind && x.since === item.since)) list.push(item);
+      }
+      return list.length ? { checkIns: list.slice(-MAX_REPORTED) } : {};
+    };
 
     // Done signals and spawns can sit in the session's own transcript or, for an agent's own
     // agents, in that agent's transcript, so look in all of them. A spawn keeps which file made it.
@@ -331,7 +352,8 @@ export function createClaudeCode(io: SourceIo) {
       status: leadWorking ? "working" : "idle",
       statusSince: iso(leadWorking ? main.turnAt : main.lastMessageAt, c.ownMtime),
       lastActive: iso(c.ownMtime),
-      doing: leadWorking ? await doingOf(main, place, c.ownMtime, config, known) : null,
+      doing: leadWorking ? await doingOf(main, place, c.ownMtime, config) : null,
+      ...checkInsOf(lead, main, c.ownMtime),
       usage: usageOf(main, c.ownMtime),
     });
     main.touches = await addFiles(facts.edits, lead, main.touches, [...config.touchedTools, ...config.shellTools], now, config, place);
@@ -375,7 +397,8 @@ export function createClaudeCode(io: SourceIo) {
         status: s.status,
         statusSince: iso(s.since, a.mtimeMs),
         lastActive: iso(a.mtimeMs),
-        doing: live ? await doingOf(a.t, place, a.mtimeMs, config, known) : null,
+        doing: live ? await doingOf(a.t, place, a.mtimeMs, config) : null,
+        ...checkInsOf(id, a.t, a.mtimeMs),
         usage: usageOf(a.t, a.mtimeMs),
         ...(worktree ? { checkout: worktree, branch: agentBranch } : {}),
         extra: { description: a.meta.description ?? null, ...(s.endState ? { endState: s.endState } : {}) },
@@ -523,8 +546,6 @@ interface LastTool {
   dir?: string;
   at: number;
   wrote?: boolean;
-  /** A check-in on another agent, by its file id: a message sent to it, or its output read. */
-  check?: { agent: string; kind: "talk" | "read" };
 }
 
 type ToolResult = { launched: true; at?: number } | { status: string; at: number; launched?: undefined };
@@ -558,6 +579,8 @@ interface TranscriptState {
   turnAt: number; // when it opened
   results: Map<string, ToolResult>; // tool_use_id → its result
   spawns: Map<string, number>; // id of each Agent tool_use this file made → its time
+  spawnNames: Map<string, string[]>; // id of each Agent or Task tool_use → the name and description it gave the agent
+  checks: { to: string; kind: "talk" | "read"; at: number }[]; // check-ins on other agents, by id or name as written, newest last
   notes: Map<string, { status: string; at: number }>; // agent id → from <task-notification>
   touches: Touch[]; // tool uses that name a file
   reads: Touch[]; // the same, for the files a tool use read
@@ -655,6 +678,8 @@ function newTranscriptState(): TranscriptState {
     turnAt: NaN,
     results: new Map(),
     spawns: new Map(),
+    spawnNames: new Map(),
+    checks: [],
     notes: new Map(),
     touches: [],
     reads: [],
@@ -718,6 +743,10 @@ function foldLine(st: TranscriptState, line: string, home: string | null, isDir?
       st.tools++;
       st.waiting = true;
       if (c.name === "Agent" && typeof c.id === "string") st.spawns.set(c.id, at);
+      if (SPAWN_TOOLS.has(c.name) && typeof c.id === "string" && c.input && typeof c.input === "object") {
+        const names = [c.input.name, c.input.description].filter((x): x is string => typeof x === "string" && x.trim() !== "");
+        if (names.length) st.spawnNames.set(c.id, names.map((x) => x.trim()));
+      }
       if (c.name === ASK_TOOL && typeof c.id === "string") st.asks.set(c.id, { at, input: c.input });
       const input = c.input || {};
       // The line's cwd is the folder the shell is in when the call runs: a lead's shell keeps a cd
@@ -731,8 +760,9 @@ function foldLine(st: TranscriptState, line: string, home: string | null, isDir?
       const file = typeof input.file_path === "string" ? input.file_path : typeof input.notebook_path === "string" ? input.notebook_path : typeof input.path === "string" ? input.path : null;
       const dir = shell.dirs[shell.dirs.length - 1];
       st.lastTool = writes.length ? { name: c.name, file: writes[writes.length - 1]!, cwd, at, wrote: true } : { name: c.name, file, cwd, ...(dir ? { dir } : {}), at };
-      const check = checkIn(c.name, input);
-      if (check) st.lastTool.check = check;
+      // A check-in on another agent: by its id or name, as the call wrote it; resolved at read time.
+      for (const check of checkIns(c.name, input, writes)) st.checks.push({ ...check, at });
+      if (st.checks.length > MAX_CHECKS) st.checks.splice(0, st.checks.length - MAX_CHECKS);
       // Edit and Read paths and shell writes and reads are absolute; they are resolved against this
       // line's cwd at read time, which also keeps only the tools that count.
       const target = input.file_path || input.notebook_path;
@@ -929,27 +959,41 @@ function ended(state: string, at: number): AgentStatus {
   return { status: state === "completed" ? "done" : STOPPED.has(state) ? "stopped" : "failed", since: at, endState: state };
 }
 
-// Background agents' output files: <tasks folder>/<agent id>.output.
-const OUTPUT_FILE = /[\\/]tasks[\\/]([A-Za-z0-9_-]+)\.output\b/;
+// The tools that start an agent, whose input names it; the tools that only read a file or folder,
+// at `file_path` or `path`; and how many check-ins a transcript keeps and the facts report.
+const SPAWN_TOOLS = new Set(["Agent", "Task"]);
+const READ_LIKE = new Set(["Read", "Grep", "Glob", "NotebookRead"]);
+const MAX_CHECKS = 20;
+const MAX_REPORTED = 5;
 
-// A tool call that checks in on another agent: SendMessage to it, or reading its output, by the
-// Read tool, a shell command or TaskOutput. The agent by its file id; null for anything else.
-function checkIn(name: string, input: Record<string, unknown>): LastTool["check"] | null {
-  if (name === "SendMessage") return typeof input.to === "string" && input.to ? { agent: input.to, kind: "talk" } : null;
-  if (name === "TaskOutput") return typeof input.task_id === "string" && input.task_id ? { agent: input.task_id, kind: "read" } : null;
-  const text = typeof input.file_path === "string" ? input.file_path : typeof input.command === "string" ? input.command : null;
-  const m = text ? OUTPUT_FILE.exec(text) : null;
-  return m ? { agent: m[1]!, kind: "read" } : null;
+// A background agent's output file (<tasks folder>/<agent id>.output) or its transcript
+// (subagents/agent-<agent id>.jsonl), anywhere in a path or command, in any case. Background
+// shells' output files match too: only ids of the session's agents are kept at read time.
+const AGENT_FILES = /[\\/](?:tasks[\\/]([a-z0-9_-]+)\.output|subagents[\\/]agent-([a-z0-9_-]+)\.jsonl)(?![\w.-])/gi;
+const agentsIn = (text: string) => [...text.matchAll(AGENT_FILES)].map((m) => (m[1] ?? m[2])!.toLowerCase());
+
+// The check-ins a tool call makes on other agents, by id or name as it wrote them: SendMessage to
+// one; TaskOutput; a read-only tool at an agent's output file or transcript; or a shell command
+// that names one without writing it (one that writes repo files keeps that as what it is doing).
+// A Write or an Edit to such a file is not a check-in.
+function checkIns(name: string, input: Record<string, unknown>, writes: readonly string[]): { to: string; kind: "talk" | "read" }[] {
+  if (name === "SendMessage") return typeof input.to === "string" && input.to.trim() ? [{ to: input.to.trim(), kind: "talk" }] : [];
+  if (name === "TaskOutput") return typeof input.task_id === "string" && input.task_id ? [{ to: input.task_id, kind: "read" }] : [];
+  let ids: string[] = [];
+  if (READ_LIKE.has(name)) ids = [input.file_path, input.path].flatMap((x) => (typeof x === "string" ? agentsIn(x) : []));
+  else if (typeof input.command === "string") {
+    const written = new Set(writes.flatMap(agentsIn));
+    ids = agentsIn(input.command).filter((id) => !written.has(id));
+  }
+  return [...new Set(ids)].map((to) => ({ to, kind: "read" as const }));
 }
 
 // The agent's last tool call as { kind, file?, since }, the file relative to the worktree it is in,
 // with its repo when that isn't the session's, as for edits; in no repo the file is dropped. A
 // shell command with no file names the repo its programs ran in. A tool with no kind in DOING shows
-// as nothing; a shell tool's write shows as "write". A check-in on one of the session's agents
-// (`known`, by file id) is { kind: talk or read, with: that agent, since } (protocol 0.3.6).
-async function doingOf(st: TranscriptState, place: Attribution, fallbackMs: number, config: Config, known: ReadonlySet<string>): Promise<AgentFact["doing"]> {
+// as nothing; a shell tool's write shows as "write".
+async function doingOf(st: TranscriptState, place: Attribution, fallbackMs: number, config: Config): Promise<AgentFact["doing"]> {
   const t = st.lastTool;
-  if (t?.check && known.has(t.check.agent)) return { kind: t.check.kind, with: agentId(t.check.agent), since: iso(t.at, fallbackMs) };
   const kind = t && (t.wrote && config.shellTools.includes(t.name) ? "write" : Object.hasOwn(DOING, t.name) ? DOING[t.name] : undefined);
   if (!t || !kind) return null;
   const placed = t.file && t.cwd ? await place.file(t.file) : t.dir ? await place.dir(t.dir) : null;
