@@ -14,5 +14,7 @@
   "gitTimeoutSeconds": 120,
   "setupTimeoutMinutes": 15,
   "cloneSearchDays": 30,
-  "repoSearchDepth": 3
+  "repoSearchDepth": 3,
+  "askPolls": 6,
+  "askPollSeconds": 10
 }

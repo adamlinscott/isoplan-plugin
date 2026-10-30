@@ -5974,6 +5974,22 @@ discriminatedUnion("type", [
 			repo: string().min(1).optional(),
 			output: string()
 		}))
+	}),
+	object({
+		type: literal("ask-room"),
+		v: Version,
+		question: string().trim().min(1).max(4e3),
+		key: string().min(1).max(100).optional()
+	}),
+	object({
+		type: literal("ask-check"),
+		v: Version,
+		question: RequestId
+	}),
+	object({
+		type: literal("asked-ack"),
+		v: Version,
+		question: RequestId
 	})
 ]);
 /** Asks the data layer to send its facts in full. */
@@ -6084,7 +6100,32 @@ const OfficeServerMessageSchema = discriminatedUnion("type", [
 		to: Account
 	}),
 	HandOverReadyMessageSchema,
-	DropMessageSchema
+	DropMessageSchema,
+	object({
+		type: literal("asked"),
+		v: Version,
+		question: RequestId,
+		text: string().min(1),
+		state: _enum([
+			"queued",
+			"asking",
+			"withheld",
+			"answered",
+			"dropped"
+		]),
+		answer: string().min(1).optional(),
+		note: string().min(1).optional(),
+		owner: string().optional(),
+		/** The `key` the question was asked under, so the asking side knows which of its asks it was. */
+		key: string().min(1).max(100).optional()
+	}),
+	object({
+		type: literal("ask-rights"),
+		v: Version,
+		room: string().min(1),
+		owner: Account,
+		granted: boolean()
+	})
 ]);
 /** Validates a message a data layer received from an office server. */
 function parseOfficeServerMessage(value) {
@@ -6628,7 +6669,7 @@ function createLink({ url, hello, emit, minIntervalMs = 1e3, retryBaseMs = 1e3, 
 		} else if (message.type === "error" && message.code === "forged-hello") {
 			isTaken = true;
 			emit(message);
-		} else if (message.type === "conflict" || message.type === "error") {
+		} else if (message.type === "conflict" || message.type === "error" || message.type === "asked" || message.type === "ask-rights") {
 			emit(message);
 			if (message.type === "error" && message.code === "not-wanted") {
 				isUnwanted = true;
@@ -10106,6 +10147,7 @@ function createRunner({ answerer, ledger, settings, prompts, scan, send, log, is
 	}
 	async function answer(request) {
 		const { id, room, session } = request;
+		if (dropping.has(id)) return unavailable(id, "dropped before it ran");
 		const lead = await answerer.lead(session);
 		if (!lead) return unavailable(id, "this machine has no such session");
 		if (!await isReported(session, lead)) {
@@ -10157,6 +10199,11 @@ function createRunner({ answerer, ledger, settings, prompts, scan, send, log, is
 				question: request.question
 			});
 			const free = await forkSlot(s.maxForks);
+			if (dropping.has(id)) {
+				free();
+				await reservation.cancel().catch((err) => log(`couldn't record ${id} in the ledger: ${err.message}`));
+				return unavailable(id, "dropped before its fork ran");
+			}
 			const answered = await answerer.ask(session, lead, {
 				instructions: p.instructions,
 				request: text,

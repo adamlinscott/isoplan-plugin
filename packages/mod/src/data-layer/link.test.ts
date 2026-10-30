@@ -148,7 +148,7 @@ test("link: changes go no faster than once a second, carrying the latest facts",
   expect(s.got[2]).toMatchObject({ upsert: { session: facts("idle").session, edits: facts("idle", ["a.md"]).edits } });
 });
 
-test("link: the server's conflict notes and errors go out as lines; a message it can't read is logged", async () => {
+test("link: the server's conflict notes, errors and late answers from the room go out as lines; a message it can't read is logged", async () => {
   const s = await server();
   const { link: l, lines } = link(s.url, { minIntervalMs: 0 });
   l.update(facts("active"));
@@ -156,9 +156,13 @@ test("link: the server's conflict notes and errors go out as lines; a message it
   const conflict = { type: "conflict", v: PROTOCOL_VERSION, agent: "claude-code:s:lead", file: "a.md", text: "Bea's agent edited a.md 3 minutes ago." };
   s.sockets[0]!.send(JSON.stringify(conflict));
   s.sockets[0]!.send(JSON.stringify({ type: "error", v: PROTOCOL_VERSION, code: "not-paired", message: "Pair this machine first." }));
+  const asked = { type: "asked", v: PROTOCOL_VERSION, question: "q-1", text: "Which branch?", state: "answered", answer: "feat/migrate-v2." };
+  const rights = { type: "ask-rights", v: PROTOCOL_VERSION, room: "room:claude-code:a1", owner: { id: "p-adam", name: "Adam" }, granted: true };
+  s.sockets[0]!.send(JSON.stringify(asked));
+  s.sockets[0]!.send(JSON.stringify(rights));
   s.sockets[0]!.send(JSON.stringify({ type: "conflict", v: PROTOCOL_VERSION + 1 }));
-  await until(() => lines.length >= 5);
-  expect(lines.slice(2)).toEqual([conflict, { type: "error", v: PROTOCOL_VERSION, code: "not-paired", message: "Pair this machine first." }, { type: "log", text: expect.stringContaining("unsupported-version") }]);
+  await until(() => lines.length >= 7);
+  expect(lines.slice(2)).toEqual([conflict, { type: "error", v: PROTOCOL_VERSION, code: "not-paired", message: "Pair this machine first." }, asked, rights, { type: "log", text: expect.stringContaining("unsupported-version") }]);
 });
 
 test("link: not-wanted is passed on, then the link waits and asks again only after notWantedRetryMs", async () => {

@@ -262,7 +262,7 @@ async function takeCommand(argv: string[]): Promise<string> {
     // No setup runs on this path; the agent is told when the repo has one, in case it matters here.
     const setup = remote ? await setupCommand(run, { dir, remote }, process.platform, timeoutMs) : null;
     const setupNote = setup ? [`The repo's worktree setup script has NOT been run here: \`${setup}\` (from isoplan.json). Run it only if this folder isn't set up yet.`] : [];
-    return [`You have taken Isoplan handoff ${handoff.id}, and this session is in its room now.`, checkout, ...setupNote, "", "The brief:", "", handoff.brief].join("\n");
+    return [`You have taken Isoplan handoff ${handoff.id}, and this session is in its room now.`, checkout, ...setupNote, "To ask the session it came from a question, use the Isoplan ask_room tool.", "", "The brief:", "", handoff.brief].join("\n");
   } finally {
     await link.close();
   }

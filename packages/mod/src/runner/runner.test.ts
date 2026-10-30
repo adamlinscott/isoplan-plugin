@@ -218,6 +218,27 @@ test("runner: a commit with a possible secret holds the push, naming the file; t
   expect(t.sent[2]).toEqual({ type: "reply", v: PROTOCOL_VERSION, id: "b1", kind: "write-brief", handoff: { id: "h-1", brief: "Goal: ship.", repos } });
 });
 
+test("runner: several questions in one room; one dropped while it waits its turn never runs or reserves, and one dropped waiting for a fork gives its estimate back", async () => {
+  const t = await setup({ settings: { maxForks: 1 } });
+  t.runner.take(question("q1", "room-1"));
+  await t.asked(1);
+  t.runner.take(question("q2", "room-1"));
+  t.runner.take(question("q3", "room-1"));
+  t.runner.take(question("q4", "room-2"));
+  // q4 has reserved and waits for the one fork slot; q2 and q3 wait their turn in room-1.
+  await until(() => t.ledger.entries(NOW).length === 2);
+  t.runner.take({ type: "drop", v: PROTOCOL_VERSION, id: "q2" });
+  t.runner.take({ type: "drop", v: PROTOCOL_VERSION, id: "q4" });
+  t.askFor("q1")!.settle(ok("One."));
+  await t.asked(2);
+  expect(t.askFor("q3")).toBeDefined();
+  t.askFor("q3")!.settle(ok("Three."));
+  await t.runner.settled();
+  expect(t.asks.map((a) => a.ask.request.match(/\((q\d)\)/)![1])).toEqual(["q1", "q3"]);
+  expect(t.sent.map((m) => "id" in m && m.id)).toEqual(["q1", "q3"]);
+  expect(t.ledger.entries(NOW)).toHaveLength(2);
+});
+
 test("runner: a drop ends a request: what is held goes, and one still being written neither pushes nor sends", async () => {
   const pushes: (Record<string, string> | null)[] = [];
   const t = await setup({ push: async (_s, _l, _h, pushAnyway) => (pushes.push(pushAnyway), { held: ["a.ts"], commits: { ".": "c".repeat(40) }, unchecked: [] }) });

@@ -28,7 +28,9 @@
 // or been released. The push scans what it would send: on a match nothing is pushed, the refusal is
 // `withheld` naming the files, in every repo (never the pattern), and the files it couldn't read, and the owner's
 // release pushes that exact commit anyway. A push that fails is refused `unavailable` with the
-// reason. Without `push` a write-brief is refused before the fork runs. A `drop` ends a request: what
+// reason. Without `push` a write-brief is refused before the fork runs. A `drop` of a request still
+// waiting in its room's line, or for a fork, takes it out: it never runs, and its estimate is never
+// reserved, or is given back. Otherwise a `drop` ends a request: what
 // is held for it goes, and one still running neither pushes nor sends. A handoff to take goes to
 // `take`, with how to open its session; each take (the session id the server chose) runs once, however
 // often it is sent, and what it did goes back as `taken`. owner-answer requests go to the live session, not
@@ -144,6 +146,8 @@ export function createRunner({ answerer, ledger, settings, prompts, scan, send, 
 
   async function answer(request: Ask): Promise<Outgoing> {
     const { id, room, session } = request;
+    // Dropped while it waited its turn: what is returned isn't sent (deliver).
+    if (dropping.has(id)) return unavailable(id, "dropped before it ran");
     const lead = await answerer.lead(session);
     if (!lead) return unavailable(id, "this machine has no such session");
     if (!(await isReported(session, lead))) {
@@ -189,6 +193,11 @@ export function createRunner({ answerer, ledger, settings, prompts, scan, send, 
         ? fill(p.brief, { to: request.to.name || request.to.id, untracked: untrackedLine(brief.files) })
         : fill(p.question, { from: request.from.name || request.from.id, question: request.question });
       const free = await forkSlot(s.maxForks);
+      if (dropping.has(id)) {
+        free();
+        await reservation.cancel().catch((err: unknown) => log(`couldn't record ${id} in the ledger: ${(err as Error).message}`));
+        return unavailable(id, "dropped before its fork ran");
+      }
       const answered = await answerer.ask(session, lead, { instructions: p.instructions, request: text, timeoutMs: (isBrief ? s.briefTimeoutSeconds : s.answerTimeoutSeconds) * 1000 }).finally(free);
       // No fork ran when it couldn't be set up: the answer and its tokens are given back. One that ran
       // but failed before it was metered keeps its estimate.

@@ -218,6 +218,39 @@ export const TakenMessageSchema = z.object({
   ),
 });
 
+/** The longest question a session may ask the room. */
+export const MAX_QUESTION_LENGTH = 4000;
+
+/**
+ * The receiver's session asks the room it was handed a question (#49), on its own short link with
+ * the session's hello: the room's lead, on its owner's machine, answers it. The server answers
+ * `asked`, or an error (`ask-refused`) when the session may not ask. `key`, the asking side's own id
+ * for this ask, makes a retry of it the same question rather than a second one.
+ */
+export const AskRoomMessageSchema = z.object({
+  type: z.literal("ask-room"),
+  v: Version,
+  question: z.string().trim().min(1).max(MAX_QUESTION_LENGTH),
+  key: z.string().min(1).max(100).optional(),
+});
+
+/** The asking session polls a question it asked: the server answers `asked`. */
+export const AskCheckMessageSchema = z.object({
+  type: z.literal("ask-check"),
+  v: Version,
+  question: RequestId,
+});
+
+/**
+ * The asking session's agent was shown how a question ended (answered or dropped): the server stops
+ * sending it again.
+ */
+export const AskedAckMessageSchema = z.object({
+  type: z.literal("asked-ack"),
+  v: Version,
+  question: RequestId,
+});
+
 export const DataLayerMessageSchema = z.discriminatedUnion("type", [
   HelloMessageSchema,
   RunnerHelloMessageSchema,
@@ -229,6 +262,9 @@ export const DataLayerMessageSchema = z.discriminatedUnion("type", [
   HandOverCheckMessageSchema,
   TakeMessageSchema,
   TakenMessageSchema,
+  AskRoomMessageSchema,
+  AskCheckMessageSchema,
+  AskedAckMessageSchema,
 ]);
 
 // Office server → data layer.
@@ -349,6 +385,44 @@ export const HandedOverMessageSchema = z.object({
   to: Account,
 });
 
+/**
+ * Where a question asked of the room stands (#49), sent in answer to ask-room and ask-check, and
+ * down the asking session's own link when an answer arrives after it stopped polling. `queued`: the
+ * owner's machine can't answer now (it is off, its runner is away, a cap is reached, or the fork
+ * couldn't answer), and it is asked again later; `note` says why. `asking`: the owner's runner is
+ * answering. `withheld`: the answer matched a secret pattern on the owner's machine, which keeps it
+ * until they release it. `answered`, with `answer`. `dropped`: it won't be answered (the owner
+ * turned asking off, the handoff was dismissed, or it ran out of tries or time); `note` says why.
+ * `text` is the question as it was asked, `owner` the name of the person whose session answers, and
+ * `key` the ask's own key.
+ * An answered or dropped question is sent again down the session's own link until it is acked.
+ */
+export const AskedMessageSchema = z.object({
+  type: z.literal("asked"),
+  v: Version,
+  question: RequestId,
+  text: z.string().min(1),
+  state: z.enum(["queued", "asking", "withheld", "answered", "dropped"]),
+  answer: z.string().min(1).optional(),
+  note: z.string().min(1).optional(),
+  owner: z.string().optional(),
+  /** The `key` the question was asked under, so the asking side knows which of its asks it was. */
+  key: z.string().min(1).max(100).optional(),
+});
+
+/**
+ * Whether this session may ask `room` now (#49), sent down its own link when it connects in a room
+ * that was handed to its person, and whenever that changes: a take grants it, and the owner can
+ * turn it off and on again.
+ */
+export const AskRightsMessageSchema = z.object({
+  type: z.literal("ask-rights"),
+  v: Version,
+  room: z.string().min(1),
+  owner: Account,
+  granted: z.boolean(),
+});
+
 export const OfficeServerMessageSchema = z.discriminatedUnion("type", [
   RepairMessageSchema,
   ConflictMessageSchema,
@@ -359,6 +433,8 @@ export const OfficeServerMessageSchema = z.discriminatedUnion("type", [
   HandedOverMessageSchema,
   HandOverReadyMessageSchema,
   DropMessageSchema,
+  AskedMessageSchema,
+  AskRightsMessageSchema,
 ]);
 
 export type Project = z.infer<typeof ProjectSchema>;
@@ -385,6 +461,11 @@ export type HandedOverMessage = z.infer<typeof HandedOverMessageSchema>;
 export type HandOverCheckMessage = z.infer<typeof HandOverCheckMessageSchema>;
 export type HandOverReadyMessage = z.infer<typeof HandOverReadyMessageSchema>;
 export type DropMessage = z.infer<typeof DropMessageSchema>;
+export type AskRoomMessage = z.infer<typeof AskRoomMessageSchema>;
+export type AskCheckMessage = z.infer<typeof AskCheckMessageSchema>;
+export type AskedMessage = z.infer<typeof AskedMessageSchema>;
+export type AskedAckMessage = z.infer<typeof AskedAckMessageSchema>;
+export type AskRightsMessage = z.infer<typeof AskRightsMessageSchema>;
 export type OfficeServerMessage = z.infer<typeof OfficeServerMessageSchema>;
 
 /**
