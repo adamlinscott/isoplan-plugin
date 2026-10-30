@@ -298,3 +298,21 @@ test("hooks: a question answered in the terminal first keeps that answer, and a 
   const h = await start([{ type: "owner-answer", question: "toolu_1", answers: { "Which branch?": "main" }, file }]);
   await vi.waitFor(() => expect(h.written).toEqual([[file, JSON.stringify({ question: "toolu_1", taken: false })]]));
 });
+
+test("hooks: a question's wait is marked where the data layer says, from its start until it ends; an unsafe call id is never marked", async () => {
+  const dir = "C:/Users/ada/.claude/isoplan/waits/s1";
+  const h = await start([{ type: "waits", dir }], { stays: true });
+  await vi.waitFor(() => expect(h.spawned).toHaveLength(1));
+  await new Promise((r) => setTimeout(r, 10));
+  let end!: (r: ToolCallResult) => void;
+  const asked = hooks["tool.call"]!(h.$, { tool: "AskUserQuestion", tool_use_id: "toolu_1" }, () => new Promise<ToolCallResult>((resolve) => (end = resolve))) as Promise<ToolCallResult>;
+  await vi.waitFor(() => expect(h.written).toEqual([[`${dir}/toolu_1.json`, JSON.stringify({ question: "toolu_1", waiting: true })]]));
+  end({ result: "answered in the terminal" });
+  await asked;
+  await vi.waitFor(() => expect(h.written.at(-1)).toEqual([`${dir}/toolu_1.json`, JSON.stringify({ question: "toolu_1", waiting: false })]));
+  // A call id that isn't safe as a file name is never marked, so its question stays read-only.
+  const before = h.written.length;
+  await hooks["tool.call"]!(h.$, { tool: "AskUserQuestion", tool_use_id: "../x" }, async () => ({ result: "ok" }));
+  await new Promise((r) => setTimeout(r, 10));
+  expect(h.written).toHaveLength(before);
+});
