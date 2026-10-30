@@ -161,7 +161,7 @@ const valid = {
   "asked-ack": { type: "asked-ack", v, question: "q-4f9c" },
   "ask-rights": { type: "ask-rights", v, room: "room:claude-code:s1", owner: adam, granted: true },
   "ask-check": { type: "ask-check", v, question: "q-4f9c" },
-  asked: { type: "asked", v, question: "q-4f9c", text: "Why does the CRLF check exist?", state: "answered", answer: "Windows checkouts.", owner: "Adam" },
+  asked: { type: "asked", v, question: "q-4f9c", text: "Why does the CRLF check exist?", state: "answered", answer: "Windows checkouts.", owner: "Adam", key: "toolu_01" },
   "asked queued": { type: "asked", v, question: "q-4f9c", text: "Why does the CRLF check exist?", state: "queued", note: "Adam's machine isn't reachable." },
 };
 

@@ -7,10 +7,12 @@
 //
 // It also gives the session's agent the ask_room tool (#49), once the office server says this
 // session may ask its room (an `ask-rights` line): the session took a handoff, and its owner hasn't
-// turned asking off. The tool asks the room's lead a question through the office server
+// turned asking off. A tool can't be taken away again, so once the rights go (turned off, the
+// handoff dismissed, another session id) it answers that asking is off, without running anything. The tool asks the room's lead a question through the office server
 // (dist/ask.js), with no one typing anything; the script waits only as long as runner.json says,
 // then tells the agent to carry on. The end of a question that comes after that arrives as an
-// `asked` line and is kept until it goes on one of the lead's tool results; only then is it acked
+// `asked` line and is kept until it goes on a tool result of the agent that asked, or of the lead
+// once that agent has stopped; only then is it acked
 // (dist/ask.js --ack), so the server sends it again until it has been shown, and one shown already
 // is only acked again. Answers are labelled as another person's session and quoted (ask/text.ts).
 //
@@ -32,12 +34,12 @@ const STABLE_MS = 60000;
 const SWITCH_CHECK_MS = 1000;
 // The most of a server's note that reaches the model, and of a late reply from the room.
 const NOTE_MAX = 1000;
-const ANSWER_MAX = 8000;
-/** The ask_room tool, as the model calls it. */
-export const ASK_TOOL = "mcp__isoplan__ask_room";
-// The script stops waiting at MAX_WAIT_MS whatever runner.json says, and connecting, its last check
-// and the ack take under two minutes more; this only ends a script that hangs.
+// The script's whole wait fits in MAX_WAIT_MS (five minutes) whatever runner.json says, and
+// connecting, a token renewal and the ack take under two minutes more; this, under Claude Code's
+// ten-minute limit, only ends a script that hangs.
 const ASK_TIMEOUT_MS = MAX_WAIT_MS + 2 * 60 * 1000;
+// An agent in one of these is still running, so a late reply waits for its next tool result.
+const RUNNING = new Set(["pending", "running", "waiting"]);
 
 let running: string | null = null; // the session id the data layer runs for
 let lead: string | null = null; // that session's lead, as the facts name it
@@ -45,10 +47,14 @@ let stop: (() => void) | null = null; // ends the current run, for a new session
 let started = false;
 // Notes waiting for their agent's next tool result, by agent id.
 const notes = new Map<string, string[]>();
-// Late replies from the room waiting for the lead's next tool result, by question id, and those shown.
-const replies = new Map<string, string>();
+// Late replies from the room waiting for a tool result, by question id, each for the agent that
+// asked (null for the lead); those shown; and which agent made each ask, by its key (the call's id).
+const replies = new Map<string, { agent: string | null; text: string }>();
 const shown = new Set<string>();
-let toolAdded = false;
+const askedBy = new Map<string, string | null>();
+let toolName: string | null = null; // the ask_room tool's full name, as registering it answered
+let toolAdded = false; // registered for this session
+let mayAsk = false; // the office server last said this session may ask
 let asking = false; // one title call at a time
 let lastError: string | null = null;
 let pairing: PairLine | null = null; // the link waiting to be clicked, last shown
@@ -76,7 +82,7 @@ export function register(on: On): void {
   // handler answers only when `next` itself rejected; there `next(e)` replays what that call
   // settled to (the mod API's documented guard pattern), and the tool never runs twice.
   on("tool.call", async ($, e, next) => {
-    if (e.tool === ASK_TOOL) return askRoom($, e);
+    if (toolName !== null && e.tool === toolName) return askRoom($, e);
     const r = await next(e);
     try {
       void checkSession($);
@@ -84,15 +90,14 @@ export function register(on: On): void {
       const agent = e.agentId ? "claude-code:" + e.agentId : lead;
       const waiting = notes.get(agent) ?? [];
       notes.delete(agent);
-      // The room's late replies go to the lead, which asked; each is acked once it is shown.
-      const late = agent === lead ? [...replies] : [];
+      const late = await lateFor($, e.agentId ?? null);
       for (const [question] of late) {
         replies.delete(question);
         shown.add(question);
         ack($, question);
       }
       if (!waiting.length && !late.length) return r;
-      return { ...r, context: [...(r.context ?? []), ...waiting, ...late.map(([, text]) => text)] };
+      return { ...r, context: [...(r.context ?? []), ...waiting, ...late.map(([, reply]) => reply.text)] };
     } catch {
       return r;
     }
@@ -114,6 +119,9 @@ async function run($: Host): Promise<void> {
     if (session !== running) {
       notes.clear();
       replies.clear();
+      askedBy.clear();
+      // The new session has rights only once the server says so.
+      toolAdded = mayAsk = false;
     }
     running = session;
     lead = `claude-code:${session}:lead`;
@@ -208,6 +216,7 @@ function handle($: Host, text: string): void {
       addReply($, line);
       break;
     case "ask-rights":
+      mayAsk = line.granted;
       if (line.granted) addTool($);
       break;
     case "error": {
@@ -255,8 +264,17 @@ function addNote(line: ConflictMessage): void {
 function addReply($: Host, line: AskedMessage): void {
   if (line.state !== "answered" && line.state !== "dropped") return;
   if (shown.has(line.question)) return ack($, line.question);
-  const answer = line.answer && line.answer.length > ANSWER_MAX ? line.answer.slice(0, ANSWER_MAX - 1) + "…" : line.answer;
-  replies.set(line.question, endText({ ...line, ...(answer ? { answer } : {}) }, true));
+  replies.set(line.question, { agent: (line.key && askedBy.get(line.key)) ?? null, text: endText(line, true) });
+}
+
+// The late replies a tool result of `agent` (null for the lead) shows: its own, and for the lead
+// also those of agents that have stopped since they asked.
+async function lateFor($: Host, agent: string | null): Promise<[string, { agent: string | null; text: string }][]> {
+  const all = [...replies];
+  if (agent !== null) return all.filter(([, r]) => r.agent === agent);
+  const others = all.filter(([, r]) => r.agent !== null);
+  const running = others.length ? new Set((await $.agent.list().catch(() => [])).filter((a) => RUNNING.has(a.status)).map((a) => a.id)) : new Set<string>();
+  return all.filter(([, r]) => r.agent === null || !running.has(r.agent));
 }
 
 // Tells the server the lead was shown the question's end, so it isn't sent again.
@@ -282,6 +300,7 @@ function addTool($: Host): void {
       inputSchema: { type: "object", properties: { question: { type: "string", description: "The question, on its own: that session hasn't seen this conversation." } }, required: ["question"] },
       isDeferred: false,
     })
+    .then(({ tool }) => void (toolName = tool))
     .catch((err) => {
       toolAdded = false;
       $.ui.log("isoplan: the ask_room tool couldn't be added: " + message(err), { to: "debug" });
@@ -291,8 +310,10 @@ function addTool($: Host): void {
 // The ask_room tool: the script asks as this session, under the tool call's id so a retry is the
 // same question, and prints what the agent is told.
 async function askRoom($: Host, e: ToolCallInput): Promise<ToolCallResult> {
+  if (!mayAsk) return { result: "Asking this room is off now: its owner turned it off, the handoff was dismissed, or this session took no handoff. Carry on without asking." };
   const question = typeof e.question === "string" ? e.question.trim() : "";
   if (!question) return { result: "Give the question to ask the room as `question`." };
+  askedBy.set(e.tool_use_id, e.agentId ?? null);
   try {
     const session = await $.session.id();
     const cwd = await $.session.cwd();

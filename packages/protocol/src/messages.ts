@@ -393,7 +393,8 @@ export const HandedOverMessageSchema = z.object({
  * answering. `withheld`: the answer matched a secret pattern on the owner's machine, which keeps it
  * until they release it. `answered`, with `answer`. `dropped`: it won't be answered (the owner
  * turned asking off, the handoff was dismissed, or it ran out of tries or time); `note` says why.
- * `text` is the question as it was asked, and `owner` the name of the person whose session answers.
+ * `text` is the question as it was asked, `owner` the name of the person whose session answers, and
+ * `key` the ask's own key.
  * An answered or dropped question is sent again down the session's own link until it is acked.
  */
 export const AskedMessageSchema = z.object({
@@ -405,6 +406,8 @@ export const AskedMessageSchema = z.object({
   answer: z.string().min(1).optional(),
   note: z.string().min(1).optional(),
   owner: z.string().optional(),
+  /** The `key` the question was asked under, so the asking side knows which of its asks it was. */
+  key: z.string().min(1).max(100).optional(),
 });
 
 /**

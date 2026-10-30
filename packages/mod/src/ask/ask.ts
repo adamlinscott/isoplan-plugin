@@ -2,8 +2,9 @@
 // question goes to the office server on the session's short link, and the answer comes back from
 // the fork of the room's lead on its owner's machine. It never blocks the session for long (#45):
 // it polls askPolls times, askPollSeconds apart (runner.json, with the caps), and the server's own
-// news of the question cuts a wait short; however runner.json is set, it waits at most
-// MAX_WAIT_MS. With no answer by then, the agent is told to carry on: the question stays queued on
+// news of the question cuts a wait short. However runner.json is set, the whole wait, the ask and
+// every check included, fits in MAX_WAIT_MS, well under the ten minutes Claude Code gives a
+// command the hooks module runs. With no answer by then, the agent is told to carry on: the question stays queued on
 // the server, and its end reaches the agent later as a note on one of its next tool results
 // (hooks/register.ts). An end shown here is acked (asked-ack), so the server doesn't send it again.
 //
@@ -12,7 +13,7 @@
 
 import { PROTOCOL_VERSION, type AskedMessage, type OfficeServerMessage } from "@isoplan/protocol";
 import type { SideLink } from "../handoff/connection.js";
-import { endText, MAX_WAIT_MS } from "./text.js";
+import { endText, MAX_WAIT_MS, waitText } from "./text.js";
 
 export { MAX_WAIT_MS };
 
@@ -42,9 +43,10 @@ export const UNCONFIRMED =
   "The office server didn't confirm the question in time. It may have been logged all the same, and if so its answer reaches you later as a note on one of your next tool results. Carry on without it, and don't ask it again.";
 
 /** What the agent is told: the answer, or why there is none and that it should carry on. */
-export async function askRoom(link: SideLink, question: string, s: AskSettings, key?: string): Promise<string> {
+export async function askRoom(link: SideLink, question: string, s: AskSettings, { key, deadline = Date.now() + MAX_WAIT_MS, now = Date.now }: { key?: string; deadline?: number; now?: () => number } = {}): Promise<string> {
+  const left = () => deadline - now();
   link.send({ type: "ask-room", v: PROTOCOL_VERSION, question, ...(key ? { key } : {}) });
-  const first = await link.next(isAsked(null), ANSWER_MS).catch(() => null);
+  const first = left() > 0 ? await link.next(isAsked(null), Math.min(ANSWER_MS, left())).catch(() => null) : null;
   if (!first) return UNCONFIRMED;
   if (first.type === "error") {
     if (first.code === "token-expired") throw new TokenExpired(first.message);
@@ -54,36 +56,27 @@ export async function askRoom(link: SideLink, question: string, s: AskSettings, 
   let latest: AskedMessage = first;
   const id = latest.question;
   const pollMs = s.askPollSeconds * 1000;
-  const polls = Math.min(s.askPolls, Math.floor(MAX_WAIT_MS / Math.max(pollMs, 1)));
   try {
-    for (let poll = 1; poll <= polls && !over(latest); poll++) {
+    for (let poll = 1; poll <= s.askPolls && !over(latest) && left() > 0; poll++) {
       // A change the server sends ends the wait early; otherwise the poll asks where it stands.
-      const pushed = await link.next(isAsked(id), pollMs).catch(() => null);
+      const pushed = await link.next(isAsked(id), Math.min(pollMs, left())).catch(() => null);
       if (pushed?.type === "error") break;
       if (pushed) {
         latest = pushed;
         continue;
       }
+      if (left() <= 0) break;
       link.send({ type: "ask-check", v: PROTOCOL_VERSION, question: id });
-      const checked = await link.next(isAsked(id), ANSWER_MS);
+      const checked = await link.next(isAsked(id), Math.min(ANSWER_MS, left()));
       if (checked.type === "error") break;
       latest = checked;
     }
     if (over(latest)) link.send({ type: "asked-ack", v: PROTOCOL_VERSION, question: id });
   } catch {
-    // The link went: what the server knows stands, and the end still arrives as a note.
+    // The link went, or the last check ran out of time: what the server knows stands, and the end
+    // still arrives as a note.
   }
-  return said(latest);
+  return over(latest) ? endText(latest, false) : waitText(latest);
 }
 
 const over = (m: AskedMessage) => m.state === "answered" || m.state === "dropped";
-
-function said(m: AskedMessage): string {
-  if (over(m)) return endText(m, false);
-  const why = m.note ?? (m.state === "withheld" ? "the answer is held on the owner's machine until they release it" : "the room's lead is still answering");
-  return [
-    `The room hasn't answered yet: ${why}`,
-    "",
-    `Carry on without the answer, and don't ask again or wait for it. The question (${m.question}) stays queued, and if an answer comes later it reaches you as a note on one of your next tool results.`,
-  ].join("\n");
-}

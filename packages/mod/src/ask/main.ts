@@ -25,7 +25,7 @@ import { accountOf, claudePaths, projectOf } from "../data-layer/identity.js";
 import { nodeIo } from "../data-layer/io.js";
 import { createPairing, pairingLockPath, pairingPath, pairingWriteLockPath, postJson, readPairing } from "../data-layer/pairing.js";
 import { openSideLink } from "../handoff/connection.js";
-import { askRoom, TokenExpired, type AskSettings } from "./ask.js";
+import { askRoom, MAX_WAIT_MS, TokenExpired, type AskSettings } from "./ask.js";
 
 const CONNECT_MS = 20000;
 
@@ -105,6 +105,8 @@ async function main(argv: string[]): Promise<string> {
   const config = await loadConfig(io, path.join(modDir, "config.json"), path.join(isoplanDir, "config.json"));
   if (config.plainRefused) return `The room can't be asked: config.json's server, ${config.plainRefused}, is plain ws:// to another machine. Carry on without the answer.`;
   const pairing = await machinePairing(config.server, config.allowPlainWs);
+  // One bound for the whole wait, a retry after an expired token included.
+  const deadline = Date.now() + MAX_WAIT_MS;
   try {
     for (let tries = 0; ; tries++) {
       const token = await pairing.token();
@@ -114,7 +116,7 @@ async function main(argv: string[]): Promise<string> {
           link.send({ type: "asked-ack", v: PROTOCOL_VERSION, question: ack });
           return `acked ${ack}`;
         }
-        return await askRoom(link, question, settings, key);
+        return await askRoom(link, question, settings, { key, deadline });
       } catch (err) {
         if (!(err instanceof TokenExpired) || tries > 0) throw err;
         await pairing.expired(token);

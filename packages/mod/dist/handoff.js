@@ -6114,7 +6114,9 @@ const OfficeServerMessageSchema = discriminatedUnion("type", [
 		]),
 		answer: string().min(1).optional(),
 		note: string().min(1).optional(),
-		owner: string().optional()
+		owner: string().optional(),
+		/** The `key` the question was asked under, so the asking side knows which of its asks it was. */
+		key: string().min(1).max(100).optional()
 	}),
 	object({
 		type: literal("ask-rights"),

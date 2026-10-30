@@ -40,6 +40,10 @@ export interface Host {
     /** Runs a command by argv (no shell) and resolves once it exits; the timeout is 30 s unless given, ten minutes at most. */
     run(argv: readonly string[], init?: { cwd?: string; stdin?: string; timeoutMs?: number }): Promise<{ exitCode: number; stdout: string; stderr: string }>;
   };
+  agent: {
+    /** The session's agents, each with its id (a loop's `agentId`) and status. */
+    list(): Promise<{ id: string; status: string }[]>;
+  };
   tool: {
     /** Declares a tool the model can call, as `mcp__<plugin>__<name>`, served by a `tool.call` hook on that name. */
     register(tool: { name: string; description: string; inputSchema?: Record<string, unknown>; isDeferred?: boolean }): Promise<{ tool: string }>;
