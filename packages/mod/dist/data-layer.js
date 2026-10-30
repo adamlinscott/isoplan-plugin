@@ -1,9 +1,9 @@
 import { execFile, spawn } from "node:child_process";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { createHash, randomBytes, randomUUID } from "node:crypto";
 import http from "node:http";
 //#region ../../node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/core/util.js
 function getEnumValues(entries) {
@@ -5735,7 +5735,11 @@ const ReportFactSchema = object({
 /**
 * A question an agent asked its owner, open until it is answered, so the floor can show it and the
 * owner can answer it there. One of the named cases of session-derived text leaving a machine: the
-* server keeps it only for the retention period. `id` is the tool call's own id.
+* server keeps it only for the retention period. `id` is the tool call's own id. `answerable`: the
+* session's own plugin is waiting for it, so an answer from the floor reaches it; without it (a
+* session seen only through the wake hook, a question asked before the plugin loaded) the floor
+* shows the question read-only. `withheld`: the secret scan matched its text, or the patterns
+* couldn't be read, so `questions` is only a placeholder; it is answered in the terminal.
 */
 const QuestionFactSchema = object({
 	id: string().min(1),
@@ -5750,6 +5754,8 @@ const QuestionFactSchema = object({
 		})),
 		multiSelect: boolean()
 	})).min(1),
+	answerable: literal(true).optional(),
+	withheld: literal(true).optional(),
 	extra: Extra
 });
 const FactsSchema = object({
@@ -5909,7 +5915,9 @@ discriminatedUnion("type", [
 			type: literal("reply"),
 			v: Version,
 			id: RequestId,
-			kind: literal("owner-answer")
+			kind: literal("owner-answer"),
+			closed: literal(true).optional(),
+			late: literal(true).optional()
 		})
 	]),
 	discriminatedUnion("reason", [
@@ -7621,6 +7629,7 @@ const DOING = {
 	Agent: "talk",
 	SendMessage: "talk"
 };
+const ASK_TOOL = "AskUserQuestion";
 const READ_TOOLS = ["Read"];
 const STOPPED = /* @__PURE__ */ new Set(["killed", "stopped"]);
 const encoder = new TextEncoder();
@@ -7789,7 +7798,8 @@ function createClaudeCode(io) {
 			edits: [],
 			reads: [],
 			waits: [],
-			reports: []
+			reports: [],
+			questions: []
 		};
 		const leadWorking = main.turnOpen && now - c.ownMtime <= config.stalledMinutes * 6e4;
 		facts.agents.push({
@@ -7807,6 +7817,7 @@ function createClaudeCode(io) {
 		});
 		main.touches = await addFiles(facts.edits, lead, main.touches, [...config.touchedTools, ...config.shellTools], now, config, resolve);
 		main.reads = await addFiles(facts.reads, lead, main.reads, [...READ_TOOLS, ...config.shellTools], now, config, resolve);
+		if (main.turnOpen) addQuestions(facts.questions, lead, main, results, c.ownMtime);
 		for (const a of agentFiles) {
 			const id = agentId(a.id);
 			const type = typeof a.meta.agentType === "string" && a.meta.agentType ? a.meta.agentType : null;
@@ -7845,6 +7856,7 @@ function createClaudeCode(io) {
 				on: id,
 				since: iso(spawn ? spawn.at : a.t.firstAt, a.mtimeMs)
 			});
+			if (live) addQuestions(facts.questions, id, a.t, results, a.mtimeMs);
 			if ((s.status === "done" || s.status === "failed") && a.t.lastText !== null) facts.reports.push({
 				agent: id,
 				at: iso(a.t.lastTextAt, a.mtimeMs),
@@ -7916,6 +7928,40 @@ function createClaudeCode(io) {
 	};
 }
 const agentId = (id) => `${SOURCE}:${id}`;
+function addQuestions(list, agent, t, results, mtimeMs) {
+	for (const [id, ask] of t.asks) {
+		if (results.has(id)) continue;
+		const asked = ask.input?.questions;
+		if (!Array.isArray(asked)) continue;
+		const questions = [];
+		let incomplete = false;
+		for (const q of asked) {
+			if (!q || typeof q.question !== "string" || !q.question) {
+				incomplete = true;
+				continue;
+			}
+			const given = Array.isArray(q.options) ? q.options : [];
+			const options = given.filter((o) => o && typeof o.label === "string" && o.label);
+			if (options.length !== given.length) incomplete = true;
+			questions.push({
+				question: q.question,
+				header: typeof q.header === "string" ? q.header : "",
+				options: options.map((o) => ({
+					label: o.label,
+					description: typeof o.description === "string" ? o.description : ""
+				})),
+				multiSelect: q.multiSelect === true
+			});
+		}
+		if (questions.length) list.push({
+			id,
+			agent,
+			at: iso(ask.at, mtimeMs),
+			questions,
+			...incomplete ? { extra: { incomplete: true } } : {}
+		});
+	}
+}
 const message = (err) => String(err && err.message || err);
 function iso(ms, fallback) {
 	return new Date(Number.isFinite(ms) ? ms : fallback).toISOString();
@@ -7977,7 +8023,8 @@ function newTranscriptState() {
 		prompts: 0,
 		tools: 0,
 		firstPrompt: null,
-		compacted: false
+		compacted: false,
+		asks: /* @__PURE__ */ new Map()
 	};
 }
 const MESSAGE_TYPES = /* @__PURE__ */ new Set([
@@ -8023,6 +8070,10 @@ function foldLine(st, line) {
 			st.tools++;
 			st.waiting = true;
 			if (c.name === "Agent" && typeof c.id === "string") st.spawns.set(c.id, at);
+			if (c.name === ASK_TOOL && typeof c.id === "string") st.asks.set(c.id, {
+				at,
+				input: c.input
+			});
 			const input = c.input || {};
 			const cwd = ev.cwd || st.cwd;
 			const shell = typeof input.command === "string" ? shellFiles(input.command, cwd, { powershell: c.name === "PowerShell" }) : {
@@ -8081,6 +8132,7 @@ function foldLine(st, line) {
 		if (turn !== null) setTurn(st, turn, at);
 		if (turn === true && !toolResults) {
 			st.lastTool = null;
+			st.asks.clear();
 			st.prompts++;
 			if (st.firstPrompt === null) st.firstPrompt = promptText(content).slice(0, PROMPT_CHARS);
 		}
@@ -8268,6 +8320,9 @@ function diffFacts(before, after) {
 	const reports = diff(before.reports, after.reports, (r) => r.agent);
 	if (reports.upsert.length) upsert.reports = reports.upsert;
 	if (reports.remove.length) remove.reports = reports.remove.map((r) => r.agent);
+	const questions = diff(before.questions ?? [], after.questions ?? [], (q) => q.id);
+	if (questions.upsert.length) upsert.questions = questions.upsert;
+	if (questions.remove.length) remove.questions = questions.remove.map((q) => q.id);
 	return Object.keys(upsert).length || Object.keys(remove).length ? {
 		upsert,
 		remove
@@ -8539,6 +8594,127 @@ function createLink({ url, hello, emit, minIntervalMs = 1e3, retryBaseMs = 1e3, 
 		}
 	};
 }
+//#endregion
+//#region src/data-layer/owner-answers.ts
+const TAKEN_WAIT_MS = 1e4;
+const POLL_MS = 100;
+const LATE_MS = 6e4;
+/** What a withheld question says in place of its text. */
+const WITHHELD_QUESTION = "Held for its owner to check: the secret check found what may be a secret in this question, so it is answered in the terminal.";
+/**
+* The facts with their questions as they are sent: each one the scan matches, or every one while
+* `patterns` is null, as a placeholder marked `withheld`; each other one `answerable` while `waiting`
+* holds its id, unless the source left part of it out.
+*/
+function prepareQuestions(facts, patterns, waiting, log) {
+	if (!facts.questions?.length) return facts;
+	const questions = facts.questions.map((q) => {
+		const matched = scan(q.questions.flatMap((x) => [
+			x.question,
+			x.header,
+			...x.options.flatMap((o) => [o.label, o.description])
+		]).join("\n"), patterns);
+		if (matched) {
+			log(`withheld the question ${q.id} of ${q.agent}: ${patterns ? `it matches the secret pattern "${matched}"` : "the secret patterns couldn't be read"}; it is answered in the terminal`);
+			return {
+				id: q.id,
+				agent: q.agent,
+				at: q.at,
+				questions: [{
+					question: WITHHELD_QUESTION,
+					header: "",
+					options: [],
+					multiSelect: false
+				}],
+				withheld: true
+			};
+		}
+		return waiting.has(q.id) && !q.extra?.incomplete ? {
+			...q,
+			answerable: true
+		} : q;
+	});
+	return {
+		...facts,
+		questions
+	};
+}
+/**
+* A reply only once the hooks module says the answer ended the question's call; a refusal saying why
+* not otherwise. With no word from it in `waitMs`, a question that has closed since gets a `closed`
+* reply, which says only that it has an answer, the floor's or the terminal's.
+*/
+async function relayOwnerAnswer(request, { detached, facts, file, emit, take, sleep = wait, waitMs = TAKEN_WAIT_MS }) {
+	const refuse = (detail, gaveUp = false) => ({
+		message: {
+			type: "refusal",
+			v: 1,
+			id: request.id,
+			reason: "unavailable",
+			detail
+		},
+		gaveUp
+	});
+	const open = () => facts()?.questions?.find((q) => q.id === request.question);
+	if (detached) return refuse("This session is seen only through Isoplan's wake hook, so its question can only be answered in its terminal.");
+	const question = open();
+	if (!question) return refuse("The question isn't waiting for an answer any more: it was answered in the terminal, or the agent moved on.");
+	if (!question.answerable) return refuse("Isoplan's plugin isn't waiting for this question in its session, so answer it in its terminal.");
+	emit({
+		type: "owner-answer",
+		question: request.question,
+		answers: request.answers,
+		file
+	});
+	for (let waited = 0; waited < waitMs; waited += POLL_MS) {
+		await sleep(POLL_MS);
+		const taken = await takenFrom(take, file, request.question);
+		if (taken === null) continue;
+		if (taken) return {
+			message: {
+				type: "reply",
+				v: 1,
+				id: request.id,
+				kind: "owner-answer"
+			},
+			gaveUp: false
+		};
+		return refuse("The question was answered in the terminal first.");
+	}
+	if (!open()) return {
+		message: {
+			type: "reply",
+			v: 1,
+			id: request.id,
+			kind: "owner-answer",
+			closed: true
+		},
+		gaveUp: true
+	};
+	return refuse("Claude Code didn't take the answer in time: answer it in the terminal.", true);
+}
+/**
+* After a request gave up: whether the hooks module still says, within `ms`, that it took the answer
+* (true), that it didn't (false), or nothing at all (null).
+*/
+async function lateTake(question, file, take, { sleep = wait, ms = LATE_MS } = {}) {
+	for (let waited = 0; waited < ms; waited += POLL_MS) {
+		await sleep(POLL_MS);
+		const taken = await takenFrom(take, file, question);
+		if (taken !== null) return taken;
+	}
+	return null;
+}
+async function takenFrom(take, file, question) {
+	const text = await take(file);
+	if (text === null) return null;
+	let taken = {};
+	try {
+		taken = JSON.parse(text);
+	} catch {}
+	return taken.question === question ? taken.taken === true : null;
+}
+const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 //#endregion
 //#region src/data-layer/pairing.ts
 /** Renewed this long before it runs out. */
@@ -9034,6 +9210,8 @@ async function main(argv) {
 	const userConfigPath = path.join(claudeDir, "isoplan", "config.json");
 	const titlesDir = path.join(claudeDir, "isoplan", "titles");
 	const titleFile = path.join(titlesDir, `${sessionId}.json`);
+	const answersDir = path.join(claudeDir, "isoplan", "answers", sessionId);
+	const waitsDir = path.join(claudeDir, "isoplan", "waits", sessionId);
 	const modPatterns = path.join(here, "..", "secret-patterns.json");
 	const ownerPatterns = path.join(claudeDir, "isoplan", "secret-patterns.json");
 	const machine = os.hostname();
@@ -9154,6 +9332,16 @@ async function main(argv) {
 		server,
 		state: "waiting"
 	});
+	if (!detached) {
+		for (const dir of [answersDir, waitsDir]) await fs.rm(dir, {
+			recursive: true,
+			force: true
+		}).catch(() => {});
+		if (await fs.mkdir(waitsDir, { recursive: true }).then(() => true, () => false)) emit({
+			type: "waits",
+			dir: waitsDir
+		});
+	}
 	let link = null;
 	let reported = "";
 	let title = null;
@@ -9166,6 +9354,8 @@ async function main(argv) {
 		text
 	}));
 	let shown = null;
+	let waiting = /* @__PURE__ */ new Set();
+	let sent = null;
 	const said = /* @__PURE__ */ new Set();
 	const patternLog = (text) => {
 		if (!said.has(text)) emit({
@@ -9174,6 +9364,7 @@ async function main(argv) {
 		});
 		said.add(text);
 	};
+	const outgoing = (facts, patterns) => prepareQuestions(hold.apply(facts, patterns), patterns, waiting, patternLog);
 	do {
 		const now = Date.now();
 		const isFirstPass = passes++ === 0;
@@ -9280,12 +9471,43 @@ async function main(argv) {
 				}),
 				onNotWanted: () => isUnwanted = detached,
 				onMessage: (message) => {
+					if (message.type === "request" && message.kind === "owner-answer") {
+						const file = path.join(answersDir, `${randomUUID()}.json`);
+						fs.mkdir(answersDir, { recursive: true }).then(async () => {
+							const relayed = await relayOwnerAnswer(message, {
+								detached,
+								facts: () => sent,
+								file,
+								emit,
+								take: takeFile
+							});
+							link?.send(relayed.message);
+							if (!relayed.gaveUp) return;
+							const late = await lateTake(message.question, file, takeFile);
+							if (late === null) return;
+							emit({
+								type: "log",
+								text: `the hooks module said late that it ${late ? "took" : "didn't take"} the owner's answer to ${message.question}`
+							});
+							if (late) link?.send({
+								type: "reply",
+								v: 1,
+								id: message.id,
+								kind: "owner-answer",
+								late: true
+							});
+						}).finally(() => fs.rm(file, { force: true }).catch(() => {})).catch((err) => emit({
+							type: "log",
+							text: `couldn't pass the owner's answer on: ${String(err?.message ?? err)}`
+						}));
+						return;
+					}
 					if (message.type !== "release") return emit({
 						type: "log",
 						text: `the office server sent a ${message.type} message, which this data layer doesn't handle yet`
 					});
 					hold.release(message.id).then((released) => {
-						if (released && shown) link?.update(hold.apply(...shown));
+						if (released && shown) link?.update(sent = outgoing(...shown));
 					});
 				},
 				hello: {
@@ -9303,8 +9525,9 @@ async function main(argv) {
 			patternLog(`couldn't read the secret patterns, so every report is withheld: ${String(err?.message ?? err)}`);
 			return null;
 		});
+		waiting = detached ? /* @__PURE__ */ new Set() : await waitsOf(waitsDir, facts);
 		shown = [facts, patterns];
-		link.update(hold.apply(facts, patterns));
+		link.update(sent = outgoing(facts, patterns));
 		const why = detached ? detachedStop({
 			now,
 			lastActive: facts.session.lastActive,
@@ -9332,6 +9555,25 @@ async function writeLog(file, text) {
 	await fs.mkdir(path.dirname(file), { recursive: true });
 	if (size > LOG_CAP_BYTES) await fs.writeFile(file, text);
 	else await fs.appendFile(file, text);
+}
+async function waitsOf(dir, facts) {
+	const out = /* @__PURE__ */ new Set();
+	for (const q of facts.questions ?? []) {
+		if (!/^[A-Za-z0-9_-]{1,200}$/.test(q.id)) continue;
+		const mark = await fs.readFile(path.join(dir, `${q.id}.json`), "utf8").then((text) => JSON.parse(text), () => null);
+		if (mark?.question === q.id && mark.waiting === true) out.add(q.id);
+	}
+	return out;
+}
+async function takeFile(file) {
+	const text = await fs.readFile(file, "utf8").catch(() => null);
+	try {
+		JSON.parse(text ?? "");
+	} catch {
+		return null;
+	}
+	await fs.rm(file, { force: true }).catch(() => {});
+	return text;
 }
 async function takeReply(file) {
 	let value;

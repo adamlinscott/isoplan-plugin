@@ -43,3 +43,13 @@ test("changes: nothing changed is null; each list upserts what is new or differs
     remove: { reads: [{ agent: "claude-code:w", file: "b.md" }], waits: [{ waiter: lead, on: "claude-code:w" }] },
   });
 });
+
+test("changes: a question is upserted when new or changed, and removed by its id; none before counts as none", () => {
+  const asked = (id: string, question: string) => ({ id, agent: lead, at, questions: [{ question, header: "", options: [], multiSelect: false }] });
+  const one: Facts = { ...base, questions: [asked("toolu_1", "Which branch?")] };
+  expect(diffFacts(base, one)).toEqual({ upsert: { questions: one.questions }, remove: {} });
+  const two: Facts = { ...base, questions: [{ ...asked("toolu_1", "Which branch?"), answerable: true }, asked("toolu_2", "Ship it?")] };
+  expect(diffFacts(one, two)).toEqual({ upsert: { questions: two.questions }, remove: {} });
+  expect(diffFacts(two, { ...base, questions: [] })).toEqual({ upsert: {}, remove: { questions: ["toolu_1", "toolu_2"] } });
+  expect(diffFacts(one, base)).toEqual({ upsert: {}, remove: { questions: ["toolu_1"] } });
+});

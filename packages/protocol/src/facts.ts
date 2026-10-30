@@ -94,7 +94,11 @@ export const ReportFactSchema = z.object({
 /**
  * A question an agent asked its owner, open until it is answered, so the floor can show it and the
  * owner can answer it there. One of the named cases of session-derived text leaving a machine: the
- * server keeps it only for the retention period. `id` is the tool call's own id.
+ * server keeps it only for the retention period. `id` is the tool call's own id. `answerable`: the
+ * session's own plugin is waiting for it, so an answer from the floor reaches it; without it (a
+ * session seen only through the wake hook, a question asked before the plugin loaded) the floor
+ * shows the question read-only. `withheld`: the secret scan matched its text, or the patterns
+ * couldn't be read, so `questions` is only a placeholder; it is answered in the terminal.
  */
 export const QuestionFactSchema = z.object({
   id: z.string().min(1),
@@ -110,6 +114,8 @@ export const QuestionFactSchema = z.object({
       }),
     )
     .min(1),
+  answerable: z.literal(true).optional(),
+  withheld: z.literal(true).optional(),
   extra: Extra,
 });
 

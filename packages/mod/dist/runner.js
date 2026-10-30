@@ -5737,7 +5737,11 @@ const ReportFactSchema = object({
 /**
 * A question an agent asked its owner, open until it is answered, so the floor can show it and the
 * owner can answer it there. One of the named cases of session-derived text leaving a machine: the
-* server keeps it only for the retention period. `id` is the tool call's own id.
+* server keeps it only for the retention period. `id` is the tool call's own id. `answerable`: the
+* session's own plugin is waiting for it, so an answer from the floor reaches it; without it (a
+* session seen only through the wake hook, a question asked before the plugin loaded) the floor
+* shows the question read-only. `withheld`: the secret scan matched its text, or the patterns
+* couldn't be read, so `questions` is only a placeholder; it is answered in the terminal.
 */
 const QuestionFactSchema = object({
 	id: string().min(1),
@@ -5752,6 +5756,8 @@ const QuestionFactSchema = object({
 		})),
 		multiSelect: boolean()
 	})).min(1),
+	answerable: literal(true).optional(),
+	withheld: literal(true).optional(),
 	extra: Extra
 });
 const FactsSchema = object({
@@ -5911,7 +5917,9 @@ discriminatedUnion("type", [
 			type: literal("reply"),
 			v: Version,
 			id: RequestId,
-			kind: literal("owner-answer")
+			kind: literal("owner-answer"),
+			closed: literal(true).optional(),
+			late: literal(true).optional()
 		})
 	]),
 	discriminatedUnion("reason", [
@@ -6437,6 +6445,9 @@ function diffFacts(before, after) {
 	const reports = diff(before.reports, after.reports, (r) => r.agent);
 	if (reports.upsert.length) upsert.reports = reports.upsert;
 	if (reports.remove.length) remove.reports = reports.remove.map((r) => r.agent);
+	const questions = diff(before.questions ?? [], after.questions ?? [], (q) => q.id);
+	if (questions.upsert.length) upsert.questions = questions.upsert;
+	if (questions.remove.length) remove.questions = questions.remove.map((q) => q.id);
 	return Object.keys(upsert).length || Object.keys(remove).length ? {
 		upsert,
 		remove
@@ -7679,6 +7690,7 @@ const DOING = {
 	Agent: "talk",
 	SendMessage: "talk"
 };
+const ASK_TOOL = "AskUserQuestion";
 const READ_TOOLS = ["Read"];
 const STOPPED = /* @__PURE__ */ new Set(["killed", "stopped"]);
 const encoder = new TextEncoder();
@@ -7847,7 +7859,8 @@ function createClaudeCode(io) {
 			edits: [],
 			reads: [],
 			waits: [],
-			reports: []
+			reports: [],
+			questions: []
 		};
 		const leadWorking = main.turnOpen && now - c.ownMtime <= config.stalledMinutes * 6e4;
 		facts.agents.push({
@@ -7865,6 +7878,7 @@ function createClaudeCode(io) {
 		});
 		main.touches = await addFiles(facts.edits, lead, main.touches, [...config.touchedTools, ...config.shellTools], now, config, resolve);
 		main.reads = await addFiles(facts.reads, lead, main.reads, [...READ_TOOLS, ...config.shellTools], now, config, resolve);
+		if (main.turnOpen) addQuestions(facts.questions, lead, main, results, c.ownMtime);
 		for (const a of agentFiles) {
 			const id = agentId(a.id);
 			const type = typeof a.meta.agentType === "string" && a.meta.agentType ? a.meta.agentType : null;
@@ -7903,6 +7917,7 @@ function createClaudeCode(io) {
 				on: id,
 				since: iso(spawn ? spawn.at : a.t.firstAt, a.mtimeMs)
 			});
+			if (live) addQuestions(facts.questions, id, a.t, results, a.mtimeMs);
 			if ((s.status === "done" || s.status === "failed") && a.t.lastText !== null) facts.reports.push({
 				agent: id,
 				at: iso(a.t.lastTextAt, a.mtimeMs),
@@ -7974,6 +7989,40 @@ function createClaudeCode(io) {
 	};
 }
 const agentId = (id) => `${SOURCE}:${id}`;
+function addQuestions(list, agent, t, results, mtimeMs) {
+	for (const [id, ask] of t.asks) {
+		if (results.has(id)) continue;
+		const asked = ask.input?.questions;
+		if (!Array.isArray(asked)) continue;
+		const questions = [];
+		let incomplete = false;
+		for (const q of asked) {
+			if (!q || typeof q.question !== "string" || !q.question) {
+				incomplete = true;
+				continue;
+			}
+			const given = Array.isArray(q.options) ? q.options : [];
+			const options = given.filter((o) => o && typeof o.label === "string" && o.label);
+			if (options.length !== given.length) incomplete = true;
+			questions.push({
+				question: q.question,
+				header: typeof q.header === "string" ? q.header : "",
+				options: options.map((o) => ({
+					label: o.label,
+					description: typeof o.description === "string" ? o.description : ""
+				})),
+				multiSelect: q.multiSelect === true
+			});
+		}
+		if (questions.length) list.push({
+			id,
+			agent,
+			at: iso(ask.at, mtimeMs),
+			questions,
+			...incomplete ? { extra: { incomplete: true } } : {}
+		});
+	}
+}
 const message = (err) => String(err && err.message || err);
 function iso(ms, fallback) {
 	return new Date(Number.isFinite(ms) ? ms : fallback).toISOString();
@@ -8035,7 +8084,8 @@ function newTranscriptState() {
 		prompts: 0,
 		tools: 0,
 		firstPrompt: null,
-		compacted: false
+		compacted: false,
+		asks: /* @__PURE__ */ new Map()
 	};
 }
 const MESSAGE_TYPES = /* @__PURE__ */ new Set([
@@ -8081,6 +8131,10 @@ function foldLine(st, line) {
 			st.tools++;
 			st.waiting = true;
 			if (c.name === "Agent" && typeof c.id === "string") st.spawns.set(c.id, at);
+			if (c.name === ASK_TOOL && typeof c.id === "string") st.asks.set(c.id, {
+				at,
+				input: c.input
+			});
 			const input = c.input || {};
 			const cwd = ev.cwd || st.cwd;
 			const shell = typeof input.command === "string" ? shellFiles(input.command, cwd, { powershell: c.name === "PowerShell" }) : {
@@ -8139,6 +8193,7 @@ function foldLine(st, line) {
 		if (turn !== null) setTurn(st, turn, at);
 		if (turn === true && !toolResults) {
 			st.lastTool = null;
+			st.asks.clear();
 			st.prompts++;
 			if (st.firstPrompt === null) st.firstPrompt = promptText(content).slice(0, PROMPT_CHARS);
 		}

@@ -44,6 +44,40 @@ export interface PairLine {
   expires: string;
 }
 
+/**
+ * The owner answered a question from the floor: `question` is the AskUserQuestion call's id, and
+ * `answers` maps each question's text to its answer. The hooks module ends the call with them if
+ * it is still waiting for it, and writes an AnswerTaken as JSON to `file` either way.
+ */
+export interface OwnerAnswerLine {
+  type: "owner-answer";
+  question: string;
+  answers: Record<string, string>;
+  file: string;
+}
+
+/**
+ * Where the hooks module marks the questions it waits on: `<dir>/<call id>.json`, a WaitMark, written
+ * as it starts to wait for a floor answer and again when it stops. The data layer marks a question
+ * answerable only while its mark says it waits. Sent once each time the data layer starts.
+ */
+export interface WaitsLine {
+  type: "waits";
+  dir: string;
+}
+
+/** A question's wait mark. */
+export interface WaitMark {
+  question: string;
+  waiting: boolean;
+}
+
+/** What an owner-answer's file holds: whether the answer reached the call waiting for it. */
+export interface AnswerTaken {
+  question: string;
+  taken: boolean;
+}
+
 /** A problem worth a line in the debug log. */
 export interface LogLine {
   type: "log";
@@ -61,4 +95,4 @@ export interface TitleReply {
  * `asked` is the end of a question the session's agent asked the room, arriving after it stopped
  * waiting, and `ask-rights` whether the session may ask its room (#49).
  */
-export type DataLayerLine = StatusLine | TitleAskLine | PairLine | LogLine | ConflictMessage | ErrorMessage | AskedMessage | AskRightsMessage;
+export type DataLayerLine = StatusLine | TitleAskLine | PairLine | WaitsLine | OwnerAnswerLine | LogLine | ConflictMessage | ErrorMessage | AskedMessage | AskRightsMessage;

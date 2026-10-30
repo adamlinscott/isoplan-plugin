@@ -1,7 +1,8 @@
 // What changed between two sets of one session's facts, as a `changes` message carries it: the
 // records that are new or differ, and the keys of those that went away. Records are keyed as the
 // protocol keys them: an agent by its id, an edit or read by agent and file, a wait by waiter and
-// on, a report by its agent. The session is one record, sent whole when it changed.
+// on, a report by its agent, a question by its id. The session is one record, sent whole when it
+// changed. Facts without questions have none.
 
 import type { FactRemove, Facts, FactUpsert } from "@isoplan/protocol";
 
@@ -28,6 +29,10 @@ export function diffFacts(before: Facts, after: Facts): { upsert: FactUpsert; re
   const reports = diff(before.reports, after.reports, (r) => r.agent);
   if (reports.upsert.length) upsert.reports = reports.upsert;
   if (reports.remove.length) remove.reports = reports.remove.map((r) => r.agent);
+
+  const questions = diff(before.questions ?? [], after.questions ?? [], (q) => q.id);
+  if (questions.upsert.length) upsert.questions = questions.upsert;
+  if (questions.remove.length) remove.questions = questions.remove.map((q) => q.id);
 
   return Object.keys(upsert).length || Object.keys(remove).length ? { upsert, remove } : null;
 }

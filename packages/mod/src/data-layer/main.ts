@@ -13,6 +13,9 @@
 // until its owner releases it (src/data-layer/reports.ts). An office server that signs people in
 // wants the machine paired first: the link pairs it, keeping the credential in
 // <claude dir>/isoplan/pairing.json, under the machine's Claude account (src/data-layer/pairing.ts).
+// An agent's open question to its owner is reported too, secret-checked like a report, and
+// answerable from the floor while this data layer's hooks module marks that it waits for it
+// (src/data-layer/owner-answers.ts); a detached one's are read-only.
 //
 //   node dist/data-layer.js --session <session id> --cwd <the session's folder> --detached
 //
@@ -31,6 +34,7 @@
 // without it if the folder can't be written.
 
 import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -38,9 +42,9 @@ import { fileURLToPath } from "node:url";
 import { PROTOCOL_VERSION, type Facts } from "@isoplan/protocol";
 import { installWake } from "../install/install.js";
 import { managedDir, pluginDirsOf, pluginState, pluginsDir, type Place } from "../install/state.js";
-import type { DataLayerLine, TitleReply } from "../lines.js";
+import type { DataLayerLine, TitleReply, WaitMark } from "../lines.js";
 import { findClaude } from "../runner/claude-binary.js";
-import { loadPatterns } from "../runner/scan.js";
+import { loadPatterns, type Pattern } from "../runner/scan.js";
 import { startRunner } from "../runner/start.js";
 import { recentSessions } from "../sweep/find.js";
 import { backfill } from "../wake/backfill.js";
@@ -52,6 +56,7 @@ import { createGit } from "./git.js";
 import { accountOf, claudePaths, projectOf } from "./identity.js";
 import { nodeIo } from "./io.js";
 import { createLink, type Link } from "./link.js";
+import { lateTake, prepareQuestions, relayOwnerAnswer } from "./owner-answers.js";
 import { createPairing, pairingLockPath, pairingPath, pairingWriteLockPath } from "./pairing.js";
 import { openReportHold } from "./reports.js";
 import { cleanTitle, nextTitle, TITLE_SYSTEM, type TitleCache } from "./titles.js";
@@ -82,6 +87,10 @@ async function main(argv: string[]): Promise<number> {
   // The person's own folder, not the machine's shared temp folder.
   const titlesDir = path.join(claudeDir, "isoplan", "titles");
   const titleFile = path.join(titlesDir, `${sessionId}.json`);
+  // Where the hooks module says whether it took an owner's answer, one file per request, and where it
+  // marks the questions it waits on: this session's own folders, cleared as the data layer starts.
+  const answersDir = path.join(claudeDir, "isoplan", "answers", sessionId);
+  const waitsDir = path.join(claudeDir, "isoplan", "waits", sessionId);
   const modPatterns = path.join(here, "..", "secret-patterns.json");
   const ownerPatterns = path.join(claudeDir, "isoplan", "secret-patterns.json");
   const machine = os.hostname();
@@ -175,6 +184,10 @@ async function main(argv: string[]): Promise<number> {
     return 0;
   }
   emit({ type: "status", server, state: "waiting" });
+  if (!detached) {
+    for (const dir of [answersDir, waitsDir]) await fs.rm(dir, { recursive: true, force: true }).catch(() => {});
+    if (await fs.mkdir(waitsDir, { recursive: true }).then(() => true, () => false)) emit({ type: "waits", dir: waitsDir });
+  }
 
   let link: Link | null = null;
   let reported = ""; // the last problem logged, so a lasting one is logged once
@@ -185,11 +198,15 @@ async function main(argv: string[]): Promise<number> {
   let passes = 0;
   const hold = await openReportHold(path.join(claudeDir, "isoplan", "released", `${sessionId}.json`), (text) => emit({ type: "log", text }));
   let shown: Parameters<typeof hold.apply> | null = null; // the last facts and patterns the hold was applied to
+  let waiting: ReadonlySet<string> = new Set(); // the open questions the hooks module marks it waits on
+  let sent: Facts | null = null; // the facts last given to the link
   const said = new Set<string>(); // the pattern files' problems, logged once each, since they are read every pass
   const patternLog = (text: string) => {
     if (!said.has(text)) emit({ type: "log", text });
     said.add(text);
   };
+  // What goes to the link: the reports the scan holds held, and the questions checked and marked.
+  const outgoing = (facts: Facts, patterns: Pattern[] | null) => prepareQuestions(hold.apply(facts, patterns), patterns, waiting, patternLog);
 
   do {
     const now = Date.now();
@@ -259,10 +276,30 @@ async function main(argv: string[]): Promise<number> {
         }),
         onNotWanted: () => (isUnwanted = detached),
         // The owner released a withheld report: it goes to the link now, not on the next pass.
+        // The owner answered a question from the floor: it goes to the hooks module.
         onMessage: (message) => {
+          if (message.type === "request" && message.kind === "owner-answer") {
+            const file = path.join(answersDir, `${randomUUID()}.json`);
+            void fs
+              .mkdir(answersDir, { recursive: true })
+              .then(async () => {
+                const relayed = await relayOwnerAnswer(message, { detached, facts: () => sent, file, emit, take: takeFile });
+                link?.send(relayed.message);
+                if (!relayed.gaveUp) return;
+                // The hooks module's word may still come: a take that does follows as a late reply.
+                const late = await lateTake(message.question, file, takeFile);
+                if (late === null) return;
+                emit({ type: "log", text: `the hooks module said late that it ${late ? "took" : "didn't take"} the owner's answer to ${message.question}` });
+                if (late) link?.send({ type: "reply", v: PROTOCOL_VERSION, id: message.id, kind: "owner-answer", late: true });
+              })
+              // A word that came later still, or not at all, is left over: it goes.
+              .finally(() => fs.rm(file, { force: true }).catch(() => {}))
+              .catch((err: unknown) => emit({ type: "log", text: `couldn't pass the owner's answer on: ${String((err as Error)?.message ?? err)}` }));
+            return;
+          }
           if (message.type !== "release") return emit({ type: "log", text: `the office server sent a ${message.type} message, which this data layer doesn't handle yet` });
           void hold.release(message.id).then((released) => {
-            if (released && shown) link?.update(hold.apply(...shown));
+            if (released && shown) link?.update((sent = outgoing(...shown)));
           });
         },
         hello: {
@@ -280,8 +317,9 @@ async function main(argv: string[]): Promise<number> {
       patternLog(`couldn't read the secret patterns, so every report is withheld: ${String((err as Error)?.message ?? err)}`);
       return null;
     });
+    waiting = detached ? new Set() : await waitsOf(waitsDir, facts);
     shown = [facts, patterns];
-    link.update(hold.apply(facts, patterns));
+    link.update((sent = outgoing(facts, patterns)));
     const why = detached ? detachedStop({ now, lastActive: facts.session.lastActive, idleMinutes: config.idleMinutes, downSince }) : null;
     if (why) {
       emit({ type: "log", text: `stopping: ${why}` });
@@ -306,6 +344,30 @@ async function writeLog(file: string, text: string): Promise<void> {
   await fs.mkdir(path.dirname(file), { recursive: true });
   if (size > LOG_CAP_BYTES) await fs.writeFile(file, text);
   else await fs.appendFile(file, text);
+}
+
+// The open questions the hooks module marks it waits on, each in <dir>/<call id>.json.
+async function waitsOf(dir: string, facts: Facts): Promise<Set<string>> {
+  const out = new Set<string>();
+  for (const q of facts.questions ?? []) {
+    if (!/^[A-Za-z0-9_-]{1,200}$/.test(q.id)) continue;
+    const mark = await fs.readFile(path.join(dir, `${q.id}.json`), "utf8").then((text) => JSON.parse(text) as Partial<WaitMark>, () => null);
+    if (mark?.question === q.id && mark.waiting === true) out.add(q.id);
+  }
+  return out;
+}
+
+// A JSON file the hooks module wrote, which goes once it is read; null while it isn't there, or
+// doesn't parse yet (it may still be being written).
+async function takeFile(file: string): Promise<string | null> {
+  const text = await fs.readFile(file, "utf8").catch(() => null);
+  try {
+    JSON.parse(text ?? "");
+  } catch {
+    return null;
+  }
+  await fs.rm(file, { force: true }).catch(() => {});
+  return text;
 }
 
 // The title reply, if the hooks module has written one; the file goes once it is read. One that

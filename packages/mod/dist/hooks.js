@@ -20,6 +20,8 @@ const RUNNING = /* @__PURE__ */ new Set([
 	"running",
 	"waiting"
 ]);
+const ASK_TOOL = "AskUserQuestion";
+const SAFE_ID = /^[A-Za-z0-9_-]{1,200}$/;
 let running = null;
 let lead = null;
 let stop = null;
@@ -35,6 +37,9 @@ let asking = false;
 let lastError = null;
 let pairing = null;
 let pairSaid = false;
+const floorWaits = /* @__PURE__ */ new Map();
+let waitsDir = null;
+let marking = Promise.resolve();
 function register(on) {
 	on("session.start", async ($, e, next) => {
 		const result = await next(e);
@@ -52,7 +57,7 @@ function register(on) {
 	});
 	on("tool.call", async ($, e, next) => {
 		if (toolName !== null && e.tool === toolName) return askRoom($, e);
-		const r = await next(e);
+		const r = await (e.tool === ASK_TOOL ? askBoth($, e, next) : next(e));
 		try {
 			checkSession($);
 			if (!lead || r.deny || r.isError) return r;
@@ -78,6 +83,42 @@ function register(on) {
 			return r;
 		}
 	}).catch(($, e, next) => next(e));
+}
+async function askBoth($, e, next) {
+	const ran = next(e);
+	ran.catch(() => {});
+	let answer;
+	const floor = new Promise((resolve) => answer = resolve);
+	floorWaits.set(e.tool_use_id, answer);
+	mark($, e.tool_use_id, true);
+	try {
+		const first = await Promise.race([ran.then((r) => ({ r })), floor.then((answers) => ({ answers }))]);
+		return "r" in first ? first.r : { result: {
+			questions: e.questions,
+			answers: first.answers
+		} };
+	} finally {
+		floorWaits.delete(e.tool_use_id);
+		mark($, e.tool_use_id, false);
+	}
+}
+function mark($, question, waiting) {
+	const dir = waitsDir;
+	if (!dir || !SAFE_ID.test(question)) return;
+	const wait = {
+		question,
+		waiting
+	};
+	marking = marking.then(() => $.fs.write(`${dir}/${question}.json`, JSON.stringify(wait))).catch((err) => $.ui.log("isoplan: could not mark a question's wait: " + message(err), { to: "debug" }));
+}
+function ownerAnswer($, line) {
+	const answer = floorWaits.get(line.question);
+	answer?.(line.answers);
+	const taken = {
+		question: line.question,
+		taken: !!answer
+	};
+	$.fs.write(line.file, JSON.stringify(taken)).catch((err) => $.ui.log("isoplan: could not say whether the floor's answer was taken: " + message(err), { to: "debug" }));
 }
 async function checkSession($) {
 	const id = await $.session.id().catch(() => null);
@@ -193,6 +234,13 @@ function handle($, text) {
 		case "ask-rights":
 			mayAsk = line.granted;
 			if (line.granted) addTool($);
+			break;
+		case "owner-answer":
+			ownerAnswer($, line);
+			break;
+		case "waits":
+			waitsDir = line.dir;
+			for (const question of floorWaits.keys()) mark($, question, true);
 			break;
 		case "error": {
 			const said = `Isoplan: the office server says: ${line.message} (${line.code})`;

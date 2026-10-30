@@ -278,3 +278,41 @@ test("hooks: a late reply goes to the subagent that asked while it runs, and to 
   expect(lead.context).toEqual([expect.stringContaining("main (q-2).")]);
   expect(await call(h, { agentId: "w1" })).toEqual({ result: "ok", context: [expect.stringContaining("main (q-1).")] });
 });
+
+test("hooks: a question runs at once, so the terminal shows it; an answer from the floor that comes first is the call's result", async () => {
+  const file = "C:/Users/ada/.claude/isoplan/answers/s1-1.json";
+  const next = vi.fn(() => new Promise<ToolCallResult>(() => {})); // the dialog, still open
+  const questions = [{ question: "Which branch?", header: "Branch", options: [{ label: "main", description: "" }], multiSelect: false }];
+  const asked = hooks["tool.call"]!(host([]).$, { tool: "AskUserQuestion", tool_use_id: "toolu_1", questions }, next) as Promise<ToolCallResult>;
+  expect(next).toHaveBeenCalledTimes(1);
+  const h = await start([{ type: "owner-answer", question: "toolu_1", answers: { "Which branch?": "main" }, file }]);
+  expect(await asked).toEqual({ result: { questions, answers: { "Which branch?": "main" } } });
+  await vi.waitFor(() => expect(h.written).toEqual([[file, JSON.stringify({ question: "toolu_1", taken: true })]]));
+});
+
+test("hooks: a question answered in the terminal first keeps that answer, and a later floor answer isn't taken", async () => {
+  const file = "C:/Users/ada/.claude/isoplan/answers/s1-1.json";
+  const answered: ToolCallResult = { result: { answers: { "Which branch?": "A new branch" } } };
+  const asked = hooks["tool.call"]!(host([]).$, { tool: "AskUserQuestion", tool_use_id: "toolu_1" }, async () => answered) as Promise<ToolCallResult>;
+  expect(await asked).toEqual(answered);
+  const h = await start([{ type: "owner-answer", question: "toolu_1", answers: { "Which branch?": "main" }, file }]);
+  await vi.waitFor(() => expect(h.written).toEqual([[file, JSON.stringify({ question: "toolu_1", taken: false })]]));
+});
+
+test("hooks: a question's wait is marked where the data layer says, from its start until it ends; an unsafe call id is never marked", async () => {
+  const dir = "C:/Users/ada/.claude/isoplan/waits/s1";
+  const h = await start([{ type: "waits", dir }], { stays: true });
+  await vi.waitFor(() => expect(h.spawned).toHaveLength(1));
+  await new Promise((r) => setTimeout(r, 10));
+  let end!: (r: ToolCallResult) => void;
+  const asked = hooks["tool.call"]!(h.$, { tool: "AskUserQuestion", tool_use_id: "toolu_1" }, () => new Promise<ToolCallResult>((resolve) => (end = resolve))) as Promise<ToolCallResult>;
+  await vi.waitFor(() => expect(h.written).toEqual([[`${dir}/toolu_1.json`, JSON.stringify({ question: "toolu_1", waiting: true })]]));
+  end({ result: "answered in the terminal" });
+  await asked;
+  await vi.waitFor(() => expect(h.written.at(-1)).toEqual([`${dir}/toolu_1.json`, JSON.stringify({ question: "toolu_1", waiting: false })]));
+  // A call id that isn't safe as a file name is never marked, so its question stays read-only.
+  const before = h.written.length;
+  await hooks["tool.call"]!(h.$, { tool: "AskUserQuestion", tool_use_id: "../x" }, async () => ({ result: "ok" }));
+  await new Promise((r) => setTimeout(r, 10));
+  expect(h.written).toHaveLength(before);
+});

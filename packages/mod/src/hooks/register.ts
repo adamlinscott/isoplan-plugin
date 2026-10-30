@@ -16,6 +16,15 @@
 // (dist/ask.js --ack), so the server sends it again until it has been shown, and one shown already
 // is only acked again. Answers are labelled as another person's session and quoted (ask/text.ts).
 //
+// An agent's question to its owner (AskUserQuestion) is in the terminal and on the floor at once,
+// and the first answer wins (#50): the call goes ahead at once, so its dialog shows, while the hook
+// waits for an answer from the floor too. One that comes first answers the call in the dialog's
+// place, which closes it: the agent reads the answers as the tool's own result, as if they had been
+// picked in the terminal. One answered in the terminal first just ends the wait. Nothing times out:
+// the terminal has the question all along. Each wait is marked in a file in the folder the data
+// layer's `waits` line names, so the data layer offers the question to the floor only while this
+// hook really waits for it: not one asked before the plugin loaded, nor one this hook never saw.
+//
 // The data layer talks back as JSON lines on stdout (src/lines.ts). Claude Code closes the child's
 // stdin at launch, so what goes the other way, a title, goes through a file the line names. A data
 // layer that ends is started again, backing off while it keeps failing; one running for a session
@@ -23,7 +32,7 @@
 
 import type { AskedMessage, ConflictMessage } from "@isoplan/protocol";
 import { endText, MAX_WAIT_MS } from "../ask/text.js";
-import type { DataLayerLine, PairLine, StatusLine, TitleAskLine } from "../lines.js";
+import type { AnswerTaken, DataLayerLine, OwnerAnswerLine, PairLine, StatusLine, TitleAskLine, WaitMark } from "../lines.js";
 import type { Host, On, ToolCallInput, ToolCallResult } from "./host.js";
 
 const RETRY_CAP_MS = 30000;
@@ -40,6 +49,10 @@ const NOTE_MAX = 1000;
 const ASK_TIMEOUT_MS = MAX_WAIT_MS + 2 * 60 * 1000;
 // An agent in one of these is still running, so a late reply waits for its next tool result.
 const RUNNING = new Set(["pending", "running", "waiting"]);
+// The tool an agent asks its owner with.
+const ASK_TOOL = "AskUserQuestion";
+// A call id that is safe as a file name; a question with any other id is never marked, so never answerable.
+const SAFE_ID = /^[A-Za-z0-9_-]{1,200}$/;
 
 let running: string | null = null; // the session id the data layer runs for
 let lead: string | null = null; // that session's lead, as the facts name it
@@ -59,6 +72,10 @@ let asking = false; // one title call at a time
 let lastError: string | null = null;
 let pairing: PairLine | null = null; // the link waiting to be clicked, last shown
 let pairSaid = false; // a link was put in the transcript since the session started
+// The questions waiting for an answer from the floor too, by their call's id: each ends its call.
+const floorWaits = new Map<string, (answers: Record<string, string>) => void>();
+let waitsDir: string | null = null; // where the waits are marked, as the data layer said
+let marking: Promise<unknown> = Promise.resolve(); // the marks, written in order
 
 export function register(on: On): void {
   on("session.start", async ($, e, next) => {
@@ -83,7 +100,7 @@ export function register(on: On): void {
   // settled to (the mod API's documented guard pattern), and the tool never runs twice.
   on("tool.call", async ($, e, next) => {
     if (toolName !== null && e.tool === toolName) return askRoom($, e);
-    const r = await next(e);
+    const r = await (e.tool === ASK_TOOL ? askBoth($, e, next) : next(e));
     try {
       void checkSession($);
       if (!lead || r.deny || r.isError) return r;
@@ -102,6 +119,46 @@ export function register(on: On): void {
       return r;
     }
   }).catch(($, e, next) => next(e));
+}
+
+// Runs the question's call, so the terminal shows it, and answers it with the floor's answers if
+// they come first: the tool's own result, its questions and their answers, which the engine checks
+// and gives the model as it gives a dialog's. Returning while the call is still running ends it,
+// dialog and all. The hook's own time doesn't count while `next` runs, so a wait of any length stays
+// inside its budget.
+async function askBoth($: Host, e: ToolCallInput, next: (e: ToolCallInput) => Promise<ToolCallResult>): Promise<ToolCallResult> {
+  const ran = next(e);
+  ran.catch(() => {});
+  let answer!: (answers: Record<string, string>) => void;
+  const floor = new Promise<Record<string, string>>((resolve) => (answer = resolve));
+  floorWaits.set(e.tool_use_id, answer);
+  mark($, e.tool_use_id, true);
+  try {
+    const first = await Promise.race([ran.then((r) => ({ r })), floor.then((answers) => ({ answers }))]);
+    return "r" in first ? first.r : { result: { questions: e.questions, answers: first.answers } };
+  } finally {
+    floorWaits.delete(e.tool_use_id);
+    mark($, e.tool_use_id, false);
+  }
+}
+
+// Marks whether this hook waits for the question's floor answer, once the data layer has said where.
+function mark($: Host, question: string, waiting: boolean): void {
+  const dir = waitsDir;
+  if (!dir || !SAFE_ID.test(question)) return;
+  const wait: WaitMark = { question, waiting };
+  marking = marking
+    .then(() => $.fs.write(`${dir}/${question}.json`, JSON.stringify(wait)))
+    .catch((err) => $.ui.log("isoplan: could not mark a question's wait: " + message(err), { to: "debug" }));
+}
+
+// The floor's answer to a question: it ends the call if the call still waits, and the data layer is
+// told whether it did.
+function ownerAnswer($: Host, line: OwnerAnswerLine): void {
+  const answer = floorWaits.get(line.question);
+  answer?.(line.answers);
+  const taken: AnswerTaken = { question: line.question, taken: !!answer };
+  $.fs.write(line.file, JSON.stringify(taken)).catch((err) => $.ui.log("isoplan: could not say whether the floor's answer was taken: " + message(err), { to: "debug" }));
 }
 
 // Restarts the data layer when the session's id is no longer the one it runs for.
@@ -218,6 +275,14 @@ function handle($: Host, text: string): void {
     case "ask-rights":
       mayAsk = line.granted;
       if (line.granted) addTool($);
+      break;
+    case "owner-answer":
+      ownerAnswer($, line);
+      break;
+    case "waits":
+      // A data layer that started again clears the marks: the waits still going are marked anew.
+      waitsDir = line.dir;
+      for (const question of floorWaits.keys()) mark($, question, true);
       break;
     case "error": {
       // Shown once in the transcript (never to the model), not on every reconnect.

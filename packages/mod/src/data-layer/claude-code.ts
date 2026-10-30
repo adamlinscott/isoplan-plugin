@@ -10,7 +10,7 @@
 // Ids are source-scoped: the session is claude-code:<session id>, its lead claude-code:<session
 // id>:lead, and a subagent claude-code:<agent id>.
 
-import type { AgentFact, Facts, FileFact } from "@isoplan/protocol";
+import type { AgentFact, Facts, FileFact, QuestionFact } from "@isoplan/protocol";
 import type { Config } from "./config.js";
 import { join, normalize, pathKey, relativeTo, type MaybePromise, type Stat, type Where } from "./git.js";
 import type { DirEntry } from "./io.js";
@@ -43,6 +43,9 @@ const DOING: Record<string, NonNullable<AgentFact["doing"]>["kind"]> = {
   Agent: "talk",
   SendMessage: "talk",
 };
+
+// The tool an agent asks its owner with. Each call with no result yet is an open question.
+const ASK_TOOL = "AskUserQuestion";
 
 // The tools whose file path counts as a read. A shell tool (`shellTools`) counts the files its
 // command reads.
@@ -256,6 +259,7 @@ export function createClaudeCode(io: SourceIo) {
       reads: [],
       waits: [],
       reports: [],
+      questions: [],
     };
 
     // The lead works while its turn is open: from a prompt (or a notification it takes up) until
@@ -278,6 +282,8 @@ export function createClaudeCode(io: SourceIo) {
     });
     main.touches = await addFiles(facts.edits, lead, main.touches, [...config.touchedTools, ...config.shellTools], now, config, resolve);
     main.reads = await addFiles(facts.reads, lead, main.reads, [...READ_TOOLS, ...config.shellTools], now, config, resolve);
+    // The lead's question is open while its turn is: a prompt after it means it was never answered.
+    if (main.turnOpen) addQuestions(facts.questions!, lead, main, results, c.ownMtime);
 
     for (const a of agentFiles) {
       const id = agentId(a.id);
@@ -319,6 +325,7 @@ export function createClaudeCode(io: SourceIo) {
       if (live) {
         facts.waits.push({ waiter: startedBy, on: id, since: iso(spawn ? spawn.at : a.t.firstAt, a.mtimeMs) });
       }
+      if (live) addQuestions(facts.questions!, id, a.t, results, a.mtimeMs);
       if ((s.status === "done" || s.status === "failed") && a.t.lastText !== null) {
         facts.reports.push({ agent: id, at: iso(a.t.lastTextAt, a.mtimeMs), text: a.t.lastText });
       }
@@ -495,9 +502,40 @@ interface TranscriptState {
   tools: number; // tool_use blocks
   firstPrompt: string | null; // the first prompt's opening, for leftOut only: it is never sent
   compacted: boolean; // the session was compacted at least once
+  asks: Map<string, { at: number; input: unknown }>; // id of each AskUserQuestion tool_use since the last prompt → its time and input
 }
 
 const agentId = (id: string) => `${SOURCE}:${id}`;
+
+// Pushes each question `t` asked that has no result yet, as the protocol shapes it. A call whose
+// input doesn't have that shape (the tool's input is the model's to write) is left out. One of which
+// a question or option was left out (no text, no label) is marked `incomplete`: an answer from the
+// floor would not cover all of it, so it is answered in the terminal.
+function addQuestions(list: QuestionFact[], agent: string, t: TranscriptState, results: Map<string, ToolResult>, mtimeMs: number): void {
+  for (const [id, ask] of t.asks) {
+    if (results.has(id)) continue;
+    const asked = (ask.input as { questions?: unknown } | null)?.questions;
+    if (!Array.isArray(asked)) continue;
+    const questions: QuestionFact["questions"] = [];
+    let incomplete = false;
+    for (const q of asked as Line[]) {
+      if (!q || typeof q.question !== "string" || !q.question) {
+        incomplete = true;
+        continue;
+      }
+      const given: Line[] = Array.isArray(q.options) ? q.options : [];
+      const options = given.filter((o) => o && typeof o.label === "string" && o.label);
+      if (options.length !== given.length) incomplete = true;
+      questions.push({
+        question: q.question,
+        header: typeof q.header === "string" ? q.header : "",
+        options: options.map((o) => ({ label: o.label, description: typeof o.description === "string" ? o.description : "" })),
+        multiSelect: q.multiSelect === true,
+      });
+    }
+    if (questions.length) list.push({ id, agent, at: iso(ask.at, mtimeMs), questions, ...(incomplete ? { extra: { incomplete: true } } : {}) });
+  }
+}
 
 const message = (err: unknown) => String((err && (err as Error).message) || err);
 
@@ -559,6 +597,7 @@ function newTranscriptState(): TranscriptState {
     tools: 0,
     firstPrompt: null,
     compacted: false,
+    asks: new Map(),
   };
 }
 
@@ -609,6 +648,7 @@ function foldLine(st: TranscriptState, line: string): void {
       st.tools++;
       st.waiting = true;
       if (c.name === "Agent" && typeof c.id === "string") st.spawns.set(c.id, at);
+      if (c.name === ASK_TOOL && typeof c.id === "string") st.asks.set(c.id, { at, input: c.input });
       const input = c.input || {};
       // The line's cwd is the folder the shell is in when the call runs: a lead's shell keeps a cd
       // between calls and its next lines carry the new folder; a subagent's shell starts each call
@@ -652,6 +692,7 @@ function foldLine(st: TranscriptState, line: string): void {
     // A prompt (not a tool result) starts a new turn: the last turn's tool is not what it is doing.
     if (turn === true && !toolResults) {
       st.lastTool = null;
+      st.asks.clear();
       st.prompts++;
       if (st.firstPrompt === null) st.firstPrompt = promptText(content).slice(0, PROMPT_CHARS);
     }
