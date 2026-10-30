@@ -49,6 +49,7 @@ import { startRunner } from "../runner/start.js";
 import { recentSessions } from "../sweep/find.js";
 import { backfill } from "../wake/backfill.js";
 import { alive, HOLD_OFF_MS, holdOff, lockHolder, lockPath, releaseLock, takeLock } from "../wake/lock.js";
+import { forOffice } from "./attribution.js";
 import { createClaudeCode } from "./claude-code.js";
 import { loadConfig, type Config } from "./config.js";
 import { detachedStop } from "./detached.js";
@@ -100,7 +101,21 @@ async function main(argv: string[]): Promise<number> {
   // The project of each repo an edit or command lands in, by its common dir, looked up again as
   // git's answers are (#74).
   const projects = new Map<string, { at: number; project: ReturnType<typeof projectOf> }>();
-  const source = createClaudeCode({ ...io, claudeDir });
+  const source = createClaudeCode({ ...io, claudeDir, home: os.homedir() });
+  // The projects each office server's office holds, from the welcomes it sent (#74): a workspace
+  // folder's own local path leaves the machine only once its office is known to hold it.
+  const officesFile = path.join(claudeDir, "isoplan", "office-projects.json");
+  const officeProjects = async (): Promise<Record<string, string[]>> => {
+    const value: unknown = await fs.readFile(officesFile, "utf8").then(JSON.parse, () => ({}));
+    return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, string[]>) : {};
+  };
+  const welcomed = (projects: string[]) =>
+    void officeProjects()
+      .then(async (known) => {
+        await fs.mkdir(path.dirname(officesFile), { recursive: true });
+        await fs.writeFile(officesFile, JSON.stringify({ ...known, [server]: projects }));
+      })
+      .catch(() => {});
 
   // Ends when stdout can no longer be written, or the parent is gone (checked each pass). On POSIX
   // an orphan is re-parented, so a changed ppid means gone even if the old pid is reused. Detached,
@@ -209,8 +224,10 @@ async function main(argv: string[]): Promise<number> {
     said.add(text);
   };
   // What goes to the link: the reports the scan holds held, and the questions checked and marked.
-  const outgoing = (facts: Facts, patterns: Pattern[] | null) => prepareQuestions(hold.apply(facts, patterns), patterns, waiting, patternLog);
+  // Another repo's files and commands go only to a server that welcomed them, for its office's repos.
+  const outgoing = (facts: Facts, patterns: Pattern[] | null) => forOffice(prepareQuestions(hold.apply(facts, patterns), patterns, waiting, patternLog), link?.projects() ?? null);
 
+  let saidWorkspace = false;
   do {
     const now = Date.now();
     const isFirstPass = passes++ === 0;
@@ -266,6 +283,19 @@ async function main(argv: string[]): Promise<number> {
     }
     const facts: Facts = read.facts.session.titleFrom === "branch" && title?.title ? { ...read.facts, session: { ...read.facts.session, title: title.title } } : read.facts;
 
+    // A workspace whose office isn't known to hold it says nothing, not even its folder's path.
+    if (read.workspace) {
+      const own = (await projectOf(io.run, null, cwd, machine)).id.toLowerCase();
+      if (!((await officeProjects())[server] ?? []).includes(own)) {
+        if (!saidWorkspace) emit({ type: "log", text: "this workspace folder isn't in the office server's office, so it stays on this machine" });
+        saidWorkspace = true;
+        if (detached) break;
+        link?.close();
+        link = null;
+        continue;
+      }
+    }
+
     if (!link) {
       const where = await resolve(cwd);
       const readText = (p: string) => fs.readFile(p, "utf8").catch(() => null);
@@ -286,6 +316,7 @@ async function main(argv: string[]): Promise<number> {
           allowPlainWs: config.allowPlainWs,
         }),
         onNotWanted: () => (isUnwanted = detached),
+        onWelcome: welcomed,
         // The owner released a withheld report: it goes to the link now, not on the next pass.
         // The owner answered a question from the floor: it goes to the hooks module.
         onMessage: (message) => {

@@ -808,3 +808,56 @@ test("attribution, workspace: a session in a folder holding repos reports, each 
   session(home, "p", [line.user(plain, "x")]);
   expect((await sourceIn(home)("p", plain)).facts).toBe(null);
 });
+
+test("attribution, nested repos: a file is credited to the innermost repo it is in, whatever folder the call came from", async () => {
+  const { home, main, other } = office();
+  const inner = gitRepo(path.join(main, "vendor", "inner"));
+  session(home, "s", [
+    line.tool(main, "Edit", { file_path: path.join(inner, "lib.ts") }, 60),
+    line.tool(other, "Edit", { file_path: path.join(inner, "lib2.ts") }, 50),
+    line.tool(inner, "Edit", { file_path: path.join(main, "top.ts") }, 40),
+  ]);
+  expect((await sourceIn(home)("s", main)).facts!.edits).toEqual([
+    { agent: cc("s:lead"), file: "lib.ts", project: localProject(inner), at: at(60) },
+    { agent: cc("s:lead"), file: "lib2.ts", project: localProject(inner), at: at(50) },
+    { agent: cc("s:lead"), file: "top.ts", at: at(40) },
+  ]);
+});
+
+test("attribution, symlinks: a path through a link is compared with the repo's real folder", async () => {
+  const { root, home, main, other } = office();
+  const link = path.join(root, "linked-other");
+  fs.symlinkSync(other, link, "junction");
+  session(home, "s", [line.tool(main, "Edit", { file_path: path.join(link, "src", "x.ts") }, 30)]);
+  expect((await sourceIn(home)("s", main)).facts!.edits).toEqual([{ agent: cc("s:lead"), file: "src/x.ts", project: localProject(other), away: true, at: at(30) }]);
+});
+
+test("attribution, a second clone with the session's remote is the session's own project, not another repo", async () => {
+  const { root, home, main, other } = office();
+  const clone = gitRepo(path.join(root, "clone-of-repo"));
+  const remotes: Record<string, string> = { [normalize(main)]: "github.com/team/app", [normalize(clone)]: "github.com/team/app", [normalize(other)]: "github.com/team/api" };
+  const byRemote = (where: { toplevel: string }) => ({ id: remotes[normalize(where.toplevel)]!, name: path.basename(where.toplevel) });
+  session(home, "s", [line.tool(main, "Edit", { file_path: path.join(clone, "a.ts") }, 40), line.tool(main, "Edit", { file_path: path.join(other, "a.ts") }, 30)]);
+  expect((await sourceIn(home, { projectOf: byRemote })("s", main)).facts!.edits).toEqual([
+    { agent: cc("s:lead"), file: "a.ts", at: at(40) },
+    { agent: cc("s:lead"), file: "a.ts", project: { id: "github.com/team/api", name: "other" }, away: true, at: at(30) },
+  ]);
+});
+
+test("attribution, workspace: never the home folder or one above it, nor a folder with more repos than workspaceRepos; its listing is kept a while", async () => {
+  const { root, home } = office();
+  const ws = path.join(root, "work", "lorveil");
+  for (const r of ["api", "web"]) gitRepo(path.join(ws, r));
+  session(home, "s", [line.user(ws, "x")]);
+  // The folder is the person's home, or above it.
+  expect((await sourceIn(home, { home: ws })("s", ws)).facts).toBe(null);
+  expect((await sourceIn(home, { home: path.join(ws, "api") })("s", ws)).facts).toBe(null);
+  // Too many repos to be one piece of work.
+  expect((await sourceIn(home, { config: { workspaceRepos: 1 } })("s", ws)).facts).toBe(null);
+  const listed: string[] = [];
+  const base = nodeIo({ run: null });
+  const read = sourceIn(home, { io: { listDir: (dir) => (listed.push(normalize(dir)), base.listDir(dir)) } });
+  expect((await read("s", ws)).workspace).toBe(true);
+  await read("s", ws);
+  expect(listed.filter((d) => d === normalize(ws))).toHaveLength(1);
+});

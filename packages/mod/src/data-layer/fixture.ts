@@ -7,7 +7,8 @@ import path from "node:path";
 import { afterAll } from "vitest";
 import { createClaudeCode, type SourceRead } from "./claude-code.js";
 import type { Config } from "./config.js";
-import { createGit } from "./git.js";
+import type { Project } from "@isoplan/protocol";
+import { createGit, type Where } from "./git.js";
 import { projectOf } from "./identity.js";
 import { nodeIo, type NodeIo } from "./io.js";
 
@@ -121,6 +122,10 @@ export interface SourceOptions {
   now?: () => number;
   config?: Partial<Config>;
   io?: Partial<NodeIo>;
+  /** The project a repo is; by default its local id on "test-machine", as with no remote. */
+  projectOf?: (where: Where) => Project;
+  /** The person's home folder; by default none. */
+  home?: string;
 }
 
 /**
@@ -130,12 +135,12 @@ export interface SourceOptions {
  */
 export function sourceIn(home: string, opts: SourceOptions = {}) {
   const io = { ...nodeIo({ run: null }), ...opts.io };
-  const source = createClaudeCode({ ...io, claudeDir: path.join(home, ".claude") });
+  const source = createClaudeCode({ ...io, claudeDir: path.join(home, ".claude"), ...(opts.home ? { home: opts.home } : {}) });
   const git = createGit(io);
   return (sessionId: string, cwd = path.join(home, "elsewhere")): Promise<SourceRead> => {
     const now = (opts.now ?? (() => NOW))();
     const config = { ...defaults, ...opts.config };
-    return source.read({ sessionId, cwd, now, config, resolve: (dir) => git.resolve(dir, { now, maxAgeMs: config.gitCacheSeconds * 1000 }), projectOf: (where) => projectOf(null, where, where.toplevel, "test-machine") });
+    return source.read({ sessionId, cwd, now, config, resolve: (dir) => git.resolve(dir, { now, maxAgeMs: config.gitCacheSeconds * 1000 }), projectOf: opts.projectOf ?? ((where) => projectOf(null, where, where.toplevel, "test-machine")) });
   };
 }
 

@@ -73,6 +73,8 @@ export interface LinkOptions {
   onPairingEnded?: () => void;
   /** Takes the server's requests, releases and handoffs; without it they are logged as not handled. */
   onMessage?: (message: ServerAsk) => void;
+  /** The server's welcome: the projects its office holds (#74). */
+  onWelcome?: (projects: string[]) => void;
   /** Where the hello's token comes from, for a server that signs people in. */
   pairing?: Pairing;
   /** How often a link waiting for its code to be approved asks again. */
@@ -91,6 +93,11 @@ export interface Link {
   update(facts: Facts): void;
   /** A reply, refusal or taken. One sent while the link is down goes out after the next hello. */
   send(message: Outgoing): void;
+  /**
+   * The projects the office holds, from this connection's welcome; null before one, and from a
+   * server too old to send one, which would read another repo's files as the session's own (#74).
+   */
+  projects(): ReadonlySet<string> | null;
   close(): void;
 }
 
@@ -106,6 +113,7 @@ export function createLink({
   onNotWanted,
   onPairingEnded,
   onMessage,
+  onWelcome,
   pairing,
   pairPollMs = 5000,
   random = Math.random,
@@ -128,6 +136,7 @@ export function createLink({
   let refusedFor: string | null = null; // why
   let isTaken = false; // the server said the session belongs to someone else
   let refusals = 0; // hellos refused for their token, in a row
+  let projects: ReadonlySet<string> | null = null; // the office's, from this connection's welcome
   let stable: ReturnType<typeof setTimeout> | null = null; // counts refusals from zero once the link has stayed up
 
   function connect() {
@@ -160,6 +169,7 @@ export function createLink({
       failures = 0;
       isOpen = true;
       seq = 0;
+      projects = null;
       stable = setTimeout(() => (refusals = 0), STABLE_MS);
       send(token ? { ...hello, token } : hello);
       for (const { message, at } of outbox.splice(0)) if (Date.now() - at < OUTBOX_MAX_AGE_MS) send(message);
@@ -188,6 +198,7 @@ export function createLink({
   function dropped() {
     socket = null;
     isOpen = false;
+    projects = null;
     sent = null;
     if (pacing) clearTimeout(pacing);
     pacing = null;
@@ -269,7 +280,10 @@ export function createLink({
       return;
     }
     const message = parsed.message;
-    if (message.type === "repair") {
+    if (message.type === "welcome") {
+      projects = new Set(message.projects);
+      onWelcome?.(message.projects);
+    } else if (message.type === "repair") {
       if (pacing) clearTimeout(pacing);
       pacing = null;
       sendFull();
@@ -314,6 +328,7 @@ export function createLink({
         if (outbox.length > OUTBOX_MAX) outbox.shift();
       }
     },
+    projects: () => projects,
     close() {
       isClosed = true;
       if (pacing) clearTimeout(pacing);

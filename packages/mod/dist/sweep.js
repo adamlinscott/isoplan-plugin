@@ -5790,10 +5790,12 @@ const ProjectSchema = object({
 	name: string().min(1)
 });
 /**
-* Where a file or a command lands when it isn't the session's own project (#74): `project` is the
-* repo it is in, and `away` is true when that repo is outside the session's folder, so the agent is
-* working away from home. A repo inside the folder (a workspace folder holding several repos) has
-* `project` and no `away`. Both absent: the session's own project.
+* Where a file or a command lands when it isn't in the session's own project (#74): `project` is
+* the repo it is in, and `away` is true when that repo is outside the session's folder, so the
+* agent is working away from home; a repo inside the folder (a workspace above several repos) has
+* `project` and no `away`. Both absent: the session's own project, as for a peer that predates
+* them. A data layer sends them only to a server that said it reads them (`welcome`), and only for
+* a project the server's office holds; anything else stays on the machine.
 */
 const Elsewhere = {
 	project: ProjectSchema.optional(),
@@ -5859,7 +5861,10 @@ const AgentFactSchema = object({
 	branch: string().nullable().optional(),
 	extra: Extra
 });
-/** An edit or a read: `file` is relative to its repo's root, with forward slashes. */
+/**
+* An edit or a read: `file` is relative to its repo's root, with forward slashes. One is known by
+* its agent, file and project, so one agent's README.md at home and in another repo are two.
+*/
 const FileFactSchema = object({
 	agent: string().min(1),
 	file: string().min(1),
@@ -5933,10 +5938,12 @@ const FactUpsertSchema = object({
 });
 const FileKey = FileFactSchema.pick({
 	agent: true,
-	file: true
+	file: true,
+	project: true
 });
 /**
-* The keys of records that went away: an agent by its id, an edit or read by agent and file, a
+* The keys of records that went away: an agent by its id, an edit or read by agent, file and
+* project (absent for the session's own), a
 * wait by waiter and on, a report by its agent, a question by its id. The session itself goes with
 * the connection.
 */
@@ -6161,6 +6168,17 @@ const ConflictMessageSchema = object({
 	file: string().min(1),
 	text: string().min(1)
 });
+/**
+* Sent after a hello is let in, by a server that reads where an edit or command lands (#74): the
+* projects the office holds, so the data layer may report a file or command in one of them that is
+* outside the session's own project. A data layer that hasn't had one keeps such files on the
+* machine, as an older server would read them as the session's own.
+*/
+const WelcomeMessageSchema = object({
+	type: literal("welcome"),
+	v: Version,
+	projects: array(string().min(1))
+});
 /** Something the data layer should show. */
 const ErrorMessageSchema = object({
 	type: literal("error"),
@@ -6243,6 +6261,7 @@ const HandOverReadyMessageSchema = object({
 });
 discriminatedUnion("type", [
 	RepairMessageSchema,
+	WelcomeMessageSchema,
 	ConflictMessageSchema,
 	ErrorMessageSchema,
 	RequestMessageSchema,
@@ -6391,6 +6410,7 @@ function nodeIo({ run = runCommand } = {}) {
 				return null;
 			}
 		},
+		realpath: (p) => fs.realpath(p),
 		async read(p, start, end) {
 			if (start === void 0 || end === void 0) return fs.readFile(p, "utf8");
 			const fh = await fs.open(p, "r");

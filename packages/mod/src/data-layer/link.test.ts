@@ -331,3 +331,19 @@ test("link: a token that runs out on a link that stayed up is renewed and the li
   expect(s.got.filter((m) => m.type === "hello").map((m) => m.token)).toEqual(["first-token", "second-token"]);
   expect(lines.some((x) => x.type === "status" && x.state === "disconnected")).toBe(false);
 });
+
+test("link: a welcome says which projects the office holds, until the connection drops; none before it", async () => {
+  const s = await server();
+  const seen: string[][] = [];
+  const { link: l } = link(s.url, { minIntervalMs: 0, onWelcome: (p) => seen.push(p) });
+  l.update(facts("active"));
+  await until(() => s.got.length === 2);
+  expect(l.projects()).toBe(null);
+  s.sockets[0]!.send(JSON.stringify({ type: "welcome", v: PROTOCOL_VERSION, projects: ["github.com/team/app", "github.com/team/web"] }));
+  await until(() => l.projects() !== null);
+  expect([...l.projects()!]).toEqual(["github.com/team/app", "github.com/team/web"]);
+  expect(seen).toEqual([["github.com/team/app", "github.com/team/web"]]);
+  s.sockets[0]!.close();
+  await until(() => l.projects() === null);
+  l.close();
+});

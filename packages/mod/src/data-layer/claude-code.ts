@@ -13,7 +13,7 @@
 import type { AgentFact, Facts, FileFact, Project, QuestionFact } from "@isoplan/protocol";
 import { createAttribution, type Attribution, type Placed } from "./attribution.js";
 import type { Config } from "./config.js";
-import { join, normalize, pathKey, type MaybePromise, type Stat, type Where } from "./git.js";
+import { join, normalize, pathKey, relativeTo, type MaybePromise, type Stat, type Where } from "./git.js";
 import type { DirEntry } from "./io.js";
 import { shellFiles } from "./shell-writes.js";
 
@@ -60,9 +60,13 @@ const encoder = new TextEncoder();
 export interface SourceIo {
   /** Claude Code's config folder: $CLAUDE_CONFIG_DIR, or ~/.claude. */
   claudeDir: string;
+  /** The person's home folder: `~` in shell commands, and never a workspace, nor any folder above it. */
+  home?: string;
   listDir(dir: string): MaybePromise<DirEntry[]>;
   stat(path: string): MaybePromise<Stat | null>;
   read(path: string, start?: number, end?: number): MaybePromise<string>;
+  /** The path with symlinks resolved; without it, paths are compared as written. */
+  realpath?(path: string): MaybePromise<string>;
 }
 
 export interface ReadInput {
@@ -85,6 +89,8 @@ export interface SourceRead {
   status: string | null;
   /** Transcripts that couldn't be read, counted, with the first error. */
   errors: { count: number; first: string | null };
+  /** The session's folder is a workspace above several repos, so its own project is a local path. */
+  workspace?: boolean;
 }
 
 /**
@@ -96,6 +102,7 @@ export function createClaudeCode(io: SourceIo) {
   const transcripts = new Map<string, TranscriptState>();
   const metas = new Map<string, { mtimeMs: number; meta: Meta }>();
   const found = new Map<string, string>(); // session id → its transcript, once located
+  const workspaces = new Map<string, { at: number; is: boolean }>(); // folder → whether it is a workspace
   const searched = new Map<string, number>(); // session id → when every project folder was last searched
   let used = new Set<string>(); // the cache keys this pass has used
 
@@ -128,12 +135,19 @@ export function createClaudeCode(io: SourceIo) {
       // The session's own folder is home (#74). One git can't place that holds repos is a workspace:
       // the session stays in its own room, whichever of its repos it works in.
       const home = await resolve(cwd);
-      const workspace = !home && (await isWorkspace(cwd));
+      const workspace = !home && (await isWorkspace(cwd, now, config));
       const where = workspace ? { toplevel: normalize(cwd), commonDir: "", branch: null } : await resolve(main.cwd);
       if (!where) return none(`git could not place ${normalize(main.cwd)}`);
-      const place = createAttribution({ folder: cwd, where: workspace ? null : (home ?? where), resolve, projectOf });
+      const place = createAttribution({
+        folder: cwd,
+        where: workspace ? null : (home ?? where),
+        resolve,
+        projectOf,
+        stat: (p) => io.stat(p),
+        realpath: (p) => (io.realpath ? io.realpath(p) : p),
+      });
       const facts = await sessionFacts(c, main, where, workspace, now, config, resolve, place, fail);
-      return { facts, status: null, errors };
+      return { facts, status: null, errors, workspace };
     } finally {
       for (const cache of [transcripts, metas]) {
         for (const key of cache.keys()) if (!used.has(key)) cache.delete(key);
@@ -213,11 +227,20 @@ export function createClaudeCode(io: SourceIo) {
   }
 
   // A folder with a repo directly in it.
-  async function isWorkspace(dir: string): Promise<boolean> {
+  // A folder the person works in that holds repos: one to `workspaceRepos` repos directly in it.
+  // The home folder and the folders above it never are (~/Projects with dozens of repos is not a
+  // piece of work). The answer is looked up again once gitCacheSeconds have passed.
+  async function isWorkspace(dir: string, now: number, config: Config): Promise<boolean> {
+    if (io.home && (pathKey(dir) === pathKey(io.home) || relativeTo(dir, io.home) !== null)) return false;
+    const key = pathKey(dir);
+    const hit = workspaces.get(key);
+    if (hit && now - hit.at <= config.gitCacheSeconds * 1000) return hit.is;
     const st = await io.stat(dir);
-    if (!st || !st.isDir) return false;
-    for (const e of await io.listDir(dir)) if (e.isDir && (await io.stat(join(dir, `${e.name}/.git`)))) return true;
-    return false;
+    let repos = 0;
+    if (st && st.isDir) for (const e of await io.listDir(dir)) if (e.isDir && (await io.stat(join(dir, `${e.name}/.git`)))) repos++;
+    const is = repos >= 1 && repos <= config.workspaceRepos;
+    workspaces.set(key, { at: now, is });
+    return is;
   }
 
   async function sessionFacts(
@@ -396,7 +419,7 @@ export function createClaudeCode(io: SourceIo) {
       lines[0] = st.head + lines[0]; // a tail read starts mid-line
       st.head = null;
     }
-    for (const line of lines) if (line.trim()) foldLine(st, line);
+    for (const line of lines) if (line.trim()) foldLine(st, line, io.home ?? null);
     return st;
   }
 
@@ -565,16 +588,17 @@ function iso(ms: number, fallback?: number): string {
   return new Date(Number.isFinite(ms) ? ms : fallback!).toISOString();
 }
 
-// Pushes { agent, file, at } to `list` for each file `touches` names by one of `tools`, each made
-// relative to the worktree it is in, newest time per file, with its repo when that isn't the
-// session's (attribution.ts). In no repo: dropped. Returns the touches still inside the window.
+// Pushes { agent, file, at } to `list` for each file `touches` names by one of `tools`: the file
+// relative to the innermost worktree it is in, with that repo when it isn't the session's own
+// (attribution.ts), at its newest time, one per repo and file. In no repo: dropped. Whether it may
+// leave the machine is decided later (forOffice). Returns the touches still inside the window.
 async function addFiles(list: FileFact[], agent: string, touches: Touch[], tools: string[], now: number, config: Config, place: Attribution): Promise<Touch[]> {
   const since = now - config.touchedWindowMinutes * 60000;
   const kept = touches.filter((t) => t.at >= since);
   const newest = new Map<string, { placed: Placed; at: number }>();
   for (const t of kept) {
     if (!tools.includes(t.name) || !t.cwd) continue;
-    const placed = await place.file(t.path, t.cwd);
+    const placed = await place.file(t.path);
     if (!placed) continue;
     const key = `${placed.project?.id ?? ""}\n${placed.file}`;
     if (!((newest.get(key)?.at ?? -Infinity) >= t.at)) newest.set(key, { placed, at: t.at });
@@ -630,7 +654,7 @@ type Line = Record<string, any>;
 
 // Fold one transcript line into the file's running state. Lines that don't parse, or parse to
 // something without a `type`, are skipped.
-function foldLine(st: TranscriptState, line: string): void {
+function foldLine(st: TranscriptState, line: string, home: string | null): void {
   st.seen++;
   let ev: Line;
   try {
@@ -678,7 +702,7 @@ function foldLine(st: TranscriptState, line: string): void {
       // in this line, and shellFiles follows only the ones inside this command.
       const cwd: string | null = ev.cwd || st.cwd;
       // Any tool with a command is read as a shell: read time keeps only the `shellTools`.
-      const shell = typeof input.command === "string" ? shellFiles(input.command, cwd, { powershell: c.name === "PowerShell" }) : { writes: [], reads: [], dirs: [] };
+      const shell = typeof input.command === "string" ? shellFiles(input.command, cwd, { powershell: c.name === "PowerShell", home }) : { writes: [], reads: [], dirs: [] };
       const writes = shell.writes;
       const file = typeof input.file_path === "string" ? input.file_path : typeof input.notebook_path === "string" ? input.notebook_path : typeof input.path === "string" ? input.path : null;
       const dir = shell.dirs[shell.dirs.length - 1];
@@ -887,6 +911,6 @@ async function doingOf(st: TranscriptState, place: Attribution, fallbackMs: numb
   const t = st.lastTool;
   const kind = t && (t.wrote && config.shellTools.includes(t.name) ? "write" : Object.hasOwn(DOING, t.name) ? DOING[t.name] : undefined);
   if (!t || !kind) return null;
-  const placed = t.file && t.cwd ? await place.file(t.file, t.cwd) : t.dir ? await place.dir(t.dir) : null;
+  const placed = t.file && t.cwd ? await place.file(t.file) : t.dir ? await place.dir(t.dir) : null;
   return { kind, ...placed, since: iso(t.at, fallbackMs) };
 }

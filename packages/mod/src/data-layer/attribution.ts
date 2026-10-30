@@ -1,14 +1,19 @@
 // Which repo an edit, a read or a command lands in (#74), so the floor can show an agent working in
-// another repo there. Home is the session's folder: anything inside it is home, whichever repo it is
-// in (a workspace folder holding several repos stays one room). A file in a repo outside it is
-// away. The session's own repo, reached through another worktree or a second clone, is home too:
-// it is the same project, not another repo.
+// another repo there. Home is the session's folder: a file in a repo inside it is home, whichever
+// repo that is (a workspace folder holding several repos stays one room); a file in a repo outside
+// it is away. The session's own project, reached through another worktree or a second clone with
+// the same remote, is the session's own: no project is named for it.
 //
-// A file's repo is the one its nearest existing folder sits in, so a file not written yet is placed
-// too. The line's own folder answers first, which is the common case and costs no lookup.
+// A file is credited to the innermost repo it is in, whatever folder the call was made from: git
+// is asked once, at the file's nearest folder that exists (so a file not written yet is placed
+// too), and remembers the answer. Paths are compared after symlinks are resolved, as git reports
+// its top level resolved.
+//
+// What is worked out here never leaves the machine by itself: `forOffice` keeps a file or command
+// in another repo only when the server's office holds that repo and the server said it reads them.
 
-import type { Project } from "@isoplan/protocol";
-import { dirname, normalize, pathKey, relativeTo, type MaybePromise, type Where } from "./git.js";
+import type { Facts, Project } from "@isoplan/protocol";
+import { dirname, normalize, pathKey, relativeTo, type MaybePromise, type Stat, type Where } from "./git.js";
 
 /** Where something landed: `file` relative to its repo's root, and the repo when it isn't the session's. */
 export interface Placed {
@@ -24,52 +29,90 @@ export interface AttributionInput {
   where: Where | null;
   resolve: (dir: string) => Promise<Where | null>;
   projectOf: (where: Where) => MaybePromise<Project>;
+  stat: (path: string) => MaybePromise<Stat | null>;
+  /** The path with symlinks resolved; the path itself when it can't be. */
+  realpath: (path: string) => MaybePromise<string>;
 }
 
 export interface Attribution {
-  /** The file at absolute `path`, touched from `cwd`; null when it is in no repo and not in a workspace. */
-  file(path: string, cwd: string | null): Promise<Placed | null>;
+  /** The file at absolute `path`; null when it is in no repo and not in a workspace. */
+  file(path: string): Promise<Placed | null>;
   /** The repo a command run in `dir` works in: {} for the session's own, null when it is in none. */
   dir(dir: string): Promise<Omit<Placed, "file"> | null>;
 }
 
-export function createAttribution({ folder, where: home, resolve, projectOf }: AttributionInput): Attribution {
+/** Keep the object for one pass: it remembers which folders exist and where symlinks lead. */
+export function createAttribution({ folder, where: home, resolve, projectOf, stat, realpath }: AttributionInput): Attribution {
   const homeProject = home ? Promise.resolve(projectOf(home)) : null;
+  const real = new Map<string, Promise<string>>();
+  const realOf = (p: string) => {
+    const key = pathKey(p);
+    let r = real.get(key);
+    if (!r) real.set(key, (r = Promise.resolve(realpath(p)).then(normalize, () => normalize(p))));
+    return r;
+  };
+  const exists = new Map<string, Promise<boolean>>();
+  const isThere = (p: string) => {
+    const key = pathKey(p);
+    let e = exists.get(key);
+    if (!e) exists.set(key, (e = Promise.resolve(stat(p)).then((s) => !!s?.isDir, () => false)));
+    return e;
+  };
+  const homeFolder = realOf(folder);
 
-  // The repo's project, or nothing for the session's own.
-  async function elsewhere(where: Where, path: string): Promise<Omit<Placed, "file">> {
+  // `path`'s nearest folder that exists (`path` itself when it is one), with symlinks resolved and
+  // the rest of the path after it, and the repo git places it in.
+  async function locate(path: string, isDir: boolean): Promise<{ real: string; where: Where | null }> {
+    const p = normalize(path);
+    let at = isDir ? p : dirname(p);
+    while (!(await isThere(at))) {
+      const up = dirname(at);
+      if (up === at) return { real: p, where: null };
+      at = up;
+    }
+    const realAt = await realOf(at);
+    const rest = p.slice(at.length).replace(/^\/+/, "");
+    const where = await resolve(realAt);
+    return { real: rest ? `${realAt.replace(/\/$/, "")}/${rest}` : realAt, where: where && { ...where, toplevel: await realOf(where.toplevel) } };
+  }
+
+  async function elsewhere(where: Where, real: string): Promise<Omit<Placed, "file">> {
     if (home && pathKey(where.commonDir) === pathKey(home.commonDir)) return {};
     const project = await projectOf(where);
     if (homeProject && (await homeProject).id === project.id) return {};
-    return relativeTo(folder, path) === null && pathKey(folder) !== pathKey(path) ? { project, away: true } : { project };
-  }
-
-  // The nearest folder from `dir` up that git places.
-  async function repoOf(dir: string): Promise<Where | null> {
-    for (let at = normalize(dir); ; ) {
-      const where = await resolve(at);
-      if (where) return where;
-      const up = dirname(at);
-      if (up === at) return null;
-      at = up;
-    }
+    const inside = relativeTo(await homeFolder, real) !== null || pathKey(await homeFolder) === pathKey(real);
+    return inside ? { project } : { project, away: true };
   }
 
   return {
-    async file(path, cwd) {
-      const p = normalize(path);
-      const own = cwd ? await resolve(cwd) : null;
-      const where = own && relativeTo(own.toplevel, p) ? own : await repoOf(dirname(p));
+    async file(path) {
+      const { real: p, where } = await locate(path, false);
       const file = where && relativeTo(where.toplevel, p);
       if (where && file) return { file, ...(await elsewhere(where, p)) };
       // A workspace's own files, outside any of its repos.
-      const inFolder = !home && relativeTo(folder, p);
-      return inFolder ? { file: inFolder } : null;
+      const own = !home && relativeTo(await homeFolder, p);
+      return own ? { file: own } : null;
     },
     async dir(dir) {
-      const where = await repoOf(dir);
-      if (where) return elsewhere(where, normalize(dir));
-      return !home && (relativeTo(folder, dir) !== null || pathKey(folder) === pathKey(dir)) ? {} : null;
+      const { real: d, where } = await locate(dir, true);
+      if (where) return elsewhere(where, d);
+      return !home && (relativeTo(await homeFolder, d) !== null || pathKey(await homeFolder) === pathKey(d)) ? {} : null;
     },
+  };
+}
+
+/**
+ * The facts as they may leave the machine: a file or command in another repo only when `projects`,
+ * the office's from the server's welcome, holds that repo. Without a welcome (an older server, or
+ * none yet on this connection) none of them leave.
+ */
+export function forOffice(facts: Facts, projects: ReadonlySet<string> | null): Facts {
+  const ok = (p: Project | undefined) => !p || (projects !== null && projects.has(p.id.toLowerCase()));
+  const files = (list: Facts["edits"]) => (list.every((f) => ok(f.project)) ? list : list.filter((f) => ok(f.project)));
+  return {
+    ...facts,
+    agents: facts.agents.map((a) => (a.doing && !ok(a.doing.project) ? { ...a, doing: { kind: a.doing.kind, since: a.doing.since } } : a)),
+    edits: files(facts.edits),
+    reads: files(facts.reads),
   };
 }

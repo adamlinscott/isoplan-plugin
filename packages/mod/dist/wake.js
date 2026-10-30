@@ -81,6 +81,7 @@ function nodeIo({ run = runCommand } = {}) {
 				return null;
 			}
 		},
+		realpath: (p) => fs.realpath(p),
 		async read(p, start, end) {
 			if (start === void 0 || end === void 0) return fs.readFile(p, "utf8");
 			const fh = await fs.open(p, "r");
@@ -504,12 +505,14 @@ const WRITTEN = [
 	"live",
 	"logs",
 	"titles",
-	"released"
+	"released",
+	"office-projects.json"
 ];
 const SESSION_TRACES = [
 	"live",
 	"titles",
-	"released"
+	"released",
+	"office-projects.json"
 ];
 /**
 * Takes out everything install and the plugin put in place, in this order: the running runner;

@@ -205,7 +205,7 @@ const BIGINT_FORMAT_RANGES = {
 	int64: [/* @__PURE__*/ BigInt("-9223372036854775808"), /* @__PURE__*/ BigInt("9223372036854775807")],
 	uint64: [/* @__PURE__*/ BigInt(0), /* @__PURE__*/ BigInt("18446744073709551615")]
 };
-function pick(schema, mask) {
+function pick$1(schema, mask) {
 	const currDef = schema._zod.def;
 	const checks = currDef.checks;
 	if (checks && checks.length > 0) throw new Error(".pick() cannot be used on object schemas containing refinements");
@@ -5337,7 +5337,7 @@ const ZodObject = /*@__PURE__*/ $constructor("ZodObject", (inst, def) => {
 		return merge(this, other);
 	},
 	pick(mask) {
-		return pick(this, mask);
+		return pick$1(this, mask);
 	},
 	omit(mask) {
 		return omit(this, mask);
@@ -5656,10 +5656,12 @@ const ProjectSchema = object({
 	name: string().min(1)
 });
 /**
-* Where a file or a command lands when it isn't the session's own project (#74): `project` is the
-* repo it is in, and `away` is true when that repo is outside the session's folder, so the agent is
-* working away from home. A repo inside the folder (a workspace folder holding several repos) has
-* `project` and no `away`. Both absent: the session's own project.
+* Where a file or a command lands when it isn't in the session's own project (#74): `project` is
+* the repo it is in, and `away` is true when that repo is outside the session's folder, so the
+* agent is working away from home; a repo inside the folder (a workspace above several repos) has
+* `project` and no `away`. Both absent: the session's own project, as for a peer that predates
+* them. A data layer sends them only to a server that said it reads them (`welcome`), and only for
+* a project the server's office holds; anything else stays on the machine.
 */
 const Elsewhere = {
 	project: ProjectSchema.optional(),
@@ -5725,7 +5727,10 @@ const AgentFactSchema = object({
 	branch: string().nullable().optional(),
 	extra: Extra
 });
-/** An edit or a read: `file` is relative to its repo's root, with forward slashes. */
+/**
+* An edit or a read: `file` is relative to its repo's root, with forward slashes. One is known by
+* its agent, file and project, so one agent's README.md at home and in another repo are two.
+*/
 const FileFactSchema = object({
 	agent: string().min(1),
 	file: string().min(1),
@@ -5799,10 +5804,12 @@ const FactUpsertSchema = object({
 });
 const FileKey = FileFactSchema.pick({
 	agent: true,
-	file: true
+	file: true,
+	project: true
 });
 /**
-* The keys of records that went away: an agent by its id, an edit or read by agent and file, a
+* The keys of records that went away: an agent by its id, an edit or read by agent, file and
+* project (absent for the session's own), a
 * wait by waiter and on, a report by its agent, a question by its id. The session itself goes with
 * the connection.
 */
@@ -6027,6 +6034,17 @@ const ConflictMessageSchema = object({
 	file: string().min(1),
 	text: string().min(1)
 });
+/**
+* Sent after a hello is let in, by a server that reads where an edit or command lands (#74): the
+* projects the office holds, so the data layer may report a file or command in one of them that is
+* outside the session's own project. A data layer that hasn't had one keeps such files on the
+* machine, as an older server would read them as the session's own.
+*/
+const WelcomeMessageSchema = object({
+	type: literal("welcome"),
+	v: Version,
+	projects: array(string().min(1))
+});
 /** Something the data layer should show. */
 const ErrorMessageSchema = object({
 	type: literal("error"),
@@ -6109,6 +6127,7 @@ const HandOverReadyMessageSchema = object({
 });
 const OfficeServerMessageSchema = discriminatedUnion("type", [
 	RepairMessageSchema,
+	WelcomeMessageSchema,
 	ConflictMessageSchema,
 	ErrorMessageSchema,
 	RequestMessageSchema,
@@ -6411,6 +6430,7 @@ function nodeIo({ run = runCommand } = {}) {
 				return null;
 			}
 		},
+		realpath: (p) => fs.realpath(p),
 		async read(p, start, end) {
 			if (start === void 0 || end === void 0) return fs.readFile(p, "utf8");
 			const fh = await fs.open(p, "r");
@@ -6450,11 +6470,12 @@ function diffFacts(before, after) {
 	if (agents.upsert.length) upsert.agents = agents.upsert;
 	if (agents.remove.length) remove.agents = agents.remove.map((a) => a.id);
 	for (const list of ["edits", "reads"]) {
-		const d = diff(before[list], after[list], (f) => key(f.agent, f.file));
+		const d = diff(before[list], after[list], (f) => key(f.agent, f.file, f.project?.id ?? ""));
 		if (d.upsert.length) upsert[list] = d.upsert;
-		if (d.remove.length) remove[list] = d.remove.map(({ agent, file }) => ({
+		if (d.remove.length) remove[list] = d.remove.map(({ agent, file, project }) => ({
 			agent,
-			file
+			file,
+			...project ? { project } : {}
 		}));
 	}
 	const waits = diff(before.waits, after.waits, (w) => key(w.waiter, w.on));
@@ -6489,7 +6510,7 @@ const same = (a, b) => a !== void 0 && JSON.stringify(a) === JSON.stringify(b);
 const STABLE_MS$1 = 3e4;
 const OUTBOX_MAX = 100;
 const OUTBOX_MAX_AGE_MS = 36e5;
-function createLink({ url, hello, emit, minIntervalMs = 1e3, retryBaseMs = 1e3, retryCapMs = 3e4, notWantedRetryMs = 36e5, takenRetryMs = 36e5, onNotWanted, onPairingEnded, onMessage, pairing, pairPollMs = 5e3, random = Math.random }) {
+function createLink({ url, hello, emit, minIntervalMs = 1e3, retryBaseMs = 1e3, retryCapMs = 3e4, notWantedRetryMs = 36e5, takenRetryMs = 36e5, onNotWanted, onPairingEnded, onMessage, onWelcome, pairing, pairPollMs = 5e3, random = Math.random }) {
 	const outbox = [];
 	let latest = null;
 	let socket = null;
@@ -6508,6 +6529,7 @@ function createLink({ url, hello, emit, minIntervalMs = 1e3, retryBaseMs = 1e3, 
 	let refusedFor = null;
 	let isTaken = false;
 	let refusals = 0;
+	let projects = null;
 	let stable = null;
 	function connect() {
 		retry = null;
@@ -6544,6 +6566,7 @@ function createLink({ url, hello, emit, minIntervalMs = 1e3, retryBaseMs = 1e3, 
 			failures = 0;
 			isOpen = true;
 			seq = 0;
+			projects = null;
 			stable = setTimeout(() => refusals = 0, STABLE_MS$1);
 			send(token ? {
 				...hello,
@@ -6574,6 +6597,7 @@ function createLink({ url, hello, emit, minIntervalMs = 1e3, retryBaseMs = 1e3, 
 	function dropped() {
 		socket = null;
 		isOpen = false;
+		projects = null;
 		sent = null;
 		if (pacing) clearTimeout(pacing);
 		pacing = null;
@@ -6681,7 +6705,10 @@ function createLink({ url, hello, emit, minIntervalMs = 1e3, retryBaseMs = 1e3, 
 			return;
 		}
 		const message = parsed.message;
-		if (message.type === "repair") {
+		if (message.type === "welcome") {
+			projects = new Set(message.projects);
+			onWelcome?.(message.projects);
+		} else if (message.type === "repair") {
 			if (pacing) clearTimeout(pacing);
 			pacing = null;
 			sendFull();
@@ -6730,6 +6757,7 @@ function createLink({ url, hello, emit, minIntervalMs = 1e3, retryBaseMs = 1e3, 
 				if (outbox.length > OUTBOX_MAX) outbox.shift();
 			}
 		},
+		projects: () => projects,
 		close() {
 			isClosed = true;
 			if (pacing) clearTimeout(pacing);
@@ -7293,43 +7321,70 @@ const isEntry = (e) => {
 };
 //#endregion
 //#region src/data-layer/attribution.ts
-function createAttribution({ folder, where: home, resolve, projectOf }) {
+/** Keep the object for one pass: it remembers which folders exist and where symlinks lead. */
+function createAttribution({ folder, where: home, resolve, projectOf, stat, realpath }) {
 	const homeProject = home ? Promise.resolve(projectOf(home)) : null;
-	async function elsewhere(where, path) {
+	const real = /* @__PURE__ */ new Map();
+	const realOf = (p) => {
+		const key = pathKey(p);
+		let r = real.get(key);
+		if (!r) real.set(key, r = Promise.resolve(realpath(p)).then(normalize, () => normalize(p)));
+		return r;
+	};
+	const exists = /* @__PURE__ */ new Map();
+	const isThere = (p) => {
+		const key = pathKey(p);
+		let e = exists.get(key);
+		if (!e) exists.set(key, e = Promise.resolve(stat(p)).then((s) => !!s?.isDir, () => false));
+		return e;
+	};
+	const homeFolder = realOf(folder);
+	async function locate(path, isDir) {
+		const p = normalize(path);
+		let at = isDir ? p : dirname(p);
+		while (!await isThere(at)) {
+			const up = dirname(at);
+			if (up === at) return {
+				real: p,
+				where: null
+			};
+			at = up;
+		}
+		const realAt = await realOf(at);
+		const rest = p.slice(at.length).replace(/^\/+/, "");
+		const where = await resolve(realAt);
+		return {
+			real: rest ? `${realAt.replace(/\/$/, "")}/${rest}` : realAt,
+			where: where && {
+				...where,
+				toplevel: await realOf(where.toplevel)
+			}
+		};
+	}
+	async function elsewhere(where, real) {
 		if (home && pathKey(where.commonDir) === pathKey(home.commonDir)) return {};
 		const project = await projectOf(where);
 		if (homeProject && (await homeProject).id === project.id) return {};
-		return relativeTo(folder, path) === null && pathKey(folder) !== pathKey(path) ? {
+		return relativeTo(await homeFolder, real) !== null || pathKey(await homeFolder) === pathKey(real) ? { project } : {
 			project,
 			away: true
-		} : { project };
-	}
-	async function repoOf(dir) {
-		for (let at = normalize(dir);;) {
-			const where = await resolve(at);
-			if (where) return where;
-			const up = dirname(at);
-			if (up === at) return null;
-			at = up;
-		}
+		};
 	}
 	return {
-		async file(path, cwd) {
-			const p = normalize(path);
-			const own = cwd ? await resolve(cwd) : null;
-			const where = own && relativeTo(own.toplevel, p) ? own : await repoOf(dirname(p));
+		async file(path) {
+			const { real: p, where } = await locate(path, false);
 			const file = where && relativeTo(where.toplevel, p);
 			if (where && file) return {
 				file,
 				...await elsewhere(where, p)
 			};
-			const inFolder = !home && relativeTo(folder, p);
-			return inFolder ? { file: inFolder } : null;
+			const own = !home && relativeTo(await homeFolder, p);
+			return own ? { file: own } : null;
 		},
 		async dir(dir) {
-			const where = await repoOf(dir);
-			if (where) return elsewhere(where, normalize(dir));
-			return !home && (relativeTo(folder, dir) !== null || pathKey(folder) === pathKey(dir)) ? {} : null;
+			const { real: d, where } = await locate(dir, true);
+			if (where) return elsewhere(where, d);
+			return !home && (relativeTo(await homeFolder, d) !== null || pathKey(await homeFolder) === pathKey(d)) ? {} : null;
 		}
 	};
 }
@@ -7338,67 +7393,137 @@ function createAttribution({ folder, where: home, resolve, projectOf }) {
 /**
 * { writes, reads, dirs }: the absolute paths `command` writes and reads, and the folders its
 * programs run in, in order, each once. Relative paths resolve against `cwd`, or against where a
-* `cd` in the command moved to; with no cwd they are skipped. Git Bash's /c/… paths become C:/…
-* when the cwd is a Windows path.
+* `cd` in the command moved to; with no cwd they are skipped.
 */
-function shellFiles(command, cwd, { powershell = false } = {}) {
+function shellFiles(command, cwd, { powershell = false, cmd = false, home = null } = {}) {
+	const shell = cmd ? "cmd" : powershell ? "powershell" : "bash";
 	const win = Boolean(cwd) && isWindowsPath(cwd);
 	let dir = cwd ? normalize(cwd) : null;
 	const pushed = [];
-	const writes = [];
-	const reads = [];
-	const dirs = [];
-	const keep = (out, w) => {
-		const p = place(w, dir, win);
-		if (p && !out.includes(p)) out.push(p);
+	const out = {
+		writes: [],
+		reads: [],
+		dirs: []
 	};
-	for (const s of segments(tokens(command, powershell))) {
-		for (const w of s.writes) keep(writes, w);
+	const at = (w) => place(w, dir, win, home);
+	const keep = (list, p) => {
+		if (p && !list.includes(p)) list.push(p);
+	};
+	for (const s of segments(tokens(command, shell))) {
+		for (const w of s.writes) keep(out.writes, at(w));
 		let words = s.words;
-		if (!powershell) while (words.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(words[0].text)) words = words.slice(1);
+		if (shell === "bash") while (words.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(words[0].text)) words = words.slice(1);
 		if (!words.length || words[0].unsafe) continue;
-		const name = base(words[0].text).toLowerCase().replace(/\.exe$/, "");
-		const args = words.slice(1);
+		const name = base(words[0].text).toLowerCase().replace(/\.(exe|cmd|bat)$/, "");
+		const args = shell === "cmd" ? words.slice(1).filter((w) => !/^\/[a-z?](:\S*)?$/i.test(w.text)) : words.slice(1);
+		const inner = nested(name, words.slice(1));
+		if (inner) {
+			const got = shellFiles(inner.text, dir, {
+				...inner.as,
+				home
+			});
+			for (const k of [
+				"writes",
+				"reads",
+				"dirs"
+			]) for (const p of got[k]) keep(out[k], p);
+			continue;
+		}
 		if (CD.has(name)) {
-			const { named, positional } = psArgs(args);
-			const to = named.path || named.literalpath || positional[0];
+			const { named, positional } = shell === "powershell" ? psArgs(args) : {
+				named: {},
+				positional: shell === "bash" ? posix(args).positional : args
+			};
+			const to = named.path || named.literalpath || (shell === "cmd" && positional.length > 1 ? {
+				text: positional.map((w) => w.text).join(" "),
+				unsafe: positional.some((w) => w.unsafe)
+			} : positional[0]);
 			if (name === "pushd" || name === "push-location") pushed.push(dir);
-			dir = to && to !== true && to.text !== "-" ? place(to, dir, win) : null;
+			dir = to && to !== true && to.text !== "-" ? at(to) : null;
 			continue;
 		}
 		if (name === "popd" || name === "pop-location") {
 			dir = pushed.length ? pushed.pop() : null;
 			continue;
 		}
-		const runsIn = name === "git" ? gitDir(args, dir, win) : dir;
-		if (runsIn && !dirs.includes(runsIn)) dirs.push(runsIn);
-		const writer = Object.hasOwn(WRITERS, name) ? WRITERS[name] : void 0;
-		if (writer) for (const w of writer(args)) keep(writes, w);
-		const reader = powershell && Object.hasOwn(PS_READERS, name) && PS_READERS[name] || (Object.hasOwn(READERS, name) ? READERS[name] : void 0);
+		keep(out.dirs, runsIn(name, args, dir, (w, from) => place(w, from, win, home)));
+		const writer = pick(shell, name, CMD_WRITERS, PS_WRITERS, WRITERS);
+		if (writer) for (const w of writer(args)) keep(out.writes, at(w));
+		const reader = pick(shell, name, CMD_READERS, PS_READERS, READERS);
 		if (reader) {
-			for (const r of reader(args)) if (r.text !== "-") keep(reads, r);
+			for (const r of reader(args)) if (r.text !== "-") keep(out.reads, at(r));
 		}
 	}
-	return {
-		writes,
-		reads,
-		dirs
-	};
+	return out;
 }
-function gitDir(args, dir, win) {
-	let at = dir;
+function pick(shell, name, cmd, ps, common) {
+	const own = shell === "cmd" ? cmd : shell === "powershell" ? ps : null;
+	if (own && Object.hasOwn(own, name)) return own[name];
+	if (shell === "cmd") return void 0;
+	return Object.hasOwn(common, name) ? common[name] : void 0;
+}
+function nested(name, args) {
+	const rest = (from) => from >= 0 && from < args.length && !args.slice(from).some((w) => w.unsafe) ? args.slice(from).map((w) => w.text).join(" ") : null;
+	let text = null;
+	let as = {};
+	if (name === "cmd") {
+		text = rest(args.findIndex((w) => /^\/[ck]$/i.test(w.text)) + 1 || -1);
+		as = { cmd: true };
+	} else if (name === "powershell" || name === "pwsh") {
+		text = rest(args.findIndex((w) => /^-(c|command|com|comm|comma|comman)$/i.test(w.text)) + 1 || -1);
+		as = { powershell: true };
+	} else if (name === "bash" || name === "sh" || name === "zsh") {
+		const i = args.findIndex((w) => /^-[a-z]*c[a-z]*$/.test(w.text));
+		const w = i >= 0 ? args[i + 1] : void 0;
+		text = w && !w.unsafe ? w.text : null;
+	}
+	return text ? {
+		text,
+		as
+	} : null;
+}
+function runsIn(name, args, dir, at) {
+	const flag = (names) => {
+		let hit = null;
+		for (let i = 0; i < args.length; i++) {
+			const t = args[i].text;
+			const eq = /^(--?[A-Za-z-]+)=(.*)$/.exec(t);
+			if (eq && names.includes(eq[1])) hit = {
+				text: eq[2],
+				unsafe: args[i].unsafe
+			};
+			else if (names.includes(t) && args[i + 1]) hit = args[++i];
+		}
+		return hit;
+	};
+	if (name === "git") return gitDir(args, dir, at);
+	const to = name === "npm" ? flag(["--prefix", "-C"]) : name === "pnpm" ? flag(["-C", "--dir"]) : name === "yarn" ? flag(["--cwd"]) : name === "make" || name === "gmake" ? flag(["-C", "--directory"]) : null;
+	return to ? at(to, dir) : dir;
+}
+function gitDir(args, dir, at) {
+	let here = dir;
+	let tree = null;
+	let gitDirAt = null;
 	for (let i = 0; i < args.length; i++) {
 		const t = args[i].text;
-		if (t === "-C" && args[i + 1]) at = place(args[++i], at, win);
-		else if ([
-			"-c",
-			"--git-dir",
-			"--work-tree",
-			"--namespace"
-		].includes(t)) i++;
+		const eq = /^(--git-dir|--work-tree)=(.*)$/.exec(t);
+		const value = (w) => w ? at(w, here) : null;
+		if (t === "-C" && args[i + 1]) here = at(args[++i], here);
+		else if (eq) eq[1] === "--git-dir" ? gitDirAt = value({
+			text: eq[2],
+			unsafe: args[i].unsafe
+		}) : tree = value({
+			text: eq[2],
+			unsafe: args[i].unsafe
+		});
+		else if (t === "--git-dir") gitDirAt = value(args[++i]);
+		else if (t === "--work-tree") tree = value(args[++i]);
+		else if (t === "-c" || t === "--namespace") i++;
 		else if (!t.startsWith("-")) break;
 	}
-	return at;
+	if (tree) return tree;
+	if (gitDirAt) return /\/\.git$/i.test(gitDirAt) ? gitDirAt.slice(0, -5) || "/" : gitDirAt;
+	return here;
 }
 const CD = /* @__PURE__ */ new Set([
 	"cd",
@@ -7432,8 +7557,45 @@ const WRITERS = {
 		"literalpath",
 		"path"
 	]),
-	"new-item": newItem
+	"new-item": newItem,
+	rm: (args) => posix(args).positional
 };
+const copyItem = (args) => {
+	const { named, positional } = psArgs(args);
+	const to = named.destination;
+	if (to && to !== true) return [to];
+	return positional.length >= 2 ? [positional[positional.length - 1]] : [];
+};
+const removeItem = (args) => {
+	const { named, positional } = psArgs(args);
+	const hit = [named.path, named.literalpath].find((v) => !!v && v !== true);
+	return hit ? [hit] : positional;
+};
+const PS_WRITERS = {
+	"copy-item": copyItem,
+	cpi: copyItem,
+	copy: copyItem,
+	cp: copyItem,
+	"move-item": copyItem,
+	mi: copyItem,
+	move: copyItem,
+	mv: copyItem,
+	"remove-item": removeItem,
+	ri: removeItem,
+	rm: removeItem,
+	del: removeItem,
+	erase: removeItem,
+	rmdir: removeItem
+};
+const lastOf = (args) => args.length >= 2 ? [args[args.length - 1]] : [];
+const CMD_WRITERS = {
+	copy: lastOf,
+	xcopy: lastOf,
+	move: lastOf,
+	del: (args) => args,
+	erase: (args) => args
+};
+const CMD_READERS = { type: (args) => args };
 const READERS = {
 	cat: (args) => posix(args).positional,
 	head: (args) => posix(args, ["-n", "-c"]).positional,
@@ -7529,7 +7691,9 @@ const PS_SWITCHES = /* @__PURE__ */ new Set([
 	"verbose",
 	"debug",
 	"raw",
-	"wait"
+	"wait",
+	"recurse",
+	"container"
 ]);
 function psArgs(args) {
 	const named = Object.create(null);
@@ -7565,9 +7729,12 @@ function newItem(args) {
 		unsafe: path.unsafe || name.unsafe
 	} : name];
 }
-function place(w, dir, win) {
-	if (!w || w.unsafe || !w.text || w.text.startsWith("~") || w.text.startsWith("/dev/") || /^nul$/i.test(w.text)) return null;
-	const p = win ? w.text.replace(/^\/([a-zA-Z])(?=\/|$)/, (_, d) => d.toUpperCase() + ":") : w.text;
+function place(w, dir, win, home = null) {
+	if (!w || w.unsafe || !w.text || w.text.startsWith("/dev/") || /^(nul|\$null)$/i.test(w.text)) return null;
+	const tilde = /^~(?=[\\/]|$)/.test(w.text);
+	if (w.text.startsWith("~") && !(tilde && home)) return null;
+	const text = tilde ? normalize(home) + w.text.slice(1) : w.text;
+	const p = win ? text.replace(/^\/([a-zA-Z])(?=\/|$)/, (_, d) => d.toUpperCase() + ":") : text;
 	if (isAbsolute(p)) return normalize(p);
 	return dir ? join(dir, p) : null;
 }
@@ -7595,7 +7762,9 @@ function segments(toks) {
 	out.push(cur);
 	return out.filter((s) => s.words.length || s.writes.length);
 }
-function tokens(src, ps) {
+function tokens(src, shell) {
+	const ps = shell === "powershell";
+	const cmd = shell === "cmd";
 	const out = [];
 	const heredocs = [];
 	let word = null;
@@ -7616,7 +7785,7 @@ function tokens(src, ps) {
 		flush();
 		out.push({ op: o });
 	};
-	const escape = ps ? "`" : "\\";
+	const escape = ps ? "`" : cmd ? "^" : "\\";
 	while (i < src.length) {
 		const ch = src[i];
 		if (ch === "\n") {
@@ -7626,7 +7795,7 @@ function tokens(src, ps) {
 		} else if (ch === " " || ch === "	" || ch === "\r") {
 			flush();
 			i++;
-		} else if (ch === "#" && !word) while (i < src.length && src[i] !== "\n") i++;
+		} else if (ch === "#" && !word && !cmd) while (i < src.length && src[i] !== "\n") i++;
 		else if (ch === escape) {
 			if (src[i + 1] !== "\n") add(src[i + 1] || "");
 			i += 2;
@@ -7636,7 +7805,7 @@ function tokens(src, ps) {
 			const stop = end < 0 ? src.length : end;
 			add(src.slice(i + 2, stop), q === "\"" && src.slice(i + 2, stop).includes("$"));
 			i = end < 0 ? src.length : end + 3;
-		} else if (ch === "'") {
+		} else if (ch === "'" && !cmd) {
 			let j = i + 1;
 			let text = "";
 			for (;;) {
@@ -7657,7 +7826,7 @@ function tokens(src, ps) {
 		} else if (ch === "\"") {
 			let j = i + 1;
 			while (j < src.length && src[j] !== "\"") {
-				if (src[j] === escape && j + 1 < src.length) {
+				if (src[j] === escape && !cmd && j + 1 < src.length) {
 					const n = src[j + 1];
 					if (ps || "$`\"\\\n".includes(n)) {
 						if (n !== "\n") add(n);
@@ -7665,13 +7834,13 @@ function tokens(src, ps) {
 						continue;
 					}
 				}
-				if (src[j] === "$" || !ps && src[j] === "`") add(src[j], true);
+				if (cmd ? src[j] === "%" : src[j] === "$" || !ps && src[j] === "`") add(src[j], true);
 				else add(src[j]);
 				j++;
 			}
 			add("");
 			i = j + 1;
-		} else if (ch === "$" || ch === "*" || ch === "?" || !ps && ch === "`") {
+		} else if ((cmd ? ch === "%" : ch === "$" || !ps && ch === "`") || ch === "*" || ch === "?") {
 			add(ch, true);
 			i++;
 		} else if (ch === ";" || ch === "(" || ch === ")") {
@@ -7704,7 +7873,7 @@ function tokens(src, ps) {
 			}
 		} else if (ch === "<") {
 			flush();
-			if (!ps && src[i + 1] === "<" && src[i + 2] !== "<") {
+			if (shell === "bash" && src[i + 1] === "<" && src[i + 2] !== "<") {
 				i += 2;
 				const strip = src[i] === "-";
 				if (strip) i++;
@@ -7786,6 +7955,7 @@ function createClaudeCode(io) {
 	const transcripts = /* @__PURE__ */ new Map();
 	const metas = /* @__PURE__ */ new Map();
 	const found = /* @__PURE__ */ new Map();
+	const workspaces = /* @__PURE__ */ new Map();
 	const searched = /* @__PURE__ */ new Map();
 	let used = /* @__PURE__ */ new Set();
 	async function read({ sessionId, cwd, now, config, resolve, projectOf }) {
@@ -7816,7 +7986,7 @@ function createClaudeCode(io) {
 			if (leftOut(main, c, config)) return none();
 			if (!main.cwd) return none(main.seen && (!main.parsed || main.messages) ? "transcript format not recognised" : null);
 			const home = await resolve(cwd);
-			const workspace = !home && await isWorkspace(cwd);
+			const workspace = !home && await isWorkspace(cwd, now, config);
 			const where = workspace ? {
 				toplevel: normalize(cwd),
 				commonDir: "",
@@ -7827,12 +7997,15 @@ function createClaudeCode(io) {
 				folder: cwd,
 				where: workspace ? null : home ?? where,
 				resolve,
-				projectOf
+				projectOf,
+				stat: (p) => io.stat(p),
+				realpath: (p) => io.realpath ? io.realpath(p) : p
 			});
 			return {
 				facts: await sessionFacts(c, main, where, workspace, now, config, resolve, place, fail),
 				status: null,
-				errors
+				errors,
+				workspace
 			};
 		} finally {
 			for (const cache of [transcripts, metas]) for (const key of cache.keys()) if (!used.has(key)) cache.delete(key);
@@ -7907,11 +8080,22 @@ function createClaudeCode(io) {
 			subagents: all.length
 		};
 	}
-	async function isWorkspace(dir) {
+	async function isWorkspace(dir, now, config) {
+		if (io.home && (pathKey(dir) === pathKey(io.home) || relativeTo(dir, io.home) !== null)) return false;
+		const key = pathKey(dir);
+		const hit = workspaces.get(key);
+		if (hit && now - hit.at <= config.gitCacheSeconds * 1e3) return hit.is;
 		const st = await io.stat(dir);
-		if (!st || !st.isDir) return false;
-		for (const e of await io.listDir(dir)) if (e.isDir && await io.stat(join(dir, `${e.name}/.git`))) return true;
-		return false;
+		let repos = 0;
+		if (st && st.isDir) {
+			for (const e of await io.listDir(dir)) if (e.isDir && await io.stat(join(dir, `${e.name}/.git`))) repos++;
+		}
+		const is = repos >= 1 && repos <= config.workspaceRepos;
+		workspaces.set(key, {
+			at: now,
+			is
+		});
+		return is;
 	}
 	async function sessionFacts(c, main, where, workspace, now, config, resolve, place, fail) {
 		const session = `${SOURCE}:${c.id}`;
@@ -8066,7 +8250,7 @@ function createClaudeCode(io) {
 			lines[0] = st.head + lines[0];
 			st.head = null;
 		}
-		for (const line of lines) if (line.trim()) foldLine(st, line);
+		for (const line of lines) if (line.trim()) foldLine(st, line, io.home ?? null);
 		return st;
 	}
 	async function sumUsage(path, st, chunk) {
@@ -8134,7 +8318,7 @@ async function addFiles(list, agent, touches, tools, now, config, place) {
 	const newest = /* @__PURE__ */ new Map();
 	for (const t of kept) {
 		if (!tools.includes(t.name) || !t.cwd) continue;
-		const placed = await place.file(t.path, t.cwd);
+		const placed = await place.file(t.path);
 		if (!placed) continue;
 		const key = `${placed.project?.id ?? ""}\n${placed.file}`;
 		if (!((newest.get(key)?.at ?? -Infinity) >= t.at)) newest.set(key, {
@@ -8199,7 +8383,7 @@ const MESSAGE_TYPES = /* @__PURE__ */ new Set([
 	"attachment",
 	"system"
 ]);
-function foldLine(st, line) {
+function foldLine(st, line, home) {
 	st.seen++;
 	let ev;
 	try {
@@ -8242,7 +8426,10 @@ function foldLine(st, line) {
 			});
 			const input = c.input || {};
 			const cwd = ev.cwd || st.cwd;
-			const shell = typeof input.command === "string" ? shellFiles(input.command, cwd, { powershell: c.name === "PowerShell" }) : {
+			const shell = typeof input.command === "string" ? shellFiles(input.command, cwd, {
+				powershell: c.name === "PowerShell",
+				home
+			}) : {
 				writes: [],
 				reads: [],
 				dirs: []
@@ -8441,7 +8628,7 @@ async function doingOf(st, place, fallbackMs, config) {
 	if (!t || !kind) return null;
 	return {
 		kind,
-		...t.file && t.cwd ? await place.file(t.file, t.cwd) : t.dir ? await place.dir(t.dir) : null,
+		...t.file && t.cwd ? await place.file(t.file) : t.dir ? await place.dir(t.dir) : null,
 		since: iso(t.at, fallbackMs)
 	};
 }

@@ -23,6 +23,8 @@ export interface Config {
   streamSeconds: number;
   tailBytes: number;
   gitCacheSeconds: number;
+  /** A session folder git can't place is a workspace when it holds between one and this many repos directly. */
+  workspaceRepos: number;
 }
 
 export interface ConfigIo {

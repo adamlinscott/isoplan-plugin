@@ -283,6 +283,18 @@ export const ConflictMessageSchema = z.object({
   text: z.string().min(1),
 });
 
+/**
+ * Sent after a hello is let in, by a server that reads where an edit or command lands (#74): the
+ * projects the office holds, so the data layer may report a file or command in one of them that is
+ * outside the session's own project. A data layer that hasn't had one keeps such files on the
+ * machine, as an older server would read them as the session's own.
+ */
+export const WelcomeMessageSchema = z.object({
+  type: z.literal("welcome"),
+  v: Version,
+  projects: z.array(z.string().min(1)),
+});
+
 /** Something the data layer should show. */
 export const ErrorMessageSchema = z.object({
   type: z.literal("error"),
@@ -423,6 +435,7 @@ export const AskRightsMessageSchema = z.object({
 
 export const OfficeServerMessageSchema = z.discriminatedUnion("type", [
   RepairMessageSchema,
+  WelcomeMessageSchema,
   ConflictMessageSchema,
   ErrorMessageSchema,
   RequestMessageSchema,
@@ -464,6 +477,7 @@ export type AskedMessage = z.infer<typeof AskedMessageSchema>;
 export type AskedAckMessage = z.infer<typeof AskedAckMessageSchema>;
 export type AskRightsMessage = z.infer<typeof AskRightsMessageSchema>;
 export type OfficeServerMessage = z.infer<typeof OfficeServerMessageSchema>;
+export type WelcomeMessage = z.infer<typeof WelcomeMessageSchema>;
 
 /**
  * A parsed message, or why it was refused: `unsupported-version` when it carries a protocol
