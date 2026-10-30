@@ -1,7 +1,8 @@
 // The data layer's main loop, run as it ships (dist/data-layer.js, rebuilt with every change), in
 // detached mode so it installs nothing and starts no runner, against a stand-in office server, with
 // a throwaway Claude config folder: what it sends for a session in a repo the office doesn't take,
-// and when the copy of the office's list is too old (adamlinscott/isoplan#91).
+// and when the copy of the office's list is too old (adamlinscott/isoplan#91); and what a copy in
+// the plugin cache does once Claude Code has installed a newer one (adamlinscott/isoplan#96).
 
 import { execFileSync, spawn, type ChildProcess } from "node:child_process";
 import fs from "node:fs";
@@ -105,4 +106,45 @@ test("an approved session connects; once its copy of the list is past its maximu
   // The server answers again: the list is checked, and only then does it reconnect.
   o.state.status = 200;
   await until(() => o.state.connections.length === 2 && o.state.connections[1]!.messages.some((m) => m.type === "hello"));
+});
+
+test("a copy in the plugin cache that an update left behind says so, installs nothing and checks for nothing; a detached one leaves the session to the new one", async () => {
+  const root = tempRoot();
+  const claudeDir = path.join(root, "claude");
+  const plugins = path.join(claudeDir, "plugins");
+  const folder = (sha: string) => path.join(plugins, "cache", "isoplan", "isoplan", sha);
+  for (const sha of ["6658f568c1e1", "a1b2c3d4e5f6"]) {
+    fs.mkdirSync(path.join(folder(sha), "dist"), { recursive: true });
+    fs.copyFileSync(path.join(modDir, "dist", "data-layer.js"), path.join(folder(sha), "dist", "data-layer.js"));
+    fs.copyFileSync(path.join(modDir, "config.json"), path.join(folder(sha), "config.json"));
+  }
+  fs.writeFileSync(path.join(plugins, "installed_plugins.json"), JSON.stringify({ version: 2, plugins: { "isoplan@isoplan": [{ scope: "user", installPath: folder("a1b2c3d4e5f6") }] } }));
+  const repo = path.join(root, "app");
+  fs.mkdirSync(repo);
+  const run = (...flags: string[]) => {
+    const child = spawn(process.execPath, [path.join(folder("6658f568c1e1"), "dist", "data-layer.js"), "--session", "s1", "--cwd", repo, ...flags], {
+      cwd: repo,
+      env: { ...process.env, CLAUDE_CONFIG_DIR: claudeDir, CLAUDE_CODE_PLUGIN_CACHE_DIR: "" },
+      stdio: ["ignore", "pipe", "ignore"],
+      windowsHide: true,
+    });
+    children.push(child);
+    let out = "";
+    child.stdout!.on("data", (piece) => (out += piece));
+    return { lines: () => out.split("\n").filter(Boolean).map((l) => JSON.parse(l) as { type: string; text?: string }), exited: new Promise<number | null>((resolve) => child.on("exit", resolve)) };
+  };
+
+  const loaded = run();
+  await until(() => loaded.lines().some((l) => l.type === "updated"));
+  await wait(1500);
+  expect(fs.existsSync(path.join(claudeDir, "isoplan", "wake.json"))).toBe(false);
+  expect(fs.existsSync(path.join(claudeDir, "isoplan", "update.json"))).toBe(false);
+  expect(loaded.lines().filter((l) => l.type === "updated")).toHaveLength(1);
+  children.splice(0).forEach((c) => c.kill());
+
+  fs.rmSync(path.join(claudeDir, "isoplan", "live"), { recursive: true, force: true }); // the killed one's lock
+  const detached = run("--detached");
+  expect(await detached.exited).toBe(0);
+  expect(fs.existsSync(path.join(claudeDir, "isoplan", "live", "s1.json"))).toBe(false);
+  expect(fs.readFileSync(path.join(claudeDir, "isoplan", "logs", "s1.log"), "utf8")).toMatch(/a newer version of the Isoplan plugin is installed/);
 });

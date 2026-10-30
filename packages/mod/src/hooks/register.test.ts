@@ -103,6 +103,23 @@ test("hooks: starts the data layer for its session and shows the link's state, t
   expect(h.status).toEqual(["Isoplan: connected to ws://127.0.0.1:4747/data-layer", "Isoplan: the data layer stopped (node exited with code 0); restarting in 1s"]);
 });
 
+test("hooks: once a newer version is on disk, the status line says to reload, beside the link's state", async () => {
+  const h = await start([connected, { type: "updated" }, { type: "status", server: "ws://127.0.0.1:4747/data-layer", state: "disconnected", retryInMs: 2000 }]);
+  await stopped(h);
+  expect(h.status).toEqual([
+    "Isoplan: connected to ws://127.0.0.1:4747/data-layer",
+    "Isoplan: connected to ws://127.0.0.1:4747/data-layer · Isoplan updated: type /reload-plugins",
+    "Isoplan: can't reach ws://127.0.0.1:4747/data-layer; retrying in 2s · Isoplan updated: type /reload-plugins",
+    "Isoplan: the data layer stopped (node exited with code 0); restarting in 1s · Isoplan updated: type /reload-plugins",
+  ]);
+  // Before any other status, the note stands alone.
+  vi.resetModules();
+  const { register } = await import("./register.js");
+  register(((event: keyof Hooks, hook: Function) => ((hooks[event] = hook), { catch: () => {} })) as unknown as On);
+  const first = await start([{ type: "updated" }], { stays: true });
+  await vi.waitFor(() => expect(first.status.at(-1)).toBe("Isoplan updated: type /reload-plugins"));
+});
+
 test("hooks: a data layer that keeps dying soon after starting backs off, whatever it wrote; one that stayed up a minute starts over", async () => {
   const quick = await start([connected], { wakes: 3 });
   await vi.waitFor(() => expect(quick.slept).toHaveLength(4));

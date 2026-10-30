@@ -39,6 +39,8 @@ let pairing = null;
 let pairSaid = false;
 const floorWaits = /* @__PURE__ */ new Map();
 let waitsDir = null;
+let shownStatus;
+let updated = false;
 let marking = Promise.resolve();
 function register(on) {
 	on("session.start", async ($, e, next) => {
@@ -197,7 +199,7 @@ async function run($) {
 		}
 		failures = await $.clock.now() - startedAt >= STABLE_MS ? 1 : failures + 1;
 		const delay = Math.min(RETRY_CAP_MS, 1e3 * failures);
-		$.ui.status(!began ? "Isoplan needs Node.js on PATH (couldn't start `node`)" : `Isoplan: the data layer stopped${code === null ? "" : ` (node exited with code ${code})`}; restarting in ${Math.round(delay / 1e3)}s`);
+		show($, !began ? "Isoplan needs Node.js on PATH (couldn't start `node`)" : `Isoplan: the data layer stopped${code === null ? "" : ` (node exited with code ${code})`}; restarting in ${Math.round(delay / 1e3)}s`);
 		await $.clock.sleep(delay);
 	}
 }
@@ -211,7 +213,11 @@ function handle($, text) {
 	}
 	switch (line.type) {
 		case "status":
-			$.ui.status(statusText(line));
+			show($, statusText(line));
+			break;
+		case "updated":
+			updated = true;
+			show($, shownStatus);
 			break;
 		case "title-ask":
 			writeTitle($, line);
@@ -223,7 +229,7 @@ function handle($, text) {
 			if (!pairSaid) $.ui.log(`Isoplan: to report to ${line.server}, pair this machine: click ${line.url} on this computer and approve it in the office.`);
 			pairSaid = true;
 			pairing = line;
-			$.ui.status(pairText(line));
+			show($, pairText(line));
 			break;
 		case "conflict":
 			addNote(line);
@@ -250,6 +256,11 @@ function handle($, text) {
 		}
 	}
 }
+function show($, text) {
+	shownStatus = text;
+	$.ui.status(updated ? [text, UPDATED_TEXT].filter(Boolean).join(" · ") : text);
+}
+const UPDATED_TEXT = "Isoplan updated: type /reload-plugins";
 function statusText(line) {
 	switch (line.state) {
 		case "waiting": return `Isoplan: ${line.server}, not connected yet (nothing to report)`;

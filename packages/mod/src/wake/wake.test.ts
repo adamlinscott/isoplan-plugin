@@ -79,3 +79,25 @@ test("wake: a data layer held off because the office took none of its repos star
   expect(await s.run(() => false)).toBe(true);
   expect(s.spawned).toHaveLength(1);
 });
+
+test("wake: starts the newest data layer Claude Code has installed, not an older one wake.json still records", async () => {
+  const root = tempRoot();
+  const claudeDir = path.join(root, ".claude");
+  const plugins = path.join(claudeDir, "plugins");
+  const folder = (sha: string) => path.join(plugins, "cache", "isoplan", "isoplan", sha);
+  const write = (file: string, text: string) => (fs.mkdirSync(path.dirname(file), { recursive: true }), fs.writeFileSync(file, text));
+  const old = path.join(folder("6658f568c1e1"), "dist", "data-layer.js");
+  const now = path.join(folder("a1b2c3d4e5f6"), "dist", "data-layer.js");
+  write(old, "");
+  write(now, "");
+  write(wakeRecordPath(claudeDir), JSON.stringify({ dataLayer: old }));
+  write(path.join(plugins, "installed_plugins.json"), JSON.stringify({ version: 2, plugins: { "isoplan@isoplan": [{ scope: "user", installPath: folder("a1b2c3d4e5f6") }] } }));
+  const spawned: string[][] = [];
+  const input = JSON.stringify({ session_id: "s-1", cwd: "/repo" });
+  expect(await wake(input, { claudeDir, plugins, spawn: (args) => spawned.push(args), isAlive: () => false })).toBe(true);
+  expect(spawned[0]![0]).toBe(now);
+  // With the newer folder gone (say, cleaned up), the recorded one still runs.
+  fs.rmSync(now);
+  await wake(input, { claudeDir, plugins, spawn: (args) => spawned.push(args), isAlive: () => false });
+  expect(spawned[1]![0]).toBe(old);
+});

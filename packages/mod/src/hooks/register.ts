@@ -1,6 +1,7 @@
 // Isoplan's hooks module: Claude Code loads it through hooks/hooks.json. It draws nothing. It
 // starts the data layer (dist/data-layer.js) for the session and keeps it running, shows the link
-// in one status line, writes the room titles the data layer asks for on the owner's own login,
+// in one status line, with "Isoplan updated: type /reload-plugins" beside it once the data layer says
+// a newer version of the plugin is on disk (src/update), writes the room titles the data layer asks for on the owner's own login,
 // and adds the office server's conflict notes to the agent's next tool result. When the office
 // server wants the machine paired, a "Pair this machine" link is in the status line while it waits,
 // and in the transcript once per session start, so nobody types a command or is nagged.
@@ -75,6 +76,8 @@ let pairSaid = false; // a link was put in the transcript since the session star
 // The questions waiting for an answer from the floor too, by their call's id: each ends its call.
 const floorWaits = new Map<string, (answers: Record<string, string>) => void>();
 let waitsDir: string | null = null; // where the waits are marked, as the data layer said
+let shownStatus: string | undefined; // the status line, without the update note
+let updated = false; // a newer version of the plugin is on disk, loaded at /reload-plugins
 let marking: Promise<unknown> = Promise.resolve(); // the marks, written in order
 
 export function register(on: On): void {
@@ -231,7 +234,8 @@ async function run($: Host): Promise<void> {
     // backs off, however many lines it wrote first.
     failures = (await $.clock.now()) - startedAt >= STABLE_MS ? 1 : failures + 1;
     const delay = Math.min(RETRY_CAP_MS, 1000 * failures);
-    $.ui.status(
+    show(
+      $,
       !began
         ? "Isoplan needs Node.js on PATH (couldn't start `node`)"
         : `Isoplan: the data layer stopped${code === null ? "" : ` (node exited with code ${code})`}; restarting in ${Math.round(delay / 1000)}s`,
@@ -251,7 +255,11 @@ function handle($: Host, text: string): void {
   }
   switch (line.type) {
     case "status":
-      $.ui.status(statusText(line));
+      show($, statusText(line));
+      break;
+    case "updated":
+      updated = true;
+      show($, shownStatus);
       break;
     case "title-ask":
       writeTitle($, line);
@@ -264,7 +272,7 @@ function handle($: Host, text: string): void {
       if (!pairSaid) $.ui.log(`Isoplan: to report to ${line.server}, pair this machine: click ${line.url} on this computer and approve it in the office.`);
       pairSaid = true;
       pairing = line;
-      $.ui.status(pairText(line));
+      show($, pairText(line));
       break;
     case "conflict":
       addNote(line);
@@ -293,6 +301,15 @@ function handle($: Host, text: string): void {
     }
   }
 }
+
+// The status line: `text`, with the update note beside it once there is one. The mod reloads with
+// the plugin, so a reload clears the note.
+function show($: Host, text: string | undefined): void {
+  shownStatus = text;
+  $.ui.status(updated ? [text, UPDATED_TEXT].filter(Boolean).join(" · ") : text);
+}
+
+const UPDATED_TEXT = "Isoplan updated: type /reload-plugins";
 
 function statusText(line: StatusLine): string {
   switch (line.state) {

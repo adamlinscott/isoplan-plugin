@@ -31,6 +31,8 @@ export interface Config {
   approvedRefreshMinutes: number;
   /** A copy of that list not confirmed by the server for this long approves nothing. */
   approvedMaxAgeMinutes: number;
+  /** How often the plugin looks for a newer version of itself and installs it (src/update); 0 turns that off. */
+  updateCheckHours: number;
 }
 
 export interface ConfigIo {
@@ -66,7 +68,7 @@ const FLOORS = new Map([["streamSeconds", 0.25]]);
 
 // Every number in config.json is a window or a size, so it must be finite and above zero; a
 // window in ZERO_OFF may also be 0, which turns its feature off.
-const ZERO_OFF = new Set(["lightsOffHours"]);
+const ZERO_OFF = new Set(["lightsOffHours", "updateCheckHours"]);
 
 function fits(key: string, value: unknown, fallback: unknown): boolean {
   if (key === "server") return typeof value === "string" && isWebSocketUrl(value);

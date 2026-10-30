@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { expect, test } from "vitest";
 import { tempRoot } from "../data-layer/fixture.js";
-import { installedPlugins, pluginIdOf, pluginState } from "./state.js";
+import { installedPlugins, newestDataLayer, pluginIdOf, pluginState } from "./state.js";
 
 const ID = "isoplan@isoplan";
 
@@ -112,4 +112,41 @@ test("project scope: an install counts only for its project's sessions, or every
   expect(await pluginState(s.place, s.dataLayer)).toBe("enabled"); // the machine still has it: nothing is uninstalled
   s.installed({ [ID]: [{ scope: "local" }] });
   expect(await pluginState(s.place, s.dataLayer, other)).toBe("enabled");
+});
+
+test("versions by commit SHA: an update to a new folder is still the same install, and leaves the old data layer outdated", async () => {
+  const s = setup();
+  const folder = (sha: string) => path.join(s.place.plugins, "cache", "isoplan", "isoplan", sha);
+  const old = path.join(folder("6658f568c1e1"), "dist", "data-layer.js");
+  const now = path.join(folder("a1b2c3d4e5f6"), "dist", "data-layer.js");
+  s.write(old, "");
+  s.installed({ [ID]: [{ scope: "user", installPath: folder("6658f568c1e1"), version: "6658f568c1e1" }] });
+  expect(pluginIdOf(s.place.plugins, old)).toBe(ID);
+  expect(await newestDataLayer(s.place.plugins, old)).toBe(old);
+  // Claude Code updated it: the record names the new folder, the old one stays until it is cleaned up.
+  s.installed({ [ID]: [{ scope: "user", installPath: folder("a1b2c3d4e5f6"), version: "a1b2c3d4e5f6" }] });
+  expect(await newestDataLayer(s.place.plugins, old)).toBe(old); // the new folder isn't there yet
+  s.write(now, "");
+  expect(await newestDataLayer(s.place.plugins, old)).toBe(now);
+  expect(await newestDataLayer(s.place.plugins, now)).toBe(now);
+  // Uninstall and disable detection go by the id, whichever folder wake.json still records.
+  expect(await pluginState(s.place, old)).toBe("enabled");
+  s.enabled(path.join(s.place.claudeDir, "settings.json"), false);
+  expect(await pluginState(s.place, old)).toBe("disabled");
+  s.installed({});
+  expect(await pluginState(s.place, old)).toBe("uninstalled");
+});
+
+test("newest data layer: itself while any install still loads its folder, outside the cache, or with no record to read", async () => {
+  const s = setup();
+  const other = path.join(s.place.plugins, "cache", "isoplan", "isoplan", "b".repeat(12));
+  s.write(path.join(other, "dist", "data-layer.js"), "");
+  expect(await newestDataLayer(s.place.plugins, s.dataLayer)).toBe(s.dataLayer); // no record
+  s.installed({ [ID]: [{ scope: "user", installPath: path.dirname(path.dirname(s.dataLayer)) }, { scope: "project", installPath: other }] });
+  // A project still on this version keeps it current.
+  expect(await newestDataLayer(s.place.plugins, s.dataLayer)).toBe(s.dataLayer);
+  s.installed({ "isoplan@other-market": [{ scope: "user", installPath: other }] });
+  expect(await newestDataLayer(s.place.plugins, s.dataLayer)).toBe(s.dataLayer); // another id isn't an update of this one
+  const checkout = path.join(s.root, "checkout", "dist", "data-layer.js");
+  expect(await newestDataLayer(s.place.plugins, checkout)).toBe(checkout);
 });

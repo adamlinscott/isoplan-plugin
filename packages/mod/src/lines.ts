@@ -82,6 +82,14 @@ export interface AnswerTaken {
   taken: boolean;
 }
 
+/**
+ * A newer version of the plugin is in Claude Code's plugin cache than the one this session loaded
+ * (src/update): it loads at /reload-plugins, or the next session.
+ */
+export interface UpdatedLine {
+  type: "updated";
+}
+
 /** A problem worth a line in the debug log. */
 export interface LogLine {
   type: "log";
@@ -99,4 +107,4 @@ export interface TitleReply {
  * `asked` is the end of a question the session's agent asked the room, arriving after it stopped
  * waiting, and `ask-rights` whether the session may ask its room (#49).
  */
-export type DataLayerLine = StatusLine | TitleAskLine | PairLine | WaitsLine | OwnerAnswerLine | LogLine | ConflictMessage | ErrorMessage | AskedMessage | AskRightsMessage;
+export type DataLayerLine = StatusLine | TitleAskLine | PairLine | WaitsLine | OwnerAnswerLine | UpdatedLine | LogLine | ConflictMessage | ErrorMessage | AskedMessage | AskRightsMessage;

@@ -86,7 +86,7 @@ const machine = project ? await recordedState(paths).catch(() => "enabled" as co
 if (machine === "disabled") await stopOurRunner(claudeDir).catch(() => {});
 if (session === "enabled") {
   try {
-    await wake(input, { claudeDir, spawn: start, project });
+    await wake(input, { claudeDir, spawn: start, project, plugins: paths.plugins });
   } catch {
     // Nothing to do: a session is never failed for this.
   }

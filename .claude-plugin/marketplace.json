@@ -6,7 +6,6 @@
     {
       "name": "isoplan",
       "source": "./packages/mod",
-      "version": "0.2.0",
       "description": "Isoplan's Claude Code plugin: streams each session's facts to a team's office server, set in config.json."
     }
   ]

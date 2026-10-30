@@ -47,6 +47,8 @@ export interface Install {
   id: string;
   scope: string | null;
   projectPath: string | null;
+  /** The folder the install loads from: cache/<marketplace>/<plugin>/<version>. */
+  installPath: string | null;
 }
 
 /** Claude Code's plugins folder: $CLAUDE_CODE_PLUGIN_CACHE_DIR when it is set, else <claude dir>/plugins. */
@@ -68,12 +70,41 @@ export function normalPath(p: string, platform: NodeJS.Platform = process.platfo
   return platform === "win32" || platform === "darwin" ? resolved.toLowerCase() : resolved;
 }
 
-/** The id, `<plugin>@<marketplace>`, of the marketplace install `file` is part of; null for a file outside the plugin cache. */
-export function pluginIdOf(plugins: string, file: string): string | null {
+// The parts of `file`'s path below the plugin cache, `<marketplace>/<plugin>/<version>/...`; null outside it.
+function cacheParts(plugins: string, file: string): string[] | null {
   const relative = path.relative(path.join(plugins, "cache"), path.resolve(file));
   if (path.isAbsolute(relative)) return null; // another drive
   const parts = relative.split(path.sep);
-  return parts.length >= 4 && parts[0] !== ".." ? `${parts[1]}@${parts[0]}` : null;
+  return parts.length >= 4 && parts[0] !== ".." ? parts : null;
+}
+
+/** The id, `<plugin>@<marketplace>`, of the marketplace install `file` is part of; null for a file outside the plugin cache. */
+export function pluginIdOf(plugins: string, file: string): string | null {
+  const parts = cacheParts(plugins, file);
+  return parts ? `${parts[1]}@${parts[0]}` : null;
+}
+
+/**
+ * The data layer of the copy of its plugin Claude Code has installed now. That is `dataLayer` itself
+ * while installed_plugins.json records its version folder for its id, or when it is outside the
+ * cache, or the record is unknown or names no folder. Otherwise an update put another version on
+ * disk (the version is the commit's SHA, since the plugin pins none): the first one recorded whose
+ * data layer is there. A data layer this doesn't return is outdated: a session loads the new copy at
+ * its next start, or at /reload-plugins.
+ */
+export async function newestDataLayer(plugins: string, dataLayer: string): Promise<string> {
+  const parts = cacheParts(plugins, dataLayer);
+  if (!parts) return dataLayer;
+  const id = `${parts[1]}@${parts[0]}`;
+  const folders = ((await installs(plugins)) ?? []).filter((i) => i.id === id && i.installPath).map((i) => i.installPath!);
+  const root = path.join(plugins, "cache", ...parts.slice(0, 3));
+  if (!folders.length || folders.some((f) => normalPath(f) === normalPath(root))) return dataLayer;
+  const inside = parts.slice(3);
+  for (const folder of folders) {
+    const candidate = path.join(folder, ...inside);
+    if (await fs.stat(candidate).then((s) => s.isFile(), () => false)) return candidate;
+  }
+  return dataLayer;
 }
 
 const nameOf = (id: string) => id.slice(0, id.lastIndexOf("@"));
@@ -86,7 +117,8 @@ export async function installs(plugins: string): Promise<Install[] | null> {
   return Object.entries(list).flatMap(([id, entries]) =>
     (entries as unknown[]).map((entry) => {
       const e = isObject(entry) ? entry : {};
-      return { id, scope: typeof e.scope === "string" ? e.scope : null, projectPath: typeof e.projectPath === "string" ? e.projectPath : null };
+      const text = (key: string) => (typeof e[key] === "string" ? (e[key] as string) : null);
+      return { id, scope: text("scope"), projectPath: text("projectPath"), installPath: text("installPath") };
     }),
   );
 }

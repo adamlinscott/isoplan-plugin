@@ -16,6 +16,11 @@
 // An office server that signs people in wants the machine paired first: reading that list pairs it,
 // keeping the credential in <claude dir>/isoplan/pairing.json, under the machine's Claude account
 // (src/data-layer/pairing.ts).
+// It keeps the plugin up to date (src/update): as it starts and every `updateCheckHours` it installs
+// a newer version in the background, and once one is on disk it says so in the status line, since
+// the session loads it only at /reload-plugins. An outdated data layer installs nothing, so it never
+// hands the wake hook and the runner back to older code; a detached one stops, leaving its session
+// to the newest one, which the wake hook starts.
 // An agent's open question to its owner is reported too, secret-checked like a report, and
 // answerable from the floor while this data layer's hooks module marks that it waits for it
 // (src/data-layer/owner-answers.ts); a detached one's are read-only.
@@ -44,12 +49,13 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { PROTOCOL_VERSION, type Facts, type Project } from "@isoplan/protocol";
 import { installWake } from "../install/install.js";
-import { managedDir, pluginDirsOf, pluginState, pluginsDir, type Place } from "../install/state.js";
+import { managedDir, newestDataLayer, pluginDirsOf, pluginIdOf, pluginState, pluginsDir, type Place } from "../install/state.js";
 import type { DataLayerLine, TitleReply, WaitMark } from "../lines.js";
-import { findClaude } from "../runner/claude-binary.js";
+import { claudeBinary, claudeCommand, findClaude } from "../runner/claude-binary.js";
 import { loadPatterns, type Pattern } from "../runner/scan.js";
 import { startRunner } from "../runner/start.js";
 import { recentSessions } from "../sweep/find.js";
+import { checkForUpdate, START_GAP_MS, updatesOffBy } from "../update/update.js";
 import { backfill } from "../wake/backfill.js";
 import { alive, HOLD_OFF_MS, holdOff, lockHolder, lockPath, releaseLock, takeLock } from "../wake/lock.js";
 import { approvedPath, createApproved, createSessionGate, type Dormancy } from "./approved.js";
@@ -150,6 +156,14 @@ async function main(argv: string[]): Promise<number> {
     emit({ type: "log", text: "Claude Code lists the Isoplan plugin as uninstalled or disabled here, so this session isn't reported" });
     return 0;
   }
+  // Whether Claude Code has put a newer version of the plugin on disk than this one (state.ts).
+  const isOutdated = async () => (await newestDataLayer(place.plugins, self).catch(() => self)) !== self;
+  let outdated = await isOutdated();
+  if (detached && outdated) {
+    emit({ type: "log", text: "a newer version of the Isoplan plugin is installed, so it reports this session instead" });
+    await logging;
+    return 0;
+  }
 
   try {
     if (!(await takeLock(lock, process.pid, alive, !detached))) {
@@ -163,7 +177,7 @@ async function main(argv: string[]): Promise<number> {
 
   const paths = { ...place, settings: path.join(claudeDir, "settings.json") };
   const start = (args: string[], dir: string, env?: Record<string, string>) => spawn(process.execPath, args, { cwd: dir, env, detached: true, stdio: "ignore", windowsHide: true }).on("error", () => {}).unref();
-  const installing = detached
+  const installing = detached || outdated
     ? Promise.resolve([])
     : installWake(paths, path.join(here, "data-layer.js"), path.join(here, "wake.js"), {
         auto: true,
@@ -175,9 +189,33 @@ async function main(argv: string[]): Promise<number> {
       );
   // The machine's runner answers for its rooms; it is started here as well as by the wake hook.
   // Not while the plugin is disabled for the machine, though this session's project enables it.
-  if (!detached) void installing.then(async () => (await pluginState(place, self)) === "enabled" && startRunner({ claudeDir, spawn: start })).catch(() => {});
+  if (!detached && !outdated) void installing.then(async () => (await pluginState(place, self)) === "enabled" && startRunner({ claudeDir, spawn: start })).catch(() => {});
 
   let config: Config = await loadConfig(io, defaultsPath, userConfigPath);
+  if (outdated) emit({ type: "updated" });
+  // The update check (src/update), for a copy in Claude Code's plugin cache: there is nothing to
+  // update in a checkout or a folder loaded in place. One at a time in this process; the machine's
+  // lock and record keep sessions from checking together.
+  const pluginId = pluginIdOf(place.plugins, self);
+  let checking = false;
+  let checkedAt = Date.now(); // the timed checks count from the one at start
+  const checkUpdate = (gapMs: number) => {
+    if (detached || !pluginId || outdated || checking || !config.updateCheckHours) return;
+    checkedAt = Date.now();
+    const off = updatesOffBy(process.env);
+    if (off) return emit({ type: "log", text: `not checking for a newer version of the plugin: ${off} is set (FORCE_AUTOUPDATE_PLUGINS=1 turns plugin updates back on)` });
+    checking = true;
+    void (async () => {
+      const binary = await claudeBinary(claudeDir, process.env, process.platform, os.homedir());
+      if (!binary) return emit({ type: "log", text: "couldn't find the claude binary, so the plugin can't update itself" });
+      const checked = await checkForUpdate({ claudeDir, settings: paths.settings, id: pluginId, cwd: project, claude: claudeCommand(binary), gapMs });
+      for (const text of checked.said) emit({ type: "log", text: `update check: ${text}` });
+    })()
+      .catch((err: unknown) => emit({ type: "log", text: `couldn't check for a newer version of the plugin: ${String((err as Error)?.message ?? err)}` }))
+      .finally(() => (checking = false));
+  };
+  // After the wake hook's install, which writes settings.json too: neither then loses the other's change.
+  void installing.then(() => checkUpdate(START_GAP_MS));
   // A hook just installed sees other sessions only on their next turn: they are reported now.
   void installing
     .then(async (changes) => {
@@ -319,6 +357,14 @@ async function main(argv: string[]): Promise<number> {
     // A detached data layer that stopped may have deleted this one's lock as it went.
     if (!detached && (await lockHolder(lock)) !== process.pid) await takeLock(lock, process.pid, alive, true).catch(() => {});
     config = await loadConfig(io, defaultsPath, userConfigPath).catch(() => config);
+    if (!outdated && (outdated = await isOutdated())) {
+      if (detached) {
+        emit({ type: "log", text: "stopping: a newer version of the Isoplan plugin is installed, which the wake hook starts next" });
+        break;
+      }
+      emit({ type: "updated" });
+    }
+    if (now - checkedAt >= config.updateCheckHours * 3600000) checkUpdate(config.updateCheckHours * 3600000);
     const gitOpts = { now, maxAgeMs: config.gitCacheSeconds * 1000 };
     const resolve = (dir: string) => git.resolve(dir, gitOpts);
     const projectOfRepo = (where: Where) => {

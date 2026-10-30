@@ -125,7 +125,7 @@ function slugify(input) {
 	return input.toLowerCase().trim().replace(/[^\w\s-]/g, "").replace(/[\s_-]+/g, "-").replace(/^-+|-+$/g, "");
 }
 const captureStackTrace = "captureStackTrace" in Error ? Error.captureStackTrace : (..._args) => {};
-function isObject$1(data) {
+function isObject$2(data) {
 	return typeof data === "object" && data !== null && !Array.isArray(data);
 }
 const allowsEval = /* @__PURE__*/ cached(() => {
@@ -139,12 +139,12 @@ const allowsEval = /* @__PURE__*/ cached(() => {
 	}
 });
 function isPlainObject(o) {
-	if (isObject$1(o) === false) return false;
+	if (isObject$2(o) === false) return false;
 	const ctor = o.constructor;
 	if (ctor === void 0) return true;
 	if (typeof ctor !== "function") return true;
 	const prot = ctor.prototype;
-	if (isObject$1(prot) === false) return false;
+	if (isObject$2(prot) === false) return false;
 	if (Object.prototype.hasOwnProperty.call(prot, "isPrototypeOf") === false) return false;
 	return true;
 }
@@ -2091,7 +2091,7 @@ const $ZodObject = /*@__PURE__*/ $constructor("$ZodObject", (inst, def) => {
 		}
 		return propValues;
 	});
-	const isObject = isObject$1;
+	const isObject = isObject$2;
 	const catchall = def.catchall;
 	let value;
 	const memo = globalConfig.memoizer;
@@ -2229,7 +2229,7 @@ const $ZodObjectJIT = /*@__PURE__*/ $constructor("$ZodObjectJIT", (inst, def) =>
 		return doc.compile();
 	};
 	let fastpass;
-	const isObject = isObject$1;
+	const isObject = isObject$2;
 	const jit = !globalConfig.jitless;
 	const fastEnabled = jit && allowsEval.value;
 	const catchall = def.catchall;
@@ -2348,7 +2348,7 @@ const $ZodDiscriminatedUnion = /*@__PURE__*/ $constructor("$ZodDiscriminatedUnio
 	const disc = cached(() => discriminatorMap(def));
 	inst._zod.parse = (payload, ctx) => {
 		const input = payload.value;
-		if (!isObject$1(input)) {
+		if (!isObject$2(input)) {
 			payload.issues.push({
 				code: "invalid_type",
 				expected: "object",
@@ -6273,7 +6273,7 @@ async function loadSettings(io, defaultsPath, userPath) {
 }
 const BYTE_KEYS = /* @__PURE__ */ new Set(["tailBytes"]);
 const FLOORS = /* @__PURE__ */ new Map([["streamSeconds", .25]]);
-const ZERO_OFF = /* @__PURE__ */ new Set(["lightsOffHours"]);
+const ZERO_OFF = /* @__PURE__ */ new Set(["lightsOffHours", "updateCheckHours"]);
 function fits(key, value, fallback) {
 	if (key === "server") return typeof value === "string" && isWebSocketUrl(value);
 	if (typeof fallback === "number") {
@@ -6393,6 +6393,16 @@ async function findClaude(env, platform, home, exists = isFile$1) {
 		if (await exists(join(d, "claude.cmd")) && await exists(cli)) return cli;
 	}
 	return null;
+}
+/** What runs it: the binary itself, or node and the cli.js. */
+const claudeCommand = (binary, node = process.execPath) => binary.endsWith(".js") ? [node, binary] : [binary];
+/** The recorded binary when it is still there, else a fresh lookup. */
+async function claudeBinary(claudeDir, env, platform, home) {
+	try {
+		const recorded = JSON.parse(await fs.readFile(claudeBinaryPath(claudeDir), "utf8")).path;
+		if (typeof recorded === "string" && await isFile$1(recorded)) return recorded;
+	} catch {}
+	return findClaude(env, platform, home);
 }
 //#endregion
 //#region src/wake/lock.ts
@@ -6550,6 +6560,141 @@ function freshRepos(copy, maxAgeMs, now) {
 	return copy && now - copy.checked <= maxAgeMs ? new Set(copy.repos.map((r) => r.toLowerCase())) : null;
 }
 //#endregion
+//#region src/install/state.ts
+/** Claude Code's plugins folder: $CLAUDE_CODE_PLUGIN_CACHE_DIR when it is set, else <claude dir>/plugins. */
+const pluginsDir = (claudeDir, env) => env.CLAUDE_CODE_PLUGIN_CACHE_DIR || path.join(claudeDir, "plugins");
+/** The folders $CLAUDE_CODE_PLUGIN_DIRS names. */
+const pluginDirsOf = (env) => (env.CLAUDE_CODE_PLUGIN_DIRS ?? "").split(path.delimiter).filter(Boolean);
+/** The system folder Claude Code reads managed-settings.json from. */
+function managedDir(platform) {
+	if (platform === "win32") return "C:\\Program Files\\ClaudeCode";
+	if (platform === "darwin") return "/Library/Application Support/ClaudeCode";
+	return "/etc/claude-code";
+}
+/** A path as compared: resolved, with forward slashes, and on Windows and macOS without regard to case. */
+function normalPath(p, platform = process.platform) {
+	const resolved = path.resolve(p).replace(/\\/g, "/");
+	return platform === "win32" || platform === "darwin" ? resolved.toLowerCase() : resolved;
+}
+function cacheParts(plugins, file) {
+	const relative = path.relative(path.join(plugins, "cache"), path.resolve(file));
+	if (path.isAbsolute(relative)) return null;
+	const parts = relative.split(path.sep);
+	return parts.length >= 4 && parts[0] !== ".." ? parts : null;
+}
+/** The id, `<plugin>@<marketplace>`, of the marketplace install `file` is part of; null for a file outside the plugin cache. */
+function pluginIdOf(plugins, file) {
+	const parts = cacheParts(plugins, file);
+	return parts ? `${parts[1]}@${parts[0]}` : null;
+}
+/**
+* The data layer of the copy of its plugin Claude Code has installed now. That is `dataLayer` itself
+* while installed_plugins.json records its version folder for its id, or when it is outside the
+* cache, or the record is unknown or names no folder. Otherwise an update put another version on
+* disk (the version is the commit's SHA, since the plugin pins none): the first one recorded whose
+* data layer is there. A data layer this doesn't return is outdated: a session loads the new copy at
+* its next start, or at /reload-plugins.
+*/
+async function newestDataLayer(plugins, dataLayer) {
+	const parts = cacheParts(plugins, dataLayer);
+	if (!parts) return dataLayer;
+	const id = `${parts[1]}@${parts[0]}`;
+	const folders = (await installs(plugins) ?? []).filter((i) => i.id === id && i.installPath).map((i) => i.installPath);
+	const root = path.join(plugins, "cache", ...parts.slice(0, 3));
+	if (!folders.length || folders.some((f) => normalPath(f) === normalPath(root))) return dataLayer;
+	const inside = parts.slice(3);
+	for (const folder of folders) {
+		const candidate = path.join(folder, ...inside);
+		if (await fs.stat(candidate).then((s) => s.isFile(), () => false)) return candidate;
+	}
+	return dataLayer;
+}
+const nameOf = (id) => id.slice(0, id.lastIndexOf("@"));
+/** Every install installed_plugins.json records; null when it is missing, can't be read, or isn't the shape known. */
+async function installs(plugins) {
+	const record = await readJson(path.join(plugins, "installed_plugins.json"));
+	const list = record?.plugins;
+	if (record?.version !== 2 || !isObject$1(list) || !Object.values(list).every(Array.isArray)) return null;
+	return Object.entries(list).flatMap(([id, entries]) => entries.map((entry) => {
+		const e = isObject$1(entry) ? entry : {};
+		const text = (key) => typeof e[key] === "string" ? e[key] : null;
+		return {
+			id,
+			scope: text("scope"),
+			projectPath: text("projectPath"),
+			installPath: text("installPath")
+		};
+	}));
+}
+/** Whether `enabledPlugins` names the plugin `id` enabled, disabled, or not at all (null). */
+async function enabledIn(file, id) {
+	const value = (await readJson(file))?.enabledPlugins;
+	return isObject$1(value) && typeof value[id] === "boolean" ? value[id] : null;
+}
+/**
+* What Claude Code says of the plugin `dataLayer` belongs to. With `project` (a session's project
+* folder) the project's settings and installs count too; without, only the machine's: the
+* managed files, the user's settings, and every install.
+*/
+async function pluginState(place, dataLayer, project) {
+	const id = pluginIdOf(place.plugins, dataLayer);
+	if (!id) return "enabled";
+	const name = nameOf(id);
+	const all = await installs(place.plugins);
+	let ids = [id];
+	if (all) {
+		const mine = all.filter((i) => nameOf(i.id) === name);
+		if (!mine.length) return await isInPluginDirs(place.pluginDirs ?? [], name) ? "enabled" : "uninstalled";
+		const here = project ? mine.filter((i) => !(i.scope === "project" || i.scope === "local") || !i.projectPath || normalPath(i.projectPath) === normalPath(project)) : mine;
+		if (!here.length) return "disabled";
+		ids = [...new Set(here.map((i) => i.id))];
+	}
+	return (await Promise.all(ids.map((one) => enabledFor(place, one, project)))).includes(true) ? "enabled" : "disabled";
+}
+async function enabledFor(place, id, project) {
+	const managed = await Promise.all((await managedFiles(place.managed)).map((file) => enabledIn(file, id)));
+	if (managed.includes(false)) return false;
+	if (managed.includes(true)) return true;
+	for (const file of await ownFiles(place, project)) {
+		const enabled = await enabledIn(file, id);
+		if (enabled !== null) return enabled;
+	}
+	return true;
+}
+async function isInPluginDirs(dirs, name) {
+	for (const dir of dirs) if ((await readJson(path.join(dir, ".claude-plugin", "plugin.json")))?.name === name) return true;
+	return false;
+}
+async function managedFiles(managed) {
+	const dropIns = await fs.readdir(path.join(managed, "managed-settings.d")).then((names) => names.filter((n) => n.endsWith(".json")).map((n) => path.join(managed, "managed-settings.d", n)), () => []);
+	return [path.join(managed, "managed-settings.json"), ...dropIns];
+}
+async function ownFiles({ claudeDir }, project) {
+	const files = [];
+	if (project) {
+		const root = await gitRoot(project);
+		if (root && normalPath(root) !== normalPath(project)) files.push(path.join(root, ".claude", "settings.local.json"));
+		files.push(path.join(project, ".claude", "settings.local.json"), path.join(project, ".claude", "settings.json"));
+	}
+	files.push(path.join(claudeDir, "settings.json"));
+	return files;
+}
+async function gitRoot(dir) {
+	for (let at = path.resolve(dir);; at = path.dirname(at)) {
+		if (await fs.stat(path.join(at, ".git")).then(() => true, () => false)) return at;
+		if (path.dirname(at) === at) return null;
+	}
+}
+const isObject$1 = (value) => !!value && typeof value === "object" && !Array.isArray(value);
+async function readJson(file) {
+	try {
+		const value = JSON.parse((await fs.readFile(file, "utf8")).replace(/^\uFEFF/, ""));
+		return isObject$1(value) ? value : null;
+	} catch {
+		return null;
+	}
+}
+//#endregion
 //#region src/wake/wake.ts
 const wakeRecordPath = (claudeDir) => path.join(claudeDir, "isoplan", "wake.json");
 //#endregion
@@ -6644,113 +6789,6 @@ async function stopRunner(claudeDir, { isAlive = alive, kill = (pid) => process.
 	} catch {}
 	await releaseLock(runnerLockPath(claudeDir), live.pid);
 	return true;
-}
-//#endregion
-//#region src/install/state.ts
-/** Claude Code's plugins folder: $CLAUDE_CODE_PLUGIN_CACHE_DIR when it is set, else <claude dir>/plugins. */
-const pluginsDir = (claudeDir, env) => env.CLAUDE_CODE_PLUGIN_CACHE_DIR || path.join(claudeDir, "plugins");
-/** The folders $CLAUDE_CODE_PLUGIN_DIRS names. */
-const pluginDirsOf = (env) => (env.CLAUDE_CODE_PLUGIN_DIRS ?? "").split(path.delimiter).filter(Boolean);
-/** The system folder Claude Code reads managed-settings.json from. */
-function managedDir(platform) {
-	if (platform === "win32") return "C:\\Program Files\\ClaudeCode";
-	if (platform === "darwin") return "/Library/Application Support/ClaudeCode";
-	return "/etc/claude-code";
-}
-/** A path as compared: resolved, with forward slashes, and on Windows and macOS without regard to case. */
-function normalPath(p, platform = process.platform) {
-	const resolved = path.resolve(p).replace(/\\/g, "/");
-	return platform === "win32" || platform === "darwin" ? resolved.toLowerCase() : resolved;
-}
-/** The id, `<plugin>@<marketplace>`, of the marketplace install `file` is part of; null for a file outside the plugin cache. */
-function pluginIdOf(plugins, file) {
-	const relative = path.relative(path.join(plugins, "cache"), path.resolve(file));
-	if (path.isAbsolute(relative)) return null;
-	const parts = relative.split(path.sep);
-	return parts.length >= 4 && parts[0] !== ".." ? `${parts[1]}@${parts[0]}` : null;
-}
-const nameOf = (id) => id.slice(0, id.lastIndexOf("@"));
-/** Every install installed_plugins.json records; null when it is missing, can't be read, or isn't the shape known. */
-async function installs(plugins) {
-	const record = await readJson(path.join(plugins, "installed_plugins.json"));
-	const list = record?.plugins;
-	if (record?.version !== 2 || !isObject(list) || !Object.values(list).every(Array.isArray)) return null;
-	return Object.entries(list).flatMap(([id, entries]) => entries.map((entry) => {
-		const e = isObject(entry) ? entry : {};
-		return {
-			id,
-			scope: typeof e.scope === "string" ? e.scope : null,
-			projectPath: typeof e.projectPath === "string" ? e.projectPath : null
-		};
-	}));
-}
-/** Whether `enabledPlugins` names the plugin `id` enabled, disabled, or not at all (null). */
-async function enabledIn(file, id) {
-	const value = (await readJson(file))?.enabledPlugins;
-	return isObject(value) && typeof value[id] === "boolean" ? value[id] : null;
-}
-/**
-* What Claude Code says of the plugin `dataLayer` belongs to. With `project` (a session's project
-* folder) the project's settings and installs count too; without, only the machine's: the
-* managed files, the user's settings, and every install.
-*/
-async function pluginState(place, dataLayer, project) {
-	const id = pluginIdOf(place.plugins, dataLayer);
-	if (!id) return "enabled";
-	const name = nameOf(id);
-	const all = await installs(place.plugins);
-	let ids = [id];
-	if (all) {
-		const mine = all.filter((i) => nameOf(i.id) === name);
-		if (!mine.length) return await isInPluginDirs(place.pluginDirs ?? [], name) ? "enabled" : "uninstalled";
-		const here = project ? mine.filter((i) => !(i.scope === "project" || i.scope === "local") || !i.projectPath || normalPath(i.projectPath) === normalPath(project)) : mine;
-		if (!here.length) return "disabled";
-		ids = [...new Set(here.map((i) => i.id))];
-	}
-	return (await Promise.all(ids.map((one) => enabledFor(place, one, project)))).includes(true) ? "enabled" : "disabled";
-}
-async function enabledFor(place, id, project) {
-	const managed = await Promise.all((await managedFiles(place.managed)).map((file) => enabledIn(file, id)));
-	if (managed.includes(false)) return false;
-	if (managed.includes(true)) return true;
-	for (const file of await ownFiles(place, project)) {
-		const enabled = await enabledIn(file, id);
-		if (enabled !== null) return enabled;
-	}
-	return true;
-}
-async function isInPluginDirs(dirs, name) {
-	for (const dir of dirs) if ((await readJson(path.join(dir, ".claude-plugin", "plugin.json")))?.name === name) return true;
-	return false;
-}
-async function managedFiles(managed) {
-	const dropIns = await fs.readdir(path.join(managed, "managed-settings.d")).then((names) => names.filter((n) => n.endsWith(".json")).map((n) => path.join(managed, "managed-settings.d", n)), () => []);
-	return [path.join(managed, "managed-settings.json"), ...dropIns];
-}
-async function ownFiles({ claudeDir }, project) {
-	const files = [];
-	if (project) {
-		const root = await gitRoot(project);
-		if (root && normalPath(root) !== normalPath(project)) files.push(path.join(root, ".claude", "settings.local.json"));
-		files.push(path.join(project, ".claude", "settings.local.json"), path.join(project, ".claude", "settings.json"));
-	}
-	files.push(path.join(claudeDir, "settings.json"));
-	return files;
-}
-async function gitRoot(dir) {
-	for (let at = path.resolve(dir);; at = path.dirname(at)) {
-		if (await fs.stat(path.join(at, ".git")).then(() => true, () => false)) return at;
-		if (path.dirname(at) === at) return null;
-	}
-}
-const isObject = (value) => !!value && typeof value === "object" && !Array.isArray(value);
-async function readJson(file) {
-	try {
-		const value = JSON.parse((await fs.readFile(file, "utf8")).replace(/^\uFEFF/, ""));
-		return isObject(value) ? value : null;
-	} catch {
-		return null;
-	}
 }
 //#endregion
 //#region src/install/install.ts
@@ -6922,6 +6960,7 @@ async function isOptedOut(claudeDir) {
 		return false;
 	}
 }
+/** The settings as an object; {} when there is no file yet. A leading byte order mark is skipped. Throws when it isn't a JSON object. */
 async function readSettings(file) {
 	let text;
 	try {
@@ -6939,6 +6978,7 @@ async function readSettings(file) {
 	if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(`${file} isn't a JSON object; left it alone`);
 	return value;
 }
+/** Writes the settings whole, as two-space JSON. */
 const writeSettings = (file, settings) => writeWhole(file, JSON.stringify(settings, null, 2) + "\n");
 async function writeIfChanged(file, text) {
 	if (await fs.readFile(file, "utf8").catch(() => null) === text) return false;
@@ -7278,6 +7318,96 @@ async function recentSessions(io, projectsDir, since) {
 	}
 	return out;
 }
+//#endregion
+//#region src/update/update.ts
+const updateRecordPath = (claudeDir) => path.join(claudeDir, "isoplan", "update.json");
+const updateLockPath = (claudeDir) => path.join(claudeDir, "isoplan", "update.lock");
+/** A check at session start is skipped when one started this recently. */
+const START_GAP_MS = 6e5;
+const COMMAND_TIMEOUT_MS = 3e5;
+/** The variables that turn updates off, and the one that turns plugin updates back on. */
+const OFF_VARIABLES = [
+	"DISABLE_UPDATES",
+	"DISABLE_AUTOUPDATER",
+	"CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"
+];
+const isSet = (value) => !!value && !/^(0|false|no|off)$/i.test(value.trim());
+/** The variable that turns updates off here; null when none does, or FORCE_AUTOUPDATE_PLUGINS turns them back on. */
+function updatesOffBy(env) {
+	if (isSet(env["FORCE_AUTOUPDATE_PLUGINS"])) return null;
+	return OFF_VARIABLES.find((name) => isSet(env[name])) ?? null;
+}
+/** Turns on Claude Code's auto-update for `marketplace` in `settings` (see above); what it changed, or null. */
+async function turnOnAutoUpdate(settings, marketplace) {
+	const current = await readSettings(settings);
+	const known = current.extraKnownMarketplaces;
+	const entry = isObject(known) ? known[marketplace] : void 0;
+	if (!isObject(entry) || !isObject(entry.source) || "autoUpdate" in entry) return null;
+	entry.autoUpdate = true;
+	await writeSettings(settings, current);
+	return `turned on Claude Code's auto-update for the ${marketplace} marketplace in ${settings}`;
+}
+/** One check (see above), unless another is running or one started within `gapMs`. */
+async function checkForUpdate({ claudeDir, settings, id, cwd, claude, gapMs, run = runHidden, now = Date.now, isAlive = alive }) {
+	const lock = updateLockPath(claudeDir);
+	if (!await takeLock(lock, process.pid, isAlive, false, now(), { freshMs: 66e4 })) return {
+		ran: false,
+		said: []
+	};
+	try {
+		const record = updateRecordPath(claudeDir);
+		const last = await fs.readFile(record, "utf8").then((text) => JSON.parse(text).checkedAt, () => null);
+		if (typeof last === "number" && now() - last < gapMs) return {
+			ran: false,
+			said: []
+		};
+		await fs.writeFile(record, JSON.stringify({ checkedAt: now() }) + "\n");
+		const marketplace = id.slice(id.lastIndexOf("@") + 1);
+		const said = [];
+		const turnedOn = await turnOnAutoUpdate(settings, marketplace).catch((err) => `couldn't turn on Claude Code's auto-update for ${marketplace}: ${err.message}`);
+		if (turnedOn) said.push(turnedOn);
+		for (const args of [[
+			"plugin",
+			"marketplace",
+			"update",
+			marketplace
+		], [
+			"plugin",
+			"update",
+			id
+		]]) {
+			const [file, ...rest] = [...claude, ...args];
+			const r = await run([file, ...rest], cwd);
+			const tail = lastLine(r.output);
+			const failed = r.code === null ? "didn't finish" : r.code !== 0 ? `failed with exit code ${r.code}` : null;
+			said.push(`claude ${args.join(" ")}: ${[failed, tail].filter(Boolean).join(": ")}`);
+			if (r.code !== 0) break;
+		}
+		return {
+			ran: true,
+			said
+		};
+	} finally {
+		await releaseLock(lock, process.pid).catch(() => {});
+	}
+}
+function runHidden(argv, cwd) {
+	return new Promise((resolve) => {
+		execFile(argv[0], argv.slice(1), {
+			cwd,
+			windowsHide: true,
+			timeout: COMMAND_TIMEOUT_MS,
+			maxBuffer: 1048576
+		}, (err, stdout, stderr) => {
+			resolve({
+				code: !err ? 0 : typeof err.code === "number" && !err.killed ? err.code : null,
+				output: `${stdout}\n${stderr}`
+			});
+		});
+	});
+}
+const lastLine = (output) => output.replace(/\u001b\[[0-9;]*[A-Za-z]/g, "").split(/\r?\n/).map((l) => l.trim()).filter(Boolean).at(-1) ?? "";
+const isObject = (value) => !!value && typeof value === "object" && !Array.isArray(value);
 /** Starts a data layer for each session no one reports whose folder is still there; returns how many. */
 async function backfill(found, { claudeDir, dataLayer, spawn, isAlive = alive, pause = (ms) => new Promise((r) => setTimeout(r, ms)) }) {
 	let started = 0;
@@ -10051,6 +10181,16 @@ async function main(argv) {
 		});
 		return 0;
 	}
+	const isOutdated = async () => await newestDataLayer(place.plugins, self).catch(() => self) !== self;
+	let outdated = await isOutdated();
+	if (detached && outdated) {
+		emit({
+			type: "log",
+			text: "a newer version of the Isoplan plugin is installed, so it reports this session instead"
+		});
+		await logging;
+		return 0;
+	}
 	try {
 		if (!await takeLock(lock, process.pid, alive, !detached)) {
 			process.stderr.write(`another data layer already reports session ${sessionId}\n`);
@@ -10074,7 +10214,7 @@ async function main(argv) {
 		stdio: "ignore",
 		windowsHide: true
 	}).on("error", () => {}).unref();
-	const installing = detached ? Promise.resolve([]) : installWake(paths, path.join(here, "data-layer.js"), path.join(here, "wake.js"), {
+	const installing = detached || outdated ? Promise.resolve([]) : installWake(paths, path.join(here, "data-layer.js"), path.join(here, "wake.js"), {
 		auto: true,
 		runnerFrom: path.join(here, ".."),
 		findClaude: () => findClaude(process.env, process.platform, os.homedir())
@@ -10085,11 +10225,48 @@ async function main(argv) {
 		type: "log",
 		text: `couldn't install the wake hook: ${String(err?.message ?? err)}`
 	}), []));
-	if (!detached) installing.then(async () => await pluginState(place, self) === "enabled" && startRunner({
+	if (!detached && !outdated) installing.then(async () => await pluginState(place, self) === "enabled" && startRunner({
 		claudeDir,
 		spawn: start
 	})).catch(() => {});
 	let config = await loadConfig(io, defaultsPath, userConfigPath);
+	if (outdated) emit({ type: "updated" });
+	const pluginId = pluginIdOf(place.plugins, self);
+	let checking = false;
+	let checkedAt = Date.now();
+	const checkUpdate = (gapMs) => {
+		if (detached || !pluginId || outdated || checking || !config.updateCheckHours) return;
+		checkedAt = Date.now();
+		const off = updatesOffBy(process.env);
+		if (off) return emit({
+			type: "log",
+			text: `not checking for a newer version of the plugin: ${off} is set (FORCE_AUTOUPDATE_PLUGINS=1 turns plugin updates back on)`
+		});
+		checking = true;
+		(async () => {
+			const binary = await claudeBinary(claudeDir, process.env, process.platform, os.homedir());
+			if (!binary) return emit({
+				type: "log",
+				text: "couldn't find the claude binary, so the plugin can't update itself"
+			});
+			const checked = await checkForUpdate({
+				claudeDir,
+				settings: paths.settings,
+				id: pluginId,
+				cwd: project,
+				claude: claudeCommand(binary),
+				gapMs
+			});
+			for (const text of checked.said) emit({
+				type: "log",
+				text: `update check: ${text}`
+			});
+		})().catch((err) => emit({
+			type: "log",
+			text: `couldn't check for a newer version of the plugin: ${String(err?.message ?? err)}`
+		})).finally(() => checking = false);
+	};
+	installing.then(() => checkUpdate(START_GAP_MS));
 	installing.then(async (changes) => {
 		if (!changes.length) return;
 		const started = await backfill(await recentSessions(io, path.join(claudeDir, "projects"), Date.now() - config.lightsOffHours * 36e5), {
@@ -10264,6 +10441,17 @@ async function main(argv) {
 		const isFirstPass = passes++ === 0;
 		if (!detached && await lockHolder(lock) !== process.pid) await takeLock(lock, process.pid, alive, true).catch(() => {});
 		config = await loadConfig(io, defaultsPath, userConfigPath).catch(() => config);
+		if (!outdated && (outdated = await isOutdated())) {
+			if (detached) {
+				emit({
+					type: "log",
+					text: "stopping: a newer version of the Isoplan plugin is installed, which the wake hook starts next"
+				});
+				break;
+			}
+			emit({ type: "updated" });
+		}
+		if (now - checkedAt >= config.updateCheckHours * 36e5) checkUpdate(config.updateCheckHours * 36e5);
 		const gitOpts = {
 			now,
 			maxAgeMs: config.gitCacheSeconds * 1e3

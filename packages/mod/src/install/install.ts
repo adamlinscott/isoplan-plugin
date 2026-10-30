@@ -230,11 +230,11 @@ async function finishOptOut({ claudeDir, settings }: Paths): Promise<string[]> {
 
 // The runner's state, the machine's pairing credential (pairing.json) and its locks (pairing.lock
 // while a pairing is under way, pairing.write.lock while the file is written), and the sessions'
-// traces: locks, logs, title files, released-report hashes and the office's list of repos
-// (approved.json). Removed before the hooks.
-const WRITTEN = ["runner", "pairing.json", "pairing.lock", "pairing.write.lock", "live", "logs", "titles", "released", "approved.json"];
+// traces: locks, logs, title files, released-report hashes, the office's list of repos
+// (approved.json) and the update check's record and lock (src/update). Removed before the hooks.
+const WRITTEN = ["runner", "pairing.json", "pairing.lock", "pairing.write.lock", "live", "logs", "titles", "released", "approved.json", "update.json", "update.lock"];
 // What a session's data layer writes as it runs, so may come back during an uninstall.
-const SESSION_TRACES = ["live", "titles", "released", "approved.json"];
+const SESSION_TRACES = ["live", "titles", "released", "approved.json", "update.json", "update.lock"];
 
 export interface UninstallOptions {
   /** Leave wake.json as `{ "disabled": true }`, so a plugin still installed doesn't put the hook back. */
@@ -469,8 +469,8 @@ async function isOptedOut(claudeDir: string): Promise<boolean> {
   }
 }
 
-// The settings as an object; {} when there is no file yet. A leading byte order mark is skipped.
-async function readSettings(file: string): Promise<Json> {
+/** The settings as an object; {} when there is no file yet. A leading byte order mark is skipped. Throws when it isn't a JSON object. */
+export async function readSettings(file: string): Promise<Json> {
   let text: string;
   try {
     text = await fs.readFile(file, "utf8");
@@ -488,7 +488,8 @@ async function readSettings(file: string): Promise<Json> {
   return value as Json;
 }
 
-const writeSettings = (file: string, settings: Json) => writeWhole(file, JSON.stringify(settings, null, 2) + "\n");
+/** Writes the settings whole, as two-space JSON. */
+export const writeSettings = (file: string, settings: Json) => writeWhole(file, JSON.stringify(settings, null, 2) + "\n");
 
 async function writeIfChanged(file: string, text: string): Promise<boolean> {
   if ((await fs.readFile(file, "utf8").catch(() => null)) === text) return false;
