@@ -21,6 +21,7 @@ import { fileURLToPath } from "node:url";
 import { MAX_QUESTION_LENGTH, PROTOCOL_VERSION, type HelloMessage } from "@isoplan/protocol";
 import { loadConfig, loadSettings } from "../data-layer/config.js";
 import { createGit } from "../data-layer/git.js";
+import { approvedPath, cachedRepos } from "../data-layer/approved.js";
 import { accountOf, claudePaths, projectOf } from "../data-layer/identity.js";
 import { nodeIo } from "../data-layer/io.js";
 import { createPairing, pairingLockPath, pairingPath, pairingWriteLockPath, postJson, readPairing } from "../data-layer/pairing.js";
@@ -104,6 +105,9 @@ async function main(argv: string[]): Promise<string> {
   const settings = await loadSettings<AskSettings>(io, path.join(modDir, "runner.json"), path.join(isoplanDir, "runner.json"));
   const config = await loadConfig(io, path.join(modDir, "config.json"), path.join(isoplanDir, "config.json"));
   if (config.plainRefused) return `The room can't be asked: config.json's server, ${config.plainRefused}, is plain ws:// to another machine. Carry on without the answer.`;
+  // Nothing of a repo the office doesn't take is sent, its id included (#91): the session's data layer keeps the list.
+  const project = await projectOf(io.run, await createGit(io).resolve(cwd), cwd, os.hostname());
+  if (!(await cachedRepos(approvedPath(claudeDir), config.server))?.has(project.id.toLowerCase())) return "The room can't be asked: this repo isn't one the office takes, so nothing of it is sent there. Carry on without the answer.";
   const pairing = await machinePairing(config.server, config.allowPlainWs);
   // One bound for the whole wait, a retry after an expired token included.
   const deadline = Date.now() + MAX_WAIT_MS;

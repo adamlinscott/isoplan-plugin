@@ -30,6 +30,7 @@ import { fileURLToPath } from "node:url";
 import { PROTOCOL_VERSION, type HandedOverMessage, type HandOverReadyMessage, type HandoffMessage, type HandoffRepo, type HelloMessage, type OfficeServerMessage } from "@isoplan/protocol";
 import { loadConfig, loadSettings } from "../data-layer/config.js";
 import { createGit } from "../data-layer/git.js";
+import { approvedPath, cachedRepos } from "../data-layer/approved.js";
 import { accountOf, claudePaths, projectOf } from "../data-layer/identity.js";
 import { nodeIo } from "../data-layer/io.js";
 import { fill, loadPrompts } from "../runner/prompts.js";
@@ -79,11 +80,15 @@ async function settings() {
   return loadSettings<TakeSettings & { repoSearchDepth: number }>(io, path.join(modDir, "runner.json"), path.join(isoplanDir, "runner.json"));
 }
 
-async function hello(cwd: string): Promise<HelloMessage> {
+async function hello(cwd: string, server: string): Promise<HelloMessage> {
   const id = process.env.CLAUDE_CODE_SESSION_ID;
   if (!id) stop("This runs inside a Claude Code session, which sets CLAUDE_CODE_SESSION_ID; it isn't set here.");
   const machine = os.hostname();
   const where = await createGit(io).resolve(cwd);
+  const project = await projectOf(io.run, where, cwd, machine);
+  // Nothing of a repo the office doesn't take is sent, its id included (#91): the session's data layer keeps the list.
+  const repos = await cachedRepos(approvedPath(claudeDir), server);
+  if (!repos?.has(project.id.toLowerCase())) stop(repos ? `This repo isn't in the office on ${server}, so nothing of it is sent there. An admin adds it under Repos on the floor.` : `Can't tell yet which repos ${server} takes, so nothing is sent: a Claude Code session with the Isoplan plugin reads that list within a few minutes.`);
   return {
     type: "hello",
     v: PROTOCOL_VERSION,
@@ -91,7 +96,7 @@ async function hello(cwd: string): Promise<HelloMessage> {
     account: await accountOf({ readText: (p) => fs.readFile(p, "utf8").catch(() => null), run: io.run }, claudeJson, cwd),
     machine: { name: machine },
     session: `claude-code:${id}`,
-    project: await projectOf(io.run, where, cwd, machine),
+    project,
   };
 }
 
@@ -131,7 +136,7 @@ async function office(): Promise<{ server: string; pairing: CommandPairing }> {
 async function exchange<T extends OfficeServerMessage>(cwd: string, first: Parameters<typeof openPairedLink>[3], wanted: (m: OfficeServerMessage) => m is T, before = "") {
   const { server, pairing } = await office();
   try {
-    return await openPairedLink(server, await hello(cwd), pairing, first, wanted, ANSWER_MS);
+    return await openPairedLink(server, await hello(cwd, server), pairing, first, wanted, ANSWER_MS);
   } catch (err) {
     if (err instanceof PairingRefused) stop(`${before}${err.message}`);
     throw err;

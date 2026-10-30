@@ -7280,6 +7280,509 @@ async function backfill(found, { claudeDir, dataLayer, spawn, isAlive = alive, p
 	return started;
 }
 //#endregion
+//#region src/data-layer/pairing.ts
+/** Renewed this long before it runs out. */
+const RENEW_EARLY_MS = 3e5;
+const PAIRING_REFRESH_MS = 2e4;
+/** pairing.write.lock: free once this old, and waited for at most WRITE_WAIT_MS. */
+const WRITE_FRESH_MS = 1e4;
+const WRITE_WAIT_MS = 1e4;
+/** How often the callback tries to write the credential it got before saying it couldn't. */
+const WRITE_TRIES = 4;
+const pairingPath = (claudeDir) => path.join(claudeDir, "isoplan", "pairing.json");
+const pairingLockPath = (claudeDir) => path.join(claudeDir, "isoplan", "pairing.lock");
+const pairingWriteLockPath = (claudeDir) => path.join(claudeDir, "isoplan", "pairing.write.lock");
+const postJson = async (url, body) => {
+	const response = await fetch(url, {
+		method: "POST",
+		headers: { "content-type": "application/json" },
+		body: JSON.stringify(body),
+		signal: AbortSignal.timeout(15e3)
+	});
+	const value = await response.json().catch(() => ({}));
+	return {
+		status: response.status,
+		body: value && typeof value === "object" ? value : {}
+	};
+};
+/** The server's http address for a data-layer path: ws(s)://host/data-layer → http(s)://host/data-layer/<path>. */
+function httpUrl(server, sub) {
+	const url = new URL(server);
+	url.protocol = url.protocol === "wss:" ? "https:" : "http:";
+	url.pathname = url.pathname.replace(/\/$/, "") + sub;
+	url.search = "";
+	return url.toString();
+}
+const LOOPBACK = /* @__PURE__ */ new Set([
+	"127.0.0.1",
+	"[::1]",
+	"localhost"
+]);
+/** Whether `server` is plain ws:// to another machine, where a credential would cross the network unencrypted. */
+const isPlainRemote = (server) => {
+	const url = new URL(server);
+	return url.protocol === "ws:" && !LOOPBACK.has(url.hostname);
+};
+async function readPairing(file) {
+	try {
+		const value = JSON.parse(await fs.readFile(file, "utf8"));
+		return value && typeof value.accounts === "object" && value.accounts ? value : { accounts: {} };
+	} catch {
+		return { accounts: {} };
+	}
+}
+/** Written whole, through a temp file, so a reader never sees half of it; owner-only. */
+async function writePairing(file, value) {
+	await fs.mkdir(path.dirname(file), { recursive: true });
+	const temp = `${file}.${process.pid}.${randomBytes(4).toString("hex")}`;
+	await fs.writeFile(temp, JSON.stringify(value, null, 2) + "\n", { mode: 384 });
+	try {
+		await fs.rename(temp, file);
+	} catch (err) {
+		await fs.rm(temp, { force: true }).catch(() => {});
+		throw err;
+	}
+}
+const queues = /* @__PURE__ */ new Map();
+/** Runs `change` on pairing.json under both locks, and writes what it returns (or nothing, for null). */
+async function locked(file, writeLock, pid, isAlive, change) {
+	const run = async () => {
+		const until = Date.now() + WRITE_WAIT_MS;
+		while (!await takeLock(writeLock, pid, isAlive, false, Date.now(), { freshMs: WRITE_FRESH_MS })) {
+			if (Date.now() > until) throw new Error(`couldn't take ${writeLock} in ${WRITE_WAIT_MS / 1e3} s`);
+			await new Promise((r) => setTimeout(r, 25));
+		}
+		try {
+			const { write, result } = change(await readPairing(file));
+			if (write) await writePairing(file, write);
+			return result;
+		} finally {
+			await releaseLock(writeLock, pid).catch(() => {});
+		}
+	};
+	const next = (queues.get(file) ?? Promise.resolve()).then(run, run);
+	queues.set(file, next.catch(() => {}));
+	return next;
+}
+const page = (worked, text) => `<!doctype html><meta charset="utf-8"><title>Isoplan: ${worked ? "paired" : "not paired"}</title><p style="font:16px system-ui;margin:3em auto;max-width:30em">${text}</p>`;
+const HTML = {
+	"content-type": "text/html; charset=utf-8",
+	connection: "close"
+};
+function createPairing({ file, lock, writeLock, server, account, machine, emit, allowPlainWs = false, post = postJson, now = Date.now, pid = process.pid, isAlive = alive, retryMs = 200 }) {
+	let asked = false;
+	let shown = null;
+	let unreadable = false;
+	let callback = null;
+	const empty = () => ({ server });
+	const entryOf = (all) => {
+		const kept = all.accounts[account.id];
+		return kept && kept.server === server ? kept : empty();
+	};
+	const withEntry = (all, entry) => ({
+		...all,
+		accounts: {
+			...all.accounts,
+			[account.id]: entry
+		}
+	});
+	const mine = async () => entryOf(await readPairing(file));
+	const update = (decide) => locked(file, writeLock, pid, isAlive, (all) => {
+		const { entry, result } = decide(entryOf(all));
+		return {
+			write: entry ? withEntry(all, entry) : null,
+			result
+		};
+	});
+	const drop = ({ credential: _, token: __, tokenExpires: ___, ...rest }) => rest;
+	const show = (waiting) => {
+		if (shown === waiting.url) return;
+		shown = waiting.url;
+		emit({
+			type: "pair",
+			server,
+			url: waiting.url,
+			expires: new Date(waiting.expires).toISOString()
+		});
+	};
+	const plainRefused = () => {
+		if (!allowPlainWs && isPlainRemote(server)) throw new Error(`${server} is plain ws:// to another machine, so this machine's credential isn't sent; use wss://, or set "allowPlainWs": true in config.json`);
+	};
+	async function renew(used) {
+		const answer = await post(httpUrl(server, "/token"), { credential: used });
+		if (answer.status === 200 && typeof answer.body.token === "string") {
+			const token = answer.body.token;
+			const expires = Date.parse(String(answer.body.expires));
+			return update((e) => e.credential === used ? {
+				entry: {
+					...e,
+					token,
+					tokenExpires: Number.isFinite(expires) ? expires : now()
+				},
+				result: token
+			} : {
+				entry: null,
+				result: void 0
+			});
+		}
+		if (answer.status === 401 && answer.body.code === "pairing-ended") {
+			emit({
+				type: "log",
+				text: `the office server says this machine's pairing has ended: ${String(answer.body.error ?? "")}`
+			});
+			asked = true;
+			return update((e) => ({
+				entry: e.credential === used ? drop(e) : null,
+				result: void 0
+			}));
+		}
+		throw new Error(`the office server answered ${answer.status} when renewing this machine's token`);
+	}
+	async function stopAnswering() {
+		if (!callback) return;
+		for (const timer of callback.timers) clearTimeout(timer);
+		callback.server.close();
+		callback = null;
+		await update((e) => ({
+			entry: e.waiting ? (({ waiting: _, ...rest }) => rest)(e) : null,
+			result: void 0
+		})).catch(() => {});
+		await releaseLock(lock, pid).catch(() => {});
+	}
+	async function keep(credential) {
+		for (let i = 0; i < WRITE_TRIES; i++) try {
+			await update((e) => ({
+				entry: (({ waiting: _, ...rest }) => ({
+					...rest,
+					credential
+				}))(e),
+				result: void 0
+			}));
+			return true;
+		} catch (err) {
+			emit({
+				type: "log",
+				text: `couldn't write this machine's credential (try ${i + 1}): ${String(err?.message ?? err)}`
+			});
+			await new Promise((r) => setTimeout(r, retryMs * 2 ** i));
+		}
+		return false;
+	}
+	async function finish(code, verifier, response) {
+		let worked = false;
+		let text = "This machine couldn't be paired: the office server couldn't be reached. Click the link in Claude Code again in a moment.";
+		try {
+			const answer = await post(httpUrl(server, "/pair/token"), {
+				code,
+				verifier
+			});
+			if (answer.status === 200 && typeof answer.body.credential === "string") {
+				worked = await keep(answer.body.credential);
+				text = worked ? "This machine is paired with the office. You can close this tab; Claude Code reports to it within a few seconds." : "The office paired this machine, but its credential couldn't be saved here. Claude Code shows a new link to try again.";
+				emit({
+					type: "log",
+					text: worked ? "this machine is paired with the office server" : "couldn't save this machine's credential; pairing again"
+				});
+			} else {
+				text = "This machine couldn't be paired: the link was used or has expired. Claude Code shows a new one.";
+				emit({
+					type: "log",
+					text: `the office server didn't pair this machine (${answer.status}): ${String(answer.body.error ?? "")}`
+				});
+			}
+		} catch (err) {
+			emit({
+				type: "log",
+				text: `couldn't finish pairing: ${String(err?.message ?? err)}`
+			});
+		}
+		try {
+			response.writeHead(worked ? 200 : 400, HTML).end(page(worked, text));
+		} catch {}
+		await stopAnswering().catch(() => {});
+	}
+	async function startPairing() {
+		const verifier = randomBytes(32).toString("base64url");
+		const challenge = createHash("sha256").update(verifier).digest("base64url");
+		const nonce = randomBytes(16).toString("base64url");
+		let finishing = false;
+		const listener = http.createServer((request, response) => {
+			const url = new URL(request.url ?? "/", "http://127.0.0.1");
+			const code = url.searchParams.get("code");
+			if (request.method !== "GET" || url.pathname !== `/${nonce}` || !code || finishing) {
+				response.writeHead(404, HTML).end(page(false, "Not found."));
+				return;
+			}
+			finishing = true;
+			finish(code, verifier, response);
+		});
+		listener.on("error", () => {});
+		await new Promise((resolve, reject) => listener.once("error", reject).listen(0, "127.0.0.1", () => resolve()));
+		listener.unref();
+		const { port } = listener.address();
+		const refresh = setInterval(() => void refreshLock(lock, pid).catch(() => {}), PAIRING_REFRESH_MS);
+		refresh.unref();
+		callback = {
+			server: listener,
+			timers: [refresh]
+		};
+		try {
+			const machineId = await locked(file, writeLock, pid, isAlive, (all) => {
+				if (all.machine) return {
+					write: null,
+					result: all.machine
+				};
+				const made = randomBytes(16).toString("base64url");
+				return {
+					write: {
+						...all,
+						machine: made
+					},
+					result: made
+				};
+			});
+			const answer = await post(httpUrl(server, "/pair"), {
+				account,
+				machine: {
+					name: machine,
+					id: machineId
+				},
+				callback: `http://127.0.0.1:${port}/${nonce}`,
+				challenge
+			});
+			if (answer.status !== 200 || typeof answer.body.url !== "string") throw new Error(`the office server answered ${answer.status} when asked to pair${answer.body.error ? `: ${String(answer.body.error)}` : ""}`);
+			const waiting = {
+				url: answer.body.url,
+				expires: Date.parse(String(answer.body.expires)) || now()
+			};
+			const expiry = setTimeout(() => void stopAnswering(), Math.max(0, waiting.expires - now()));
+			expiry.unref();
+			callback.timers.push(expiry);
+			await update((e) => ({
+				entry: {
+					...e,
+					waiting
+				},
+				result: void 0
+			}));
+			show(waiting);
+		} catch (err) {
+			await stopAnswering();
+			throw err;
+		}
+	}
+	return {
+		async token() {
+			const entry = await mine();
+			if (entry.token && (entry.tokenExpires ?? 0) - RENEW_EARLY_MS > now()) {
+				plainRefused();
+				return entry.token;
+			}
+			if (entry.credential) {
+				plainRefused();
+				const renewed = await renew(entry.credential);
+				if (renewed) return renewed;
+				const again = await mine();
+				if (again.token && again.token !== entry.token) return again.token;
+			}
+			if (!asked && !entry.waiting) return void 0;
+			if (callback) return null;
+			plainRefused();
+			if (!await takeLock(lock, pid, isAlive, false, Date.now(), { freshMs: 6e4 })) {
+				if (entry.waiting && entry.waiting.expires > now()) show(entry.waiting);
+				return null;
+			}
+			await startPairing();
+			return null;
+		},
+		async refused(code, sent) {
+			if (code !== "token-expired") asked = true;
+			if (code === "not-paired" && sent) {
+				if (!unreadable) emit({
+					type: "log",
+					text: "the office server didn't find this machine's token in its hello; it may be older than pairing. The credential is kept."
+				});
+				unreadable = true;
+				return;
+			}
+			if (!sent) return;
+			await update((e) => {
+				if (e.token !== sent) return {
+					entry: null,
+					result: void 0
+				};
+				if (code === "token-expired") return {
+					entry: {
+						...e,
+						tokenExpires: 0
+					},
+					result: void 0
+				};
+				return {
+					entry: code === "pairing-ended" ? drop(e) : null,
+					result: void 0
+				};
+			});
+		},
+		close: stopAnswering
+	};
+}
+//#endregion
+//#region src/data-layer/approved.ts
+const getJson = async (url, headers) => {
+	const response = await fetch(url, {
+		headers,
+		signal: AbortSignal.timeout(15e3)
+	});
+	return {
+		status: response.status,
+		body: response.status === 200 || response.status === 401 ? await response.json().catch(() => null) : null
+	};
+};
+const approvedPath = (claudeDir) => path.join(claudeDir, "isoplan", "approved.json");
+/** A forced refresh comes at most this often. */
+const FORCE_MS = 3e4;
+/** While the machine waits to be paired, or the server can't be reached, the list is asked for again this soon. */
+const PAIR_POLL_MS = 5e3;
+const RETRY_MS = 3e4;
+const isList = (value) => {
+	const v = value;
+	return !!v && typeof v.version === "string" && Array.isArray(v.offices) && v.offices.every((o) => o && Array.isArray(o.repos) && o.repos.every((r) => typeof r === "string"));
+};
+async function readCache(file, server) {
+	try {
+		const value = JSON.parse(await fs.readFile(file, "utf8"));
+		return value.server === server && typeof value.checked === "number" && isList(value) ? value : null;
+	} catch {
+		return null;
+	}
+}
+/** Written whole, through a temp file, so a reader never sees half of it; owner-only. */
+async function writeCache(file, value) {
+	await fs.mkdir(path.dirname(file), { recursive: true });
+	const temp = `${file}.${process.pid}.${randomBytes(4).toString("hex")}`;
+	await fs.writeFile(temp, JSON.stringify(value, null, 2) + "\n", { mode: 384 });
+	await fs.rename(temp, file).catch(async (err) => {
+		await fs.rm(temp, { force: true }).catch(() => {});
+		throw err;
+	});
+}
+const idsOf = (list) => new Set(list.offices.flatMap((o) => o.repos.map((r) => r.toLowerCase())));
+/**
+* A session's link as the list allows it: while `project` is on it, `link`, or one `open` opens now;
+* while it isn't, none (`link` is closed), and why. Nothing opens a socket before the list says so.
+*/
+async function gateLink(approved, project, link, open) {
+	await approved.refresh();
+	const repos = approved.repos();
+	if (repos?.has(project.toLowerCase())) return {
+		link: link ?? open(),
+		dormancy: null
+	};
+	link?.close();
+	return {
+		link: null,
+		dormancy: repos ? "not-approved" : approved.problem() === "pairing" ? "pairing" : "no-list"
+	};
+}
+function createApproved({ server, file, pairing, refreshMs, log, get = getJson, now = Date.now }) {
+	let list = null;
+	let ids = null;
+	let problem = "unreachable";
+	let nextAt = -Infinity;
+	let forcedAt = -Infinity;
+	let busy = null;
+	let said = "";
+	const take = (value) => {
+		list = value;
+		ids = idsOf(value);
+		problem = null;
+		nextAt = value.checked + refreshMs;
+	};
+	const tell = (text) => {
+		if (text !== said) log(text);
+		said = text;
+	};
+	async function check() {
+		const shared = await readCache(file, server);
+		if (shared && shared.checked > (list?.checked ?? -Infinity)) take(shared);
+		if (list && now() < nextAt) return;
+		let token;
+		try {
+			token = pairing ? await pairing.token() : void 0;
+		} catch (err) {
+			tell(`couldn't read which repos the office takes: ${String(err?.message ?? err)}`);
+			if (!list) problem = "unreachable";
+			nextAt = now() + RETRY_MS;
+			return;
+		}
+		if (token === null) {
+			if (!list) problem = "pairing";
+			nextAt = now() + PAIR_POLL_MS;
+			return;
+		}
+		const headers = {};
+		if (token) headers.authorization = `Bearer ${token}`;
+		if (list) headers["if-none-match"] = `"${list.version}"`;
+		let answer;
+		try {
+			answer = await get(httpUrl(server, "/repos"), headers);
+		} catch (err) {
+			tell(`couldn't read which repos the office takes from ${server}: ${String(err?.message ?? err)}`);
+			if (!list) problem = "unreachable";
+			nextAt = now() + RETRY_MS;
+			return;
+		}
+		const code = answer.body?.code;
+		if (answer.status === 304 && list) {
+			const kept = {
+				...list,
+				checked: now()
+			};
+			take(kept);
+			await writeCache(file, kept).catch(() => {});
+		} else if (answer.status === 200 && isList(answer.body)) {
+			const fresh = {
+				server,
+				version: answer.body.version,
+				offices: answer.body.offices,
+				checked: now()
+			};
+			take(fresh);
+			said = "";
+			await writeCache(file, fresh).catch((err) => tell(`couldn't keep the office's list of repos in ${file}: ${String(err?.message ?? err)}`));
+		} else if (answer.status === 401 && pairing && (code === "not-paired" || code === "pairing-ended" || code === "token-expired")) {
+			await pairing.refused(code, token).catch(() => {});
+			if (!list) problem = "pairing";
+			nextAt = now() + (code === "token-expired" || !token ? 0 : PAIR_POLL_MS);
+		} else if (answer.status === 404) {
+			tell(`${server} is too old to say which repos its office takes, so nothing is sent to it; it needs updating`);
+			list = null;
+			ids = null;
+			problem = "too-old";
+			nextAt = now() + refreshMs;
+		} else {
+			tell(`the office server answered ${answer.status} when asked which repos it takes`);
+			if (!list) problem = "unreachable";
+			nextAt = now() + RETRY_MS;
+		}
+	}
+	return {
+		repos: () => ids,
+		problem: () => problem,
+		refresh(force = false) {
+			if (busy) return busy;
+			if (force && now() - forcedAt >= FORCE_MS) {
+				forcedAt = now();
+				nextAt = -Infinity;
+			}
+			if (now() < nextAt) return Promise.resolve();
+			busy = check().catch((err) => tell(`couldn't read which repos the office takes: ${String(err?.message ?? err)}`)).finally(() => busy = null);
+			return busy;
+		}
+	};
+}
+//#endregion
 //#region src/data-layer/attribution.ts
 /** How long what a folder is (there or not, where its links lead) is believed. */
 const CACHE_MS = 1e4;
@@ -9219,354 +9722,6 @@ async function takenFrom(take, file, question) {
 }
 const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 //#endregion
-//#region src/data-layer/pairing.ts
-/** Renewed this long before it runs out. */
-const RENEW_EARLY_MS = 3e5;
-const PAIRING_REFRESH_MS = 2e4;
-/** pairing.write.lock: free once this old, and waited for at most WRITE_WAIT_MS. */
-const WRITE_FRESH_MS = 1e4;
-const WRITE_WAIT_MS = 1e4;
-/** How often the callback tries to write the credential it got before saying it couldn't. */
-const WRITE_TRIES = 4;
-const pairingPath = (claudeDir) => path.join(claudeDir, "isoplan", "pairing.json");
-const pairingLockPath = (claudeDir) => path.join(claudeDir, "isoplan", "pairing.lock");
-const pairingWriteLockPath = (claudeDir) => path.join(claudeDir, "isoplan", "pairing.write.lock");
-const postJson = async (url, body) => {
-	const response = await fetch(url, {
-		method: "POST",
-		headers: { "content-type": "application/json" },
-		body: JSON.stringify(body),
-		signal: AbortSignal.timeout(15e3)
-	});
-	const value = await response.json().catch(() => ({}));
-	return {
-		status: response.status,
-		body: value && typeof value === "object" ? value : {}
-	};
-};
-/** The server's http address for a data-layer path: ws(s)://host/data-layer → http(s)://host/data-layer/<path>. */
-function httpUrl(server, sub) {
-	const url = new URL(server);
-	url.protocol = url.protocol === "wss:" ? "https:" : "http:";
-	url.pathname = url.pathname.replace(/\/$/, "") + sub;
-	url.search = "";
-	return url.toString();
-}
-const LOOPBACK = /* @__PURE__ */ new Set([
-	"127.0.0.1",
-	"[::1]",
-	"localhost"
-]);
-/** Whether `server` is plain ws:// to another machine, where a credential would cross the network unencrypted. */
-const isPlainRemote = (server) => {
-	const url = new URL(server);
-	return url.protocol === "ws:" && !LOOPBACK.has(url.hostname);
-};
-async function readPairing(file) {
-	try {
-		const value = JSON.parse(await fs.readFile(file, "utf8"));
-		return value && typeof value.accounts === "object" && value.accounts ? value : { accounts: {} };
-	} catch {
-		return { accounts: {} };
-	}
-}
-/** Written whole, through a temp file, so a reader never sees half of it; owner-only. */
-async function writePairing(file, value) {
-	await fs.mkdir(path.dirname(file), { recursive: true });
-	const temp = `${file}.${process.pid}.${randomBytes(4).toString("hex")}`;
-	await fs.writeFile(temp, JSON.stringify(value, null, 2) + "\n", { mode: 384 });
-	try {
-		await fs.rename(temp, file);
-	} catch (err) {
-		await fs.rm(temp, { force: true }).catch(() => {});
-		throw err;
-	}
-}
-const queues = /* @__PURE__ */ new Map();
-/** Runs `change` on pairing.json under both locks, and writes what it returns (or nothing, for null). */
-async function locked(file, writeLock, pid, isAlive, change) {
-	const run = async () => {
-		const until = Date.now() + WRITE_WAIT_MS;
-		while (!await takeLock(writeLock, pid, isAlive, false, Date.now(), { freshMs: WRITE_FRESH_MS })) {
-			if (Date.now() > until) throw new Error(`couldn't take ${writeLock} in ${WRITE_WAIT_MS / 1e3} s`);
-			await new Promise((r) => setTimeout(r, 25));
-		}
-		try {
-			const { write, result } = change(await readPairing(file));
-			if (write) await writePairing(file, write);
-			return result;
-		} finally {
-			await releaseLock(writeLock, pid).catch(() => {});
-		}
-	};
-	const next = (queues.get(file) ?? Promise.resolve()).then(run, run);
-	queues.set(file, next.catch(() => {}));
-	return next;
-}
-const page = (worked, text) => `<!doctype html><meta charset="utf-8"><title>Isoplan: ${worked ? "paired" : "not paired"}</title><p style="font:16px system-ui;margin:3em auto;max-width:30em">${text}</p>`;
-const HTML = {
-	"content-type": "text/html; charset=utf-8",
-	connection: "close"
-};
-function createPairing({ file, lock, writeLock, server, account, machine, emit, allowPlainWs = false, post = postJson, now = Date.now, pid = process.pid, isAlive = alive, retryMs = 200 }) {
-	let asked = false;
-	let shown = null;
-	let unreadable = false;
-	let callback = null;
-	const empty = () => ({ server });
-	const entryOf = (all) => {
-		const kept = all.accounts[account.id];
-		return kept && kept.server === server ? kept : empty();
-	};
-	const withEntry = (all, entry) => ({
-		...all,
-		accounts: {
-			...all.accounts,
-			[account.id]: entry
-		}
-	});
-	const mine = async () => entryOf(await readPairing(file));
-	const update = (decide) => locked(file, writeLock, pid, isAlive, (all) => {
-		const { entry, result } = decide(entryOf(all));
-		return {
-			write: entry ? withEntry(all, entry) : null,
-			result
-		};
-	});
-	const drop = ({ credential: _, token: __, tokenExpires: ___, ...rest }) => rest;
-	const show = (waiting) => {
-		if (shown === waiting.url) return;
-		shown = waiting.url;
-		emit({
-			type: "pair",
-			server,
-			url: waiting.url,
-			expires: new Date(waiting.expires).toISOString()
-		});
-	};
-	const plainRefused = () => {
-		if (!allowPlainWs && isPlainRemote(server)) throw new Error(`${server} is plain ws:// to another machine, so this machine's credential isn't sent; use wss://, or set "allowPlainWs": true in config.json`);
-	};
-	async function renew(used) {
-		const answer = await post(httpUrl(server, "/token"), { credential: used });
-		if (answer.status === 200 && typeof answer.body.token === "string") {
-			const token = answer.body.token;
-			const expires = Date.parse(String(answer.body.expires));
-			return update((e) => e.credential === used ? {
-				entry: {
-					...e,
-					token,
-					tokenExpires: Number.isFinite(expires) ? expires : now()
-				},
-				result: token
-			} : {
-				entry: null,
-				result: void 0
-			});
-		}
-		if (answer.status === 401 && answer.body.code === "pairing-ended") {
-			emit({
-				type: "log",
-				text: `the office server says this machine's pairing has ended: ${String(answer.body.error ?? "")}`
-			});
-			asked = true;
-			return update((e) => ({
-				entry: e.credential === used ? drop(e) : null,
-				result: void 0
-			}));
-		}
-		throw new Error(`the office server answered ${answer.status} when renewing this machine's token`);
-	}
-	async function stopAnswering() {
-		if (!callback) return;
-		for (const timer of callback.timers) clearTimeout(timer);
-		callback.server.close();
-		callback = null;
-		await update((e) => ({
-			entry: e.waiting ? (({ waiting: _, ...rest }) => rest)(e) : null,
-			result: void 0
-		})).catch(() => {});
-		await releaseLock(lock, pid).catch(() => {});
-	}
-	async function keep(credential) {
-		for (let i = 0; i < WRITE_TRIES; i++) try {
-			await update((e) => ({
-				entry: (({ waiting: _, ...rest }) => ({
-					...rest,
-					credential
-				}))(e),
-				result: void 0
-			}));
-			return true;
-		} catch (err) {
-			emit({
-				type: "log",
-				text: `couldn't write this machine's credential (try ${i + 1}): ${String(err?.message ?? err)}`
-			});
-			await new Promise((r) => setTimeout(r, retryMs * 2 ** i));
-		}
-		return false;
-	}
-	async function finish(code, verifier, response) {
-		let worked = false;
-		let text = "This machine couldn't be paired: the office server couldn't be reached. Click the link in Claude Code again in a moment.";
-		try {
-			const answer = await post(httpUrl(server, "/pair/token"), {
-				code,
-				verifier
-			});
-			if (answer.status === 200 && typeof answer.body.credential === "string") {
-				worked = await keep(answer.body.credential);
-				text = worked ? "This machine is paired with the office. You can close this tab; Claude Code reports to it within a few seconds." : "The office paired this machine, but its credential couldn't be saved here. Claude Code shows a new link to try again.";
-				emit({
-					type: "log",
-					text: worked ? "this machine is paired with the office server" : "couldn't save this machine's credential; pairing again"
-				});
-			} else {
-				text = "This machine couldn't be paired: the link was used or has expired. Claude Code shows a new one.";
-				emit({
-					type: "log",
-					text: `the office server didn't pair this machine (${answer.status}): ${String(answer.body.error ?? "")}`
-				});
-			}
-		} catch (err) {
-			emit({
-				type: "log",
-				text: `couldn't finish pairing: ${String(err?.message ?? err)}`
-			});
-		}
-		try {
-			response.writeHead(worked ? 200 : 400, HTML).end(page(worked, text));
-		} catch {}
-		await stopAnswering().catch(() => {});
-	}
-	async function startPairing() {
-		const verifier = randomBytes(32).toString("base64url");
-		const challenge = createHash("sha256").update(verifier).digest("base64url");
-		const nonce = randomBytes(16).toString("base64url");
-		let finishing = false;
-		const listener = http.createServer((request, response) => {
-			const url = new URL(request.url ?? "/", "http://127.0.0.1");
-			const code = url.searchParams.get("code");
-			if (request.method !== "GET" || url.pathname !== `/${nonce}` || !code || finishing) {
-				response.writeHead(404, HTML).end(page(false, "Not found."));
-				return;
-			}
-			finishing = true;
-			finish(code, verifier, response);
-		});
-		listener.on("error", () => {});
-		await new Promise((resolve, reject) => listener.once("error", reject).listen(0, "127.0.0.1", () => resolve()));
-		listener.unref();
-		const { port } = listener.address();
-		const refresh = setInterval(() => void refreshLock(lock, pid).catch(() => {}), PAIRING_REFRESH_MS);
-		refresh.unref();
-		callback = {
-			server: listener,
-			timers: [refresh]
-		};
-		try {
-			const machineId = await locked(file, writeLock, pid, isAlive, (all) => {
-				if (all.machine) return {
-					write: null,
-					result: all.machine
-				};
-				const made = randomBytes(16).toString("base64url");
-				return {
-					write: {
-						...all,
-						machine: made
-					},
-					result: made
-				};
-			});
-			const answer = await post(httpUrl(server, "/pair"), {
-				account,
-				machine: {
-					name: machine,
-					id: machineId
-				},
-				callback: `http://127.0.0.1:${port}/${nonce}`,
-				challenge
-			});
-			if (answer.status !== 200 || typeof answer.body.url !== "string") throw new Error(`the office server answered ${answer.status} when asked to pair${answer.body.error ? `: ${String(answer.body.error)}` : ""}`);
-			const waiting = {
-				url: answer.body.url,
-				expires: Date.parse(String(answer.body.expires)) || now()
-			};
-			const expiry = setTimeout(() => void stopAnswering(), Math.max(0, waiting.expires - now()));
-			expiry.unref();
-			callback.timers.push(expiry);
-			await update((e) => ({
-				entry: {
-					...e,
-					waiting
-				},
-				result: void 0
-			}));
-			show(waiting);
-		} catch (err) {
-			await stopAnswering();
-			throw err;
-		}
-	}
-	return {
-		async token() {
-			const entry = await mine();
-			if (entry.token && (entry.tokenExpires ?? 0) - RENEW_EARLY_MS > now()) {
-				plainRefused();
-				return entry.token;
-			}
-			if (entry.credential) {
-				plainRefused();
-				const renewed = await renew(entry.credential);
-				if (renewed) return renewed;
-				const again = await mine();
-				if (again.token && again.token !== entry.token) return again.token;
-			}
-			if (!asked && !entry.waiting) return void 0;
-			if (callback) return null;
-			plainRefused();
-			if (!await takeLock(lock, pid, isAlive, false, Date.now(), { freshMs: 6e4 })) {
-				if (entry.waiting && entry.waiting.expires > now()) show(entry.waiting);
-				return null;
-			}
-			await startPairing();
-			return null;
-		},
-		async refused(code, sent) {
-			if (code !== "token-expired") asked = true;
-			if (code === "not-paired" && sent) {
-				if (!unreadable) emit({
-					type: "log",
-					text: "the office server didn't find this machine's token in its hello; it may be older than pairing. The credential is kept."
-				});
-				unreadable = true;
-				return;
-			}
-			if (!sent) return;
-			await update((e) => {
-				if (e.token !== sent) return {
-					entry: null,
-					result: void 0
-				};
-				if (code === "token-expired") return {
-					entry: {
-						...e,
-						tokenExpires: 0
-					},
-					result: void 0
-				};
-				return {
-					entry: code === "pairing-ended" ? drop(e) : null,
-					result: void 0
-				};
-			});
-		},
-		close: stopAnswering
-	};
-}
-//#endregion
 //#region src/data-layer/reports.ts
 /** What a withheld report says in place of its text. */
 const WITHHELD_TEXT = "Held for its owner to check: the secret check found what may be a secret in this report.";
@@ -9733,8 +9888,10 @@ async function main(argv) {
 	const logFile = path.join(claudeDir, "isoplan", "logs", `${sessionId}.log`);
 	let logging = Promise.resolve();
 	let downSince = Date.now();
+	let dropped = () => {};
 	const emit = (line) => {
 		if (line.type === "status") downSince = line.state === "connected" ? null : downSince ?? Date.now();
+		if (line.type === "status" && line.state === "disconnected") dropped();
 		if (isOut) process.stdout.write(JSON.stringify(line) + "\n");
 		else if (detached && (line.type === "log" || line.type === "error" || line.type === "pair")) {
 			const said = line.type === "log" ? line.text : line.type === "pair" ? pairNote(line) : `the office server says: ${line.message} (${line.code})`;
@@ -9847,6 +10004,34 @@ async function main(argv) {
 			dir: waitsDir
 		});
 	}
+	const machineAccount = await accountOf({
+		readText: (p) => fs.readFile(p, "utf8").catch(() => null),
+		run: io.run
+	}, claudeJson, os.homedir());
+	const pairing = createPairing({
+		file: pairingPath(claudeDir),
+		lock: pairingLockPath(claudeDir),
+		writeLock: pairingWriteLockPath(claudeDir),
+		server,
+		account: machineAccount,
+		machine,
+		emit,
+		allowPlainWs: config.allowPlainWs
+	});
+	const approved = createApproved({
+		server,
+		file: approvedPath(claudeDir),
+		pairing,
+		refreshMs: config.approvedRefreshMinutes * 6e4,
+		log: (text) => emit({
+			type: "log",
+			text
+		})
+	});
+	dropped = () => void approved.refresh(true);
+	let home = null;
+	let homeAt = -Infinity;
+	let dormant = null;
 	let link = null;
 	let reported = "";
 	let title = null;
@@ -9872,6 +10057,70 @@ async function main(argv) {
 	const outgoing = (facts, patterns) => prepareQuestions(hold.apply(facts, patterns), patterns, waiting, patternLog);
 	let checkouts = {};
 	let answered = (_id) => false;
+	const account = await accountOf({
+		readText: (p) => fs.readFile(p, "utf8").catch(() => null),
+		run: io.run
+	}, claudeJson, cwd);
+	const openLink = (session) => createLink({
+		url: server,
+		emit,
+		pairing,
+		onNotWanted: () => {
+			isUnwanted = detached;
+			approved.refresh(true);
+		},
+		filter: (f, projects) => forOffice(f, projects, checkouts),
+		answered: (id) => answered(id),
+		onMessage: (message) => {
+			if (message.type === "request" && message.kind === "owner-answer") {
+				const file = path.join(answersDir, `${randomUUID()}.json`);
+				fs.mkdir(answersDir, { recursive: true }).then(async () => {
+					const relayed = await relayOwnerAnswer(message, {
+						detached,
+						facts: () => sent,
+						file,
+						emit,
+						take: takeFile
+					});
+					link?.send(relayed.message);
+					if (!relayed.gaveUp) return;
+					const late = await lateTake(message.question, file, takeFile);
+					if (late === null) return;
+					emit({
+						type: "log",
+						text: `the hooks module said late that it ${late ? "took" : "didn't take"} the owner's answer to ${message.question}`
+					});
+					if (late) link?.send({
+						type: "reply",
+						v: 1,
+						id: message.id,
+						kind: "owner-answer",
+						late: true
+					});
+				}).finally(() => fs.rm(file, { force: true }).catch(() => {})).catch((err) => emit({
+					type: "log",
+					text: `couldn't pass the owner's answer on: ${String(err?.message ?? err)}`
+				}));
+				return;
+			}
+			if (message.type !== "release") return emit({
+				type: "log",
+				text: `the office server sent a ${message.type} message, which this data layer doesn't handle yet`
+			});
+			hold.release(message.id).then((released) => {
+				if (released && shown) link?.update(sent = outgoing(...shown));
+			});
+		},
+		hello: {
+			type: "hello",
+			v: 1,
+			source: "claude-code",
+			account,
+			machine: { name: machine },
+			session,
+			project: home
+		}
+	});
 	do {
 		const now = Date.now();
 		const isFirstPass = passes++ === 0;
@@ -9930,6 +10179,46 @@ async function main(argv) {
 			}
 			continue;
 		}
+		if (!home || now - homeAt > gitOpts.maxAgeMs) {
+			home = await projectOf(io.run, await resolve(cwd), cwd, machine);
+			homeAt = now;
+		}
+		const session = read.facts.session.id;
+		const gated = await gateLink(approved, home.id, link, () => openLink(session));
+		link = gated.link;
+		const dormancy = gated.dormancy;
+		if (dormancy !== dormant) {
+			if (dormancy) emit({
+				type: "status",
+				server,
+				state: dormancy
+			});
+			if (dormancy === "not-approved") emit({
+				type: "log",
+				text: `${home.id} isn't one of the repos ${server} takes, so nothing of this session is sent`
+			});
+			if (dormancy === "no-list") emit({
+				type: "log",
+				text: `can't tell yet which repos ${server} takes, so nothing of this session is sent`
+			});
+		}
+		dormant = dormancy;
+		if (!link) {
+			const why = detached ? detachedStop({
+				now,
+				lastActive: read.facts.session.lastActive,
+				idleMinutes: config.idleMinutes,
+				downSince: null
+			}) : null;
+			if (why) {
+				emit({
+					type: "log",
+					text: `stopping: ${why}`
+				});
+				break;
+			}
+			continue;
+		}
 		const reply = await takeReply(titleFile);
 		if (reply) {
 			const text = reply.key === asked ? cleanTitle(reply.text) : null;
@@ -9966,84 +10255,6 @@ async function main(argv) {
 		} : read.facts;
 		checkouts = read.checkouts ?? {};
 		answered = read.answered ?? answered;
-		if (!link) {
-			const where = await resolve(cwd);
-			const readText = (p) => fs.readFile(p, "utf8").catch(() => null);
-			const account = await accountOf({
-				readText,
-				run: io.run
-			}, claudeJson, cwd);
-			const machineAccount = await accountOf({
-				readText,
-				run: io.run
-			}, claudeJson, os.homedir());
-			link = createLink({
-				url: server,
-				emit,
-				pairing: createPairing({
-					file: pairingPath(claudeDir),
-					lock: pairingLockPath(claudeDir),
-					writeLock: pairingWriteLockPath(claudeDir),
-					server,
-					account: machineAccount,
-					machine,
-					emit,
-					allowPlainWs: config.allowPlainWs
-				}),
-				onNotWanted: () => isUnwanted = detached,
-				filter: (f, projects) => forOffice(f, projects, checkouts),
-				answered: (id) => answered(id),
-				onMessage: (message) => {
-					if (message.type === "request" && message.kind === "owner-answer") {
-						const file = path.join(answersDir, `${randomUUID()}.json`);
-						fs.mkdir(answersDir, { recursive: true }).then(async () => {
-							const relayed = await relayOwnerAnswer(message, {
-								detached,
-								facts: () => sent,
-								file,
-								emit,
-								take: takeFile
-							});
-							link?.send(relayed.message);
-							if (!relayed.gaveUp) return;
-							const late = await lateTake(message.question, file, takeFile);
-							if (late === null) return;
-							emit({
-								type: "log",
-								text: `the hooks module said late that it ${late ? "took" : "didn't take"} the owner's answer to ${message.question}`
-							});
-							if (late) link?.send({
-								type: "reply",
-								v: 1,
-								id: message.id,
-								kind: "owner-answer",
-								late: true
-							});
-						}).finally(() => fs.rm(file, { force: true }).catch(() => {})).catch((err) => emit({
-							type: "log",
-							text: `couldn't pass the owner's answer on: ${String(err?.message ?? err)}`
-						}));
-						return;
-					}
-					if (message.type !== "release") return emit({
-						type: "log",
-						text: `the office server sent a ${message.type} message, which this data layer doesn't handle yet`
-					});
-					hold.release(message.id).then((released) => {
-						if (released && shown) link?.update(sent = outgoing(...shown));
-					});
-				},
-				hello: {
-					type: "hello",
-					v: 1,
-					source: "claude-code",
-					account,
-					machine: { name: machine },
-					session: facts.session.id,
-					project: await projectOf(io.run, where, cwd, machine)
-				}
-			});
-		}
 		const patterns = await loadPatterns(modPatterns, ownerPatterns, patternLog).catch((err) => {
 			patternLog(`couldn't read the secret patterns, so every report is withheld: ${String(err?.message ?? err)}`);
 			return null;

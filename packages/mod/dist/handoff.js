@@ -2,9 +2,9 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { randomBytes } from "node:crypto";
 import { execFile, spawn, spawnSync } from "node:child_process";
 import { realpath, statSync } from "node:fs";
-import { randomBytes } from "node:crypto";
 import { promisify } from "node:util";
 //#region ../../node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/core/util.js
 function getEnumValues(entries) {
@@ -6444,6 +6444,72 @@ async function readOptional(io, p) {
 	}
 }
 //#endregion
+//#region src/data-layer/pairing.ts
+const pairingPath = (claudeDir) => path.join(claudeDir, "isoplan", "pairing.json");
+const postJson = async (url, body) => {
+	const response = await fetch(url, {
+		method: "POST",
+		headers: { "content-type": "application/json" },
+		body: JSON.stringify(body),
+		signal: AbortSignal.timeout(15e3)
+	});
+	const value = await response.json().catch(() => ({}));
+	return {
+		status: response.status,
+		body: value && typeof value === "object" ? value : {}
+	};
+};
+/** The server's http address for a data-layer path: ws(s)://host/data-layer → http(s)://host/data-layer/<path>. */
+function httpUrl(server, sub) {
+	const url = new URL(server);
+	url.protocol = url.protocol === "wss:" ? "https:" : "http:";
+	url.pathname = url.pathname.replace(/\/$/, "") + sub;
+	url.search = "";
+	return url.toString();
+}
+const LOOPBACK = /* @__PURE__ */ new Set([
+	"127.0.0.1",
+	"[::1]",
+	"localhost"
+]);
+/** Whether `server` is plain ws:// to another machine, where a credential would cross the network unencrypted. */
+const isPlainRemote = (server) => {
+	const url = new URL(server);
+	return url.protocol === "ws:" && !LOOPBACK.has(url.hostname);
+};
+async function readPairing(file) {
+	try {
+		const value = JSON.parse(await fs.readFile(file, "utf8"));
+		return value && typeof value.accounts === "object" && value.accounts ? value : { accounts: {} };
+	} catch {
+		return { accounts: {} };
+	}
+}
+//#endregion
+//#region src/data-layer/approved.ts
+const approvedPath = (claudeDir) => path.join(claudeDir, "isoplan", "approved.json");
+const isList = (value) => {
+	const v = value;
+	return !!v && typeof v.version === "string" && Array.isArray(v.offices) && v.offices.every((o) => o && Array.isArray(o.repos) && o.repos.every((r) => typeof r === "string"));
+};
+async function readCache(file, server) {
+	try {
+		const value = JSON.parse(await fs.readFile(file, "utf8"));
+		return value.server === server && typeof value.checked === "number" && isList(value) ? value : null;
+	} catch {
+		return null;
+	}
+}
+const idsOf = (list) => new Set(list.offices.flatMap((o) => o.repos.map((r) => r.toLowerCase())));
+/**
+* The approved repos as approved.json last had them from `server`, for a command that only reads
+* (the handoff and ask-the-room commands); null with no copy.
+*/
+async function cachedRepos(file, server) {
+	const cached = await readCache(file, server);
+	return cached && idsOf(cached);
+}
+//#endregion
 //#region src/data-layer/claude-paths.ts
 /**
 * Claude Code's config folder and its .claude.json: both in $CLAUDE_CONFIG_DIR when it is set,
@@ -6651,48 +6717,6 @@ async function loadPatterns(modFile, ownerFile, log) {
 function scan(text, patterns) {
 	if (!patterns) return UNREADABLE;
 	return patterns.find((p) => p.regex.test(text))?.name ?? null;
-}
-//#endregion
-//#region src/data-layer/pairing.ts
-const pairingPath = (claudeDir) => path.join(claudeDir, "isoplan", "pairing.json");
-const postJson = async (url, body) => {
-	const response = await fetch(url, {
-		method: "POST",
-		headers: { "content-type": "application/json" },
-		body: JSON.stringify(body),
-		signal: AbortSignal.timeout(15e3)
-	});
-	const value = await response.json().catch(() => ({}));
-	return {
-		status: response.status,
-		body: value && typeof value === "object" ? value : {}
-	};
-};
-/** The server's http address for a data-layer path: ws(s)://host/data-layer → http(s)://host/data-layer/<path>. */
-function httpUrl(server, sub) {
-	const url = new URL(server);
-	url.protocol = url.protocol === "wss:" ? "https:" : "http:";
-	url.pathname = url.pathname.replace(/\/$/, "") + sub;
-	url.search = "";
-	return url.toString();
-}
-const LOOPBACK = /* @__PURE__ */ new Set([
-	"127.0.0.1",
-	"[::1]",
-	"localhost"
-]);
-/** Whether `server` is plain ws:// to another machine, where a credential would cross the network unencrypted. */
-const isPlainRemote = (server) => {
-	const url = new URL(server);
-	return url.protocol === "ws:" && !LOOPBACK.has(url.hostname);
-};
-async function readPairing(file) {
-	try {
-		const value = JSON.parse(await fs.readFile(file, "utf8"));
-		return value && typeof value.accounts === "object" && value.accounts ? value : { accounts: {} };
-	} catch {
-		return { accounts: {} };
-	}
 }
 //#endregion
 //#region src/handoff/connection.ts
@@ -7850,11 +7874,14 @@ const stop = (text) => {
 async function settings() {
 	return loadSettings(io, path.join(modDir, "runner.json"), path.join(isoplanDir, "runner.json"));
 }
-async function hello(cwd) {
+async function hello(cwd, server) {
 	const id = process.env.CLAUDE_CODE_SESSION_ID;
 	if (!id) stop("This runs inside a Claude Code session, which sets CLAUDE_CODE_SESSION_ID; it isn't set here.");
 	const machine = os.hostname();
 	const where = await createGit(io).resolve(cwd);
+	const project = await projectOf(io.run, where, cwd, machine);
+	const repos = await cachedRepos(approvedPath(claudeDir), server);
+	if (!repos?.has(project.id.toLowerCase())) stop(repos ? `This repo isn't in the office on ${server}, so nothing of it is sent there. An admin adds it under Repos on the floor.` : `Can't tell yet which repos ${server} takes, so nothing is sent: a Claude Code session with the Isoplan plugin reads that list within a few minutes.`);
 	return {
 		type: "hello",
 		v: 1,
@@ -7865,7 +7892,7 @@ async function hello(cwd) {
 		}, claudeJson, cwd),
 		machine: { name: machine },
 		session: `claude-code:${id}`,
-		project: await projectOf(io.run, where, cwd, machine)
+		project
 	};
 }
 const TOKEN_LEFT_MS = 3e5;
@@ -7900,7 +7927,7 @@ async function office() {
 async function exchange(cwd, first, wanted, before = "") {
 	const { server, pairing } = await office();
 	try {
-		return await openPairedLink(server, await hello(cwd), pairing, first, wanted, ANSWER_MS);
+		return await openPairedLink(server, await hello(cwd, server), pairing, first, wanted, ANSWER_MS);
 	} catch (err) {
 		if (err instanceof PairingRefused) stop(`${before}${err.message}`);
 		throw err;

@@ -20,7 +20,8 @@
 // (src/data-layer/pairing.ts; a link to approve goes
 // to the log, and the data layers show the same one in Claude Code), and stays up while
 // any session on the machine is inside its lights-off window. A server that doesn't want this
-// machine's runner ends it, and it holds off starting again for HOLD_OFF_MS. The worker exits when
+// machine's runner ends it, and it holds off starting again for HOLD_OFF_MS. It answers only for
+// sessions in a repo the office takes, from the same list the data layers read (src/data-layer/approved.ts). The worker exits when
 // its supervisor has gone too, since its stdin closes then, and ends its forks as it goes.
 //
 // Its settings are runner.json, overridden per key by ~/.claude/isoplan/runner.json; the secret
@@ -35,7 +36,9 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { PROTOCOL_VERSION } from "@isoplan/protocol";
 import { loadConfig, loadSettings } from "../data-layer/config.js";
-import { accountOf, claudePaths } from "../data-layer/identity.js";
+import { approvedPath, createApproved } from "../data-layer/approved.js";
+import { createGit } from "../data-layer/git.js";
+import { accountOf, claudePaths, projectOf } from "../data-layer/identity.js";
 import { nodeIo } from "../data-layer/io.js";
 import { createLink } from "../data-layer/link.js";
 import { createPairing, pairingLockPath, pairingPath, pairingWriteLockPath } from "../data-layer/pairing.js";
@@ -154,6 +157,25 @@ async function worker(): Promise<number> {
     return new PushFailed(gitFailed(err));
   };
   const scanText = async (text: string) => scan(text, await loadPatterns(path.join(appDir, "secret-patterns.json"), path.join(isoplanDir, "secret-patterns.json"), log));
+  const account = await accountOf({ readText: (p) => fs.readFile(p, "utf8").catch(() => null), run: io.run }, claudeJson, os.homedir());
+  const emit: Parameters<typeof createLink>[0]["emit"] = (line) => {
+    if (line.type === "log") log(line.text);
+    else if (line.type === "error") log(`the office server says: ${line.message} (${line.code})`);
+    else if (line.type === "pair") log(`to answer for this machine's rooms through ${line.server}, pair it: click ${line.url} on this computer and approve it in the office (it works until ${line.expires})`);
+  };
+  const pairing = createPairing({
+    file: pairingPath(claudeDir),
+    lock: pairingLockPath(claudeDir),
+    writeLock: pairingWriteLockPath(claudeDir),
+    server: first.server,
+    account,
+    machine: os.hostname(),
+    emit,
+    allowPlainWs: first.allowPlainWs,
+  });
+  // The repos the office takes (src/data-layer/approved.ts): the runner answers only for sessions in them.
+  const approved = createApproved({ server: first.server, file: approvedPath(claudeDir), pairing, refreshMs: first.approvedRefreshMinutes * 60000, log });
+  const placeGit = createGit(io);
   let send: Parameters<typeof createRunner>[0]["send"] = () => {};
   // What each brief's prepare found, by handoff, for its push and any push anyway after it.
   const preparedFor = new Map<string, Prepared>();
@@ -169,11 +191,16 @@ async function worker(): Promise<number> {
     // Only the rooms the data layer would report: inside the askable window, and not held off,
     // which a detached data layer leaves when the server doesn't want the session's project (or git
     // can't place its folder). That hold-off in isoplan/live/<id>.json is the only record of it.
+    // And only in a repo the office takes (#91), as the data layer would report it.
     isReported: async (session, lead) => {
       const id = forkableId(session);
       const lock = id ? await readLock(lockPath(claudeDir, id)) : null;
       if (!id || (lock && lock.pid === null && lock.until !== null && lock.until > Date.now())) return false;
-      return Date.now() - lead.lastActive <= askableMs(await config().catch(() => first));
+      if (Date.now() - lead.lastActive > askableMs(await config().catch(() => first))) return false;
+      await approved.refresh();
+      const repos = approved.repos();
+      const project = repos && (await projectOf(io.run, await placeGit.resolve(lead.cwd), lead.cwd, os.hostname()));
+      return !!project && repos!.has(project.id.toLowerCase());
     },
     // The handoff (#48): the brief names the untracked files, then the branch is pushed, both from
     // the lead's folder, in the background, with no prompts and under gitTimeoutSeconds.
@@ -208,25 +235,10 @@ async function worker(): Promise<number> {
   let notWanted = false;
   let unpaired = false;
   let wake: () => void = () => {};
-  const account = await accountOf({ readText: (p) => fs.readFile(p, "utf8").catch(() => null), run: io.run }, claudeJson, os.homedir());
-  const emit: Parameters<typeof createLink>[0]["emit"] = (line) => {
-    if (line.type === "log") log(line.text);
-    else if (line.type === "error") log(`the office server says: ${line.message} (${line.code})`);
-    else if (line.type === "pair") log(`to answer for this machine's rooms through ${line.server}, pair it: click ${line.url} on this computer and approve it in the office (it works until ${line.expires})`);
-  };
   const link = createLink({
     url: first.server,
     emit,
-    pairing: createPairing({
-      file: pairingPath(claudeDir),
-      lock: pairingLockPath(claudeDir),
-      writeLock: pairingWriteLockPath(claudeDir),
-      server: first.server,
-      account,
-      machine: os.hostname(),
-      emit,
-      allowPlainWs: first.allowPlainWs,
-    }),
+    pairing,
     onMessage: (message) => runner.take(message),
     onNotWanted: () => {
       notWanted = true;

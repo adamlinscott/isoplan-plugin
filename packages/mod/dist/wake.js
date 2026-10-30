@@ -513,12 +513,14 @@ const WRITTEN = [
 	"live",
 	"logs",
 	"titles",
-	"released"
+	"released",
+	"approved.json"
 ];
 const SESSION_TRACES = [
 	"live",
 	"titles",
-	"released"
+	"released",
+	"approved.json"
 ];
 /**
 * Takes out everything install and the plugin put in place, in this order: the running runner;

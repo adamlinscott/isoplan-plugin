@@ -10,9 +10,12 @@
 // sessions without the plugin are seen too, and the first time, reports the machine's other recent
 // sessions at once (src/wake/backfill.ts), and starts the machine's runner (src/runner) if none is
 // running. Each agent's report is secret-checked before it is sent, and one that matches is held
-// until its owner releases it (src/data-layer/reports.ts). An office server that signs people in
-// wants the machine paired first: the link pairs it, keeping the credential in
-// <claude dir>/isoplan/pairing.json, under the machine's Claude account (src/data-layer/pairing.ts).
+// until its owner releases it (src/data-layer/reports.ts). Only a session in a repo the office takes
+// is reported: the data layer reads the office's list of repos (src/data-layer/approved.ts) and opens
+// no link for any other, sending nothing of it, its hello included, and says so in the status line.
+// An office server that signs people in wants the machine paired first: reading that list pairs it,
+// keeping the credential in <claude dir>/isoplan/pairing.json, under the machine's Claude account
+// (src/data-layer/pairing.ts).
 // An agent's open question to its owner is reported too, secret-checked like a report, and
 // answerable from the floor while this data layer's hooks module marks that it waits for it
 // (src/data-layer/owner-answers.ts); a detached one's are read-only.
@@ -39,7 +42,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { PROTOCOL_VERSION, type Facts } from "@isoplan/protocol";
+import { PROTOCOL_VERSION, type Facts, type Project } from "@isoplan/protocol";
 import { installWake } from "../install/install.js";
 import { managedDir, pluginDirsOf, pluginState, pluginsDir, type Place } from "../install/state.js";
 import type { DataLayerLine, TitleReply, WaitMark } from "../lines.js";
@@ -49,6 +52,7 @@ import { startRunner } from "../runner/start.js";
 import { recentSessions } from "../sweep/find.js";
 import { backfill } from "../wake/backfill.js";
 import { alive, HOLD_OFF_MS, holdOff, lockHolder, lockPath, releaseLock, takeLock } from "../wake/lock.js";
+import { approvedPath, createApproved, gateLink, type Dormancy } from "./approved.js";
 import { forOffice } from "./attribution.js";
 import { createClaudeCode } from "./claude-code.js";
 import { loadConfig, type Config } from "./config.js";
@@ -113,8 +117,11 @@ async function main(argv: string[]): Promise<number> {
   const logFile = path.join(claudeDir, "isoplan", "logs", `${sessionId}.log`);
   let logging = Promise.resolve();
   let downSince: number | null = Date.now(); // since when the link hasn't been connected; null while it is
+  // A link that drops has the list of repos the office takes read again, in case that is why.
+  let dropped = () => {};
   const emit = (line: DataLayerLine) => {
     if (line.type === "status") downSince = line.state === "connected" ? null : (downSince ?? Date.now());
+    if (line.type === "status" && line.state === "disconnected") dropped();
     if (isOut) process.stdout.write(JSON.stringify(line) + "\n");
     else if (detached && (line.type === "log" || line.type === "error" || line.type === "pair")) {
       const said = line.type === "log" ? line.text : line.type === "pair" ? pairNote(line) : `the office server says: ${line.message} (${line.code})`;
@@ -193,6 +200,24 @@ async function main(argv: string[]): Promise<number> {
     if (await fs.mkdir(waitsDir, { recursive: true }).then(() => true, () => false)) emit({ type: "waits", dir: waitsDir });
   }
 
+  // The pairing is the machine's, whichever folder the session is in. The list of repos the office
+  // takes is read with it, which pairs a machine not paired yet (approved.ts).
+  const machineAccount = await accountOf({ readText: (p) => fs.readFile(p, "utf8").catch(() => null), run: io.run }, claudeJson, os.homedir());
+  const pairing = createPairing({
+    file: pairingPath(claudeDir),
+    lock: pairingLockPath(claudeDir),
+    writeLock: pairingWriteLockPath(claudeDir),
+    server,
+    account: machineAccount,
+    machine,
+    emit,
+    allowPlainWs: config.allowPlainWs,
+  });
+  const approved = createApproved({ server, file: approvedPath(claudeDir), pairing, refreshMs: config.approvedRefreshMinutes * 60000, log: (text) => emit({ type: "log", text }) });
+  dropped = () => void approved.refresh(true);
+  let home: Project | null = null; // the session's project, looked up again as git's answers are
+  let homeAt = -Infinity;
+  let dormant: Dormancy | null = null; // why nothing is sent, while it isn't
   let link: Link | null = null;
   let reported = ""; // the last problem logged, so a lasting one is logged once
   let title: TitleCache | null = null;
@@ -215,6 +240,60 @@ async function main(argv: string[]): Promise<number> {
   let checkouts: Record<string, string> = {};
   // Whether a question got an answer, from the latest read, so one that closed says how.
   let answered = (_id: string) => false;
+
+  const account = await accountOf({ readText: (p) => fs.readFile(p, "utf8").catch(() => null), run: io.run }, claudeJson, cwd);
+  // The session's link, opened only while its repo is one the office takes (gateLink).
+  const openLink = (session: string): Link =>
+    createLink({
+      url: server,
+      emit,
+      pairing,
+      // The list may have changed: it is read again, and the link goes once the repo is off it.
+      onNotWanted: () => {
+        isUnwanted = detached;
+        void approved.refresh(true);
+      },
+      // Another repo's files, commands and checkouts go only to a server that welcomed them, and
+      // only for its office's repos; the link applies this at every send, on every connection.
+      filter: (f, projects) => forOffice(f, projects, checkouts),
+      answered: (id) => answered(id),
+      // The owner released a withheld report: it goes to the link now, not on the next pass.
+      // The owner answered a question from the floor: it goes to the hooks module.
+      onMessage: (message) => {
+        if (message.type === "request" && message.kind === "owner-answer") {
+          const file = path.join(answersDir, `${randomUUID()}.json`);
+          void fs
+            .mkdir(answersDir, { recursive: true })
+            .then(async () => {
+              const relayed = await relayOwnerAnswer(message, { detached, facts: () => sent, file, emit, take: takeFile });
+              link?.send(relayed.message);
+              if (!relayed.gaveUp) return;
+              // The hooks module's word may still come: a take that does follows as a late reply.
+              const late = await lateTake(message.question, file, takeFile);
+              if (late === null) return;
+              emit({ type: "log", text: `the hooks module said late that it ${late ? "took" : "didn't take"} the owner's answer to ${message.question}` });
+              if (late) link?.send({ type: "reply", v: PROTOCOL_VERSION, id: message.id, kind: "owner-answer", late: true });
+            })
+            // A word that came later still, or not at all, is left over: it goes.
+            .finally(() => fs.rm(file, { force: true }).catch(() => {}))
+            .catch((err: unknown) => emit({ type: "log", text: `couldn't pass the owner's answer on: ${String((err as Error)?.message ?? err)}` }));
+          return;
+        }
+        if (message.type !== "release") return emit({ type: "log", text: `the office server sent a ${message.type} message, which this data layer doesn't handle yet` });
+        void hold.release(message.id).then((released) => {
+          if (released && shown) link?.update((sent = outgoing(...shown)));
+        });
+      },
+      hello: {
+        type: "hello",
+        v: PROTOCOL_VERSION,
+        source: "claude-code",
+        account,
+        machine: { name: machine },
+        session,
+        project: home!,
+      },
+    });
 
   do {
     const now = Date.now();
@@ -257,6 +336,32 @@ async function main(argv: string[]): Promise<number> {
       continue;
     }
 
+    // Only a repo the office takes is reported (#91): for any other, no link opens and nothing is
+    // sent, not even a hello; one already open closes. It connects once the list has its repo.
+    if (!home || now - homeAt > gitOpts.maxAgeMs) {
+      home = await projectOf(io.run, await resolve(cwd), cwd, machine);
+      homeAt = now;
+    }
+    const session = read.facts.session.id;
+    const gated = await gateLink(approved, home.id, link, () => openLink(session));
+    link = gated.link;
+    const dormancy = gated.dormancy;
+    if (dormancy !== dormant) {
+      if (dormancy) emit({ type: "status", server, state: dormancy });
+      if (dormancy === "not-approved") emit({ type: "log", text: `${home.id} isn't one of the repos ${server} takes, so nothing of this session is sent` });
+      if (dormancy === "no-list") emit({ type: "log", text: `can't tell yet which repos ${server} takes, so nothing of this session is sent` });
+    }
+    dormant = dormancy;
+    if (!link) {
+      // Dormant, nothing is down: a detached one stays only while the session is at work.
+      const why = detached ? detachedStop({ now, lastActive: read.facts.session.lastActive, idleMinutes: config.idleMinutes, downSince: null }) : null;
+      if (why) {
+        emit({ type: "log", text: `stopping: ${why}` });
+        break;
+      }
+      continue;
+    }
+
     // A written title replaces the branch stand-in; the hooks module writes the reply to a file.
     const reply = await takeReply(titleFile);
     if (reply) {
@@ -274,68 +379,6 @@ async function main(argv: string[]): Promise<number> {
     checkouts = read.checkouts ?? {};
     answered = read.answered ?? answered;
 
-    if (!link) {
-      const where = await resolve(cwd);
-      const readText = (p: string) => fs.readFile(p, "utf8").catch(() => null);
-      const account = await accountOf({ readText, run: io.run }, claudeJson, cwd);
-      // The pairing is the machine's, whichever folder the session is in.
-      const machineAccount = await accountOf({ readText, run: io.run }, claudeJson, os.homedir());
-      link = createLink({
-        url: server,
-        emit,
-        pairing: createPairing({
-          file: pairingPath(claudeDir),
-          lock: pairingLockPath(claudeDir),
-          writeLock: pairingWriteLockPath(claudeDir),
-          server,
-          account: machineAccount,
-          machine,
-          emit,
-          allowPlainWs: config.allowPlainWs,
-        }),
-        onNotWanted: () => (isUnwanted = detached),
-        // Another repo's files, commands and checkouts go only to a server that welcomed them, and
-        // only for its office's repos; the link applies this at every send, on every connection.
-        filter: (f, projects) => forOffice(f, projects, checkouts),
-        answered: (id) => answered(id),
-        // The owner released a withheld report: it goes to the link now, not on the next pass.
-        // The owner answered a question from the floor: it goes to the hooks module.
-        onMessage: (message) => {
-          if (message.type === "request" && message.kind === "owner-answer") {
-            const file = path.join(answersDir, `${randomUUID()}.json`);
-            void fs
-              .mkdir(answersDir, { recursive: true })
-              .then(async () => {
-                const relayed = await relayOwnerAnswer(message, { detached, facts: () => sent, file, emit, take: takeFile });
-                link?.send(relayed.message);
-                if (!relayed.gaveUp) return;
-                // The hooks module's word may still come: a take that does follows as a late reply.
-                const late = await lateTake(message.question, file, takeFile);
-                if (late === null) return;
-                emit({ type: "log", text: `the hooks module said late that it ${late ? "took" : "didn't take"} the owner's answer to ${message.question}` });
-                if (late) link?.send({ type: "reply", v: PROTOCOL_VERSION, id: message.id, kind: "owner-answer", late: true });
-              })
-              // A word that came later still, or not at all, is left over: it goes.
-              .finally(() => fs.rm(file, { force: true }).catch(() => {}))
-              .catch((err: unknown) => emit({ type: "log", text: `couldn't pass the owner's answer on: ${String((err as Error)?.message ?? err)}` }));
-            return;
-          }
-          if (message.type !== "release") return emit({ type: "log", text: `the office server sent a ${message.type} message, which this data layer doesn't handle yet` });
-          void hold.release(message.id).then((released) => {
-            if (released && shown) link?.update((sent = outgoing(...shown)));
-          });
-        },
-        hello: {
-          type: "hello",
-          v: PROTOCOL_VERSION,
-          source: "claude-code",
-          account,
-          machine: { name: machine },
-          session: facts.session.id,
-          project: await projectOf(io.run, where, cwd, machine),
-        },
-      });
-    }
     const patterns = await loadPatterns(modPatterns, ownerPatterns, patternLog).catch((err: unknown) => {
       patternLog(`couldn't read the secret patterns, so every report is withheld: ${String((err as Error)?.message ?? err)}`);
       return null;
