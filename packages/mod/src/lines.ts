@@ -17,6 +17,8 @@ export interface StatusLine {
   type: "status";
   server: string;
   state: "waiting" | "connecting" | "connected" | "disconnected" | "not-wanted" | "not-approved" | "no-list" | "pairing" | "taken" | "insecure";
+  /** With `not-approved`: the session's folder is a workspace, none of whose repos the office takes. */
+  workspace?: true;
   /** With `disconnected`: when the next try is. */
   retryInMs?: number;
 }

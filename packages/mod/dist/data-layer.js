@@ -6370,13 +6370,13 @@ function runCommand([cmd, ...args], { cwd }) {
 //#endregion
 //#region src/runner/claude-binary.ts
 const claudeBinaryPath = (claudeDir) => path.join(claudeDir, "isoplan", "claude-binary.json");
-const isFile = (p) => fs.stat(p).then((s) => s.isFile(), () => false);
+const isFile$1 = (p) => fs.stat(p).then((s) => s.isFile(), () => false);
 /**
 * The `claude` binary's path: PATH first, then where Claude Code's installers put it. On Windows
 * an npm install leaves only a claude.cmd shim, which can't be run without a shell, so its cli.js
 * is used instead (run with node). Null when none is found.
 */
-async function findClaude(env, platform, home, exists = isFile) {
+async function findClaude(env, platform, home, exists = isFile$1) {
 	const windows = platform === "win32";
 	const join = windows ? path.win32.join : path.posix.join;
 	const dirs = (Object.entries(env).find(([key]) => key.toUpperCase() === "PATH")?.[1] ?? "").split(windows ? ";" : ":").filter(Boolean);
@@ -6531,6 +6531,23 @@ function alive(pid) {
 	} catch (err) {
 		return err.code === "EPERM";
 	}
+}
+//#endregion
+//#region src/data-layer/approved-file.ts
+const approvedPath = (claudeDir) => path.join(claudeDir, "isoplan", "approved.json");
+const isFile = (v) => !!v && typeof v.server === "string" && typeof v.version === "string" && typeof v.fetched === "number" && typeof v.checked === "number" && Array.isArray(v.repos) && v.repos.every((r) => typeof r === "string");
+/** approved.json, for `server` when given; null when there is none, or it is another server's. */
+async function readApproved(file, server) {
+	try {
+		const value = JSON.parse(await fs.readFile(file, "utf8"));
+		return isFile(value) && (server === void 0 || value.server === server) ? value : null;
+	} catch {
+		return null;
+	}
+}
+/** The approved repos' ids, lower case, while the copy is younger than `maxAgeMs`; null after, or with none. */
+function freshRepos(copy, maxAgeMs, now) {
+	return copy && now - copy.checked <= maxAgeMs ? new Set(copy.repos.map((r) => r.toLowerCase())) : null;
 }
 //#endregion
 //#region src/wake/wake.ts
@@ -7639,63 +7656,44 @@ const getJson = async (url, headers) => {
 		body: response.status === 200 || response.status === 401 ? await response.json().catch(() => null) : null
 	};
 };
-const approvedPath = (claudeDir) => path.join(claudeDir, "isoplan", "approved.json");
-/** A forced refresh comes at most this often. */
-const FORCE_MS = 3e4;
-/** While the machine waits to be paired, or the server can't be reached, the list is asked for again this soon. */
+/** While the machine waits to be paired the list is asked for again this soon, and after a failure this soon. */
 const PAIR_POLL_MS = 5e3;
 const RETRY_MS = 3e4;
+/** A rename the file system refuses for a moment (a scanner holding the file, on Windows) is tried this often. */
+const RENAME_TRIES = 5;
 const isList = (value) => {
 	const v = value;
-	return !!v && typeof v.version === "string" && Array.isArray(v.offices) && v.offices.every((o) => o && Array.isArray(o.repos) && o.repos.every((r) => typeof r === "string"));
+	return !!v && typeof v.version === "string" && Array.isArray(v.repos) && v.repos.every((r) => typeof r === "string");
 };
-async function readCache(file, server) {
-	try {
-		const value = JSON.parse(await fs.readFile(file, "utf8"));
-		return value.server === server && typeof value.checked === "number" && isList(value) ? value : null;
-	} catch {
-		return null;
-	}
-}
-/** Written whole, through a temp file, so a reader never sees half of it; owner-only. */
-async function writeCache(file, value) {
+/** Whether `a` is a later list than `b`: a newer version, by when it was first had, or the same one confirmed later. */
+const later = (a, b) => !b || (a.version !== b.version ? a.fetched > b.fetched : a.checked > b.checked);
+/** Written whole, through a temp file, so a reader never sees half of it; owner-only. A refused rename is tried again, then thrown. */
+async function writeFile(file, value) {
 	await fs.mkdir(path.dirname(file), { recursive: true });
 	const temp = `${file}.${process.pid}.${randomBytes(4).toString("hex")}`;
 	await fs.writeFile(temp, JSON.stringify(value, null, 2) + "\n", { mode: 384 });
-	await fs.rename(temp, file).catch(async (err) => {
+	for (let i = 0;; i++) try {
+		await fs.rename(temp, file);
+		return;
+	} catch (err) {
+		const code = err.code;
+		if (i + 1 < RENAME_TRIES && (code === "EPERM" || code === "EBUSY" || code === "EACCES")) {
+			await new Promise((r) => setTimeout(r, 25 * 2 ** i));
+			continue;
+		}
 		await fs.rm(temp, { force: true }).catch(() => {});
 		throw err;
-	});
+	}
 }
-const idsOf = (list) => new Set(list.offices.flatMap((o) => o.repos.map((r) => r.toLowerCase())));
-/**
-* A session's link as the list allows it: while `project` is on it, `link`, or one `open` opens now;
-* while it isn't, none (`link` is closed), and why. Nothing opens a socket before the list says so.
-*/
-async function gateLink(approved, project, link, open) {
-	await approved.refresh();
-	const repos = approved.repos();
-	if (repos?.has(project.toLowerCase())) return {
-		link: link ?? open(),
-		dormancy: null
-	};
-	link?.close();
-	return {
-		link: null,
-		dormancy: repos ? "not-approved" : approved.problem() === "pairing" ? "pairing" : "no-list"
-	};
-}
-function createApproved({ server, file, pairing, refreshMs, log, get = getJson, now = Date.now }) {
+function createApproved({ server, file, pairing, refreshMs, maxAgeMs, log, get = (url, headers) => getJson(url, headers), now = Date.now }) {
 	let list = null;
-	let ids = null;
 	let problem = "unreachable";
 	let nextAt = -Infinity;
-	let forcedAt = -Infinity;
 	let busy = null;
+	let queued = null;
 	let said = "";
 	const take = (value) => {
 		list = value;
-		ids = idsOf(value);
 		problem = null;
 		nextAt = value.checked + refreshMs;
 	};
@@ -7703,21 +7701,31 @@ function createApproved({ server, file, pairing, refreshMs, log, get = getJson, 
 		if (text !== said) log(text);
 		said = text;
 	};
+	async function keep(mine) {
+		const theirs = await readApproved(file, server);
+		const kept = theirs && !later(mine, theirs) ? theirs.version === mine.version ? {
+			...theirs,
+			checked: Math.max(theirs.checked, mine.checked)
+		} : theirs : mine;
+		take(kept);
+		if (kept === theirs) return;
+		await writeFile(file, kept).catch((err) => tell(`couldn't keep the office's list of repos in ${file}: ${String(err?.message ?? err)}`));
+	}
 	async function check() {
-		const shared = await readCache(file, server);
-		if (shared && shared.checked > (list?.checked ?? -Infinity)) take(shared);
+		const shared = await readApproved(file, server);
+		if (shared && later(shared, list)) take(shared);
 		if (list && now() < nextAt) return;
 		let token;
 		try {
 			token = pairing ? await pairing.token() : void 0;
 		} catch (err) {
 			tell(`couldn't read which repos the office takes: ${String(err?.message ?? err)}`);
-			if (!list) problem = "unreachable";
+			problem = "unreachable";
 			nextAt = now() + RETRY_MS;
 			return;
 		}
 		if (token === null) {
-			if (!list) problem = "pairing";
+			problem = "pairing";
 			nextAt = now() + PAIR_POLL_MS;
 			return;
 		}
@@ -7728,58 +7736,116 @@ function createApproved({ server, file, pairing, refreshMs, log, get = getJson, 
 		try {
 			answer = await get(httpUrl(server, "/repos"), headers);
 		} catch (err) {
-			tell(`couldn't read which repos the office takes from ${server}: ${String(err?.message ?? err)}`);
-			if (!list) problem = "unreachable";
-			nextAt = now() + RETRY_MS;
-			return;
+			answer = {
+				status: 0,
+				body: String(err?.message ?? err)
+			};
 		}
 		const code = answer.body?.code;
+		const at = now();
 		if (answer.status === 304 && list) {
-			const kept = {
+			said = "";
+			await keep({
 				...list,
-				checked: now()
-			};
-			take(kept);
-			await writeCache(file, kept).catch(() => {});
+				checked: at
+			});
 		} else if (answer.status === 200 && isList(answer.body)) {
-			const fresh = {
+			said = "";
+			const same = list?.version === answer.body.version;
+			await keep({
 				server,
 				version: answer.body.version,
-				offices: answer.body.offices,
-				checked: now()
-			};
-			take(fresh);
-			said = "";
-			await writeCache(file, fresh).catch((err) => tell(`couldn't keep the office's list of repos in ${file}: ${String(err?.message ?? err)}`));
+				repos: answer.body.repos,
+				fetched: same ? list.fetched : at,
+				checked: at
+			});
 		} else if (answer.status === 401 && pairing && (code === "not-paired" || code === "pairing-ended" || code === "token-expired")) {
 			await pairing.refused(code, token).catch(() => {});
-			if (!list) problem = "pairing";
-			nextAt = now() + (code === "token-expired" || !token ? 0 : PAIR_POLL_MS);
+			problem = "pairing";
+			nextAt = at + (code === "token-expired" || !token ? 0 : PAIR_POLL_MS);
 		} else if (answer.status === 404) {
 			tell(`${server} is too old to say which repos its office takes, so nothing is sent to it; it needs updating`);
 			list = null;
-			ids = null;
 			problem = "too-old";
-			nextAt = now() + refreshMs;
+			nextAt = at + refreshMs;
 		} else {
-			tell(`the office server answered ${answer.status} when asked which repos it takes`);
-			if (!list) problem = "unreachable";
-			nextAt = now() + RETRY_MS;
+			tell(`couldn't read which repos the office takes from ${server}: ${answer.status ? `it answered ${answer.status}` : String(answer.body)}`);
+			problem = "unreachable";
+			nextAt = at + RETRY_MS;
 		}
 	}
-	return {
-		repos: () => ids,
-		problem: () => problem,
-		refresh(force = false) {
-			if (busy) return busy;
-			if (force && now() - forcedAt >= FORCE_MS) {
-				forcedAt = now();
-				nextAt = -Infinity;
-			}
-			if (now() < nextAt) return Promise.resolve();
-			busy = check().catch((err) => tell(`couldn't read which repos the office takes: ${String(err?.message ?? err)}`)).finally(() => busy = null);
-			return busy;
+	function refresh(force = false) {
+		if (force) nextAt = -Infinity;
+		if (busy) {
+			if (!force) return busy;
+			queued ??= busy.then(() => {
+				queued = null;
+				return refresh(true);
+			});
+			return queued;
 		}
+		if (now() < nextAt) return Promise.resolve();
+		busy = check().catch((err) => tell(`couldn't read which repos the office takes: ${String(err?.message ?? err)}`)).finally(() => busy = null);
+		return busy;
+	}
+	return {
+		repos: () => freshRepos(list, maxAgeMs, now()),
+		version: () => list?.version ?? null,
+		problem: () => list && !freshRepos(list, maxAgeMs, now()) ? "unreachable" : list ? null : problem,
+		refresh
+	};
+}
+function createSessionGate({ approved, open }) {
+	let link = null;
+	let home = null;
+	let linked = null;
+	let unwanted;
+	const shut = () => {
+		link?.close();
+		link = null;
+		linked = null;
+	};
+	const mayConnect = async () => {
+		await approved.refresh(true);
+		const repos = approved.repos();
+		return !!repos && linked !== null && repos.has(linked.toLowerCase());
+	};
+	return {
+		async home(candidates) {
+			await approved.refresh();
+			const repos = approved.repos();
+			home = repos && candidates.find((p) => repos.has(p.id.toLowerCase())) || null;
+			if (!home) {
+				shut();
+				return {
+					home: null,
+					dormancy: repos ? "not-approved" : approved.problem() === "pairing" ? "pairing" : "no-list"
+				};
+			}
+			if (linked !== null && linked !== home.id) shut();
+			if (unwanted !== void 0 && approved.version() !== unwanted) {
+				unwanted = void 0;
+				shut();
+			}
+			return {
+				home,
+				dormancy: null
+			};
+		},
+		link() {
+			if (!link) {
+				link = open(home, mayConnect);
+				linked = home.id;
+			}
+			return link;
+		},
+		current: () => link,
+		drop: shut,
+		notWanted() {
+			unwanted = approved.version();
+			approved.refresh(true);
+		},
+		mayConnect
 	};
 }
 //#endregion
@@ -7886,6 +7952,55 @@ function forOffice(facts, projects, checkouts = {}) {
 		}),
 		edits: files(facts.edits),
 		reads: files(facts.reads)
+	};
+}
+//#endregion
+//#region src/data-layer/home.ts
+/** The projects `folder` may report as, and whether it is a workspace. */
+async function candidatesOf(folder, io) {
+	const where = await io.resolve(folder);
+	if (where) return {
+		projects: [await io.projectOf(where, folder)],
+		workspace: false
+	};
+	const tooWide = pathKey(folder) === pathKey(io.home) || relativeTo(folder, io.home) !== null;
+	const st = await io.stat(folder);
+	const repos = [];
+	if (!tooWide && st?.isDir) {
+		for (const e of await io.listDir(folder)) if (e.isDir && await io.stat(join(folder, `${e.name}/.git`))) repos.push(join(folder, e.name));
+	}
+	if (!repos.length || repos.length > io.workspaceRepos) return {
+		projects: [await io.projectOf(null, folder)],
+		workspace: false
+	};
+	const projects = [];
+	for (const dir of repos.sort()) {
+		const at = await io.resolve(dir);
+		if (at) projects.push(await io.projectOf(at, dir));
+	}
+	return {
+		projects,
+		workspace: true
+	};
+}
+/**
+* A workspace's facts as they may leave the machine: only its work inside a repo, each named by its
+* repo; files outside every repo, and a command's file there, stay on the machine. Which of those
+* repos may go is the link's filter (attribution.ts forOffice), by the server's welcome.
+*/
+function inRepos(facts) {
+	const placed = (list) => list.every((f) => f.project) ? list : list.filter((f) => f.project);
+	return {
+		...facts,
+		edits: placed(facts.edits),
+		reads: placed(facts.reads),
+		agents: facts.agents.map((a) => a.doing && !a.doing.project && a.doing.file !== void 0 ? {
+			...a,
+			doing: {
+				kind: a.doing.kind,
+				since: a.doing.since
+			}
+		} : a)
 	};
 }
 //#endregion
@@ -9340,7 +9455,7 @@ const same = (a, b) => a !== void 0 && JSON.stringify(a) === JSON.stringify(b);
 const STABLE_MS = 3e4;
 const OUTBOX_MAX = 100;
 const OUTBOX_MAX_AGE_MS = 36e5;
-function createLink({ url, hello, emit, minIntervalMs = 1e3, retryBaseMs = 1e3, retryCapMs = 3e4, notWantedRetryMs = 36e5, takenRetryMs = 36e5, onNotWanted, onPairingEnded, onMessage, filter = (facts) => facts, answered, pairing, pairPollMs = 5e3, random = Math.random }) {
+function createLink({ url, hello, emit, minIntervalMs = 1e3, retryBaseMs = 1e3, retryCapMs = 3e4, notWantedRetryMs = 36e5, takenRetryMs = 36e5, onNotWanted, onPairingEnded, onMessage, filter = (facts) => facts, answered, pairing, pairPollMs = 5e3, admit, random = Math.random }) {
 	const outbox = [];
 	let latest = null;
 	let socket = null;
@@ -9363,6 +9478,21 @@ function createLink({ url, hello, emit, minIntervalMs = 1e3, retryBaseMs = 1e3, 
 	let stable = null;
 	function connect() {
 		retry = null;
+		if (!admit) return proceed();
+		admit().then((ok) => {
+			if (isClosed) return;
+			if (ok) return proceed();
+			emit({
+				type: "status",
+				server: url,
+				state: "not-approved"
+			});
+			retry = setTimeout(connect, retryCapMs);
+		}, () => {
+			if (!isClosed) retry = setTimeout(connect, retryCapMs);
+		});
+	}
+	function proceed() {
 		if (!pairing) return open(void 0);
 		refusing.then(() => pairing.token()).then((token) => {
 			if (isClosed) return;
@@ -9849,6 +9979,7 @@ const cmp = (a, b) => a < b ? -1 : a > b ? 1 : 0;
 //#endregion
 //#region src/data-layer/main.ts
 const LOG_CAP_BYTES = 65536;
+const DORMANT_MS = 3e4;
 const value = (argv, flag) => {
 	const i = argv.indexOf(flag);
 	return i >= 0 && argv[i + 1] && !argv[i + 1].startsWith("--") ? argv[i + 1] : null;
@@ -10023,15 +10154,18 @@ async function main(argv) {
 		file: approvedPath(claudeDir),
 		pairing,
 		refreshMs: config.approvedRefreshMinutes * 6e4,
+		maxAgeMs: config.approvedMaxAgeMinutes * 6e4,
 		log: (text) => emit({
 			type: "log",
 			text
 		})
 	});
 	dropped = () => void approved.refresh(true);
-	let home = null;
-	let homeAt = -Infinity;
+	let candidates = null;
+	let candidatesAt = -Infinity;
 	let dormant = null;
+	let notApproved = null;
+	let factsSession = "";
 	let link = null;
 	let reported = "";
 	let title = null;
@@ -10061,65 +10195,69 @@ async function main(argv) {
 		readText: (p) => fs.readFile(p, "utf8").catch(() => null),
 		run: io.run
 	}, claudeJson, cwd);
-	const openLink = (session) => createLink({
-		url: server,
-		emit,
-		pairing,
-		onNotWanted: () => {
-			isUnwanted = detached;
-			approved.refresh(true);
-		},
-		filter: (f, projects) => forOffice(f, projects, checkouts),
-		answered: (id) => answered(id),
-		onMessage: (message) => {
-			if (message.type === "request" && message.kind === "owner-answer") {
-				const file = path.join(answersDir, `${randomUUID()}.json`);
-				fs.mkdir(answersDir, { recursive: true }).then(async () => {
-					const relayed = await relayOwnerAnswer(message, {
-						detached,
-						facts: () => sent,
-						file,
-						emit,
-						take: takeFile
-					});
-					link?.send(relayed.message);
-					if (!relayed.gaveUp) return;
-					const late = await lateTake(message.question, file, takeFile);
-					if (late === null) return;
-					emit({
+	const gate = createSessionGate({
+		approved,
+		open: (home, mayConnect) => createLink({
+			url: server,
+			emit,
+			pairing,
+			admit: mayConnect,
+			onNotWanted: () => {
+				isUnwanted = detached;
+				gate.notWanted();
+			},
+			filter: (f, projects) => forOffice(candidates?.workspace ? inRepos(f) : f, projects, checkouts),
+			answered: (id) => answered(id),
+			onMessage: (message) => {
+				if (message.type === "request" && message.kind === "owner-answer") {
+					const file = path.join(answersDir, `${randomUUID()}.json`);
+					fs.mkdir(answersDir, { recursive: true }).then(async () => {
+						const relayed = await relayOwnerAnswer(message, {
+							detached,
+							facts: () => sent,
+							file,
+							emit,
+							take: takeFile
+						});
+						link?.send(relayed.message);
+						if (!relayed.gaveUp) return;
+						const late = await lateTake(message.question, file, takeFile);
+						if (late === null) return;
+						emit({
+							type: "log",
+							text: `the hooks module said late that it ${late ? "took" : "didn't take"} the owner's answer to ${message.question}`
+						});
+						if (late) link?.send({
+							type: "reply",
+							v: 1,
+							id: message.id,
+							kind: "owner-answer",
+							late: true
+						});
+					}).finally(() => fs.rm(file, { force: true }).catch(() => {})).catch((err) => emit({
 						type: "log",
-						text: `the hooks module said late that it ${late ? "took" : "didn't take"} the owner's answer to ${message.question}`
-					});
-					if (late) link?.send({
-						type: "reply",
-						v: 1,
-						id: message.id,
-						kind: "owner-answer",
-						late: true
-					});
-				}).finally(() => fs.rm(file, { force: true }).catch(() => {})).catch((err) => emit({
+						text: `couldn't pass the owner's answer on: ${String(err?.message ?? err)}`
+					}));
+					return;
+				}
+				if (message.type !== "release") return emit({
 					type: "log",
-					text: `couldn't pass the owner's answer on: ${String(err?.message ?? err)}`
-				}));
-				return;
+					text: `the office server sent a ${message.type} message, which this data layer doesn't handle yet`
+				});
+				hold.release(message.id).then((released) => {
+					if (released && shown) link?.update(sent = outgoing(...shown));
+				});
+			},
+			hello: {
+				type: "hello",
+				v: 1,
+				source: "claude-code",
+				account,
+				machine: { name: machine },
+				session: factsSession,
+				project: home
 			}
-			if (message.type !== "release") return emit({
-				type: "log",
-				text: `the office server sent a ${message.type} message, which this data layer doesn't handle yet`
-			});
-			hold.release(message.id).then((released) => {
-				if (released && shown) link?.update(sent = outgoing(...shown));
-			});
-		},
-		hello: {
-			type: "hello",
-			v: 1,
-			source: "claude-code",
-			account,
-			machine: { name: machine },
-			session,
-			project: home
-		}
+		})
 	});
 	do {
 		const now = Date.now();
@@ -10142,6 +10280,57 @@ async function main(argv) {
 			});
 			return project;
 		};
+		if (!candidates || now - candidatesAt > gitOpts.maxAgeMs) {
+			candidates = await candidatesOf(cwd, {
+				resolve,
+				projectOf: (where, dir) => projectOf(io.run, where, dir, machine),
+				stat: (f) => io.stat(f),
+				listDir: (d) => io.listDir(d),
+				home: os.homedir(),
+				workspaceRepos: config.workspaceRepos
+			});
+			candidatesAt = now;
+		}
+		const gated = await gate.home(candidates.projects);
+		link = gate.current();
+		if (gated.dormancy !== dormant) {
+			if (gated.dormancy) emit({
+				type: "status",
+				server,
+				state: gated.dormancy,
+				...candidates.workspace && { workspace: true }
+			});
+			const what = candidates.workspace ? "none of the repos in this folder is" : `${candidates.projects[0]?.id ?? cwd} isn't`;
+			if (gated.dormancy === "not-approved") emit({
+				type: "log",
+				text: `${what} one the office at ${server} takes, so nothing of this session is sent`
+			});
+			if (gated.dormancy === "no-list") emit({
+				type: "log",
+				text: `can't tell which repos ${server} takes (no list, or one older than ${config.approvedMaxAgeMinutes} minutes), so nothing of this session is sent`
+			});
+		}
+		dormant = gated.dormancy;
+		if (!gated.home) {
+			if (detached && gated.dormancy === "not-approved") {
+				notApproved = candidates.projects.map((p) => p.id.toLowerCase());
+				break;
+			}
+			const why = detached ? detachedStop({
+				now,
+				lastActive: new Date(now).toISOString(),
+				idleMinutes: config.idleMinutes,
+				downSince
+			}) : null;
+			if (why) {
+				emit({
+					type: "log",
+					text: `stopping: ${why}`
+				});
+				break;
+			}
+			continue;
+		}
 		const read = await source.read({
 			sessionId,
 			cwd,
@@ -10169,7 +10358,7 @@ async function main(argv) {
 				break;
 			}
 			if (link) {
-				link.close();
+				gate.drop();
 				link = null;
 				emit({
 					type: "status",
@@ -10179,46 +10368,8 @@ async function main(argv) {
 			}
 			continue;
 		}
-		if (!home || now - homeAt > gitOpts.maxAgeMs) {
-			home = await projectOf(io.run, await resolve(cwd), cwd, machine);
-			homeAt = now;
-		}
-		const session = read.facts.session.id;
-		const gated = await gateLink(approved, home.id, link, () => openLink(session));
-		link = gated.link;
-		const dormancy = gated.dormancy;
-		if (dormancy !== dormant) {
-			if (dormancy) emit({
-				type: "status",
-				server,
-				state: dormancy
-			});
-			if (dormancy === "not-approved") emit({
-				type: "log",
-				text: `${home.id} isn't one of the repos ${server} takes, so nothing of this session is sent`
-			});
-			if (dormancy === "no-list") emit({
-				type: "log",
-				text: `can't tell yet which repos ${server} takes, so nothing of this session is sent`
-			});
-		}
-		dormant = dormancy;
-		if (!link) {
-			const why = detached ? detachedStop({
-				now,
-				lastActive: read.facts.session.lastActive,
-				idleMinutes: config.idleMinutes,
-				downSince: null
-			}) : null;
-			if (why) {
-				emit({
-					type: "log",
-					text: `stopping: ${why}`
-				});
-				break;
-			}
-			continue;
-		}
+		factsSession = read.facts.session.id;
+		link = gate.link();
 		const reply = await takeReply(titleFile);
 		if (reply) {
 			const text = reply.key === asked ? cleanTitle(reply.text) : null;
@@ -10275,9 +10426,13 @@ async function main(argv) {
 			});
 			break;
 		}
-	} while (await wait(config.streamSeconds * 1e3) && !isUnwanted && (!detached || await lockHolder(lock) === process.pid) && !await isOff());
+	} while (await wait(dormant ? DORMANT_MS : config.streamSeconds * 1e3) && !isUnwanted && (!detached || await lockHolder(lock) === process.pid) && !await isOff());
 	link?.close();
 	if (isUnwanted || isPlaceless) await holdOff(lock, process.pid, Date.now() + HOLD_OFF_MS).catch(() => {});
+	else if (notApproved) await holdOff(lock, process.pid, Date.now() + HOLD_OFF_MS, {
+		reason: "not-approved",
+		projects: notApproved
+	}).catch(() => {});
 	else await releaseLock(lock, process.pid).catch(() => {});
 	await logging;
 	return 0;

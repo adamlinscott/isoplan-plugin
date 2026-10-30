@@ -6305,6 +6305,74 @@ async function readJson(io, p, optional = false) {
 	}
 }
 //#endregion
+//#region src/data-layer/approved-file.ts
+const approvedPath = (claudeDir) => path.join(claudeDir, "isoplan", "approved.json");
+const isFile = (v) => !!v && typeof v.server === "string" && typeof v.version === "string" && typeof v.fetched === "number" && typeof v.checked === "number" && Array.isArray(v.repos) && v.repos.every((r) => typeof r === "string");
+/** approved.json, for `server` when given; null when there is none, or it is another server's. */
+async function readApproved(file, server) {
+	try {
+		const value = JSON.parse(await fs.readFile(file, "utf8"));
+		return isFile(value) && (server === void 0 || value.server === server) ? value : null;
+	} catch {
+		return null;
+	}
+}
+/** The approved repos' ids, lower case, while the copy is younger than `maxAgeMs`; null after, or with none. */
+function freshRepos(copy, maxAgeMs, now) {
+	return copy && now - copy.checked <= maxAgeMs ? new Set(copy.repos.map((r) => r.toLowerCase())) : null;
+}
+//#endregion
+//#region src/data-layer/pairing.ts
+const pairingPath = (claudeDir) => path.join(claudeDir, "isoplan", "pairing.json");
+const postJson = async (url, body) => {
+	const response = await fetch(url, {
+		method: "POST",
+		headers: { "content-type": "application/json" },
+		body: JSON.stringify(body),
+		signal: AbortSignal.timeout(15e3)
+	});
+	const value = await response.json().catch(() => ({}));
+	return {
+		status: response.status,
+		body: value && typeof value === "object" ? value : {}
+	};
+};
+/** The server's http address for a data-layer path: ws(s)://host/data-layer → http(s)://host/data-layer/<path>. */
+function httpUrl(server, sub) {
+	const url = new URL(server);
+	url.protocol = url.protocol === "wss:" ? "https:" : "http:";
+	url.pathname = url.pathname.replace(/\/$/, "") + sub;
+	url.search = "";
+	return url.toString();
+}
+const LOOPBACK = /* @__PURE__ */ new Set([
+	"127.0.0.1",
+	"[::1]",
+	"localhost"
+]);
+/** Whether `server` is plain ws:// to another machine, where a credential would cross the network unencrypted. */
+const isPlainRemote = (server) => {
+	const url = new URL(server);
+	return url.protocol === "ws:" && !LOOPBACK.has(url.hostname);
+};
+async function readPairing(file) {
+	try {
+		const value = JSON.parse(await fs.readFile(file, "utf8"));
+		return value && typeof value.accounts === "object" && value.accounts ? value : { accounts: {} };
+	} catch {
+		return { accounts: {} };
+	}
+}
+//#endregion
+//#region src/data-layer/approved.ts
+/**
+* The approved repos as approved.json has them from `server`, for a command that only reads (the
+* handoff and ask-the-room commands); null with no copy, or one past `maxAgeMs`.
+*/
+async function cachedRepos(file, server, maxAgeMs, now = Date.now()) {
+	return freshRepos(await readApproved(file, server), maxAgeMs, now);
+}
+//#endregion
 //#region src/data-layer/git.ts
 /** True for a Windows-shaped path: a drive letter, a UNC prefix, or any backslash. */
 function isWindowsPath(p) {
@@ -6354,6 +6422,21 @@ function dirname(p) {
 	if (i === 0) return "/";
 	if (/^[A-Z]:$/.test(n.slice(0, i))) return n.slice(0, i + 1);
 	return n.slice(0, i);
+}
+/**
+* `p` relative to `root` with forward slashes, or null when `p` is not inside `root`. Windows
+* paths compare case-insensitively; the relative part keeps `p`'s own spelling, so whoever
+* matches files by name compares them case-insensitively too.
+*/
+function relativeTo(root, p) {
+	const win = isWindowsPath(root) || isWindowsPath(p);
+	const r = normalize(root);
+	const n = normalize(p);
+	const rk = win ? r.toLowerCase() : r;
+	const nk = win ? n.toLowerCase() : n;
+	const base = rk.endsWith("/") ? rk : rk + "/";
+	if (!nk.startsWith(base)) return null;
+	return n.slice(base.length);
 }
 /**
 * Answers are cached per folder and looked up again once older than `maxAgeMs` at `now`, so
@@ -6442,72 +6525,6 @@ async function readOptional(io, p) {
 	} catch {
 		return null;
 	}
-}
-//#endregion
-//#region src/data-layer/pairing.ts
-const pairingPath = (claudeDir) => path.join(claudeDir, "isoplan", "pairing.json");
-const postJson = async (url, body) => {
-	const response = await fetch(url, {
-		method: "POST",
-		headers: { "content-type": "application/json" },
-		body: JSON.stringify(body),
-		signal: AbortSignal.timeout(15e3)
-	});
-	const value = await response.json().catch(() => ({}));
-	return {
-		status: response.status,
-		body: value && typeof value === "object" ? value : {}
-	};
-};
-/** The server's http address for a data-layer path: ws(s)://host/data-layer → http(s)://host/data-layer/<path>. */
-function httpUrl(server, sub) {
-	const url = new URL(server);
-	url.protocol = url.protocol === "wss:" ? "https:" : "http:";
-	url.pathname = url.pathname.replace(/\/$/, "") + sub;
-	url.search = "";
-	return url.toString();
-}
-const LOOPBACK = /* @__PURE__ */ new Set([
-	"127.0.0.1",
-	"[::1]",
-	"localhost"
-]);
-/** Whether `server` is plain ws:// to another machine, where a credential would cross the network unencrypted. */
-const isPlainRemote = (server) => {
-	const url = new URL(server);
-	return url.protocol === "ws:" && !LOOPBACK.has(url.hostname);
-};
-async function readPairing(file) {
-	try {
-		const value = JSON.parse(await fs.readFile(file, "utf8"));
-		return value && typeof value.accounts === "object" && value.accounts ? value : { accounts: {} };
-	} catch {
-		return { accounts: {} };
-	}
-}
-//#endregion
-//#region src/data-layer/approved.ts
-const approvedPath = (claudeDir) => path.join(claudeDir, "isoplan", "approved.json");
-const isList = (value) => {
-	const v = value;
-	return !!v && typeof v.version === "string" && Array.isArray(v.offices) && v.offices.every((o) => o && Array.isArray(o.repos) && o.repos.every((r) => typeof r === "string"));
-};
-async function readCache(file, server) {
-	try {
-		const value = JSON.parse(await fs.readFile(file, "utf8"));
-		return value.server === server && typeof value.checked === "number" && isList(value) ? value : null;
-	} catch {
-		return null;
-	}
-}
-const idsOf = (list) => new Set(list.offices.flatMap((o) => o.repos.map((r) => r.toLowerCase())));
-/**
-* The approved repos as approved.json last had them from `server`, for a command that only reads
-* (the handoff and ask-the-room commands); null with no copy.
-*/
-async function cachedRepos(file, server) {
-	const cached = await readCache(file, server);
-	return cached && idsOf(cached);
 }
 //#endregion
 //#region src/data-layer/claude-paths.ts
@@ -6654,6 +6671,66 @@ function runCommand([cmd, ...args], { cwd }) {
 			});
 		});
 	});
+}
+//#endregion
+//#region src/data-layer/home.ts
+/** The projects `folder` may report as, and whether it is a workspace. */
+async function candidatesOf(folder, io) {
+	const where = await io.resolve(folder);
+	if (where) return {
+		projects: [await io.projectOf(where, folder)],
+		workspace: false
+	};
+	const tooWide = pathKey(folder) === pathKey(io.home) || relativeTo(folder, io.home) !== null;
+	const st = await io.stat(folder);
+	const repos = [];
+	if (!tooWide && st?.isDir) {
+		for (const e of await io.listDir(folder)) if (e.isDir && await io.stat(join(folder, `${e.name}/.git`))) repos.push(join(folder, e.name));
+	}
+	if (!repos.length || repos.length > io.workspaceRepos) return {
+		projects: [await io.projectOf(null, folder)],
+		workspace: false
+	};
+	const projects = [];
+	for (const dir of repos.sort()) {
+		const at = await io.resolve(dir);
+		if (at) projects.push(await io.projectOf(at, dir));
+	}
+	return {
+		projects,
+		workspace: true
+	};
+}
+/** Whether the repo whose top is `dir` is on `repos`, for a handoff's prepare (handoff/git.ts). */
+const takesFrom = (io, repos) => async (dir) => {
+	const where = repos && await io.resolve(dir);
+	return !!where && repos.has((await io.projectOf(where, dir)).id.toLowerCase());
+};
+/** A HomeIo on this machine, for the runner and the commands. */
+function machineHomeIo(workspaceRepos, machine = os.hostname()) {
+	const io = nodeIo();
+	const git = createGit(io);
+	return {
+		resolve: (dir) => git.resolve(dir),
+		projectOf: (where, dir) => projectOf(io.run, where, dir, machine),
+		stat: (p) => Promise.resolve(io.stat(p)),
+		listDir: (d) => io.listDir(d),
+		home: os.homedir(),
+		workspaceRepos
+	};
+}
+/**
+* What a command (hand-over, ask the room) may say hello as: the session's home, by this machine's
+* copy of the office's list, which the session's data layer keeps fresh; or, when there is none, or
+* no fresh copy, why nothing is sent.
+*/
+async function commandHome(folder, io, list) {
+	const repos = await cachedRepos(list.file, list.server, list.maxAgeMs, list.now);
+	if (!repos) return { refused: `Can't tell which repos ${list.server} takes (this machine's copy of its list is missing or older than ${Math.round(list.maxAgeMs / 6e4)} minutes), so nothing is sent. A Claude Code session with the Isoplan plugin reads it again within a few minutes.` };
+	const { projects, workspace } = await candidatesOf(folder, io);
+	const home = projects.find((p) => repos.has(p.id.toLowerCase()));
+	if (home) return { home };
+	return { refused: `${workspace ? "No repo in this folder is" : "This repo isn't"} one the office at ${list.server} takes, so nothing of it is sent there. An admin adds it under Repos on the floor.` };
 }
 //#endregion
 //#region src/runner/prompts.ts
@@ -6859,6 +6936,7 @@ const GIT_FAILED = {
 	"not-a-repo": "the session's folder isn't in a git repo, and has none in it",
 	"too-wide": "the session's folder is the home folder or a drive's root, too wide a folder to hand over from",
 	"no-work": "none of the repos in the session's folder has work that isn't on its default branch",
+	"not-in-office": "none of the repos with work in the session's folder is one the office takes",
 	"no-commit": "the session's repo has no commit to hand over from",
 	"no-remote": "the session's repo has no remote to push the handoff's branch to",
 	lfs: "the session's repo uses Git LFS, whose files a handoff can't push yet",
@@ -7207,7 +7285,7 @@ const slug = (p) => p.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$
 * with where each pushes, their untracked files and what is left out. The folder's own repo failing
 * throws a HandoffGitError; a repo under it that git can't read is left out, with why.
 */
-async function prepare(run, cwd, timeoutMs, depth = 3, home = os.homedir()) {
+async function prepare(run, cwd, timeoutMs, depth = 3, home = os.homedir(), takes) {
 	const top = await run(["rev-parse", "--show-toplevel"], {
 		cwd,
 		timeoutMs
@@ -7221,6 +7299,8 @@ async function prepare(run, cwd, timeoutMs, depth = 3, home = os.homedir()) {
 	const dirOf = (p) => p === "." ? toplevel : path.join(toplevel, p);
 	const from = inRepo ? await branchOf(run, toplevel, timeoutMs, ".") : null;
 	const repos = [];
+	const notInOffice = [];
+	if (inRepo && takes && !await takes(toplevel)) throw new HandoffGitError("not-in-office", `${toplevel} isn't a repo the office takes`);
 	if (inRepo) {
 		const { remote, remotes } = await pushRemote(run, toplevel, from, timeoutMs, ".");
 		if (!remote) throw new HandoffGitError("no-remote", `${toplevel} has ${remotes.length ? `several remotes and none is origin: ${remotes.join(", ")}` : "no remote"}`);
@@ -7239,38 +7319,46 @@ async function prepare(run, cwd, timeoutMs, depth = 3, home = os.homedir()) {
 	}
 	const left = [...skipped];
 	const listedRepos = inRepo ? ["."] : [];
-	for (const sub of found) try {
-		const above = [...inRepo ? ["."] : [], ...found].filter((p) => p === "." || sub.startsWith(`${p}/`)).sort((a, b) => a.length - b.length).at(-1);
-		if (above) {
-			const inside = above === "." ? sub : sub.slice(above.length + 1);
-			if ((await gitIn(run, dirOf(above), timeoutMs, above).git([
-				"--literal-pathspecs",
-				"ls-files",
-				"--stage",
-				"--",
-				inside
-			])).stdout.startsWith("160000 ")) {
-				left.push({
-					path: sub,
-					why: WHY.submodule
-				});
-				continue;
-			}
+	for (const sub of found) {
+		if (notInOffice.some((p) => sub.startsWith(`${p}/`))) continue;
+		if (takes && !await takes(dirOf(sub))) {
+			notInOffice.push(sub);
+			continue;
 		}
-		const state = await inspect(run, dirOf(sub), sub, timeoutMs);
-		if (typeof state === "string") left.push({
-			path: sub,
-			why: WHY[state]
-		});
-		else if (state) repos.push(state);
-		if (state !== "unreadable") listedRepos.push(sub);
-	} catch (err) {
-		if (!(err instanceof HandoffGitError)) throw err;
-		left.push({
-			path: sub,
-			why: err.kind === "timed-out" ? WHY.slow : WHY.unreadable
-		});
+		try {
+			const above = [...inRepo ? ["."] : [], ...found].filter((p) => p === "." || sub.startsWith(`${p}/`)).sort((a, b) => a.length - b.length).at(-1);
+			if (above) {
+				const inside = above === "." ? sub : sub.slice(above.length + 1);
+				if ((await gitIn(run, dirOf(above), timeoutMs, above).git([
+					"--literal-pathspecs",
+					"ls-files",
+					"--stage",
+					"--",
+					inside
+				])).stdout.startsWith("160000 ")) {
+					left.push({
+						path: sub,
+						why: WHY.submodule
+					});
+					continue;
+				}
+			}
+			const state = await inspect(run, dirOf(sub), sub, timeoutMs);
+			if (typeof state === "string") left.push({
+				path: sub,
+				why: WHY[state]
+			});
+			else if (state) repos.push(state);
+			if (state !== "unreadable") listedRepos.push(sub);
+		} catch (err) {
+			if (!(err instanceof HandoffGitError)) throw err;
+			left.push({
+				path: sub,
+				why: err.kind === "timed-out" ? WHY.slow : WHY.unreadable
+			});
+		}
 	}
+	if (!repos.length && notInOffice.length) throw new HandoffGitError("not-in-office", `none of the repos with work under ${toplevel} is one the office takes: ${notInOffice.join(", ")}`);
 	if (!repos.length) throw new HandoffGitError("no-work", `none of the repos under ${toplevel} has work that isn't on its remote's default branch`);
 	const suffixes = /* @__PURE__ */ new Set();
 	const prepared = repos.map((r, i) => {
@@ -7286,7 +7374,7 @@ async function prepare(run, cwd, timeoutMs, depth = 3, home = os.homedir()) {
 			suffix
 		};
 	});
-	let files = [...loose];
+	let files = takes && !inRepo ? [] : [...loose];
 	for (const p of listedRepos) {
 		const own = await untracked(run, dirOf(p), timeoutMs);
 		if (own === null) {
@@ -7296,12 +7384,18 @@ async function prepare(run, cwd, timeoutMs, depth = 3, home = os.homedir()) {
 		const full = own.map((f) => p === "." ? f : `${p}/${f}`);
 		files.push(...full.filter((f) => !found.some((sub) => f === `${sub}/`)));
 	}
+	const taken = (p) => {
+		const owner = [...repos.map((r) => r.path), ...notInOffice].filter((r) => r === "." || p === r || p.startsWith(`${r}/`)).sort((a, b) => b.length - a.length)[0];
+		return owner !== void 0 && !notInOffice.includes(owner);
+	};
+	const kept = takes ? left.filter((l) => taken(l.path)) : left;
 	return {
 		toplevel,
 		from,
 		files: files && files.sort(),
 		repos: prepared,
-		left
+		left: kept,
+		notInOffice
 	};
 }
 /**
@@ -7342,8 +7436,8 @@ const IDENTITY = {
 * records names its push URL, where the branch is. Nothing is pushed until every repo's commit is
 * made and scanned. A push that fails after others went names them. Throws a HandoffGitError.
 */
-async function pushHandoff(run, cwd, id, timeoutMs, { scan, pushAnyway = {}, depth, prepared } = {}) {
-	const { repos } = prepared ?? await prepare(run, cwd, timeoutMs, depth);
+async function pushHandoff(run, cwd, id, timeoutMs, { scan, pushAnyway = {}, depth, prepared, takes } = {}) {
+	const { repos } = prepared ?? await prepare(run, cwd, timeoutMs, depth, void 0, takes);
 	const temp = await fs.mkdtemp(path.join(os.tmpdir(), "isoplan-handoff-"));
 	const ready = [];
 	try {
@@ -7874,14 +7968,14 @@ const stop = (text) => {
 async function settings() {
 	return loadSettings(io, path.join(modDir, "runner.json"), path.join(isoplanDir, "runner.json"));
 }
-async function hello(cwd, server) {
+/**
+* The session's hello, as `project`: what the session reports as (data-layer/home.ts), or for a take,
+* the project of the handoff's room. Nothing of a repo the office doesn't take is sent, its id
+* included (#91).
+*/
+async function hello(cwd, project) {
 	const id = process.env.CLAUDE_CODE_SESSION_ID;
 	if (!id) stop("This runs inside a Claude Code session, which sets CLAUDE_CODE_SESSION_ID; it isn't set here.");
-	const machine = os.hostname();
-	const where = await createGit(io).resolve(cwd);
-	const project = await projectOf(io.run, where, cwd, machine);
-	const repos = await cachedRepos(approvedPath(claudeDir), server);
-	if (!repos?.has(project.id.toLowerCase())) stop(repos ? `This repo isn't in the office on ${server}, so nothing of it is sent there. An admin adds it under Repos on the floor.` : `Can't tell yet which repos ${server} takes, so nothing is sent: a Claude Code session with the Isoplan plugin reads that list within a few minutes.`);
 	return {
 		type: "hello",
 		v: 1,
@@ -7890,10 +7984,25 @@ async function hello(cwd, server) {
 			readText: (p) => fs.readFile(p, "utf8").catch(() => null),
 			run: io.run
 		}, claudeJson, cwd),
-		machine: { name: machine },
+		machine: { name: os.hostname() },
 		session: `claude-code:${id}`,
 		project
 	};
+}
+/** What a session in `cwd` reports as, by this machine's fresh copy of the office's list; stops the command when there is none. */
+async function homeOf(cwd) {
+	const config = await loadConfig(io, path.join(modDir, "config.json"), path.join(isoplanDir, "config.json"));
+	const found = await commandHome(cwd, machineHomeIo(config.workspaceRepos), {
+		file: approvedPath(claudeDir),
+		server: config.server,
+		maxAgeMs: config.approvedMaxAgeMinutes * 6e4
+	});
+	return "home" in found ? found.home : stop(found.refused);
+}
+/** Which repos under `cwd` a handoff may take: the office's alone, by this machine's fresh copy of its list. */
+async function takesHere() {
+	const config = await loadConfig(io, path.join(modDir, "config.json"), path.join(isoplanDir, "config.json"));
+	return takesFrom(machineHomeIo(config.workspaceRepos), await cachedRepos(approvedPath(claudeDir), config.server, config.approvedMaxAgeMinutes * 6e4));
 }
 const TOKEN_LEFT_MS = 3e5;
 /**
@@ -7924,10 +8033,10 @@ async function office() {
 		} }
 	};
 }
-async function exchange(cwd, first, wanted, before = "") {
+async function exchange(cwd, first, wanted, before = "", project) {
 	const { server, pairing } = await office();
 	try {
-		return await openPairedLink(server, await hello(cwd, server), pairing, first, wanted, ANSWER_MS);
+		return await openPairedLink(server, await hello(cwd, project ?? await homeOf(cwd)), pairing, first, wanted, ANSWER_MS);
 	} catch (err) {
 		if (err instanceof PairingRefused) stop(`${before}${err.message}`);
 		throw err;
@@ -7945,7 +8054,8 @@ async function prepareCommand(argv) {
 	const to = nameOf(argv);
 	const s = await settings();
 	await tidyOut();
-	const prepared = await prepare(run, sessionDir(), s.gitTimeoutSeconds * 1e3, s.repoSearchDepth).catch((err) => stop(err instanceof HandoffGitError ? `Can't hand over from here: ${gitFailed(err)}.` : String(err)));
+	await homeOf(sessionDir());
+	const prepared = await prepare(run, sessionDir(), s.gitTimeoutSeconds * 1e3, s.repoSearchDepth, void 0, await takesHere()).catch((err) => stop(err instanceof HandoffGitError ? `Can't hand over from here: ${gitFailed(err)}.` : String(err)));
 	const id = newHandoffId();
 	const folder = outDir(id);
 	await fs.mkdir(folder, { recursive: true });
@@ -7955,6 +8065,7 @@ async function prepareCommand(argv) {
 	});
 	const repos = prepared.repos.filter((r) => r.path !== ".").length ? [`Repos, by path in this folder: ${prepared.repos.map((r) => `${r.path} (${repoBranch(id, r)}${r.from ? `, from ${r.from}` : ""})`).join(", ")}`] : [];
 	const left = prepared.left.length ? [`Left out: ${prepared.left.map((l) => `${l.path} (${l.why})`).join("; ")}`] : [];
+	if (prepared.notInOffice.length) left.push(`Left out, not in the office (named here only, never sent): ${prepared.notInOffice.join(", ")}`);
 	return [
 		`Handoff id: ${id}`,
 		`Brief file: ${path.join(folder, "brief.md")}`,
@@ -7988,7 +8099,7 @@ async function handOverCommand(argv) {
 	const cwd = sessionDir();
 	const s = await settings();
 	const timeoutMs = s.gitTimeoutSeconds * 1e3;
-	const prepared = await prepare(run, cwd, timeoutMs, s.repoSearchDepth).catch((err) => stop(err instanceof HandoffGitError ? `Can't hand over from here: ${gitFailed(err)}.` : String(err)));
+	const prepared = await prepare(run, cwd, timeoutMs, s.repoSearchDepth, void 0, await takesHere()).catch((err) => stop(err instanceof HandoffGitError ? `Can't hand over from here: ${gitFailed(err)}.` : String(err)));
 	const { from, files, repos, left } = prepared;
 	const unknown = Object.keys(pushAnyway).filter((repo) => !repos.some((r) => r.path === repo));
 	if (unknown.length) stop(`--push-anyway names ${unknown.map((r) => r === "." ? "this folder's own repo" : r).join(", ")}, which this doesn't hand over (it hands over ${repos.map((r) => r.path).join(", ")}). Nothing was pushed.`);
@@ -8047,6 +8158,41 @@ async function handOverCommand(argv) {
 		await link.close();
 	}
 }
+/**
+* The project of the room `code` takes into (POST <server>/handoff-room), which the take says hello
+* from: whatever folder the session is in, its own id isn't sent, and the session joins that room
+* (#91). The room's repo must be on this machine's fresh copy of the office's list.
+*/
+async function roomOf(code, cwd) {
+	const { server, pairing } = await office();
+	const config = await loadConfig(io, path.join(modDir, "config.json"), path.join(isoplanDir, "config.json"));
+	const token = await pairing.token(false).catch((err) => stop(err instanceof PairingRefused ? err.message : String(err)));
+	const account = await accountOf({
+		readText: (p) => fs.readFile(p, "utf8").catch(() => null),
+		run: io.run
+	}, claudeJson, cwd);
+	const answer = await fetch(httpUrl(server, "/handoff-room"), {
+		method: "POST",
+		headers: {
+			"content-type": "application/json",
+			...token ? { authorization: `Bearer ${token}` } : {}
+		},
+		body: JSON.stringify({
+			code,
+			account: account.id
+		}),
+		signal: AbortSignal.timeout(ANSWER_MS)
+	}).catch(() => stop(`The office server at ${server} couldn't be reached.`));
+	const body = await answer.json().catch(() => ({}));
+	if (answer.status === 401) stop(NEEDS_PAIRING);
+	if (answer.status !== 200 || typeof body.project !== "string") stop(`The office server says: ${typeof body.error === "string" ? body.error : `it answered ${answer.status}`}`);
+	const project = body.project;
+	if (!(await cachedRepos(approvedPath(claudeDir), server, config.approvedMaxAgeMinutes * 6e4))?.has(project.toLowerCase())) stop(`The handoff's repo, ${project}, isn't on this machine's copy of the office's list, so nothing is sent. A Claude Code session with the Isoplan plugin reads it again within a few minutes; take it then.`);
+	return {
+		id: project,
+		name: project.split("/").pop() || project
+	};
+}
 async function takeCommand(argv) {
 	const code = (argv[0] ?? "").trim();
 	if (!CODE.test(code)) stop("That isn't a take code: it is the eight letters and digits the floor shows, like ABCD-EFGH.");
@@ -8057,7 +8203,7 @@ async function takeCommand(argv) {
 		type: "take",
 		v: 1,
 		code
-	}, (m) => m.type === "handoff");
+	}, (m) => m.type === "handoff", "", await roomOf(code, cwd));
 	try {
 		if (answer.type === "error") stop(said(answer));
 		const { handoff } = answer;

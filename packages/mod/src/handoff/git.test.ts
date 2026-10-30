@@ -214,6 +214,31 @@ test("several repos: the parent always goes, and of the repos under it only thos
   expect((await prepare(run, w.dir, MS)).repos.map((r) => r.path)).toEqual([".", "api", "web"]);
 }, SLOW);
 
+test("several repos: only those the office takes are handed over; the rest, and what is in them, are named only to the sender (#91)", async () => {
+  const w = workspace(tempRoot(), "sender");
+  const api = path.join(w.dir, "api");
+  const web = path.join(w.dir, "web");
+  fs.writeFileSync(path.join(api, "server.js"), "listen(2);\n");
+  fs.writeFileSync(path.join(api, "notes.md"), "todo\n");
+  fs.writeFileSync(path.join(web, "index.html"), "<p>2</p>\n");
+  fs.writeFileSync(path.join(web, "secret-plan.md"), "side project\n");
+  const takes = async (dir: string) => path.resolve(dir) !== path.resolve(web);
+
+  const prepared = await prepare(run, w.dir, MS, undefined, undefined, takes);
+  expect(prepared.repos.map((r) => r.path)).toEqual([".", "api"]);
+  expect(prepared.notInOffice).toEqual(["web"]);
+  expect(prepared.files).toEqual(["api/notes.md"]);
+  const note = handoffNote({ branch: "isoplan/handoff/m2", from: prepared.from, files: prepared.files, at: new Date(), repos: prepared.repos, left: prepared.left });
+  expect(note).not.toContain("web");
+  expect(note).not.toContain("secret-plan");
+  const pushed = await pushHandoff(run, w.dir, "m2", MS, { scan, prepared });
+  expect("repos" in pushed && pushed.repos.map((r) => r.path)).toEqual([".", "api"]);
+  expect(refs(w.remotes.web)).toBe("refs/heads/main");
+
+  // With the folder's own repo not taken, nothing goes.
+  await expect(prepare(run, w.dir, MS, undefined, undefined, async () => false)).rejects.toMatchObject({ kind: "not-in-office" });
+}, SLOW);
+
 test("several repos: every possible secret in every repo holds every push, each named by its path in the folder; pushing anyway takes each repo's held commit", async () => {
   const w = workspace(tempRoot(), "sender");
   fs.writeFileSync(path.join(w.dir, "api", "server.js"), `const key = "${FAKE_KEY}";\n`);

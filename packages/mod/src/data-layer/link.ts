@@ -69,6 +69,8 @@ export interface LinkOptions {
   /** How long a link refused as forged-hello waits before asking again. */
   takenRetryMs?: number;
   onNotWanted?: () => void;
+  /** Asked before every connect, the first and each reconnect: false sends nothing (the office doesn't take the session's repo now). */
+  admit?: () => Promise<boolean>;
   /** The server said this machine's pairing has ended, once `pairing` has dropped the credential. */
   onPairingEnded?: () => void;
   /** Takes the server's requests, releases and handoffs; without it they are logged as not handled. */
@@ -122,6 +124,7 @@ export function createLink({
   answered,
   pairing,
   pairPollMs = 5000,
+  admit,
   random = Math.random,
 }: LinkOptions): Link {
   const outbox: { message: Outgoing; at: number }[] = [];
@@ -145,8 +148,25 @@ export function createLink({
   let projects: ReadonlySet<string> | null = null; // the office's, from this connection's welcome
   let stable: ReturnType<typeof setTimeout> | null = null; // counts refusals from zero once the link has stayed up
 
+  // Before every try, the first and each reconnect, `admit` may say no: then nothing is sent, and it
+  // asks again after retryCapMs (the data layer closes a link whose repo has left the office).
   function connect() {
     retry = null;
+    if (!admit) return proceed();
+    admit().then(
+      (ok) => {
+        if (isClosed) return;
+        if (ok) return proceed();
+        emit({ type: "status", server: url, state: "not-approved" });
+        retry = setTimeout(connect, retryCapMs);
+      },
+      () => {
+        if (!isClosed) retry = setTimeout(connect, retryCapMs);
+      },
+    );
+  }
+
+  function proceed() {
     if (!pairing) return open(undefined);
     void refusing
       .then(() => pairing.token())

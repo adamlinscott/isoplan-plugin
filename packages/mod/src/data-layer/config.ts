@@ -29,6 +29,8 @@ export interface Config {
   workspaceRepos: number;
   /** How often the list of repos the office takes is checked again (approved.ts). */
   approvedRefreshMinutes: number;
+  /** A copy of that list not confirmed by the server for this long approves nothing. */
+  approvedMaxAgeMinutes: number;
 }
 
 export interface ConfigIo {

@@ -6306,6 +6306,23 @@ async function readJson(io, p, optional = false) {
 	}
 }
 //#endregion
+//#region src/data-layer/approved-file.ts
+const approvedPath = (claudeDir) => path.join(claudeDir, "isoplan", "approved.json");
+const isFile$1 = (v) => !!v && typeof v.server === "string" && typeof v.version === "string" && typeof v.fetched === "number" && typeof v.checked === "number" && Array.isArray(v.repos) && v.repos.every((r) => typeof r === "string");
+/** approved.json, for `server` when given; null when there is none, or it is another server's. */
+async function readApproved(file, server) {
+	try {
+		const value = JSON.parse(await fs.readFile(file, "utf8"));
+		return isFile$1(value) && (server === void 0 || value.server === server) ? value : null;
+	} catch {
+		return null;
+	}
+}
+/** The approved repos' ids, lower case, while the copy is younger than `maxAgeMs`; null after, or with none. */
+function freshRepos(copy, maxAgeMs, now) {
+	return copy && now - copy.checked <= maxAgeMs ? new Set(copy.repos.map((r) => r.toLowerCase())) : null;
+}
+//#endregion
 //#region src/wake/lock.ts
 const lockPath = (claudeDir, sessionId) => path.join(claudeDir, "isoplan", "live", `${sessionId}.json`);
 const HOLD_OFF_MS = 36e5;
@@ -6796,46 +6813,44 @@ const getJson = async (url, headers) => {
 		body: response.status === 200 || response.status === 401 ? await response.json().catch(() => null) : null
 	};
 };
-const approvedPath = (claudeDir) => path.join(claudeDir, "isoplan", "approved.json");
-/** A forced refresh comes at most this often. */
-const FORCE_MS = 3e4;
-/** While the machine waits to be paired, or the server can't be reached, the list is asked for again this soon. */
+/** While the machine waits to be paired the list is asked for again this soon, and after a failure this soon. */
 const PAIR_POLL_MS = 5e3;
 const RETRY_MS = 3e4;
+/** A rename the file system refuses for a moment (a scanner holding the file, on Windows) is tried this often. */
+const RENAME_TRIES = 5;
 const isList = (value) => {
 	const v = value;
-	return !!v && typeof v.version === "string" && Array.isArray(v.offices) && v.offices.every((o) => o && Array.isArray(o.repos) && o.repos.every((r) => typeof r === "string"));
+	return !!v && typeof v.version === "string" && Array.isArray(v.repos) && v.repos.every((r) => typeof r === "string");
 };
-async function readCache(file, server) {
-	try {
-		const value = JSON.parse(await fs.readFile(file, "utf8"));
-		return value.server === server && typeof value.checked === "number" && isList(value) ? value : null;
-	} catch {
-		return null;
-	}
-}
-/** Written whole, through a temp file, so a reader never sees half of it; owner-only. */
-async function writeCache(file, value) {
+/** Whether `a` is a later list than `b`: a newer version, by when it was first had, or the same one confirmed later. */
+const later = (a, b) => !b || (a.version !== b.version ? a.fetched > b.fetched : a.checked > b.checked);
+/** Written whole, through a temp file, so a reader never sees half of it; owner-only. A refused rename is tried again, then thrown. */
+async function writeFile(file, value) {
 	await fs.mkdir(path.dirname(file), { recursive: true });
 	const temp = `${file}.${process.pid}.${randomBytes(4).toString("hex")}`;
 	await fs.writeFile(temp, JSON.stringify(value, null, 2) + "\n", { mode: 384 });
-	await fs.rename(temp, file).catch(async (err) => {
+	for (let i = 0;; i++) try {
+		await fs.rename(temp, file);
+		return;
+	} catch (err) {
+		const code = err.code;
+		if (i + 1 < RENAME_TRIES && (code === "EPERM" || code === "EBUSY" || code === "EACCES")) {
+			await new Promise((r) => setTimeout(r, 25 * 2 ** i));
+			continue;
+		}
 		await fs.rm(temp, { force: true }).catch(() => {});
 		throw err;
-	});
+	}
 }
-const idsOf = (list) => new Set(list.offices.flatMap((o) => o.repos.map((r) => r.toLowerCase())));
-function createApproved({ server, file, pairing, refreshMs, log, get = getJson, now = Date.now }) {
+function createApproved({ server, file, pairing, refreshMs, maxAgeMs, log, get = (url, headers) => getJson(url, headers), now = Date.now }) {
 	let list = null;
-	let ids = null;
 	let problem = "unreachable";
 	let nextAt = -Infinity;
-	let forcedAt = -Infinity;
 	let busy = null;
+	let queued = null;
 	let said = "";
 	const take = (value) => {
 		list = value;
-		ids = idsOf(value);
 		problem = null;
 		nextAt = value.checked + refreshMs;
 	};
@@ -6843,21 +6858,31 @@ function createApproved({ server, file, pairing, refreshMs, log, get = getJson, 
 		if (text !== said) log(text);
 		said = text;
 	};
+	async function keep(mine) {
+		const theirs = await readApproved(file, server);
+		const kept = theirs && !later(mine, theirs) ? theirs.version === mine.version ? {
+			...theirs,
+			checked: Math.max(theirs.checked, mine.checked)
+		} : theirs : mine;
+		take(kept);
+		if (kept === theirs) return;
+		await writeFile(file, kept).catch((err) => tell(`couldn't keep the office's list of repos in ${file}: ${String(err?.message ?? err)}`));
+	}
 	async function check() {
-		const shared = await readCache(file, server);
-		if (shared && shared.checked > (list?.checked ?? -Infinity)) take(shared);
+		const shared = await readApproved(file, server);
+		if (shared && later(shared, list)) take(shared);
 		if (list && now() < nextAt) return;
 		let token;
 		try {
 			token = pairing ? await pairing.token() : void 0;
 		} catch (err) {
 			tell(`couldn't read which repos the office takes: ${String(err?.message ?? err)}`);
-			if (!list) problem = "unreachable";
+			problem = "unreachable";
 			nextAt = now() + RETRY_MS;
 			return;
 		}
 		if (token === null) {
-			if (!list) problem = "pairing";
+			problem = "pairing";
 			nextAt = now() + PAIR_POLL_MS;
 			return;
 		}
@@ -6868,58 +6893,63 @@ function createApproved({ server, file, pairing, refreshMs, log, get = getJson, 
 		try {
 			answer = await get(httpUrl(server, "/repos"), headers);
 		} catch (err) {
-			tell(`couldn't read which repos the office takes from ${server}: ${String(err?.message ?? err)}`);
-			if (!list) problem = "unreachable";
-			nextAt = now() + RETRY_MS;
-			return;
+			answer = {
+				status: 0,
+				body: String(err?.message ?? err)
+			};
 		}
 		const code = answer.body?.code;
+		const at = now();
 		if (answer.status === 304 && list) {
-			const kept = {
+			said = "";
+			await keep({
 				...list,
-				checked: now()
-			};
-			take(kept);
-			await writeCache(file, kept).catch(() => {});
+				checked: at
+			});
 		} else if (answer.status === 200 && isList(answer.body)) {
-			const fresh = {
+			said = "";
+			const same = list?.version === answer.body.version;
+			await keep({
 				server,
 				version: answer.body.version,
-				offices: answer.body.offices,
-				checked: now()
-			};
-			take(fresh);
-			said = "";
-			await writeCache(file, fresh).catch((err) => tell(`couldn't keep the office's list of repos in ${file}: ${String(err?.message ?? err)}`));
+				repos: answer.body.repos,
+				fetched: same ? list.fetched : at,
+				checked: at
+			});
 		} else if (answer.status === 401 && pairing && (code === "not-paired" || code === "pairing-ended" || code === "token-expired")) {
 			await pairing.refused(code, token).catch(() => {});
-			if (!list) problem = "pairing";
-			nextAt = now() + (code === "token-expired" || !token ? 0 : PAIR_POLL_MS);
+			problem = "pairing";
+			nextAt = at + (code === "token-expired" || !token ? 0 : PAIR_POLL_MS);
 		} else if (answer.status === 404) {
 			tell(`${server} is too old to say which repos its office takes, so nothing is sent to it; it needs updating`);
 			list = null;
-			ids = null;
 			problem = "too-old";
-			nextAt = now() + refreshMs;
+			nextAt = at + refreshMs;
 		} else {
-			tell(`the office server answered ${answer.status} when asked which repos it takes`);
-			if (!list) problem = "unreachable";
-			nextAt = now() + RETRY_MS;
+			tell(`couldn't read which repos the office takes from ${server}: ${answer.status ? `it answered ${answer.status}` : String(answer.body)}`);
+			problem = "unreachable";
+			nextAt = at + RETRY_MS;
 		}
 	}
-	return {
-		repos: () => ids,
-		problem: () => problem,
-		refresh(force = false) {
-			if (busy) return busy;
-			if (force && now() - forcedAt >= FORCE_MS) {
-				forcedAt = now();
-				nextAt = -Infinity;
-			}
-			if (now() < nextAt) return Promise.resolve();
-			busy = check().catch((err) => tell(`couldn't read which repos the office takes: ${String(err?.message ?? err)}`)).finally(() => busy = null);
-			return busy;
+	function refresh(force = false) {
+		if (force) nextAt = -Infinity;
+		if (busy) {
+			if (!force) return busy;
+			queued ??= busy.then(() => {
+				queued = null;
+				return refresh(true);
+			});
+			return queued;
 		}
+		if (now() < nextAt) return Promise.resolve();
+		busy = check().catch((err) => tell(`couldn't read which repos the office takes: ${String(err?.message ?? err)}`)).finally(() => busy = null);
+		return busy;
+	}
+	return {
+		repos: () => freshRepos(list, maxAgeMs, now()),
+		version: () => list?.version ?? null,
+		problem: () => list && !freshRepos(list, maxAgeMs, now()) ? "unreachable" : list ? null : problem,
+		refresh
 	};
 }
 //#endregion
@@ -7223,6 +7253,59 @@ function runCommand([cmd, ...args], { cwd }) {
 	});
 }
 //#endregion
+//#region src/data-layer/home.ts
+/** The projects `folder` may report as, and whether it is a workspace. */
+async function candidatesOf(folder, io) {
+	const where = await io.resolve(folder);
+	if (where) return {
+		projects: [await io.projectOf(where, folder)],
+		workspace: false
+	};
+	const tooWide = pathKey(folder) === pathKey(io.home) || relativeTo(folder, io.home) !== null;
+	const st = await io.stat(folder);
+	const repos = [];
+	if (!tooWide && st?.isDir) {
+		for (const e of await io.listDir(folder)) if (e.isDir && await io.stat(join(folder, `${e.name}/.git`))) repos.push(join(folder, e.name));
+	}
+	if (!repos.length || repos.length > io.workspaceRepos) return {
+		projects: [await io.projectOf(null, folder)],
+		workspace: false
+	};
+	const projects = [];
+	for (const dir of repos.sort()) {
+		const at = await io.resolve(dir);
+		if (at) projects.push(await io.projectOf(at, dir));
+	}
+	return {
+		projects,
+		workspace: true
+	};
+}
+/** The first of `folder`'s candidates on `repos`: what a session there reports as. Null when none is, or there is no list. */
+async function approvedHome(folder, io, repos) {
+	if (!repos) return null;
+	const { projects } = await candidatesOf(folder, io);
+	return projects.find((p) => repos.has(p.id.toLowerCase())) ?? null;
+}
+/** Whether the repo whose top is `dir` is on `repos`, for a handoff's prepare (handoff/git.ts). */
+const takesFrom = (io, repos) => async (dir) => {
+	const where = repos && await io.resolve(dir);
+	return !!where && repos.has((await io.projectOf(where, dir)).id.toLowerCase());
+};
+/** A HomeIo on this machine, for the runner and the commands. */
+function machineHomeIo(workspaceRepos, machine = os.hostname()) {
+	const io = nodeIo();
+	const git = createGit(io);
+	return {
+		resolve: (dir) => git.resolve(dir),
+		projectOf: (where, dir) => projectOf(io.run, where, dir, machine),
+		stat: (p) => Promise.resolve(io.stat(p)),
+		listDir: (d) => io.listDir(d),
+		home: os.homedir(),
+		workspaceRepos
+	};
+}
+//#endregion
 //#region src/data-layer/changes.ts
 /** null when nothing changed. */
 function diffFacts(before, after, answered) {
@@ -7276,7 +7359,7 @@ const same = (a, b) => a !== void 0 && JSON.stringify(a) === JSON.stringify(b);
 const STABLE_MS$1 = 3e4;
 const OUTBOX_MAX = 100;
 const OUTBOX_MAX_AGE_MS = 36e5;
-function createLink({ url, hello, emit, minIntervalMs = 1e3, retryBaseMs = 1e3, retryCapMs = 3e4, notWantedRetryMs = 36e5, takenRetryMs = 36e5, onNotWanted, onPairingEnded, onMessage, filter = (facts) => facts, answered, pairing, pairPollMs = 5e3, random = Math.random }) {
+function createLink({ url, hello, emit, minIntervalMs = 1e3, retryBaseMs = 1e3, retryCapMs = 3e4, notWantedRetryMs = 36e5, takenRetryMs = 36e5, onNotWanted, onPairingEnded, onMessage, filter = (facts) => facts, answered, pairing, pairPollMs = 5e3, admit, random = Math.random }) {
 	const outbox = [];
 	let latest = null;
 	let socket = null;
@@ -7299,6 +7382,21 @@ function createLink({ url, hello, emit, minIntervalMs = 1e3, retryBaseMs = 1e3, 
 	let stable = null;
 	function connect() {
 		retry = null;
+		if (!admit) return proceed();
+		admit().then((ok) => {
+			if (isClosed) return;
+			if (ok) return proceed();
+			emit({
+				type: "status",
+				server: url,
+				state: "not-approved"
+			});
+			retry = setTimeout(connect, retryCapMs);
+		}, () => {
+			if (!isClosed) retry = setTimeout(connect, retryCapMs);
+		});
+	}
+	function proceed() {
 		if (!pairing) return open(void 0);
 		refusing.then(() => pairing.token()).then((token) => {
 			if (isClosed) return;
@@ -9405,6 +9503,7 @@ const GIT_FAILED = {
 	"not-a-repo": "the session's folder isn't in a git repo, and has none in it",
 	"too-wide": "the session's folder is the home folder or a drive's root, too wide a folder to hand over from",
 	"no-work": "none of the repos in the session's folder has work that isn't on its default branch",
+	"not-in-office": "none of the repos with work in the session's folder is one the office takes",
 	"no-commit": "the session's repo has no commit to hand over from",
 	"no-remote": "the session's repo has no remote to push the handoff's branch to",
 	lfs: "the session's repo uses Git LFS, whose files a handoff can't push yet",
@@ -9753,7 +9852,7 @@ const slug = (p) => p.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$
 * with where each pushes, their untracked files and what is left out. The folder's own repo failing
 * throws a HandoffGitError; a repo under it that git can't read is left out, with why.
 */
-async function prepare(run, cwd, timeoutMs, depth = 3, home = os.homedir()) {
+async function prepare(run, cwd, timeoutMs, depth = 3, home = os.homedir(), takes) {
 	const top = await run(["rev-parse", "--show-toplevel"], {
 		cwd,
 		timeoutMs
@@ -9767,6 +9866,8 @@ async function prepare(run, cwd, timeoutMs, depth = 3, home = os.homedir()) {
 	const dirOf = (p) => p === "." ? toplevel : path.join(toplevel, p);
 	const from = inRepo ? await branchOf(run, toplevel, timeoutMs, ".") : null;
 	const repos = [];
+	const notInOffice = [];
+	if (inRepo && takes && !await takes(toplevel)) throw new HandoffGitError("not-in-office", `${toplevel} isn't a repo the office takes`);
 	if (inRepo) {
 		const { remote, remotes } = await pushRemote(run, toplevel, from, timeoutMs, ".");
 		if (!remote) throw new HandoffGitError("no-remote", `${toplevel} has ${remotes.length ? `several remotes and none is origin: ${remotes.join(", ")}` : "no remote"}`);
@@ -9785,38 +9886,46 @@ async function prepare(run, cwd, timeoutMs, depth = 3, home = os.homedir()) {
 	}
 	const left = [...skipped];
 	const listedRepos = inRepo ? ["."] : [];
-	for (const sub of found) try {
-		const above = [...inRepo ? ["."] : [], ...found].filter((p) => p === "." || sub.startsWith(`${p}/`)).sort((a, b) => a.length - b.length).at(-1);
-		if (above) {
-			const inside = above === "." ? sub : sub.slice(above.length + 1);
-			if ((await gitIn(run, dirOf(above), timeoutMs, above).git([
-				"--literal-pathspecs",
-				"ls-files",
-				"--stage",
-				"--",
-				inside
-			])).stdout.startsWith("160000 ")) {
-				left.push({
-					path: sub,
-					why: WHY.submodule
-				});
-				continue;
-			}
+	for (const sub of found) {
+		if (notInOffice.some((p) => sub.startsWith(`${p}/`))) continue;
+		if (takes && !await takes(dirOf(sub))) {
+			notInOffice.push(sub);
+			continue;
 		}
-		const state = await inspect(run, dirOf(sub), sub, timeoutMs);
-		if (typeof state === "string") left.push({
-			path: sub,
-			why: WHY[state]
-		});
-		else if (state) repos.push(state);
-		if (state !== "unreadable") listedRepos.push(sub);
-	} catch (err) {
-		if (!(err instanceof HandoffGitError)) throw err;
-		left.push({
-			path: sub,
-			why: err.kind === "timed-out" ? WHY.slow : WHY.unreadable
-		});
+		try {
+			const above = [...inRepo ? ["."] : [], ...found].filter((p) => p === "." || sub.startsWith(`${p}/`)).sort((a, b) => a.length - b.length).at(-1);
+			if (above) {
+				const inside = above === "." ? sub : sub.slice(above.length + 1);
+				if ((await gitIn(run, dirOf(above), timeoutMs, above).git([
+					"--literal-pathspecs",
+					"ls-files",
+					"--stage",
+					"--",
+					inside
+				])).stdout.startsWith("160000 ")) {
+					left.push({
+						path: sub,
+						why: WHY.submodule
+					});
+					continue;
+				}
+			}
+			const state = await inspect(run, dirOf(sub), sub, timeoutMs);
+			if (typeof state === "string") left.push({
+				path: sub,
+				why: WHY[state]
+			});
+			else if (state) repos.push(state);
+			if (state !== "unreadable") listedRepos.push(sub);
+		} catch (err) {
+			if (!(err instanceof HandoffGitError)) throw err;
+			left.push({
+				path: sub,
+				why: err.kind === "timed-out" ? WHY.slow : WHY.unreadable
+			});
+		}
 	}
+	if (!repos.length && notInOffice.length) throw new HandoffGitError("not-in-office", `none of the repos with work under ${toplevel} is one the office takes: ${notInOffice.join(", ")}`);
 	if (!repos.length) throw new HandoffGitError("no-work", `none of the repos under ${toplevel} has work that isn't on its remote's default branch`);
 	const suffixes = /* @__PURE__ */ new Set();
 	const prepared = repos.map((r, i) => {
@@ -9832,7 +9941,7 @@ async function prepare(run, cwd, timeoutMs, depth = 3, home = os.homedir()) {
 			suffix
 		};
 	});
-	let files = [...loose];
+	let files = takes && !inRepo ? [] : [...loose];
 	for (const p of listedRepos) {
 		const own = await untracked(run, dirOf(p), timeoutMs);
 		if (own === null) {
@@ -9842,12 +9951,18 @@ async function prepare(run, cwd, timeoutMs, depth = 3, home = os.homedir()) {
 		const full = own.map((f) => p === "." ? f : `${p}/${f}`);
 		files.push(...full.filter((f) => !found.some((sub) => f === `${sub}/`)));
 	}
+	const taken = (p) => {
+		const owner = [...repos.map((r) => r.path), ...notInOffice].filter((r) => r === "." || p === r || p.startsWith(`${r}/`)).sort((a, b) => b.length - a.length)[0];
+		return owner !== void 0 && !notInOffice.includes(owner);
+	};
+	const kept = takes ? left.filter((l) => taken(l.path)) : left;
 	return {
 		toplevel,
 		from,
 		files: files && files.sort(),
 		repos: prepared,
-		left
+		left: kept,
+		notInOffice
 	};
 }
 /**
@@ -9888,8 +10003,8 @@ const IDENTITY = {
 * records names its push URL, where the branch is. Nothing is pushed until every repo's commit is
 * made and scanned. A push that fails after others went names them. Throws a HandoffGitError.
 */
-async function pushHandoff(run, cwd, id, timeoutMs, { scan, pushAnyway = {}, depth, prepared } = {}) {
-	const { repos } = prepared ?? await prepare(run, cwd, timeoutMs, depth);
+async function pushHandoff(run, cwd, id, timeoutMs, { scan, pushAnyway = {}, depth, prepared, takes } = {}) {
+	const { repos } = prepared ?? await prepare(run, cwd, timeoutMs, depth, void 0, takes);
 	const temp = await fs.mkdtemp(path.join(os.tmpdir(), "isoplan-handoff-"));
 	const ready = [];
 	try {
@@ -11361,9 +11476,14 @@ async function worker() {
 		file: approvedPath(claudeDir),
 		pairing,
 		refreshMs: first.approvedRefreshMinutes * 6e4,
+		maxAgeMs: first.approvedMaxAgeMinutes * 6e4,
 		log
 	});
-	const placeGit = createGit(io);
+	const homeIo = machineHomeIo(first.workspaceRepos);
+	const takes = async () => {
+		await approved.refresh();
+		return takesFrom(homeIo, approved.repos());
+	};
 	let send = () => {};
 	const preparedFor = /* @__PURE__ */ new Map();
 	const runner = createRunner({
@@ -11381,12 +11501,11 @@ async function worker() {
 			if (!id || lock && lock.pid === null && lock.until !== null && lock.until > Date.now()) return false;
 			if (Date.now() - lead.lastActive > askableMs(await config().catch(() => first))) return false;
 			await approved.refresh();
-			const repos = approved.repos();
-			const project = repos && await projectOf(io.run, await placeGit.resolve(lead.cwd), lead.cwd, os.hostname());
-			return !!project && repos.has(project.id.toLowerCase());
+			return await approvedHome(lead.cwd, homeIo, approved.repos()) !== null;
 		},
 		prepareBrief: async (lead, handoff) => {
-			const ready = await prepare(git, lead.cwd, await gitMs(), (await settings()).repoSearchDepth).catch((err) => Promise.reject(told(err)));
+			const ready = await prepare(git, lead.cwd, await gitMs(), (await settings()).repoSearchDepth, void 0, await takes()).catch((err) => Promise.reject(told(err)));
+			if (ready.notInOffice.length) log(`handoff ${handoff}: left out, not in the office: ${ready.notInOffice.join(", ")}`);
 			preparedFor.set(handoff, ready);
 			if (preparedFor.size > MAX_PREPARED) preparedFor.delete(preparedFor.keys().next().value);
 			const { from, files, repos, left } = ready;
@@ -11407,6 +11526,7 @@ async function worker() {
 				scan: scanText,
 				depth: (await settings()).repoSearchDepth,
 				prepared: preparedFor.get(handoff),
+				takes: await takes(),
 				...pushAnyway ? { pushAnyway } : {}
 			}).catch((err) => Promise.reject(told(err)));
 			return "held" in pushed ? pushed : pushed.repos;

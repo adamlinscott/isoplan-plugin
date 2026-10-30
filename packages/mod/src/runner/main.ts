@@ -37,8 +37,8 @@ import { fileURLToPath } from "node:url";
 import { PROTOCOL_VERSION } from "@isoplan/protocol";
 import { loadConfig, loadSettings } from "../data-layer/config.js";
 import { approvedPath, createApproved } from "../data-layer/approved.js";
-import { createGit } from "../data-layer/git.js";
-import { accountOf, claudePaths, projectOf } from "../data-layer/identity.js";
+import { approvedHome, machineHomeIo, takesFrom } from "../data-layer/home.js";
+import { accountOf, claudePaths } from "../data-layer/identity.js";
 import { nodeIo } from "../data-layer/io.js";
 import { createLink } from "../data-layer/link.js";
 import { createPairing, pairingLockPath, pairingPath, pairingWriteLockPath } from "../data-layer/pairing.js";
@@ -174,8 +174,13 @@ async function worker(): Promise<number> {
     allowPlainWs: first.allowPlainWs,
   });
   // The repos the office takes (src/data-layer/approved.ts): the runner answers only for sessions in them.
-  const approved = createApproved({ server: first.server, file: approvedPath(claudeDir), pairing, refreshMs: first.approvedRefreshMinutes * 60000, log });
-  const placeGit = createGit(io);
+  const approved = createApproved({ server: first.server, file: approvedPath(claudeDir), pairing, refreshMs: first.approvedRefreshMinutes * 60000, maxAgeMs: first.approvedMaxAgeMinutes * 60000, log });
+  const homeIo = machineHomeIo(first.workspaceRepos);
+  // The repos a handoff from the lead's folder may hand over: the office's alone (#91).
+  const takes = async () => {
+    await approved.refresh();
+    return takesFrom(homeIo, approved.repos());
+  };
   let send: Parameters<typeof createRunner>[0]["send"] = () => {};
   // What each brief's prepare found, by handoff, for its push and any push anyway after it.
   const preparedFor = new Map<string, Prepared>();
@@ -198,14 +203,14 @@ async function worker(): Promise<number> {
       if (!id || (lock && lock.pid === null && lock.until !== null && lock.until > Date.now())) return false;
       if (Date.now() - lead.lastActive > askableMs(await config().catch(() => first))) return false;
       await approved.refresh();
-      const repos = approved.repos();
-      const project = repos && (await projectOf(io.run, await placeGit.resolve(lead.cwd), lead.cwd, os.hostname()));
-      return !!project && repos!.has(project.id.toLowerCase());
+      return (await approvedHome(lead.cwd, homeIo, approved.repos())) !== null;
     },
     // The handoff (#48): the brief names the untracked files, then the branch is pushed, both from
     // the lead's folder, in the background, with no prompts and under gitTimeoutSeconds.
     prepareBrief: async (lead, handoff) => {
-      const ready = await prepare(git, lead.cwd, await gitMs(), (await settings()).repoSearchDepth).catch((err) => Promise.reject(told(err)));
+      const ready = await prepare(git, lead.cwd, await gitMs(), (await settings()).repoSearchDepth, undefined, await takes()).catch((err) => Promise.reject(told(err)));
+      // The repos the office doesn't take are named only here, never in the brief.
+      if (ready.notInOffice.length) log(`handoff ${handoff}: left out, not in the office: ${ready.notInOffice.join(", ")}`);
       // The push hands over the repos the brief's note names (#56).
       preparedFor.set(handoff, ready);
       if (preparedFor.size > MAX_PREPARED) preparedFor.delete(preparedFor.keys().next().value!);
@@ -213,7 +218,7 @@ async function worker(): Promise<number> {
       return { files, note: handoffNote({ branch: handoffBranch(handoff), from, files, at: new Date(), repos, left }) };
     },
     push: async (_session, lead, handoff, pushAnyway) => {
-      const pushed = await pushHandoff(git, lead.cwd, handoff, await gitMs(), { scan: scanText, depth: (await settings()).repoSearchDepth, prepared: preparedFor.get(handoff), ...(pushAnyway ? { pushAnyway } : {}) }).catch((err) => Promise.reject(told(err)));
+      const pushed = await pushHandoff(git, lead.cwd, handoff, await gitMs(), { scan: scanText, depth: (await settings()).repoSearchDepth, prepared: preparedFor.get(handoff), takes: await takes(), ...(pushAnyway ? { pushAnyway } : {}) }).catch((err) => Promise.reject(told(err)));
       return "held" in pushed ? pushed : pushed.repos;
     },
     take: (message) =>

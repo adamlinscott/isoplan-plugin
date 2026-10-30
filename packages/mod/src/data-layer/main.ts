@@ -52,8 +52,9 @@ import { startRunner } from "../runner/start.js";
 import { recentSessions } from "../sweep/find.js";
 import { backfill } from "../wake/backfill.js";
 import { alive, HOLD_OFF_MS, holdOff, lockHolder, lockPath, releaseLock, takeLock } from "../wake/lock.js";
-import { approvedPath, createApproved, gateLink, type Dormancy } from "./approved.js";
+import { approvedPath, createApproved, createSessionGate, type Dormancy } from "./approved.js";
 import { forOffice } from "./attribution.js";
+import { candidatesOf, inRepos } from "./home.js";
 import { createClaudeCode } from "./claude-code.js";
 import { loadConfig, type Config } from "./config.js";
 import { detachedStop } from "./detached.js";
@@ -68,6 +69,8 @@ import { cleanTitle, nextTitle, TITLE_SYSTEM, type TitleCache } from "./titles.j
 
 // A detached data layer's log starts over once it is this big.
 const LOG_CAP_BYTES = 64 * 1024;
+// How long a session the office doesn't take waits between passes.
+const DORMANT_MS = 30000;
 
 const value = (argv: string[], flag: string) => {
   const i = argv.indexOf(flag);
@@ -213,11 +216,21 @@ async function main(argv: string[]): Promise<number> {
     emit,
     allowPlainWs: config.allowPlainWs,
   });
-  const approved = createApproved({ server, file: approvedPath(claudeDir), pairing, refreshMs: config.approvedRefreshMinutes * 60000, log: (text) => emit({ type: "log", text }) });
+  const approved = createApproved({
+    server,
+    file: approvedPath(claudeDir),
+    pairing,
+    refreshMs: config.approvedRefreshMinutes * 60000,
+    maxAgeMs: config.approvedMaxAgeMinutes * 60000,
+    log: (text) => emit({ type: "log", text }),
+  });
   dropped = () => void approved.refresh(true);
-  let home: Project | null = null; // the session's project, looked up again as git's answers are
-  let homeAt = -Infinity;
+  // The projects the session may report as (home.ts), looked up again as git's answers are.
+  let candidates: { projects: Project[]; workspace: boolean } | null = null;
+  let candidatesAt = -Infinity;
   let dormant: Dormancy | null = null; // why nothing is sent, while it isn't
+  let notApproved: string[] | null = null; // detached, and the office takes none of these: it holds off
+  let factsSession = ""; // the session's id as its facts give it, for the hello
   let link: Link | null = null;
   let reported = ""; // the last problem logged, so a lasting one is logged once
   let title: TitleCache | null = null;
@@ -242,20 +255,24 @@ async function main(argv: string[]): Promise<number> {
   let answered = (_id: string) => false;
 
   const account = await accountOf({ readText: (p) => fs.readFile(p, "utf8").catch(() => null), run: io.run }, claudeJson, cwd);
-  // The session's link, opened only while its repo is one the office takes (gateLink).
-  const openLink = (session: string): Link =>
+  // The session's link, opened by the gate only while the office takes its home (approved.ts), which
+  // it asks again before every reconnect, so a hello never goes on a list that changed or aged out.
+  const gate = createSessionGate({
+    approved,
+    open: (home, mayConnect) =>
     createLink({
       url: server,
       emit,
       pairing,
-      // The list may have changed: it is read again, and the link goes once the repo is off it.
+      admit: mayConnect,
+      // The list may have changed: it is read again, and the link opens afresh once it has.
       onNotWanted: () => {
         isUnwanted = detached;
-        void approved.refresh(true);
+        gate.notWanted();
       },
       // Another repo's files, commands and checkouts go only to a server that welcomed them, and
       // only for its office's repos; the link applies this at every send, on every connection.
-      filter: (f, projects) => forOffice(f, projects, checkouts),
+      filter: (f, projects) => forOffice(candidates?.workspace ? inRepos(f) : f, projects, checkouts),
       answered: (id) => answered(id),
       // The owner released a withheld report: it goes to the link now, not on the next pass.
       // The owner answered a question from the floor: it goes to the hooks module.
@@ -290,10 +307,11 @@ async function main(argv: string[]): Promise<number> {
         source: "claude-code",
         account,
         machine: { name: machine },
-        session,
-        project: home!,
+        session: factsSession,
+        project: home,
       },
-    });
+    }),
+  });
 
   do {
     const now = Date.now();
@@ -311,6 +329,38 @@ async function main(argv: string[]): Promise<number> {
       projects.set(key, { at: now, project });
       return project;
     };
+    // Only a repo the office takes is reported (#91): for any other, no link opens and nothing is
+    // sent, not even a hello; one already open closes. A workspace reports as the first of its repos
+    // the office takes. It connects once the list has one.
+    if (!candidates || now - candidatesAt > gitOpts.maxAgeMs) {
+      const io2 = { resolve, projectOf: (where: Where | null, dir: string) => projectOf(io.run, where, dir, machine), stat: (f: string) => io.stat(f), listDir: (d: string) => io.listDir(d) };
+      candidates = await candidatesOf(cwd, { ...io2, home: os.homedir(), workspaceRepos: config.workspaceRepos });
+      candidatesAt = now;
+    }
+    const gated = await gate.home(candidates.projects);
+    link = gate.current();
+    if (gated.dormancy !== dormant) {
+      if (gated.dormancy) emit({ type: "status", server, state: gated.dormancy, ...(candidates.workspace && { workspace: true as const }) });
+      const what = candidates.workspace ? "none of the repos in this folder is" : `${candidates.projects[0]?.id ?? cwd} isn't`;
+      if (gated.dormancy === "not-approved") emit({ type: "log", text: `${what} one the office at ${server} takes, so nothing of this session is sent` });
+      if (gated.dormancy === "no-list") emit({ type: "log", text: `can't tell which repos ${server} takes (no list, or one older than ${config.approvedMaxAgeMinutes} minutes), so nothing of this session is sent` });
+    }
+    dormant = gated.dormancy;
+    if (!gated.home) {
+      // A detached one holds off, as for not-wanted, until the wake hook finds the list takes one of
+      // these repos, or the hold ends; one with no list stops once that has lasted LINK_DOWN_MS.
+      if (detached && gated.dormancy === "not-approved") {
+        notApproved = candidates.projects.map((p) => p.id.toLowerCase());
+        break;
+      }
+      const why = detached ? detachedStop({ now, lastActive: new Date(now).toISOString(), idleMinutes: config.idleMinutes, downSince }) : null;
+      if (why) {
+        emit({ type: "log", text: `stopping: ${why}` });
+        break;
+      }
+      continue;
+    }
+
     const read = await source.read({ sessionId, cwd, now, config, resolve, projectOf: projectOfRepo }).catch((err: unknown) => ({
       facts: null,
       status: String((err as Error)?.message ?? err),
@@ -329,38 +379,14 @@ async function main(argv: string[]): Promise<number> {
         break;
       }
       if (link) {
-        link.close();
+        gate.drop();
         link = null;
         emit({ type: "status", server, state: "waiting" });
       }
       continue;
     }
-
-    // Only a repo the office takes is reported (#91): for any other, no link opens and nothing is
-    // sent, not even a hello; one already open closes. It connects once the list has its repo.
-    if (!home || now - homeAt > gitOpts.maxAgeMs) {
-      home = await projectOf(io.run, await resolve(cwd), cwd, machine);
-      homeAt = now;
-    }
-    const session = read.facts.session.id;
-    const gated = await gateLink(approved, home.id, link, () => openLink(session));
-    link = gated.link;
-    const dormancy = gated.dormancy;
-    if (dormancy !== dormant) {
-      if (dormancy) emit({ type: "status", server, state: dormancy });
-      if (dormancy === "not-approved") emit({ type: "log", text: `${home.id} isn't one of the repos ${server} takes, so nothing of this session is sent` });
-      if (dormancy === "no-list") emit({ type: "log", text: `can't tell yet which repos ${server} takes, so nothing of this session is sent` });
-    }
-    dormant = dormancy;
-    if (!link) {
-      // Dormant, nothing is down: a detached one stays only while the session is at work.
-      const why = detached ? detachedStop({ now, lastActive: read.facts.session.lastActive, idleMinutes: config.idleMinutes, downSince: null }) : null;
-      if (why) {
-        emit({ type: "log", text: `stopping: ${why}` });
-        break;
-      }
-      continue;
-    }
+    factsSession = read.facts.session.id;
+    link = gate.link();
 
     // A written title replaces the branch stand-in; the hooks module writes the reply to a file.
     const reply = await takeReply(titleFile);
@@ -391,10 +417,12 @@ async function main(argv: string[]): Promise<number> {
       emit({ type: "log", text: `stopping: ${why}` });
       break;
     }
-  } while ((await wait(config.streamSeconds * 1000)) && !isUnwanted && (!detached || (await lockHolder(lock)) === process.pid) && !(await isOff()));
+    // A dormant session waits longer between passes: there is nothing to send, only the list to check.
+  } while ((await wait(dormant ? DORMANT_MS : config.streamSeconds * 1000)) && !isUnwanted && (!detached || (await lockHolder(lock)) === process.pid) && !(await isOff()));
 
   link?.close();
   if (isUnwanted || isPlaceless) await holdOff(lock, process.pid, Date.now() + HOLD_OFF_MS).catch(() => {});
+  else if (notApproved) await holdOff(lock, process.pid, Date.now() + HOLD_OFF_MS, { reason: "not-approved", projects: notApproved }).catch(() => {});
   else await releaseLock(lock, process.pid).catch(() => {});
   await logging;
   return 0;

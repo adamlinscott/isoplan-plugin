@@ -306,7 +306,9 @@ function statusText(line: StatusLine): string {
     case "not-wanted":
       return `Isoplan: this repo isn't in any office on ${line.server}`;
     case "not-approved":
-      return `Isoplan: this repo isn't in the office on ${line.server}, so nothing of this session is sent`;
+      return line.workspace
+        ? `Isoplan: no repo in this folder is in the office on ${line.server}, so nothing of this session is sent`
+        : `Isoplan: this repo isn't in the office on ${line.server}, so nothing of this session is sent`;
     case "no-list":
       return `Isoplan: can't tell yet which repos ${line.server} takes, so nothing of this session is sent`;
     case "taken":

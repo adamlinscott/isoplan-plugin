@@ -18,11 +18,11 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { MAX_QUESTION_LENGTH, PROTOCOL_VERSION, type HelloMessage } from "@isoplan/protocol";
+import { MAX_QUESTION_LENGTH, PROTOCOL_VERSION, type HelloMessage, type Project } from "@isoplan/protocol";
 import { loadConfig, loadSettings } from "../data-layer/config.js";
-import { createGit } from "../data-layer/git.js";
-import { approvedPath, cachedRepos } from "../data-layer/approved.js";
-import { accountOf, claudePaths, projectOf } from "../data-layer/identity.js";
+import { approvedPath } from "../data-layer/approved.js";
+import { commandHome, machineHomeIo } from "../data-layer/home.js";
+import { accountOf, claudePaths } from "../data-layer/identity.js";
 import { nodeIo } from "../data-layer/io.js";
 import { createPairing, pairingLockPath, pairingPath, pairingWriteLockPath, postJson, readPairing } from "../data-layer/pairing.js";
 import { openSideLink } from "../handoff/connection.js";
@@ -44,9 +44,8 @@ const flag = (argv: string[], name: string) => {
 const readText = (p: string) => fs.readFile(p, "utf8").catch(() => null);
 
 // The session's hello, as its own data layer says it, with the machine's token when it has one.
-async function hello(session: string, cwd: string, token: string | undefined): Promise<HelloMessage> {
+async function hello(session: string, cwd: string, token: string | undefined, project: Project): Promise<HelloMessage> {
   const machine = os.hostname();
-  const where = await createGit(io).resolve(cwd);
   return {
     type: "hello",
     v: PROTOCOL_VERSION,
@@ -54,7 +53,7 @@ async function hello(session: string, cwd: string, token: string | undefined): P
     account: await accountOf({ readText, run: io.run }, claudeJson, cwd),
     machine: { name: machine },
     session: `claude-code:${session}`,
-    project: await projectOf(io.run, where, cwd, machine),
+    project,
     ...(token ? { token } : {}),
   };
 }
@@ -106,15 +105,15 @@ async function main(argv: string[]): Promise<string> {
   const config = await loadConfig(io, path.join(modDir, "config.json"), path.join(isoplanDir, "config.json"));
   if (config.plainRefused) return `The room can't be asked: config.json's server, ${config.plainRefused}, is plain ws:// to another machine. Carry on without the answer.`;
   // Nothing of a repo the office doesn't take is sent, its id included (#91): the session's data layer keeps the list.
-  const project = await projectOf(io.run, await createGit(io).resolve(cwd), cwd, os.hostname());
-  if (!(await cachedRepos(approvedPath(claudeDir), config.server))?.has(project.id.toLowerCase())) return "The room can't be asked: this repo isn't one the office takes, so nothing of it is sent there. Carry on without the answer.";
+  const found = await commandHome(cwd, machineHomeIo(config.workspaceRepos), { file: approvedPath(claudeDir), server: config.server, maxAgeMs: config.approvedMaxAgeMinutes * 60000 });
+  if ("refused" in found) return `The room can't be asked: ${found.refused} Carry on without the answer.`;
   const pairing = await machinePairing(config.server, config.allowPlainWs);
   // One bound for the whole wait, a retry after an expired token included.
   const deadline = Date.now() + MAX_WAIT_MS;
   try {
     for (let tries = 0; ; tries++) {
       const token = await pairing.token();
-      const link = await openSideLink(config.server, await hello(session, cwd, token), CONNECT_MS);
+      const link = await openSideLink(config.server, await hello(session, cwd, token, found.home), CONNECT_MS);
       try {
         if (ack) {
           link.send({ type: "asked-ack", v: PROTOCOL_VERSION, question: ack });
