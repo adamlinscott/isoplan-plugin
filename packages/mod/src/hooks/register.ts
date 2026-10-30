@@ -29,10 +29,13 @@
 // The data layer talks back as JSON lines on stdout (src/lines.ts). Claude Code closes the child's
 // stdin at launch, so what goes the other way, a title, goes through a file the line names. A data
 // layer that ends is started again, backing off while it keeps failing; one running for a session
-// id the process has left (a /clear, a resume) is started again for the new id. Once this copy's
-// folder has gone (Claude Code cleans up a version some time after an update), or its data layer
-// says a newer one reports the session (a `superseded` line), nothing is started again, and the
-// status line asks for /reload-plugins.
+// id the process has left (a /clear, a resume) is started again for the new id. It passes the
+// time this module started (`--since`), so the data layers of a window that started later win the
+// session. Once this copy's folder has gone (Claude Code cleans up a version some time after an
+// update), nothing is started again, and the status line asks for /reload-plugins. A data layer
+// that says another reports the session (a `superseded` line: a newer version's after a reload, or
+// another window's) is started again only SUPERSEDED_RECHECK_MS later, and goes on if the session
+// is free by then.
 
 import type { AskedMessage, ConflictMessage } from "@isoplan/protocol";
 import { endText, MAX_WAIT_MS } from "../ask/text.js";
@@ -45,6 +48,8 @@ const STABLE_MS = 60000;
 // After a session ends, the process may go on under a new id (a /clear, a resume) with no
 // session.start; the id is looked at again this long after.
 const SWITCH_CHECK_MS = 1000;
+// How long after its data layer handed the session over this module tries again.
+const SUPERSEDED_RECHECK_MS = 60000;
 // The most of a server's note that reaches the model, and of a late reply from the room.
 const NOTE_MAX = 1000;
 // The script's whole wait fits in MAX_WAIT_MS (five minutes) whatever runner.json says, and
@@ -81,7 +86,7 @@ const floorWaits = new Map<string, (answers: Record<string, string>) => void>();
 let waitsDir: string | null = null; // where the waits are marked, as the data layer said
 let shownStatus: string | undefined; // the status line, without the update note
 let updated = false; // a newer version of the plugin is on disk, loaded at /reload-plugins
-let superseded = false; // the data layer said another reports this session now
+let superseded: "newer" | "window" | null = null; // the data layer said another reports this session now, and why
 let marking: Promise<unknown> = Promise.resolve(); // the marks, written in order
 
 export function register(on: On): void {
@@ -177,8 +182,9 @@ async function checkSession($: Host): Promise<void> {
 async function run($: Host): Promise<void> {
   const script = $.plugin.root.replace(/\\/g, "/") + "/dist/data-layer.js";
   let failures = 0;
+  const since = await $.clock.now();
   for (;;) {
-    if (!(await $.fs.exists(script).catch(() => true))) {
+    if (!(await isThere($, script))) {
       updated = true;
       show($, undefined);
       return;
@@ -205,7 +211,7 @@ async function run($: Host): Promise<void> {
     let code: number | null = null;
     const startedAt = await $.clock.now();
     try {
-      const child = $.process.spawn({ argv: ["node", script, "--session", session, "--cwd", cwd], cwd });
+      const child = $.process.spawn({ argv: ["node", script, "--session", session, "--cwd", cwd, "--since", String(since)], cwd });
       let buffer = "";
       for (;;) {
         const piece = await Promise.race([child.next(), switching]);
@@ -236,9 +242,12 @@ async function run($: Host): Promise<void> {
     }
     stop = null;
     if (superseded) {
-      updated = true;
-      show($, undefined);
-      return;
+      if (superseded === "newer") updated = true;
+      show($, superseded === "newer" ? undefined : "Isoplan: this session is reported from its other window");
+      superseded = null;
+      failures = 0;
+      await $.clock.sleep(SUPERSEDED_RECHECK_MS);
+      continue;
     }
     if (switched) {
       failures = 0;
@@ -276,7 +285,7 @@ function handle($: Host, text: string): void {
       show($, shownStatus);
       break;
     case "superseded":
-      superseded = true;
+      superseded = line.reason;
       break;
     case "title-ask":
       writeTitle($, line);
@@ -446,6 +455,15 @@ function writeTitle($: Host, ask: TitleAskLine): void {
     .finally(() => {
       asking = false;
     });
+}
+
+// Whether a file is there; true when the host can't say (no $.fs.exists, or it throws).
+async function isThere($: Host, file: string): Promise<boolean> {
+  try {
+    return typeof $.fs.exists !== "function" || (await $.fs.exists(file)) !== false;
+  } catch {
+    return true;
+  }
 }
 
 const message = (err: unknown) => String((err && (err as Error).message) || err);

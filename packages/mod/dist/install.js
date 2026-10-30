@@ -363,17 +363,20 @@ function normalPath(p, platform = process.platform) {
 	const resolved = path.resolve(p).replace(/\\/g, "/");
 	return platform === "win32" || platform === "darwin" ? resolved.toLowerCase() : resolved;
 }
-function cacheParts(plugins, file) {
-	const relative = path.relative(path.join(plugins, "cache"), path.resolve(file));
+function cacheParts(cache, file) {
+	const relative = path.relative(cache, path.resolve(file));
 	if (path.isAbsolute(relative)) return null;
 	const parts = relative.split(path.sep);
 	return parts.length >= 4 && parts[0] !== ".." ? parts : null;
 }
-/** The id, `<plugin>@<marketplace>`, of the marketplace install `file` is part of; null for a file outside the plugin cache. */
-function pluginIdOf(plugins, file) {
-	const parts = cacheParts(plugins, file);
-	return parts ? `${parts[1]}@${parts[0]}` : null;
+async function realCacheParts(plugins, file) {
+	const cache = await fs.realpath(path.join(plugins, "cache")).catch(() => path.join(plugins, "cache"));
+	return {
+		cache,
+		parts: cacheParts(cache, await fs.realpath(file).catch(() => file))
+	};
 }
+const appliesTo = (install, project) => !project || !(install.scope === "project" || install.scope === "local") || !install.projectPath || normalPath(install.projectPath) === normalPath(project);
 const nameOf = (id) => id.slice(0, id.lastIndexOf("@"));
 /** Every install installed_plugins.json records; null when it is missing, can't be read, or isn't the shape known. */
 async function installs(plugins) {
@@ -404,15 +407,16 @@ async function enabledIn(file, id) {
 * managed files, the user's settings, and every install.
 */
 async function pluginState(place, dataLayer, project) {
-	const id = pluginIdOf(place.plugins, dataLayer);
-	if (!id) return "enabled";
+	const { parts } = await realCacheParts(place.plugins, dataLayer);
+	if (!parts) return "enabled";
+	const id = `${parts[1]}@${parts[0]}`;
 	const name = nameOf(id);
 	const all = await installs(place.plugins);
 	let ids = [id];
 	if (all) {
 		const mine = all.filter((i) => nameOf(i.id) === name);
 		if (!mine.length) return await isInPluginDirs(place.pluginDirs ?? [], name) ? "enabled" : "uninstalled";
-		const here = project ? mine.filter((i) => !(i.scope === "project" || i.scope === "local") || !i.projectPath || normalPath(i.projectPath) === normalPath(project)) : mine;
+		const here = mine.filter((i) => appliesTo(i, project));
 		if (!here.length) return "disabled";
 		ids = [...new Set(here.map((i) => i.id))];
 	}
@@ -6957,17 +6961,18 @@ async function uninstall$1(paths, { optOut = false, settleMs = 0, confirm, runne
 	};
 }
 async function takeOutAutoUpdate({ claudeDir, settings }) {
-	let marketplace;
+	let added;
 	try {
-		marketplace = JSON.parse(await fs.readFile(path.join(claudeDir, "isoplan", "update.json"), "utf8")).autoUpdateOn;
+		added = JSON.parse(await fs.readFile(path.join(claudeDir, "isoplan", "update.json"), "utf8")).autoUpdateOn;
 	} catch {
 		return null;
 	}
-	if (typeof marketplace !== "string") return null;
+	const { marketplace, entry: left } = added && typeof added === "object" ? added : {};
+	if (typeof marketplace !== "string" || typeof left !== "string") return null;
 	const current = await readSettings(settings);
 	const known = current.extraKnownMarketplaces;
 	const entry = known && typeof known === "object" ? known[marketplace] : void 0;
-	if (!entry || typeof entry !== "object" || entry.autoUpdate !== true) return null;
+	if (!entry || typeof entry !== "object" || entry.autoUpdate !== true || JSON.stringify(entry) !== left) return null;
 	delete entry.autoUpdate;
 	await writeSettings(settings, current);
 	return `took out the auto-update the plugin turned on for the ${marketplace} marketplace in ${settings}`;

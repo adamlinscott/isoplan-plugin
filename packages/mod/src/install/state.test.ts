@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { expect, test } from "vitest";
 import { tempRoot } from "../data-layer/fixture.js";
-import { installedPlugins, newestDataLayer, pluginIdOf, pluginState } from "./state.js";
+import { installedPlugins, newestDataLayer, newestFirst, pluginIdOf, pluginState, type Install } from "./state.js";
 
 const ID = "isoplan@isoplan";
 
@@ -182,4 +182,30 @@ test("newest data layer: its own folder, however the record spells it, is never 
   const spelled = own.folder.replace(/\\/g, "/") + "/";
   s.installed({ [ID]: [{ scope: "user", installPath: process.platform === "linux" ? spelled : spelled.toUpperCase(), version: "0.3.0" }] });
   expect(await newestDataLayer(s.place.plugins, own.dataLayer)).toBe(own.dataLayer);
+});
+
+test("newest data layer: only the installs that apply to the session's project count, as for enabled and disabled", async () => {
+  const s = setup();
+  const user = copy(s, "0.3.0");
+  const other = copy(s, "0.4.0");
+  const repoX = path.join(s.root, "x");
+  const repoY = path.join(s.root, "y");
+  s.installed({ [ID]: [{ scope: "user", installPath: user.folder, version: "0.3.0" }, { scope: "project", projectPath: repoX, installPath: other.folder, version: "0.4.0" }] });
+  // A session in repo Y loads the user's 0.3.0, which stays current there; in repo X, 0.4.0 is newer.
+  expect(await newestDataLayer(s.place.plugins, user.dataLayer, repoY)).toBe(user.dataLayer);
+  expect(await newestDataLayer(s.place.plugins, user.dataLayer, repoX)).toBe(other.dataLayer);
+  expect(await newestDataLayer(s.place.plugins, other.dataLayer, repoX)).toBe(other.dataLayer);
+  // A local install for repo X counts only there too.
+  s.installed({ [ID]: [{ scope: "user", installPath: user.folder, version: "0.3.0" }, { scope: "local", projectPath: repoX, installPath: other.folder, version: "0.4.0" }] });
+  expect(await newestDataLayer(s.place.plugins, user.dataLayer, repoY)).toBe(user.dataLayer);
+});
+
+test("newest first: by semantic version, a pre-release below its release, when every version is one; else all by when they were updated", () => {
+  const at = (version: string | null, lastUpdated: string | null): Install => ({ id: ID, scope: "user", projectPath: null, installPath: `/c/${version}`, version, lastUpdated });
+  const order = (list: Install[]) => newestFirst(list).map((i) => i.version);
+  expect(order([at("0.3.0", "3"), at("0.10.0", "1"), at("0.3.0-rc.2", "5"), at("0.3.0-rc.10", "4"), at("0.3.0-beta", "6"), at("0.9.9", "2")])).toEqual(["0.10.0", "0.9.9", "0.3.0", "0.3.0-rc.10", "0.3.0-rc.2", "0.3.0-beta"]);
+  // One commit SHA among them: the whole list goes by lastUpdated, so the order is one order.
+  const mixed = [at("0.3.0", "2026-10-29"), at("a1b2c3d4e5f6", "2026-10-30"), at("0.4.0", "2026-10-28"), at(null, null)];
+  expect(order(mixed)).toEqual(["a1b2c3d4e5f6", "0.3.0", "0.4.0", null]);
+  expect(order([...mixed].reverse())).toEqual(order(mixed));
 });

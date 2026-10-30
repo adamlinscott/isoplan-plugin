@@ -92,7 +92,7 @@ test("check: refreshes the marketplace, then updates the plugin, hidden, in the 
       'claude plugin update isoplan@isoplan: ✔ Plugin "isoplan" updated from 6658f568c1e1 to a1b2c3d4e5f6 for scope user. Restart to apply changes.',
     ],
   });
-  expect(JSON.parse(fs.readFileSync(updateRecordPath(s.claudeDir), "utf8"))).toEqual({ checkedAt: 1_000_000, autoUpdateOn: "isoplan" });
+  expect(JSON.parse(fs.readFileSync(updateRecordPath(s.claudeDir), "utf8"))).toEqual({ checkedAt: 1_000_000, autoUpdateOn: { marketplace: "isoplan", entry: JSON.stringify({ source: SOURCE, autoUpdate: true }), at: 1_000_000 } });
   expect(fs.existsSync(updateLockPath(s.claudeDir))).toBe(false);
 });
 
@@ -151,7 +151,8 @@ test("check: a command that can't start or ran out of time says so", async () =>
 });
 
 test("command env: no prompts from git or ssh, and none of the session's own variables", () => {
-  const env = commandEnv({ PATH: "/bin", CLAUDE_CONFIG_DIR: "/c", CLAUDECODE: "1", CLAUDE_CODE_SESSION_ID: "s", CLAUDE_CODE_MESSAGING_TOKEN: "t", GIT_DIR: "/elsewhere" }, "/bin/node");
+  const none = { sshCommand: false, askPass: false };
+  const env = commandEnv({ PATH: "/bin", CLAUDE_CONFIG_DIR: "/c", CLAUDECODE: "1", CLAUDE_CODE_SESSION_ID: "s", CLAUDE_CODE_MESSAGING_TOKEN: "t", GIT_DIR: "/elsewhere" }, none, "/bin/node");
   expect(env).toEqual({
     PATH: "/bin",
     CLAUDE_CONFIG_DIR: "/c",
@@ -162,8 +163,16 @@ test("command env: no prompts from git or ssh, and none of the session's own var
     SSH_ASKPASS: "/bin/node",
     SSH_ASKPASS_REQUIRE: "never",
   });
-  // A person's own ssh is kept.
+  // A person's own ssh and askpass are kept, from the environment or git's config; the prompts stay off.
   expect(commandEnv({ GIT_SSH_COMMAND: "ssh -i key" }).GIT_SSH_COMMAND).toBe("ssh -i key");
+  expect(commandEnv({}, { sshCommand: true, askPass: false }).GIT_SSH_COMMAND).toBeUndefined();
+  const askPass = commandEnv({ GIT_ASKPASS: "/usr/bin/my-askpass" }, none, "/bin/node");
+  expect(askPass).toMatchObject({ GIT_ASKPASS: "/usr/bin/my-askpass", GIT_TERMINAL_PROMPT: "0", GCM_INTERACTIVE: "never" });
+  expect(askPass.SSH_ASKPASS).toBeUndefined();
+  expect(commandEnv({ SSH_ASKPASS: "/x" }, none).GIT_ASKPASS).toBeUndefined();
+  const configured = commandEnv({}, { sshCommand: false, askPass: true });
+  expect(configured.GIT_ASKPASS).toBeUndefined();
+  expect(configured).toMatchObject({ GIT_TERMINAL_PROMPT: "0", GCM_INTERACTIVE: "never" });
 });
 
 test("run hidden: a command past its time is stopped with what it started; one that can't start says why", async () => {
@@ -183,4 +192,22 @@ test("run hidden: a command past its time is stopped with what it started; one t
   expect(missing.code).toBeNull();
   expect(missing.error).toMatch(/^couldn't start .*no-such-claude: .*ENOENT/);
   expect((await runHidden([process.execPath, "-e", "process.exit(3)"], root)).code).toBe(3);
+});
+
+test("run hidden: done once the command exits, though a process it left behind (an ssh ControlMaster, say) holds its output open", async () => {
+  const root = tempRoot();
+  const pidFile = path.join(root, "left.pid");
+  const script = `const c = require("child_process").spawn(process.execPath, ["-e", "setTimeout(() => {}, 30000)"], { stdio: "inherit", windowsHide: true }); require("fs").writeFileSync(${JSON.stringify(pidFile)}, String(c.pid)); console.log("updated"); c.unref(); process.exit(0);`;
+  const started = Date.now();
+  try {
+    const r = await runHidden([process.execPath, "-e", script], root, { env: commandEnv(process.env), timeoutMs: 20000 });
+    expect(r).toEqual({ code: 0, output: expect.stringContaining("updated") });
+    expect(Date.now() - started).toBeLessThan(10000);
+  } finally {
+    try {
+      process.kill(Number(fs.readFileSync(pidFile, "utf8")));
+    } catch {
+      // Gone already.
+    }
+  }
 });

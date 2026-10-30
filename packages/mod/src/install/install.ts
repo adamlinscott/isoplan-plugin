@@ -315,19 +315,21 @@ export async function uninstall(paths: Paths, { optOut = false, settleMs = 0, co
 }
 
 // Takes out the `"autoUpdate": true` the update check put on its marketplace's entry in settings.json
-// (src/update), as update.json records; one the person set, or changed since, stays.
+// (src/update), only when update.json records that it did and the entry is still exactly as it left
+// it. When unsure (the person set it, or changed the entry since), auto-update stays on.
 async function takeOutAutoUpdate({ claudeDir, settings }: Paths): Promise<string | null> {
-  let marketplace: unknown;
+  let added: unknown;
   try {
-    marketplace = (JSON.parse(await fs.readFile(path.join(claudeDir, "isoplan", "update.json"), "utf8")) as { autoUpdateOn?: unknown }).autoUpdateOn;
+    added = (JSON.parse(await fs.readFile(path.join(claudeDir, "isoplan", "update.json"), "utf8")) as { autoUpdateOn?: unknown }).autoUpdateOn;
   } catch {
     return null;
   }
-  if (typeof marketplace !== "string") return null;
+  const { marketplace, entry: left } = (added && typeof added === "object" ? added : {}) as { marketplace?: unknown; entry?: unknown };
+  if (typeof marketplace !== "string" || typeof left !== "string") return null;
   const current = await readSettings(settings);
   const known = current.extraKnownMarketplaces as Json | undefined;
   const entry = known && typeof known === "object" ? (known[marketplace] as Json | undefined) : undefined;
-  if (!entry || typeof entry !== "object" || entry.autoUpdate !== true) return null;
+  if (!entry || typeof entry !== "object" || entry.autoUpdate !== true || JSON.stringify(entry) !== left) return null;
   delete entry.autoUpdate;
   await writeSettings(settings, current);
   return `took out the auto-update the plugin turned on for the ${marketplace} marketplace in ${settings}`;

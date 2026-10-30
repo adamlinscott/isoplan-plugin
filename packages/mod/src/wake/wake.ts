@@ -45,7 +45,7 @@ export async function wake(input: string, { claudeDir, spawn, isAlive = alive, p
   if (typeof recorded !== "string") return false;
   // Claude Code may have installed a newer version since: that one reports, until a session that
   // loads it records itself.
-  const dataLayer = plugins ? await newestDataLayer(plugins, recorded).catch(() => recorded) : recorded;
+  const dataLayer = plugins ? await newestDataLayer(plugins, recorded, project).catch(() => recorded) : recorded;
   if (!(await fs.stat(dataLayer).then((s) => s.isFile(), () => false))) return false;
   spawn([dataLayer, "--session", sessionId, "--cwd", cwd, ...(project ? ["--project", project] : []), "--detached"], cwd);
   return true;

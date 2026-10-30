@@ -146,7 +146,14 @@ function versions(server = "ws://127.0.0.1:9/data-layer") {
     const exited = new Promise<number | null>((resolve) => child.on("exit", (c) => resolve((code = c))));
     return { pid: child.pid!, hasExited: () => code !== undefined, lines: () => out.split("\n").filter(Boolean).map((l) => JSON.parse(l) as { type: string; text?: string }), exited };
   };
-  return { claudeDir, lock, run, holder: () => JSON.parse(fs.readFileSync(lock, "utf8")).pid as number };
+  // A lock as another window's plugin data layer writes it, by this test's own (live) pid.
+  const held = (version: string, since: number, ageMs = 0) => {
+    fs.mkdirSync(path.dirname(lock), { recursive: true });
+    fs.writeFileSync(lock, JSON.stringify({ pid: process.pid, dataLayer: path.join(folder(version), "dist", "data-layer.js"), detached: false, since, parent: process.pid }));
+    const t = new Date(Date.now() - ageMs);
+    fs.utimesSync(lock, t, t);
+  };
+  return { claudeDir, lock, run, held, holder: () => (fs.existsSync(lock) ? (JSON.parse(fs.readFileSync(lock, "utf8")).pid as number) : null) };
 }
 
 test("a copy in the plugin cache that an update left behind says so, installs nothing and checks for nothing; a detached one leaves the session to the new one", async () => {
@@ -176,7 +183,7 @@ test("after /reload-plugins the old version's data layer leaves the session to t
   const reloaded = v.run("0.3.0");
   expect(await old.exited).toBe(0);
   expect(old.lines().some((l) => l.text?.includes("a reload started reports this session now"))).toBe(true);
-  expect(old.lines().at(-1)).toEqual({ type: "superseded" });
+  expect(old.lines().at(-1)).toEqual({ type: "superseded", reason: "newer" });
   await wait(2500);
   expect(reloaded.hasExited()).toBe(false);
   expect(v.holder()).toBe(reloaded.pid);
@@ -184,13 +191,38 @@ test("after /reload-plugins the old version's data layer leaves the session to t
   // The old version started again (its hooks module wasn't unloaded) leaves at once, without taking the session.
   const restarted = v.run("0.2.0");
   expect(await restarted.exited).toBe(0);
-  expect(restarted.lines()).toContainEqual({ type: "superseded" });
+  expect(restarted.lines()).toContainEqual({ type: "superseded", reason: "newer" });
   expect(v.holder()).toBe(reloaded.pid);
 
-  // A reload with no new version: the data layer it starts keeps the session.
+  // A reload with no new version, or the session opened in a second window: the later start keeps it.
   const again = v.run("0.3.0");
   expect(await reloaded.exited).toBe(0);
+  expect(reloaded.lines().at(-1)).toEqual({ type: "superseded", reason: "window" });
   await wait(2500);
   expect(again.hasExited()).toBe(false);
   expect(v.holder()).toBe(again.pid);
+});
+
+test("a data layer never gives the session up to an older or equal holder, nor to one whose lock went stale", async () => {
+  const v = versions();
+  const gaveUp = (r: ReturnType<typeof v.run>) => r.lines().some((l) => l.type === "superseded");
+  // Outdated (0.2.0 here), but the holder is no newer: an older or equal window's data layer that started first.
+  v.held("0.2.0", Date.now() - 60000);
+  const equal = v.run("0.2.0");
+  await until(() => v.holder() === equal.pid);
+  expect(gaveUp(equal)).toBe(false);
+  children.splice(0).forEach((c) => c.kill());
+
+  // The newest copy and a later window, but its lock hasn't been refreshed for five minutes: its pid may be another process's.
+  v.held("0.3.0", Date.now() + 60000, 5 * 60000);
+  const stale = v.run("0.2.0");
+  await until(() => v.holder() === stale.pid);
+  expect(gaveUp(stale)).toBe(false);
+  children.splice(0).forEach((c) => c.kill());
+
+  // The same holder, fresh: it is given the session.
+  v.held("0.3.0", Date.now() + 60000);
+  const fresh = v.run("0.2.0");
+  expect(await fresh.exited).toBe(0);
+  expect(fresh.lines()).toContainEqual({ type: "superseded", reason: "newer" });
 });

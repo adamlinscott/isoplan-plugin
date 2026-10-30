@@ -6576,17 +6576,25 @@ function normalPath(p, platform = process.platform) {
 	const resolved = path.resolve(p).replace(/\\/g, "/");
 	return platform === "win32" || platform === "darwin" ? resolved.toLowerCase() : resolved;
 }
-function cacheParts(plugins, file) {
-	const relative = path.relative(path.join(plugins, "cache"), path.resolve(file));
+function cacheParts(cache, file) {
+	const relative = path.relative(cache, path.resolve(file));
 	if (path.isAbsolute(relative)) return null;
 	const parts = relative.split(path.sep);
 	return parts.length >= 4 && parts[0] !== ".." ? parts : null;
 }
+async function realCacheParts(plugins, file) {
+	const cache = await fs.realpath(path.join(plugins, "cache")).catch(() => path.join(plugins, "cache"));
+	return {
+		cache,
+		parts: cacheParts(cache, await fs.realpath(file).catch(() => file))
+	};
+}
 /** The id, `<plugin>@<marketplace>`, of the marketplace install `file` is part of; null for a file outside the plugin cache. */
 function pluginIdOf(plugins, file) {
-	const parts = cacheParts(plugins, file);
+	const parts = cacheParts(path.join(plugins, "cache"), file);
 	return parts ? `${parts[1]}@${parts[0]}` : null;
 }
+const appliesTo = (install, project) => !project || !(install.scope === "project" || install.scope === "local") || !install.projectPath || normalPath(install.projectPath) === normalPath(project);
 const KEY_FILES = [
 	["dist", "data-layer.js"],
 	["dist", "wake.js"],
@@ -6594,41 +6602,62 @@ const KEY_FILES = [
 	[".claude-plugin", "plugin.json"]
 ];
 /**
-* The data layer of the newest copy of its plugin Claude Code records, at any scope: by version
-* (as numbers when both are x.y.z, else the one updated last), counting only a folder that holds
-* KEY_FILES and whose plugin.json names the recorded version (a plugin.json naming none counts, its
-* version came from elsewhere). `dataLayer` itself when that copy is its own folder, when it is
-* outside the cache, or when no record reads. A data layer this doesn't return is outdated: an
-* update put another version on disk, which a session loads at its next start or /reload-plugins.
+* The data layer of the newest copy of its plugin Claude Code records for a session in `project`
+* (`appliesTo`, as `pluginState` counts installs): by version when every one is x.y.z, else by
+* which was updated last (`newestFirst`), counting only a folder that holds KEY_FILES and whose
+* plugin.json names the recorded version (a plugin.json naming none counts, its version came from
+* elsewhere). `dataLayer` itself when that copy is its own folder, when it is outside the cache, or
+* when no record reads. A data layer this doesn't return is outdated: an update put another version
+* on disk, which the session loads at its next start or /reload-plugins.
 */
-async function newestDataLayer(plugins, dataLayer) {
-	const parts = cacheParts(plugins, dataLayer);
+async function newestDataLayer(plugins, dataLayer, project) {
+	const { cache, parts } = await realCacheParts(plugins, dataLayer);
 	if (!parts) return dataLayer;
 	const id = `${parts[1]}@${parts[0]}`;
-	const root = await realPath(path.join(plugins, "cache", ...parts.slice(0, 3)));
-	const recorded = (await installs(plugins) ?? []).filter((i) => i.id === id && i.installPath).sort(newerFirst);
+	const root = await realPath(path.join(cache, ...parts.slice(0, 3)));
+	const recorded = newestFirst((await installs(plugins) ?? []).filter((i) => i.id === id && i.installPath && appliesTo(i, project)));
 	for (const install of recorded) {
 		if (await realPath(install.installPath) === root) return dataLayer;
 		if (await isComplete(install)) return path.join(install.installPath, ...parts.slice(3));
 	}
 	return dataLayer;
 }
-function newerFirst(a, b) {
-	const va = semver(a.version);
-	const vb = semver(b.version);
-	if (va && vb) {
-		for (let i = 0; i < 3; i++) if (va[i] !== vb[i]) return vb[i] - va[i];
-	}
-	return (b.lastUpdated ?? "").localeCompare(a.lastUpdated ?? "");
+/**
+* Installs newest first, in one order for the whole list: by semantic version when every install's
+* version is one (a pre-release below its release), else by `lastUpdated`, latest first.
+*/
+function newestFirst(list) {
+	const versions = list.map((i) => semver(i.version));
+	if (!versions.every(Boolean)) return [...list].sort((a, b) => (b.lastUpdated ?? "").localeCompare(a.lastUpdated ?? ""));
+	return list.map((install, k) => ({
+		install,
+		v: versions[k]
+	})).sort((a, b) => compareSemver(b.v, a.v)).map((x) => x.install);
 }
 const semver = (version) => {
-	const m = version ? /^(\d+)\.(\d+)\.(\d+)/.exec(version) : null;
-	return m ? [
-		Number(m[1]),
-		Number(m[2]),
-		Number(m[3])
-	] : null;
+	const m = version ? /^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?$/.exec(version) : null;
+	return m ? {
+		core: [
+			Number(m[1]),
+			Number(m[2]),
+			Number(m[3])
+		],
+		pre: m[4] ? m[4].split(".") : null
+	} : null;
 };
+function compareSemver(a, b) {
+	for (let i = 0; i < 3; i++) if (a.core[i] !== b.core[i]) return a.core[i] - b.core[i];
+	if (!a.pre || !b.pre) return (a.pre ? -1 : 0) - (b.pre ? -1 : 0);
+	for (let i = 0; i < Math.min(a.pre.length, b.pre.length); i++) {
+		const [x, y] = [a.pre[i], b.pre[i]];
+		if (x === y) continue;
+		const [nx, ny] = [/^\d+$/.test(x), /^\d+$/.test(y)];
+		if (nx && ny) return Number(x) - Number(y);
+		if (nx !== ny) return nx ? -1 : 1;
+		return x < y ? -1 : 1;
+	}
+	return a.pre.length - b.pre.length;
+}
 async function isComplete(install) {
 	for (const file of KEY_FILES) if (!await fs.stat(path.join(install.installPath, ...file)).then((s) => s.isFile(), () => false)) return false;
 	const manifest = await readJson(path.join(install.installPath, ".claude-plugin", "plugin.json"));
@@ -6665,15 +6694,16 @@ async function enabledIn(file, id) {
 * managed files, the user's settings, and every install.
 */
 async function pluginState(place, dataLayer, project) {
-	const id = pluginIdOf(place.plugins, dataLayer);
-	if (!id) return "enabled";
+	const { parts } = await realCacheParts(place.plugins, dataLayer);
+	if (!parts) return "enabled";
+	const id = `${parts[1]}@${parts[0]}`;
 	const name = nameOf(id);
 	const all = await installs(place.plugins);
 	let ids = [id];
 	if (all) {
 		const mine = all.filter((i) => nameOf(i.id) === name);
 		if (!mine.length) return await isInPluginDirs(place.pluginDirs ?? [], name) ? "enabled" : "uninstalled";
-		const here = project ? mine.filter((i) => !(i.scope === "project" || i.scope === "local") || !i.projectPath || normalPath(i.projectPath) === normalPath(project)) : mine;
+		const here = mine.filter((i) => appliesTo(i, project));
 		if (!here.length) return "disabled";
 		ids = [...new Set(here.map((i) => i.id))];
 	}
@@ -8915,6 +8945,7 @@ const updateLockPath = (claudeDir) => path.join(claudeDir, "isoplan", "update.lo
 const START_GAP_MS = 6e5;
 /** The most each `claude plugin` command may take. */
 const COMMAND_TIMEOUT_MS = 3e5;
+const EXIT_GRACE_MS = 1e3;
 /** The variables that turn updates off, and the one that turns plugin updates back on. */
 const OFF_VARIABLES = [
 	"DISABLE_UPDATES",
@@ -8930,21 +8961,45 @@ function updatesOffBy(env) {
 /**
 * The environment the commands run with: this one's without the session's own variables (as the
 * runner's fork, claude.ts), and nothing that can prompt (as a handoff's git, handoff/git.ts). The
-* askpass is node, which takes git's prompt for a script it can't find and fails, so git gives up
-* at once instead of asking.
+* askpass, where the person set none (GIT_ASKPASS, SSH_ASKPASS, core.askPass), is node, which takes
+* git's prompt for a script it can't find and fails, so git gives up at once instead of asking.
 */
-function commandEnv(env, node = process.execPath) {
-	return {
-		...noPromptEnv(forkEnv(env)),
+function commandEnv(env, git = {
+	sshCommand: false,
+	askPass: false
+}, node = process.execPath) {
+	const out = noPromptEnv(forkEnv(env), git.sshCommand);
+	if (!git.askPass && !out.GIT_ASKPASS && !out.SSH_ASKPASS) Object.assign(out, {
 		GIT_ASKPASS: node,
 		SSH_ASKPASS: node,
 		SSH_ASKPASS_REQUIRE: "never"
+	});
+	return out;
+}
+/** What git's config sets for core.sshCommand and core.askPass, as `cwd` sees it; nothing set when git can't say. */
+async function gitChoices(cwd, env = process.env) {
+	const set = async (key) => {
+		const r = await runHidden([
+			"git",
+			"config",
+			"--get",
+			key
+		], cwd, {
+			env: noPromptEnv(forkEnv(env), true),
+			timeoutMs: 15e3
+		});
+		return r.code === 0 && r.output.trim() !== "";
+	};
+	return {
+		sshCommand: await set("core.sshCommand"),
+		askPass: await set("core.askPass")
 	};
 }
 /**
-* Runs a command by argv, with no shell and no window, and keeps the end of what it printed. Past
-* `timeoutMs` it is stopped with everything it started (on Windows taskkill /T; elsewhere its
-* process group, which it leads).
+* Runs a command by argv, with no shell and no window, and keeps the end of what it printed. It is
+* done when the command exits: what it printed by then, and within EXIT_GRACE_MS, is kept, and its
+* pipes are let go even if a process it left behind holds them. Past `timeoutMs` it is stopped with
+* everything it started (on Windows taskkill /T; elsewhere its process group, which it leads).
 */
 function runHidden(argv, cwd, { env = commandEnv(process.env), timeoutMs = COMMAND_TIMEOUT_MS } = {}) {
 	return new Promise((resolve) => {
@@ -8969,6 +9024,15 @@ function runHidden(argv, cwd, { env = commandEnv(process.env), timeoutMs = COMMA
 			timedOut = true;
 			killTree(child);
 		}, timeoutMs);
+		let ended = null;
+		const done = () => {
+			child.stdout.destroy();
+			child.stderr.destroy();
+			resolve({
+				...ended,
+				output
+			});
+		};
 		child.on("error", (err) => {
 			clearTimeout(timer);
 			resolve({
@@ -8977,16 +9041,18 @@ function runHidden(argv, cwd, { env = commandEnv(process.env), timeoutMs = COMMA
 				error: `couldn't start ${argv[0]}: ${err.message}`
 			});
 		});
-		child.on("close", (code) => {
+		child.on("exit", (code) => {
 			clearTimeout(timer);
-			resolve(timedOut ? {
+			ended = timedOut ? {
 				code: null,
 				output,
 				error: `didn't finish within ${Math.round(timeoutMs / 1e3)} s, so it was stopped`
 			} : {
 				code,
 				output
-			});
+			};
+			const grace = setTimeout(done, EXIT_GRACE_MS);
+			child.on("close", () => (clearTimeout(grace), done()));
 		});
 	});
 }
@@ -9032,7 +9098,7 @@ function updateRuns(list, id, cwd) {
 	return [...runs.values()];
 }
 /** One check (see above), unless another is running or one started within `gapMs`. */
-async function checkForUpdate({ claudeDir, settings, plugins, id, cwd, claude, gapMs, run = runHidden, now = Date.now, isAlive = alive }) {
+async function checkForUpdate({ claudeDir, settings, plugins, id, cwd, claude, env = commandEnv(process.env), gapMs, run = (argv, at, e) => runHidden(argv, at, { env: e }), now = Date.now, isAlive = alive }) {
 	const lock = updateLockPath(claudeDir);
 	if (!await takeLock(lock, process.pid, isAlive, false, now(), { freshMs: 3e6 })) return {
 		ran: false,
@@ -9053,11 +9119,16 @@ async function checkForUpdate({ claudeDir, settings, plugins, id, cwd, claude, g
 		const turnedOn = await turnOnAutoUpdate(settings, marketplace).catch((err) => `couldn't turn on Claude Code's auto-update for ${marketplace}: ${err.message}`);
 		if (turnedOn) said.push(turnedOn);
 		if (turnedOn?.startsWith("turned on")) {
-			record.autoUpdateOn = marketplace;
+			const entry = (await readSettings(settings)).extraKnownMarketplaces[marketplace];
+			record.autoUpdateOn = {
+				marketplace,
+				entry: JSON.stringify(entry),
+				at: now()
+			};
 			await write();
 		}
 		const say = async (args, at) => {
-			const r = await run([...claude, ...args], at);
+			const r = await run([...claude, ...args], at, env);
 			const failed = r.error ?? (r.code === null ? "didn't finish" : r.code !== 0 ? `failed with exit code ${r.code}` : null);
 			said.push(`claude ${args.join(" ")}: ${[failed, lastLine(r.output)].filter(Boolean).join(": ")}`);
 			return !failed;
@@ -10293,6 +10364,7 @@ const cmp = (a, b) => a < b ? -1 : a > b ? 1 : 0;
 //#region src/data-layer/main.ts
 const LOG_CAP_BYTES = 65536;
 const DORMANT_MS = 3e4;
+const LOCK_FRESH_MS = 3 * DORMANT_MS;
 const value = (argv, flag) => {
 	const i = argv.indexOf(flag);
 	return i >= 0 && argv[i + 1] && !argv[i + 1].startsWith("--") ? argv[i + 1] : null;
@@ -10364,11 +10436,15 @@ async function main(argv) {
 		});
 		return 0;
 	}
+	const since = Number(value(argv, "--since")) || Date.now();
 	const lockExtra = {
 		dataLayer: self,
-		detached
+		detached,
+		since,
+		parent: process.ppid
 	};
-	const isOutdated = async () => await newestDataLayer(place.plugins, self).catch(() => self) !== self;
+	const newest = () => newestDataLayer(place.plugins, self, project).catch(() => self);
+	const isOutdated = async () => await newest() !== self;
 	let outdated = await isOutdated();
 	if (detached && outdated) {
 		emit({
@@ -10378,14 +10454,32 @@ async function main(argv) {
 		await logging;
 		return 0;
 	}
-	const isSuperseded = async () => {
+	const supersededBy = async () => {
 		const held = await readLock(lock);
-		const other = held?.pid && held.pid !== process.pid && alive(held.pid) && held.extra.detached === false && typeof held.extra.dataLayer === "string" ? held.extra.dataLayer : null;
-		return !!other && (outdated || (outdated = await isOutdated()) || normalPath(other) === normalPath(self));
+		if (!held?.pid || held.pid === process.pid || !alive(held.pid) || Date.now() - held.mtimeMs >= LOCK_FRESH_MS) return null;
+		const { dataLayer: other, detached: otherDetached, since: otherSince, parent } = held.extra;
+		if (otherDetached !== false || typeof other !== "string") return null;
+		if (normalPath(other) === normalPath(self)) return typeof otherSince === "number" && otherSince > since && typeof parent === "number" && alive(parent) ? "window" : null;
+		const current = await newest();
+		outdated = current !== self;
+		return outdated && normalPath(current) === normalPath(other) ? "newer" : null;
 	};
-	if (!detached && outdated && await isSuperseded()) {
-		emit({ type: "superseded" });
-		return 0;
+	const leave = (reason) => {
+		emit({
+			type: "log",
+			text: reason === "newer" ? "stopping: the newer version's data layer that a reload started reports this session now" : "stopping: the session's newer window reports it now"
+		});
+		emit({
+			type: "superseded",
+			reason
+		});
+	};
+	if (!detached) {
+		const reason = await supersededBy();
+		if (reason) {
+			leave(reason);
+			return 0;
+		}
 	}
 	try {
 		if (!await takeLock(lock, process.pid, alive, !detached, Date.now(), { extra: lockExtra })) {
@@ -10456,6 +10550,7 @@ async function main(argv) {
 				id: pluginId,
 				cwd: project,
 				claude: claudeCommand(binary),
+				env: commandEnv(process.env, await gitChoices(project)),
 				gapMs
 			});
 			for (const text of checked.said) emit({
@@ -10642,16 +10737,13 @@ async function main(argv) {
 		const isFirstPass = passes++ === 0;
 		if (!detached) {
 			if (await lockHolder(lock) !== process.pid) {
-				if (await isSuperseded()) {
-					emit({
-						type: "log",
-						text: "stopping: the plugin's data layer that a reload started reports this session now"
-					});
-					emit({ type: "superseded" });
+				const reason = await supersededBy();
+				if (reason) {
+					leave(reason);
 					break;
 				}
 				await takeLock(lock, process.pid, alive, true, Date.now(), { extra: lockExtra }).catch(() => {});
-			}
+			} else await refreshLock(lock, process.pid).catch(() => {});
 		}
 		config = await loadConfig(io, defaultsPath, userConfigPath).catch(() => config);
 		if (!outdated && (outdated = await isOutdated())) {

@@ -13,6 +13,7 @@ function endText(m, late) {
 const RETRY_CAP_MS = 3e4;
 const STABLE_MS = 6e4;
 const SWITCH_CHECK_MS = 1e3;
+const SUPERSEDED_RECHECK_MS = 6e4;
 const NOTE_MAX = 1e3;
 const ASK_TIMEOUT_MS = 42e4;
 const RUNNING = /* @__PURE__ */ new Set([
@@ -41,7 +42,7 @@ const floorWaits = /* @__PURE__ */ new Map();
 let waitsDir = null;
 let shownStatus;
 let updated = false;
-let superseded = false;
+let superseded = null;
 let marking = Promise.resolve();
 function register(on) {
 	on("session.start", async ($, e, next) => {
@@ -130,8 +131,9 @@ async function checkSession($) {
 async function run($) {
 	const script = $.plugin.root.replace(/\\/g, "/") + "/dist/data-layer.js";
 	let failures = 0;
+	const since = await $.clock.now();
 	for (;;) {
-		if (!await $.fs.exists(script).catch(() => true)) {
+		if (!await isThere($, script)) {
 			updated = true;
 			show($, void 0);
 			return;
@@ -164,7 +166,9 @@ async function run($) {
 					"--session",
 					session,
 					"--cwd",
-					cwd
+					cwd,
+					"--since",
+					String(since)
 				],
 				cwd
 			});
@@ -200,9 +204,12 @@ async function run($) {
 		}
 		stop = null;
 		if (superseded) {
-			updated = true;
-			show($, void 0);
-			return;
+			if (superseded === "newer") updated = true;
+			show($, superseded === "newer" ? void 0 : "Isoplan: this session is reported from its other window");
+			superseded = null;
+			failures = 0;
+			await $.clock.sleep(SUPERSEDED_RECHECK_MS);
+			continue;
 		}
 		if (switched) {
 			failures = 0;
@@ -231,7 +238,7 @@ function handle($, text) {
 			show($, shownStatus);
 			break;
 		case "superseded":
-			superseded = true;
+			superseded = line.reason;
 			break;
 		case "title-ask":
 			writeTitle($, line);
@@ -397,6 +404,13 @@ function writeTitle($, ask) {
 	}).catch((err) => $.ui.log("isoplan: could not write a room title: " + message(err), { to: "debug" })).finally(() => {
 		asking = false;
 	});
+}
+async function isThere($, file) {
+	try {
+		return typeof $.fs.exists !== "function" || await $.fs.exists(file) !== false;
+	} catch {
+		return true;
+	}
 }
 const message = (err) => String(err && err.message || err);
 //#endregion

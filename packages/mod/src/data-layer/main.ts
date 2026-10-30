@@ -37,11 +37,14 @@
 // its data layer exits, then unreachable.
 //
 // One data layer reports a session: each takes <claude dir>/isoplan/live/<session>.json (src/wake/
-// lock.ts), naming its own script and whether it is detached. A detached one exits at once if
-// another holds it, and as soon as the plugin's takes it over. The plugin's takes it regardless,
-// and goes on without it if the folder can't be written. It takes it back each pass if a detached
-// one or an older version's took it; when the plugin's data layer of the newest version holds it,
-// or another of its own version that started later (a /reload-plugins started it), it exits.
+// lock.ts), naming its own script, whether it is detached, when its window's hooks module started
+// (`--since`) and that window's Claude Code process, and refreshes it each pass. A detached one
+// exits at once if another holds it, and as soon as the plugin's takes it over. The plugin's takes
+// it regardless, and goes on without it if the folder can't be written. It takes it back each pass,
+// unless the plugin's data layer holding it, with a fresh lock, is the newest copy for this session
+// while this one isn't, or runs the same copy, started later in a window whose Claude Code is still
+// running (a /reload-plugins, or the session opened in a second window): then it says it is
+// `superseded` and exits, never for an older or equal holder.
 
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
@@ -57,9 +60,9 @@ import { claudeBinary, claudeCommand, findClaude } from "../runner/claude-binary
 import { loadPatterns, type Pattern } from "../runner/scan.js";
 import { startRunner } from "../runner/start.js";
 import { recentSessions } from "../sweep/find.js";
-import { checkForUpdate, START_GAP_MS, updatesOffBy } from "../update/update.js";
+import { checkForUpdate, commandEnv, gitChoices, START_GAP_MS, updatesOffBy } from "../update/update.js";
 import { backfill } from "../wake/backfill.js";
-import { alive, HOLD_OFF_MS, holdOff, lockHolder, lockPath, readLock, releaseLock, takeLock } from "../wake/lock.js";
+import { alive, HOLD_OFF_MS, holdOff, lockHolder, lockPath, readLock, refreshLock, releaseLock, takeLock } from "../wake/lock.js";
 import { approvedPath, createApproved, createSessionGate, type Dormancy } from "./approved.js";
 import { forOffice } from "./attribution.js";
 import { candidatesOf, inRepos } from "./home.js";
@@ -79,6 +82,9 @@ import { cleanTitle, nextTitle, TITLE_SYSTEM, type TitleCache } from "./titles.j
 const LOG_CAP_BYTES = 64 * 1024;
 // How long a session the office doesn't take waits between passes.
 const DORMANT_MS = 30000;
+// A session lock its holder hasn't refreshed for this long (three of its slowest passes) counts for
+// nothing when a data layer decides whether to give the session up: the pid may have been reused.
+const LOCK_FRESH_MS = 3 * DORMANT_MS;
 
 const value = (argv: string[], flag: string) => {
   const i = argv.indexOf(flag);
@@ -158,9 +164,12 @@ async function main(argv: string[]): Promise<number> {
     emit({ type: "log", text: "Claude Code lists the Isoplan plugin as uninstalled or disabled here, so this session isn't reported" });
     return 0;
   }
-  const lockExtra = { dataLayer: self, detached };
-  // Whether Claude Code has put a newer version of the plugin on disk than this one (state.ts).
-  const isOutdated = async () => (await newestDataLayer(place.plugins, self).catch(() => self)) !== self;
+  // When this window's hooks module started: one it starts again keeps its window's place.
+  const since = Number(value(argv, "--since")) || Date.now();
+  const lockExtra = { dataLayer: self, detached, since, parent: process.ppid };
+  // The newest copy of the plugin installed for this session (state.ts): another one means this one is outdated.
+  const newest = () => newestDataLayer(place.plugins, self, project).catch(() => self);
+  const isOutdated = async () => (await newest()) !== self;
   let outdated = await isOutdated();
   if (detached && outdated) {
     emit({ type: "log", text: "a newer version of the Isoplan plugin is installed, so it reports this session instead" });
@@ -168,15 +177,27 @@ async function main(argv: string[]): Promise<number> {
     return 0;
   }
 
-  // The plugin's data layer of this session that a reload started already reports it: this older one leaves it be.
-  const isSuperseded = async () => {
+  // Why this data layer gives the session up to the plugin's data layer holding it (see above), or null.
+  const supersededBy = async (): Promise<"newer" | "window" | null> => {
     const held = await readLock(lock);
-    const other = held?.pid && held.pid !== process.pid && alive(held.pid) && held.extra.detached === false && typeof held.extra.dataLayer === "string" ? held.extra.dataLayer : null;
-    return !!other && (outdated || (outdated = await isOutdated()) || normalPath(other) === normalPath(self));
+    if (!held?.pid || held.pid === process.pid || !alive(held.pid) || Date.now() - held.mtimeMs >= LOCK_FRESH_MS) return null;
+    const { dataLayer: other, detached: otherDetached, since: otherSince, parent } = held.extra;
+    if (otherDetached !== false || typeof other !== "string") return null;
+    if (normalPath(other) === normalPath(self)) return typeof otherSince === "number" && otherSince > since && typeof parent === "number" && alive(parent) ? "window" : null;
+    const current = await newest();
+    outdated = current !== self;
+    return outdated && normalPath(current) === normalPath(other) ? "newer" : null;
   };
-  if (!detached && outdated && (await isSuperseded())) {
-    emit({ type: "superseded" });
-    return 0;
+  const leave = (reason: "newer" | "window") => {
+    emit({ type: "log", text: reason === "newer" ? "stopping: the newer version's data layer that a reload started reports this session now" : "stopping: the session's newer window reports it now" });
+    emit({ type: "superseded", reason });
+  };
+  if (!detached) {
+    const reason = await supersededBy();
+    if (reason) {
+      leave(reason);
+      return 0;
+    }
   }
 
   try {
@@ -223,7 +244,7 @@ async function main(argv: string[]): Promise<number> {
       if ((await pluginState(place, self).catch(() => "enabled")) !== "enabled") return emit({ type: "log", text: "not checking for a newer version of the plugin: it is disabled for this machine" });
       const binary = await claudeBinary(claudeDir, process.env, process.platform, os.homedir());
       if (!binary) return emit({ type: "log", text: "couldn't find the claude binary, so the plugin can't update itself" });
-      const checked = await checkForUpdate({ claudeDir, settings: paths.settings, plugins: place.plugins, id: pluginId, cwd: project, claude: claudeCommand(binary), gapMs });
+      const checked = await checkForUpdate({ claudeDir, settings: paths.settings, plugins: place.plugins, id: pluginId, cwd: project, claude: claudeCommand(binary), env: commandEnv(process.env, await gitChoices(project)), gapMs });
       for (const text of checked.said) emit({ type: "log", text: `update check: ${text}` });
     })()
       .catch((err: unknown) => emit({ type: "log", text: `couldn't check for a newer version of the plugin: ${String((err as Error)?.message ?? err)}` }))
@@ -372,13 +393,13 @@ async function main(argv: string[]): Promise<number> {
     // A detached data layer that stopped may have deleted this one's lock as it went.
     if (!detached) {
       if ((await lockHolder(lock)) !== process.pid) {
-        if (await isSuperseded()) {
-          emit({ type: "log", text: "stopping: the plugin's data layer that a reload started reports this session now" });
-          emit({ type: "superseded" });
+        const reason = await supersededBy();
+        if (reason) {
+          leave(reason);
           break;
         }
         await takeLock(lock, process.pid, alive, true, Date.now(), { extra: lockExtra }).catch(() => {});
-      }
+      } else await refreshLock(lock, process.pid).catch(() => {});
     }
     config = await loadConfig(io, defaultsPath, userConfigPath).catch(() => config);
     if (!outdated && (outdated = await isOutdated())) {

@@ -277,17 +277,20 @@ function normalPath(p, platform = process.platform) {
 	const resolved = path.resolve(p).replace(/\\/g, "/");
 	return platform === "win32" || platform === "darwin" ? resolved.toLowerCase() : resolved;
 }
-function cacheParts(plugins, file) {
-	const relative = path.relative(path.join(plugins, "cache"), path.resolve(file));
+function cacheParts(cache, file) {
+	const relative = path.relative(cache, path.resolve(file));
 	if (path.isAbsolute(relative)) return null;
 	const parts = relative.split(path.sep);
 	return parts.length >= 4 && parts[0] !== ".." ? parts : null;
 }
-/** The id, `<plugin>@<marketplace>`, of the marketplace install `file` is part of; null for a file outside the plugin cache. */
-function pluginIdOf(plugins, file) {
-	const parts = cacheParts(plugins, file);
-	return parts ? `${parts[1]}@${parts[0]}` : null;
+async function realCacheParts(plugins, file) {
+	const cache = await fs.realpath(path.join(plugins, "cache")).catch(() => path.join(plugins, "cache"));
+	return {
+		cache,
+		parts: cacheParts(cache, await fs.realpath(file).catch(() => file))
+	};
 }
+const appliesTo = (install, project) => !project || !(install.scope === "project" || install.scope === "local") || !install.projectPath || normalPath(install.projectPath) === normalPath(project);
 const KEY_FILES = [
 	["dist", "data-layer.js"],
 	["dist", "wake.js"],
@@ -295,41 +298,62 @@ const KEY_FILES = [
 	[".claude-plugin", "plugin.json"]
 ];
 /**
-* The data layer of the newest copy of its plugin Claude Code records, at any scope: by version
-* (as numbers when both are x.y.z, else the one updated last), counting only a folder that holds
-* KEY_FILES and whose plugin.json names the recorded version (a plugin.json naming none counts, its
-* version came from elsewhere). `dataLayer` itself when that copy is its own folder, when it is
-* outside the cache, or when no record reads. A data layer this doesn't return is outdated: an
-* update put another version on disk, which a session loads at its next start or /reload-plugins.
+* The data layer of the newest copy of its plugin Claude Code records for a session in `project`
+* (`appliesTo`, as `pluginState` counts installs): by version when every one is x.y.z, else by
+* which was updated last (`newestFirst`), counting only a folder that holds KEY_FILES and whose
+* plugin.json names the recorded version (a plugin.json naming none counts, its version came from
+* elsewhere). `dataLayer` itself when that copy is its own folder, when it is outside the cache, or
+* when no record reads. A data layer this doesn't return is outdated: an update put another version
+* on disk, which the session loads at its next start or /reload-plugins.
 */
-async function newestDataLayer(plugins, dataLayer) {
-	const parts = cacheParts(plugins, dataLayer);
+async function newestDataLayer(plugins, dataLayer, project) {
+	const { cache, parts } = await realCacheParts(plugins, dataLayer);
 	if (!parts) return dataLayer;
 	const id = `${parts[1]}@${parts[0]}`;
-	const root = await realPath(path.join(plugins, "cache", ...parts.slice(0, 3)));
-	const recorded = (await installs(plugins) ?? []).filter((i) => i.id === id && i.installPath).sort(newerFirst);
+	const root = await realPath(path.join(cache, ...parts.slice(0, 3)));
+	const recorded = newestFirst((await installs(plugins) ?? []).filter((i) => i.id === id && i.installPath && appliesTo(i, project)));
 	for (const install of recorded) {
 		if (await realPath(install.installPath) === root) return dataLayer;
 		if (await isComplete(install)) return path.join(install.installPath, ...parts.slice(3));
 	}
 	return dataLayer;
 }
-function newerFirst(a, b) {
-	const va = semver(a.version);
-	const vb = semver(b.version);
-	if (va && vb) {
-		for (let i = 0; i < 3; i++) if (va[i] !== vb[i]) return vb[i] - va[i];
-	}
-	return (b.lastUpdated ?? "").localeCompare(a.lastUpdated ?? "");
+/**
+* Installs newest first, in one order for the whole list: by semantic version when every install's
+* version is one (a pre-release below its release), else by `lastUpdated`, latest first.
+*/
+function newestFirst(list) {
+	const versions = list.map((i) => semver(i.version));
+	if (!versions.every(Boolean)) return [...list].sort((a, b) => (b.lastUpdated ?? "").localeCompare(a.lastUpdated ?? ""));
+	return list.map((install, k) => ({
+		install,
+		v: versions[k]
+	})).sort((a, b) => compareSemver(b.v, a.v)).map((x) => x.install);
 }
 const semver = (version) => {
-	const m = version ? /^(\d+)\.(\d+)\.(\d+)/.exec(version) : null;
-	return m ? [
-		Number(m[1]),
-		Number(m[2]),
-		Number(m[3])
-	] : null;
+	const m = version ? /^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?$/.exec(version) : null;
+	return m ? {
+		core: [
+			Number(m[1]),
+			Number(m[2]),
+			Number(m[3])
+		],
+		pre: m[4] ? m[4].split(".") : null
+	} : null;
 };
+function compareSemver(a, b) {
+	for (let i = 0; i < 3; i++) if (a.core[i] !== b.core[i]) return a.core[i] - b.core[i];
+	if (!a.pre || !b.pre) return (a.pre ? -1 : 0) - (b.pre ? -1 : 0);
+	for (let i = 0; i < Math.min(a.pre.length, b.pre.length); i++) {
+		const [x, y] = [a.pre[i], b.pre[i]];
+		if (x === y) continue;
+		const [nx, ny] = [/^\d+$/.test(x), /^\d+$/.test(y)];
+		if (nx && ny) return Number(x) - Number(y);
+		if (nx !== ny) return nx ? -1 : 1;
+		return x < y ? -1 : 1;
+	}
+	return a.pre.length - b.pre.length;
+}
 async function isComplete(install) {
 	for (const file of KEY_FILES) if (!await fs.stat(path.join(install.installPath, ...file)).then((s) => s.isFile(), () => false)) return false;
 	const manifest = await readJson(path.join(install.installPath, ".claude-plugin", "plugin.json"));
@@ -366,15 +390,16 @@ async function enabledIn(file, id) {
 * managed files, the user's settings, and every install.
 */
 async function pluginState(place, dataLayer, project) {
-	const id = pluginIdOf(place.plugins, dataLayer);
-	if (!id) return "enabled";
+	const { parts } = await realCacheParts(place.plugins, dataLayer);
+	if (!parts) return "enabled";
+	const id = `${parts[1]}@${parts[0]}`;
 	const name = nameOf(id);
 	const all = await installs(place.plugins);
 	let ids = [id];
 	if (all) {
 		const mine = all.filter((i) => nameOf(i.id) === name);
 		if (!mine.length) return await isInPluginDirs(place.pluginDirs ?? [], name) ? "enabled" : "uninstalled";
-		const here = project ? mine.filter((i) => !(i.scope === "project" || i.scope === "local") || !i.projectPath || normalPath(i.projectPath) === normalPath(project)) : mine;
+		const here = mine.filter((i) => appliesTo(i, project));
 		if (!here.length) return "disabled";
 		ids = [...new Set(here.map((i) => i.id))];
 	}
@@ -440,7 +465,7 @@ async function wake(input, { claudeDir, spawn, isAlive = alive, project, plugins
 	}
 	const { dataLayer: recorded } = JSON.parse(await fs.readFile(wakeRecordPath(claudeDir), "utf8"));
 	if (typeof recorded !== "string") return false;
-	const dataLayer = plugins ? await newestDataLayer(plugins, recorded).catch(() => recorded) : recorded;
+	const dataLayer = plugins ? await newestDataLayer(plugins, recorded, project).catch(() => recorded) : recorded;
 	if (!await fs.stat(dataLayer).then((s) => s.isFile(), () => false)) return false;
 	spawn([
 		dataLayer,
@@ -675,17 +700,18 @@ async function uninstall(paths, { optOut = false, settleMs = 0, confirm, runner 
 	};
 }
 async function takeOutAutoUpdate({ claudeDir, settings }) {
-	let marketplace;
+	let added;
 	try {
-		marketplace = JSON.parse(await fs.readFile(path.join(claudeDir, "isoplan", "update.json"), "utf8")).autoUpdateOn;
+		added = JSON.parse(await fs.readFile(path.join(claudeDir, "isoplan", "update.json"), "utf8")).autoUpdateOn;
 	} catch {
 		return null;
 	}
-	if (typeof marketplace !== "string") return null;
+	const { marketplace, entry: left } = added && typeof added === "object" ? added : {};
+	if (typeof marketplace !== "string" || typeof left !== "string") return null;
 	const current = await readSettings(settings);
 	const known = current.extraKnownMarketplaces;
 	const entry = known && typeof known === "object" ? known[marketplace] : void 0;
-	if (!entry || typeof entry !== "object" || entry.autoUpdate !== true) return null;
+	if (!entry || typeof entry !== "object" || entry.autoUpdate !== true || JSON.stringify(entry) !== left) return null;
 	delete entry.autoUpdate;
 	await writeSettings(settings, current);
 	return `took out the auto-update the plugin turned on for the ${marketplace} marketplace in ${settings}`;

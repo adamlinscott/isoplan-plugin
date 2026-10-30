@@ -282,19 +282,26 @@ test("uninstall in the background: an uninstalled reading that doesn't hold a fe
   expect(await isUninstalling(s.claudeDir)).toBe(false);
 });
 
-test("uninstall: takes out the auto-update the plugin turned on, and leaves a person's own setting", async () => {
+test("uninstall: takes out the auto-update the plugin turned on from an entry nothing else changed, and otherwise leaves it on", async () => {
   const source = { source: "github", repo: "adamlinscott/isoplan-plugin" };
+  const added = (entry: unknown) => JSON.stringify({ checkedAt: 1, autoUpdateOn: { marketplace: "isoplan", entry: JSON.stringify(entry), at: 1 } });
   const s = setup({ extraKnownMarketplaces: { isoplan: { source, autoUpdate: true }, other: { source, autoUpdate: true } } });
   await s.install();
-  fs.writeFileSync(path.join(s.claudeDir, "isoplan", "update.json"), JSON.stringify({ checkedAt: 1, autoUpdateOn: "isoplan" }));
+  fs.writeFileSync(path.join(s.claudeDir, "isoplan", "update.json"), added({ source, autoUpdate: true }));
   expect((await uninstall(s.paths)).changes).toContain(`took out the auto-update the plugin turned on for the isoplan marketplace in ${s.paths.settings}`);
   expect(s.read()).toEqual({ extraKnownMarketplaces: { isoplan: { source }, other: { source, autoUpdate: true } } });
 
-  // Not recorded as the plugin's: left as it is.
+  // Not recorded as the plugin's, or the entry changed since: left on.
   const t = setup({ extraKnownMarketplaces: { isoplan: { source, autoUpdate: true } } });
   await t.install();
   await uninstall(t.paths);
   expect(t.read()).toEqual({ extraKnownMarketplaces: { isoplan: { source, autoUpdate: true } } });
+  const moved = { source: "git", url: "https://git.example.com/isoplan.git" };
+  const u = setup({ extraKnownMarketplaces: { isoplan: { source: moved, autoUpdate: true } } });
+  await u.install();
+  fs.writeFileSync(path.join(u.claudeDir, "isoplan", "update.json"), added({ source, autoUpdate: true }));
+  await uninstall(u.paths);
+  expect(u.read()).toEqual({ extraKnownMarketplaces: { isoplan: { source: moved, autoUpdate: true } } });
 });
 
 test("install: copies the runner and its defaults out of the plugin's folder, and records the copy", async () => {

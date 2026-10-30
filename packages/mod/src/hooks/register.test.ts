@@ -100,7 +100,7 @@ const connected: DataLayerLine = { type: "status", server: "ws://127.0.0.1:4747/
 test("hooks: starts the data layer for its session and shows the link's state, then that it stopped", async () => {
   const h = await start([connected]);
   await stopped(h);
-  expect(h.spawned).toEqual([["node", "C:/plugins/isoplan/dist/data-layer.js", "--session", "s1", "--cwd", "C:/w/repo"]]);
+  expect(h.spawned).toEqual([["node", "C:/plugins/isoplan/dist/data-layer.js", "--session", "s1", "--cwd", "C:/w/repo", "--since", "0"]]);
   expect(h.status).toEqual(["Isoplan: connected to ws://127.0.0.1:4747/data-layer", "Isoplan: the data layer stopped (node exited with code 0); restarting in 1s"]);
 });
 
@@ -121,11 +121,36 @@ test("hooks: once a newer version is on disk, the status line says to reload, be
   await vi.waitFor(() => expect(first.status.at(-1)).toBe("Isoplan updated: type /reload-plugins"));
 });
 
-test("hooks: a data layer that hands the session to a reloaded one isn't started again, and the status line asks for the reload", async () => {
-  const h = await start([connected, { type: "superseded" }], { wakes: 5 });
-  await vi.waitFor(() => expect(h.status.at(-1)).toBe("Isoplan updated: type /reload-plugins"));
-  expect(h.spawned).toHaveLength(1);
-  expect(h.slept).toEqual([]);
+test("hooks: a data layer that hands the session to a reloaded one is tried again only a minute later, and the status line asks for the reload", async () => {
+  const h = await start([connected, { type: "superseded", reason: "newer" }], { wakes: 1 });
+  await vi.waitFor(() => expect(h.spawned).toHaveLength(2));
+  expect(h.slept[0]).toBe(60000);
+  expect(h.status).toContain("Isoplan updated: type /reload-plugins");
+  // Each run keeps the time this window's module started, so it never counts as the later window.
+  expect(h.spawned[1]).toEqual(h.spawned[0]);
+});
+
+test("hooks: one that gives the session to its other window says so, not that there is an update", async () => {
+  const h = await start([{ type: "superseded", reason: "window" }]);
+  await vi.waitFor(() => expect(h.status.at(-1)).toBe("Isoplan: this session is reported from its other window"));
+  expect(h.slept).toEqual([60000]);
+});
+
+test("hooks: a host with no $.fs.exists, or one that throws, still starts the data layer", async () => {
+  const none = host([connected]);
+  delete (none.$.fs as { exists?: unknown }).exists;
+  await hooks["session.start"]!(none.$, { cwd: "C:/w/repo" }, async () => ({ cwd: "C:/w/repo" }));
+  await vi.waitFor(() => expect(none.spawned).toHaveLength(1));
+
+  vi.resetModules();
+  const { register } = await import("./register.js");
+  register(((event: keyof Hooks, hook: Function) => ((hooks[event] = hook), { catch: () => {} })) as unknown as On);
+  const throwing = host([connected]);
+  throwing.$.fs.exists = () => {
+    throw new Error("not in this build");
+  };
+  await hooks["session.start"]!(throwing.$, { cwd: "C:/w/repo" }, async () => ({ cwd: "C:/w/repo" }));
+  await vi.waitFor(() => expect(throwing.spawned).toHaveLength(1));
 });
 
 test("hooks: once this copy's folder has gone, nothing is started again, and the status line asks for a reload", async () => {

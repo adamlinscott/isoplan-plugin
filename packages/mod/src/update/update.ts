@@ -6,8 +6,9 @@
 //   `"autoUpdate": true` on the marketplace's entry under `extraKnownMarketplaces` in the user's
 //   settings.json, a documented setting, which `claude plugin marketplace add` writes. Only an entry
 //   that is there, with a source and no `autoUpdate` of its own, is changed: a person who turned it
-//   off keeps it off, and no entry or source is ever made up. update.json records that the plugin
-//   turned it on, so uninstall takes out only that (install.ts). Claude Code's own records
+//   off keeps it off, and no entry or source is ever made up. update.json records the entry as the
+//   plugin left it, and when, so uninstall takes `autoUpdate` out only from an entry nothing else
+//   has changed since, and otherwise leaves it on (install.ts). Claude Code's own records
 //   (known_marketplaces.json and the rest) are never written.
 // - it runs `claude plugin marketplace update <marketplace>`, then `claude plugin update <id>
 //   --scope <scope>` for each install installed_plugins.json records (in its project's folder for a
@@ -15,10 +16,11 @@
 //   cache if it is newer. A running session keeps the version it loaded until /reload-plugins, which
 //   the status line asks for (state.ts, `newestDataLayer`).
 //
-// The commands run with no window and no shell, never prompting: git with no terminal prompt, no
-// credential manager window, an askpass that answers nothing and ssh in batch mode; without the
-// variables that tie a process to the session that started it; and stopped with everything they
-// started if they run past COMMAND_TIMEOUT_MS.
+// The commands run with no window and no shell, never prompting: git with no terminal prompt and no
+// credential manager window, and, unless the person set their own, an askpass that answers nothing
+// and ssh in batch mode; without the variables that tie a process to the session that started it.
+// A command is done when it exits, whatever still holds its output open (an ssh ControlMaster, say),
+// and one still running after COMMAND_TIMEOUT_MS is stopped with everything it started.
 //
 // One check runs at a time on the machine (update.lock), and update.json records when the last one
 // started: a check is skipped when any session on the machine started one within its floor, which
@@ -47,6 +49,8 @@ export const START_GAP_MS = 10 * 60000;
 export const COMMAND_TIMEOUT_MS = 5 * 60000;
 // The end of a command's output kept.
 const OUTPUT_CHARS = 8000;
+// How long after a command exits its output is still read, before the pipes are let go.
+const EXIT_GRACE_MS = 1000;
 
 /** The variables that turn updates off, and the one that turns plugin updates back on. */
 export const OFF_VARIABLES = ["DISABLE_UPDATES", "DISABLE_AUTOUPDATER", "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"] as const;
@@ -60,14 +64,33 @@ export function updatesOffBy(env: Record<string, string | undefined>): string | 
   return OFF_VARIABLES.find((name) => isSet(env[name])) ?? null;
 }
 
+/** What git's own config sets that the commands' environment has to leave alone. */
+export interface GitChoices {
+  /** core.sshCommand: the person's own ssh, which isn't put in batch mode. */
+  sshCommand: boolean;
+  /** core.askPass: the person's own askpass, which isn't replaced. */
+  askPass: boolean;
+}
+
 /**
  * The environment the commands run with: this one's without the session's own variables (as the
  * runner's fork, claude.ts), and nothing that can prompt (as a handoff's git, handoff/git.ts). The
- * askpass is node, which takes git's prompt for a script it can't find and fails, so git gives up
- * at once instead of asking.
+ * askpass, where the person set none (GIT_ASKPASS, SSH_ASKPASS, core.askPass), is node, which takes
+ * git's prompt for a script it can't find and fails, so git gives up at once instead of asking.
  */
-export function commandEnv(env: Record<string, string | undefined>, node = process.execPath): Record<string, string> {
-  return { ...noPromptEnv(forkEnv(env)), GIT_ASKPASS: node, SSH_ASKPASS: node, SSH_ASKPASS_REQUIRE: "never" };
+export function commandEnv(env: Record<string, string | undefined>, git: GitChoices = { sshCommand: false, askPass: false }, node = process.execPath): Record<string, string> {
+  const out = noPromptEnv(forkEnv(env), git.sshCommand);
+  if (!git.askPass && !out.GIT_ASKPASS && !out.SSH_ASKPASS) Object.assign(out, { GIT_ASKPASS: node, SSH_ASKPASS: node, SSH_ASKPASS_REQUIRE: "never" });
+  return out;
+}
+
+/** What git's config sets for core.sshCommand and core.askPass, as `cwd` sees it; nothing set when git can't say. */
+export async function gitChoices(cwd: string, env: Record<string, string | undefined> = process.env): Promise<GitChoices> {
+  const set = async (key: string) => {
+    const r = await runHidden(["git", "config", "--get", key], cwd, { env: noPromptEnv(forkEnv(env), true), timeoutMs: 15000 });
+    return r.code === 0 && r.output.trim() !== "";
+  };
+  return { sshCommand: await set("core.sshCommand"), askPass: await set("core.askPass") };
 }
 
 /** What a command run said: its exit code and the end of its output, or why it didn't run to the end. */
@@ -78,12 +101,13 @@ export interface Ran {
   error?: string;
 }
 
-export type Run = (argv: string[], cwd: string) => Promise<Ran>;
+export type Run = (argv: string[], cwd: string, env: Record<string, string>) => Promise<Ran>;
 
 /**
- * Runs a command by argv, with no shell and no window, and keeps the end of what it printed. Past
- * `timeoutMs` it is stopped with everything it started (on Windows taskkill /T; elsewhere its
- * process group, which it leads).
+ * Runs a command by argv, with no shell and no window, and keeps the end of what it printed. It is
+ * done when the command exits: what it printed by then, and within EXIT_GRACE_MS, is kept, and its
+ * pipes are let go even if a process it left behind holds them. Past `timeoutMs` it is stopped with
+ * everything it started (on Windows taskkill /T; elsewhere its process group, which it leads).
  */
 export function runHidden(argv: string[], cwd: string, { env = commandEnv(process.env), timeoutMs = COMMAND_TIMEOUT_MS }: { env?: Record<string, string>; timeoutMs?: number } = {}): Promise<Ran> {
   return new Promise((resolve) => {
@@ -98,13 +122,21 @@ export function runHidden(argv: string[], cwd: string, { env = commandEnv(proces
       timedOut = true;
       killTree(child);
     }, timeoutMs);
+    let ended: Ran | null = null;
+    const done = () => {
+      child.stdout.destroy();
+      child.stderr.destroy();
+      resolve({ ...ended!, output });
+    };
     child.on("error", (err) => {
       clearTimeout(timer);
       resolve({ code: null, output, error: `couldn't start ${argv[0]}: ${err.message}` });
     });
-    child.on("close", (code) => {
+    child.on("exit", (code) => {
       clearTimeout(timer);
-      resolve(timedOut ? { code: null, output, error: `didn't finish within ${Math.round(timeoutMs / 1000)} s, so it was stopped` } : { code, output });
+      ended = timedOut ? { code: null, output, error: `didn't finish within ${Math.round(timeoutMs / 1000)} s, so it was stopped` } : { code, output };
+      const grace = setTimeout(done, EXIT_GRACE_MS);
+      child.on("close", () => (clearTimeout(grace), done()));
     });
   });
 }
@@ -121,6 +153,8 @@ export interface UpdateOptions {
   cwd: string;
   /** What runs `claude`: the binary, or node and its cli.js (claude-binary.ts). */
   claude: string[];
+  /** The commands' environment (`commandEnv`). */
+  env?: Record<string, string>;
   /** Skipped when a check started this recently, on any session. */
   gapMs: number;
   run?: Run;
@@ -163,7 +197,19 @@ export function updateRuns(list: Install[] | null, id: string, cwd: string): { a
 }
 
 /** One check (see above), unless another is running or one started within `gapMs`. */
-export async function checkForUpdate({ claudeDir, settings, plugins, id, cwd, claude, gapMs, run = runHidden, now = Date.now, isAlive = alive }: UpdateOptions): Promise<Checked> {
+export async function checkForUpdate({
+  claudeDir,
+  settings,
+  plugins,
+  id,
+  cwd,
+  claude,
+  env = commandEnv(process.env),
+  gapMs,
+  run = (argv, at, e) => runHidden(argv, at, { env: e }),
+  now = Date.now,
+  isAlive = alive,
+}: UpdateOptions): Promise<Checked> {
   const lock = updateLockPath(claudeDir);
   // Stale after both commands and every scope could have timed out, with time to spare.
   if (!(await takeLock(lock, process.pid, isAlive, false, now(), { freshMs: 10 * COMMAND_TIMEOUT_MS }))) return { ran: false, said: [] };
@@ -179,11 +225,13 @@ export async function checkForUpdate({ claudeDir, settings, plugins, id, cwd, cl
     const turnedOn = await turnOnAutoUpdate(settings, marketplace).catch((err: unknown) => `couldn't turn on Claude Code's auto-update for ${marketplace}: ${(err as Error).message}`);
     if (turnedOn) said.push(turnedOn);
     if (turnedOn?.startsWith("turned on")) {
-      record.autoUpdateOn = marketplace;
+      // The entry as the plugin left it, which uninstall compares (install.ts).
+      const entry = ((await readSettings(settings)).extraKnownMarketplaces as Record<string, unknown>)[marketplace];
+      record.autoUpdateOn = { marketplace, entry: JSON.stringify(entry), at: now() };
       await write();
     }
     const say = async (args: string[], at: string) => {
-      const r = await run([...claude, ...args], at);
+      const r = await run([...claude, ...args], at, env);
       const failed = r.error ?? (r.code === null ? "didn't finish" : r.code !== 0 ? `failed with exit code ${r.code}` : null);
       said.push(`claude ${args.join(" ")}: ${[failed, lastLine(r.output)].filter(Boolean).join(": ")}`);
       return !failed;
