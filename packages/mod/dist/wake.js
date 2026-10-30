@@ -288,28 +288,54 @@ function pluginIdOf(plugins, file) {
 	const parts = cacheParts(plugins, file);
 	return parts ? `${parts[1]}@${parts[0]}` : null;
 }
+const KEY_FILES = [
+	["dist", "data-layer.js"],
+	["dist", "wake.js"],
+	["dist", "hooks.js"],
+	[".claude-plugin", "plugin.json"]
+];
 /**
-* The data layer of the copy of its plugin Claude Code has installed now. That is `dataLayer` itself
-* while installed_plugins.json records its version folder for its id, or when it is outside the
-* cache, or the record is unknown or names no folder. Otherwise an update put another version on
-* disk (the version is the commit's SHA, since the plugin pins none): the first one recorded whose
-* data layer is there. A data layer this doesn't return is outdated: a session loads the new copy at
-* its next start, or at /reload-plugins.
+* The data layer of the newest copy of its plugin Claude Code records, at any scope: by version
+* (as numbers when both are x.y.z, else the one updated last), counting only a folder that holds
+* KEY_FILES and whose plugin.json names the recorded version (a plugin.json naming none counts, its
+* version came from elsewhere). `dataLayer` itself when that copy is its own folder, when it is
+* outside the cache, or when no record reads. A data layer this doesn't return is outdated: an
+* update put another version on disk, which a session loads at its next start or /reload-plugins.
 */
 async function newestDataLayer(plugins, dataLayer) {
 	const parts = cacheParts(plugins, dataLayer);
 	if (!parts) return dataLayer;
 	const id = `${parts[1]}@${parts[0]}`;
-	const folders = (await installs(plugins) ?? []).filter((i) => i.id === id && i.installPath).map((i) => i.installPath);
-	const root = path.join(plugins, "cache", ...parts.slice(0, 3));
-	if (!folders.length || folders.some((f) => normalPath(f) === normalPath(root))) return dataLayer;
-	const inside = parts.slice(3);
-	for (const folder of folders) {
-		const candidate = path.join(folder, ...inside);
-		if (await fs.stat(candidate).then((s) => s.isFile(), () => false)) return candidate;
+	const root = await realPath(path.join(plugins, "cache", ...parts.slice(0, 3)));
+	const recorded = (await installs(plugins) ?? []).filter((i) => i.id === id && i.installPath).sort(newerFirst);
+	for (const install of recorded) {
+		if (await realPath(install.installPath) === root) return dataLayer;
+		if (await isComplete(install)) return path.join(install.installPath, ...parts.slice(3));
 	}
 	return dataLayer;
 }
+function newerFirst(a, b) {
+	const va = semver(a.version);
+	const vb = semver(b.version);
+	if (va && vb) {
+		for (let i = 0; i < 3; i++) if (va[i] !== vb[i]) return vb[i] - va[i];
+	}
+	return (b.lastUpdated ?? "").localeCompare(a.lastUpdated ?? "");
+}
+const semver = (version) => {
+	const m = version ? /^(\d+)\.(\d+)\.(\d+)/.exec(version) : null;
+	return m ? [
+		Number(m[1]),
+		Number(m[2]),
+		Number(m[3])
+	] : null;
+};
+async function isComplete(install) {
+	for (const file of KEY_FILES) if (!await fs.stat(path.join(install.installPath, ...file)).then((s) => s.isFile(), () => false)) return false;
+	const manifest = await readJson(path.join(install.installPath, ".claude-plugin", "plugin.json"));
+	return !!manifest && (typeof manifest.version !== "string" || manifest.version === install.version);
+}
+const realPath = async (p) => normalPath(await fs.realpath(p).catch(() => p));
 const nameOf = (id) => id.slice(0, id.lastIndexOf("@"));
 /** Every install installed_plugins.json records; null when it is missing, can't be read, or isn't the shape known. */
 async function installs(plugins) {
@@ -323,7 +349,9 @@ async function installs(plugins) {
 			id,
 			scope: text("scope"),
 			projectPath: text("projectPath"),
-			installPath: text("installPath")
+			installPath: text("installPath"),
+			version: text("version"),
+			lastUpdated: text("lastUpdated")
 		};
 	}));
 }
@@ -573,6 +601,7 @@ const WRITTEN = [
 	"logs",
 	"titles",
 	"released",
+	"waits",
 	"approved.json",
 	"update.json",
 	"update.lock"
@@ -581,6 +610,7 @@ const SESSION_TRACES = [
 	"live",
 	"titles",
 	"released",
+	"waits",
 	"approved.json",
 	"update.json",
 	"update.lock"
@@ -615,6 +645,8 @@ async function uninstall(paths, { optOut = false, settleMs = 0, confirm, runner 
 	const reinstalled = "stopped: Claude Code lists the plugin as installed again";
 	if (!await isStillGone()) return stopped(reinstalled);
 	if (await stopOurRunner(paths.claudeDir, runner)) changes.push("stopped the runner, which answered for this machine's rooms");
+	const autoUpdate = await takeOutAutoUpdate(paths);
+	if (autoUpdate) changes.push(autoUpdate);
 	await remove(path.join(dir, "live"));
 	if (settleMs) await new Promise((r) => setTimeout(r, settleMs));
 	for (const name of WRITTEN) {
@@ -642,6 +674,24 @@ async function uninstall(paths, { optOut = false, settleMs = 0, confirm, runner 
 		isDone: true
 	};
 }
+async function takeOutAutoUpdate({ claudeDir, settings }) {
+	let marketplace;
+	try {
+		marketplace = JSON.parse(await fs.readFile(path.join(claudeDir, "isoplan", "update.json"), "utf8")).autoUpdateOn;
+	} catch {
+		return null;
+	}
+	if (typeof marketplace !== "string") return null;
+	const current = await readSettings(settings);
+	const known = current.extraKnownMarketplaces;
+	const entry = known && typeof known === "object" ? known[marketplace] : void 0;
+	if (!entry || typeof entry !== "object" || entry.autoUpdate !== true) return null;
+	delete entry.autoUpdate;
+	await writeSettings(settings, current);
+	return `took out the auto-update the plugin turned on for the ${marketplace} marketplace in ${settings}`;
+}
+/** How long a background uninstall waits to read Claude Code's records a second time before it starts. */
+const UNINSTALL_RECHECK_MS = 5e3;
 /** How long a background uninstall that failed holds off trying again. */
 const UNINSTALL_RETRY_MS = 864e5;
 /**
@@ -651,11 +701,15 @@ const UNINSTALL_RETRY_MS = 864e5;
 * says why in uninstall.log and holds off for UNINSTALL_RETRY_MS, keeping the hooks and wake.mjs;
 * deleting uninstall.json lets the next prompt try at once. One that stops because a session wrote
 * its files again says so there too, and the next prompt tries again; one that stops because the
-* plugin was installed again just ends.
+* plugin was installed again just ends. It starts only once Claude Code's records still say
+* uninstalled `recheckMs` after the reading that started it, so a record rewritten during an
+* update never counts.
 */
-async function uninstallInBackground(paths, { settleMs = 0, runner = {}, now = Date.now } = {}) {
+async function uninstallInBackground(paths, { settleMs = 0, runner = {}, now = Date.now, recheckMs = UNINSTALL_RECHECK_MS } = {}) {
 	const lock = uninstallLockPath(paths.claudeDir);
 	if (!await takeLock(lock, process.pid, alive, false, now())) return;
+	await new Promise((r) => setTimeout(r, recheckMs));
+	if (await recordedState(paths) !== "uninstalled") return releaseLock(lock, process.pid);
 	const log = (text) => fs.appendFile(uninstallLogPath(paths.claudeDir), `${new Date(now()).toISOString()} ${text}\n`).catch(() => {});
 	try {
 		const { changes, isDone } = await uninstall(paths, {

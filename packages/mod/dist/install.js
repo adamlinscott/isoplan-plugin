@@ -387,7 +387,9 @@ async function installs(plugins) {
 			id,
 			scope: text("scope"),
 			projectPath: text("projectPath"),
-			installPath: text("installPath")
+			installPath: text("installPath"),
+			version: text("version"),
+			lastUpdated: text("lastUpdated")
 		};
 	}));
 }
@@ -6881,6 +6883,7 @@ const WRITTEN = [
 	"logs",
 	"titles",
 	"released",
+	"waits",
 	"approved.json",
 	"update.json",
 	"update.lock"
@@ -6889,6 +6892,7 @@ const SESSION_TRACES = [
 	"live",
 	"titles",
 	"released",
+	"waits",
 	"approved.json",
 	"update.json",
 	"update.lock"
@@ -6923,6 +6927,8 @@ async function uninstall$1(paths, { optOut = false, settleMs = 0, confirm, runne
 	const reinstalled = "stopped: Claude Code lists the plugin as installed again";
 	if (!await isStillGone()) return stopped(reinstalled);
 	if (await stopOurRunner(paths.claudeDir, runner)) changes.push("stopped the runner, which answered for this machine's rooms");
+	const autoUpdate = await takeOutAutoUpdate(paths);
+	if (autoUpdate) changes.push(autoUpdate);
 	await remove(path.join(dir, "live"));
 	if (settleMs) await new Promise((r) => setTimeout(r, settleMs));
 	for (const name of WRITTEN) {
@@ -6949,6 +6955,22 @@ async function uninstall$1(paths, { optOut = false, settleMs = 0, confirm, runne
 		changes,
 		isDone: true
 	};
+}
+async function takeOutAutoUpdate({ claudeDir, settings }) {
+	let marketplace;
+	try {
+		marketplace = JSON.parse(await fs.readFile(path.join(claudeDir, "isoplan", "update.json"), "utf8")).autoUpdateOn;
+	} catch {
+		return null;
+	}
+	if (typeof marketplace !== "string") return null;
+	const current = await readSettings(settings);
+	const known = current.extraKnownMarketplaces;
+	const entry = known && typeof known === "object" ? known[marketplace] : void 0;
+	if (!entry || typeof entry !== "object" || entry.autoUpdate !== true) return null;
+	delete entry.autoUpdate;
+	await writeSettings(settings, current);
+	return `took out the auto-update the plugin turned on for the ${marketplace} marketplace in ${settings}`;
 }
 /**
 * How long uninstall waits for a detached data layer to see its lock has gone: two of its passes

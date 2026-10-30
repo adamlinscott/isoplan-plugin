@@ -41,6 +41,7 @@ const floorWaits = /* @__PURE__ */ new Map();
 let waitsDir = null;
 let shownStatus;
 let updated = false;
+let superseded = false;
 let marking = Promise.resolve();
 function register(on) {
 	on("session.start", async ($, e, next) => {
@@ -130,6 +131,11 @@ async function run($) {
 	const script = $.plugin.root.replace(/\\/g, "/") + "/dist/data-layer.js";
 	let failures = 0;
 	for (;;) {
+		if (!await $.fs.exists(script).catch(() => true)) {
+			updated = true;
+			show($, void 0);
+			return;
+		}
 		const session = await $.session.id();
 		const cwd = await $.session.cwd();
 		if (session !== running) {
@@ -193,6 +199,11 @@ async function run($) {
 			$.ui.log("isoplan: the data layer could not run: " + message(err), { to: "debug" });
 		}
 		stop = null;
+		if (superseded) {
+			updated = true;
+			show($, void 0);
+			return;
+		}
 		if (switched) {
 			failures = 0;
 			continue;
@@ -218,6 +229,9 @@ function handle($, text) {
 		case "updated":
 			updated = true;
 			show($, shownStatus);
+			break;
+		case "superseded":
+			superseded = true;
 			break;
 		case "title-ask":
 			writeTitle($, line);

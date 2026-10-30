@@ -88,8 +88,10 @@ test("wake: starts the newest data layer Claude Code has installed, not an older
   const write = (file: string, text: string) => (fs.mkdirSync(path.dirname(file), { recursive: true }), fs.writeFileSync(file, text));
   const old = path.join(folder("6658f568c1e1"), "dist", "data-layer.js");
   const now = path.join(folder("a1b2c3d4e5f6"), "dist", "data-layer.js");
-  write(old, "");
-  write(now, "");
+  for (const sha of ["6658f568c1e1", "a1b2c3d4e5f6"]) {
+    for (const file of ["data-layer.js", "wake.js", "hooks.js"]) write(path.join(folder(sha), "dist", file), "");
+    write(path.join(folder(sha), ".claude-plugin", "plugin.json"), JSON.stringify({ name: "isoplan" }));
+  }
   write(wakeRecordPath(claudeDir), JSON.stringify({ dataLayer: old }));
   write(path.join(plugins, "installed_plugins.json"), JSON.stringify({ version: 2, plugins: { "isoplan@isoplan": [{ scope: "user", installPath: folder("a1b2c3d4e5f6") }] } }));
   const spawned: string[][] = [];

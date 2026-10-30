@@ -230,11 +230,12 @@ async function finishOptOut({ claudeDir, settings }: Paths): Promise<string[]> {
 
 // The runner's state, the machine's pairing credential (pairing.json) and its locks (pairing.lock
 // while a pairing is under way, pairing.write.lock while the file is written), and the sessions'
-// traces: locks, logs, title files, released-report hashes, the office's list of repos
-// (approved.json) and the update check's record and lock (src/update). Removed before the hooks.
-const WRITTEN = ["runner", "pairing.json", "pairing.lock", "pairing.write.lock", "live", "logs", "titles", "released", "approved.json", "update.json", "update.lock"];
+// traces: locks, logs, title files, released-report hashes, the hooks module's marks of the questions
+// it waits on (waits/), the office's list of repos (approved.json) and the update check's record
+// and lock (src/update). Removed before the hooks.
+const WRITTEN = ["runner", "pairing.json", "pairing.lock", "pairing.write.lock", "live", "logs", "titles", "released", "waits", "approved.json", "update.json", "update.lock"];
 // What a session's data layer writes as it runs, so may come back during an uninstall.
-const SESSION_TRACES = ["live", "titles", "released", "approved.json", "update.json", "update.lock"];
+const SESSION_TRACES = ["live", "titles", "released", "waits", "approved.json", "update.json", "update.lock"];
 
 export interface UninstallOptions {
   /** Leave wake.json as `{ "disabled": true }`, so a plugin still installed doesn't put the hook back. */
@@ -280,6 +281,9 @@ export async function uninstall(paths: Paths, { optOut = false, settleMs = 0, co
 
   if (!(await isStillGone())) return stopped(reinstalled);
   if (await stopOurRunner(paths.claudeDir, runner)) changes.push("stopped the runner, which answered for this machine's rooms");
+  // Before update.json, which records it, goes.
+  const autoUpdate = await takeOutAutoUpdate(paths);
+  if (autoUpdate) changes.push(autoUpdate);
   await remove(path.join(dir, "live"));
   if (settleMs) await new Promise((r) => setTimeout(r, settleMs));
   for (const name of WRITTEN) {
@@ -310,6 +314,28 @@ export async function uninstall(paths: Paths, { optOut = false, settleMs = 0, co
   return { changes, isDone: true };
 }
 
+// Takes out the `"autoUpdate": true` the update check put on its marketplace's entry in settings.json
+// (src/update), as update.json records; one the person set, or changed since, stays.
+async function takeOutAutoUpdate({ claudeDir, settings }: Paths): Promise<string | null> {
+  let marketplace: unknown;
+  try {
+    marketplace = (JSON.parse(await fs.readFile(path.join(claudeDir, "isoplan", "update.json"), "utf8")) as { autoUpdateOn?: unknown }).autoUpdateOn;
+  } catch {
+    return null;
+  }
+  if (typeof marketplace !== "string") return null;
+  const current = await readSettings(settings);
+  const known = current.extraKnownMarketplaces as Json | undefined;
+  const entry = known && typeof known === "object" ? (known[marketplace] as Json | undefined) : undefined;
+  if (!entry || typeof entry !== "object" || entry.autoUpdate !== true) return null;
+  delete entry.autoUpdate;
+  await writeSettings(settings, current);
+  return `took out the auto-update the plugin turned on for the ${marketplace} marketplace in ${settings}`;
+}
+
+/** How long a background uninstall waits to read Claude Code's records a second time before it starts. */
+export const UNINSTALL_RECHECK_MS = 5000;
+
 /** How long a background uninstall that failed holds off trying again. */
 export const UNINSTALL_RETRY_MS = 24 * 3600000;
 
@@ -320,11 +346,18 @@ export const UNINSTALL_RETRY_MS = 24 * 3600000;
  * says why in uninstall.log and holds off for UNINSTALL_RETRY_MS, keeping the hooks and wake.mjs;
  * deleting uninstall.json lets the next prompt try at once. One that stops because a session wrote
  * its files again says so there too, and the next prompt tries again; one that stops because the
- * plugin was installed again just ends.
+ * plugin was installed again just ends. It starts only once Claude Code's records still say
+ * uninstalled `recheckMs` after the reading that started it, so a record rewritten during an
+ * update never counts.
  */
-export async function uninstallInBackground(paths: Paths, { settleMs = 0, runner = {}, now = Date.now }: Pick<UninstallOptions, "settleMs" | "runner"> & { now?: () => number } = {}): Promise<void> {
+export async function uninstallInBackground(
+  paths: Paths,
+  { settleMs = 0, runner = {}, now = Date.now, recheckMs = UNINSTALL_RECHECK_MS }: Pick<UninstallOptions, "settleMs" | "runner"> & { now?: () => number; recheckMs?: number } = {},
+): Promise<void> {
   const lock = uninstallLockPath(paths.claudeDir);
   if (!(await takeLock(lock, process.pid, alive, false, now()))) return;
+  await new Promise((r) => setTimeout(r, recheckMs));
+  if ((await recordedState(paths)) !== "uninstalled") return releaseLock(lock, process.pid);
   const log = (text: string) => fs.appendFile(uninstallLogPath(paths.claudeDir), `${new Date(now()).toISOString()} ${text}\n`).catch(() => {});
   try {
     const { changes, isDone } = await uninstall(paths, { settleMs, runner, confirm: async () => (await recordedState(paths)) === "uninstalled" });

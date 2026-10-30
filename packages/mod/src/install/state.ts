@@ -49,6 +49,10 @@ export interface Install {
   projectPath: string | null;
   /** The folder the install loads from: cache/<marketplace>/<plugin>/<version>. */
   installPath: string | null;
+  /** The version Claude Code computed for it: plugin.json's, or a commit's SHA when none is pinned. */
+  version: string | null;
+  /** When it was last installed or updated, as an ISO time. */
+  lastUpdated: string | null;
 }
 
 /** Claude Code's plugins folder: $CLAUDE_CODE_PLUGIN_CACHE_DIR when it is set, else <claude dir>/plugins. */
@@ -84,28 +88,52 @@ export function pluginIdOf(plugins: string, file: string): string | null {
   return parts ? `${parts[1]}@${parts[0]}` : null;
 }
 
+// What a version folder must hold before it counts: a copy Claude Code is still writing doesn't.
+const KEY_FILES = [["dist", "data-layer.js"], ["dist", "wake.js"], ["dist", "hooks.js"], [".claude-plugin", "plugin.json"]];
+
 /**
- * The data layer of the copy of its plugin Claude Code has installed now. That is `dataLayer` itself
- * while installed_plugins.json records its version folder for its id, or when it is outside the
- * cache, or the record is unknown or names no folder. Otherwise an update put another version on
- * disk (the version is the commit's SHA, since the plugin pins none): the first one recorded whose
- * data layer is there. A data layer this doesn't return is outdated: a session loads the new copy at
- * its next start, or at /reload-plugins.
+ * The data layer of the newest copy of its plugin Claude Code records, at any scope: by version
+ * (as numbers when both are x.y.z, else the one updated last), counting only a folder that holds
+ * KEY_FILES and whose plugin.json names the recorded version (a plugin.json naming none counts, its
+ * version came from elsewhere). `dataLayer` itself when that copy is its own folder, when it is
+ * outside the cache, or when no record reads. A data layer this doesn't return is outdated: an
+ * update put another version on disk, which a session loads at its next start or /reload-plugins.
  */
 export async function newestDataLayer(plugins: string, dataLayer: string): Promise<string> {
   const parts = cacheParts(plugins, dataLayer);
   if (!parts) return dataLayer;
   const id = `${parts[1]}@${parts[0]}`;
-  const folders = ((await installs(plugins)) ?? []).filter((i) => i.id === id && i.installPath).map((i) => i.installPath!);
-  const root = path.join(plugins, "cache", ...parts.slice(0, 3));
-  if (!folders.length || folders.some((f) => normalPath(f) === normalPath(root))) return dataLayer;
-  const inside = parts.slice(3);
-  for (const folder of folders) {
-    const candidate = path.join(folder, ...inside);
-    if (await fs.stat(candidate).then((s) => s.isFile(), () => false)) return candidate;
+  const root = await realPath(path.join(plugins, "cache", ...parts.slice(0, 3)));
+  const recorded = ((await installs(plugins)) ?? []).filter((i) => i.id === id && i.installPath).sort(newerFirst);
+  for (const install of recorded) {
+    if ((await realPath(install.installPath!)) === root) return dataLayer;
+    if (await isComplete(install)) return path.join(install.installPath!, ...parts.slice(3));
   }
   return dataLayer;
 }
+
+// Newest first: by x.y.z when both versions are, else by lastUpdated.
+function newerFirst(a: Install, b: Install): number {
+  const va = semver(a.version);
+  const vb = semver(b.version);
+  if (va && vb) for (let i = 0; i < 3; i++) if (va[i] !== vb[i]) return vb[i]! - va[i]!;
+  return (b.lastUpdated ?? "").localeCompare(a.lastUpdated ?? "");
+}
+
+const semver = (version: string | null) => {
+  const m = version ? /^(\d+)\.(\d+)\.(\d+)/.exec(version) : null;
+  return m ? [Number(m[1]), Number(m[2]), Number(m[3])] : null;
+};
+
+// Whether an install's folder holds KEY_FILES and its plugin.json agrees with the recorded version.
+async function isComplete(install: Install): Promise<boolean> {
+  for (const file of KEY_FILES) if (!(await fs.stat(path.join(install.installPath!, ...file)).then((s) => s.isFile(), () => false))) return false;
+  const manifest = await readJson(path.join(install.installPath!, ".claude-plugin", "plugin.json"));
+  return !!manifest && (typeof manifest.version !== "string" || manifest.version === install.version);
+}
+
+// A folder as compared: its real path (links and short names resolved) where it exists, in normalPath's form.
+const realPath = async (p: string) => normalPath(await fs.realpath(p).catch(() => p));
 
 const nameOf = (id: string) => id.slice(0, id.lastIndexOf("@"));
 
@@ -118,7 +146,7 @@ export async function installs(plugins: string): Promise<Install[] | null> {
     (entries as unknown[]).map((entry) => {
       const e = isObject(entry) ? entry : {};
       const text = (key: string) => (typeof e[key] === "string" ? (e[key] as string) : null);
-      return { id, scope: text("scope"), projectPath: text("projectPath"), installPath: text("installPath") };
+      return { id, scope: text("scope"), projectPath: text("projectPath"), installPath: text("installPath"), version: text("version"), lastUpdated: text("lastUpdated") };
     }),
   );
 }

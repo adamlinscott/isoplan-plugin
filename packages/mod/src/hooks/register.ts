@@ -29,7 +29,10 @@
 // The data layer talks back as JSON lines on stdout (src/lines.ts). Claude Code closes the child's
 // stdin at launch, so what goes the other way, a title, goes through a file the line names. A data
 // layer that ends is started again, backing off while it keeps failing; one running for a session
-// id the process has left (a /clear, a resume) is started again for the new id.
+// id the process has left (a /clear, a resume) is started again for the new id. Once this copy's
+// folder has gone (Claude Code cleans up a version some time after an update), or its data layer
+// says a newer one reports the session (a `superseded` line), nothing is started again, and the
+// status line asks for /reload-plugins.
 
 import type { AskedMessage, ConflictMessage } from "@isoplan/protocol";
 import { endText, MAX_WAIT_MS } from "../ask/text.js";
@@ -78,6 +81,7 @@ const floorWaits = new Map<string, (answers: Record<string, string>) => void>();
 let waitsDir: string | null = null; // where the waits are marked, as the data layer said
 let shownStatus: string | undefined; // the status line, without the update note
 let updated = false; // a newer version of the plugin is on disk, loaded at /reload-plugins
+let superseded = false; // the data layer said another reports this session now
 let marking: Promise<unknown> = Promise.resolve(); // the marks, written in order
 
 export function register(on: On): void {
@@ -174,6 +178,11 @@ async function run($: Host): Promise<void> {
   const script = $.plugin.root.replace(/\\/g, "/") + "/dist/data-layer.js";
   let failures = 0;
   for (;;) {
+    if (!(await $.fs.exists(script).catch(() => true))) {
+      updated = true;
+      show($, undefined);
+      return;
+    }
     const session = await $.session.id();
     const cwd = await $.session.cwd();
     if (session !== running) {
@@ -226,6 +235,11 @@ async function run($: Host): Promise<void> {
       $.ui.log("isoplan: the data layer could not run: " + message(err), { to: "debug" });
     }
     stop = null;
+    if (superseded) {
+      updated = true;
+      show($, undefined);
+      return;
+    }
     if (switched) {
       failures = 0;
       continue;
@@ -260,6 +274,9 @@ function handle($: Host, text: string): void {
     case "updated":
       updated = true;
       show($, shownStatus);
+      break;
+    case "superseded":
+      superseded = true;
       break;
     case "title-ask":
       writeTitle($, line);

@@ -90,6 +90,14 @@ export interface UpdatedLine {
   type: "updated";
 }
 
+/**
+ * The plugin's data layer of a newer version (or one this version started later, at a reload) took
+ * over this session, and this one stops: the hooks module starts no other.
+ */
+export interface SupersededLine {
+  type: "superseded";
+}
+
 /** A problem worth a line in the debug log. */
 export interface LogLine {
   type: "log";
@@ -107,4 +115,4 @@ export interface TitleReply {
  * `asked` is the end of a question the session's agent asked the room, arriving after it stopped
  * waiting, and `ask-rights` whether the session may ask its room (#49).
  */
-export type DataLayerLine = StatusLine | TitleAskLine | PairLine | WaitsLine | OwnerAnswerLine | UpdatedLine | LogLine | ConflictMessage | ErrorMessage | AskedMessage | AskRightsMessage;
+export type DataLayerLine = StatusLine | TitleAskLine | PairLine | WaitsLine | OwnerAnswerLine | UpdatedLine | SupersededLine | LogLine | ConflictMessage | ErrorMessage | AskedMessage | AskRightsMessage;

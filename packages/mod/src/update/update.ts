@@ -1,30 +1,41 @@
-// Keeping the plugin up to date (#96). The plugin pins no version, so Claude Code names each commit
-// of the marketplace by its SHA and every commit on main is an update. A session's data layer runs
-// this as it starts and every `updateCheckHours`, hidden and in the background:
+// Keeping the plugin up to date (#96). The plugin's version is pinned in plugin.json, and a release
+// is a bump of it: Claude Code installs a new copy only when that version changes. A session's data
+// layer runs this as it starts and every `updateCheckHours`, hidden and in the background:
 //
 // - it turns on Claude Code's own auto-update for the plugin's marketplace, by setting
 //   `"autoUpdate": true` on the marketplace's entry under `extraKnownMarketplaces` in the user's
 //   settings.json, a documented setting, which `claude plugin marketplace add` writes. Only an entry
 //   that is there, with a source and no `autoUpdate` of its own, is changed: a person who turned it
-//   off keeps it off, and no entry or source is ever made up. Claude Code's own records
+//   off keeps it off, and no entry or source is ever made up. update.json records that the plugin
+//   turned it on, so uninstall takes out only that (install.ts). Claude Code's own records
 //   (known_marketplaces.json and the rest) are never written.
-// - it runs `claude plugin marketplace update <marketplace>`, then `claude plugin update <id>`,
-//   which put a newer version in Claude Code's plugin cache if there is one. A running session keeps
-//   the version it loaded until /reload-plugins, which the status line asks for (state.ts,
-//   `newestDataLayer`).
+// - it runs `claude plugin marketplace update <marketplace>`, then `claude plugin update <id>
+//   --scope <scope>` for each install installed_plugins.json records (in its project's folder for a
+//   project or local one), which put the version the marketplace offers in Claude Code's plugin
+//   cache if it is newer. A running session keeps the version it loaded until /reload-plugins, which
+//   the status line asks for (state.ts, `newestDataLayer`).
+//
+// The commands run with no window and no shell, never prompting: git with no terminal prompt, no
+// credential manager window, an askpass that answers nothing and ssh in batch mode; without the
+// variables that tie a process to the session that started it; and stopped with everything they
+// started if they run past COMMAND_TIMEOUT_MS.
 //
 // One check runs at a time on the machine (update.lock), and update.json records when the last one
-// started, so a check at session start is skipped when one ran in the last START_GAP_MS, and the
-// timed one runs once per interval whatever number of sessions are open. Nothing runs when
-// DISABLE_UPDATES, DISABLE_AUTOUPDATER or CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC is set, as with
-// Claude Code's own plugin auto-update, unless FORCE_AUTOUPDATE_PLUGINS is set too. A data layer
-// outside the plugin cache (a checkout, --plugin-dir, a marketplace added from a local folder, which
-// loads in place) has nothing to update, and its caller doesn't run this.
+// started: a check is skipped when any session on the machine started one within its floor, which
+// is START_GAP_MS for the check a session makes as it starts and `updateCheckHours` for the timed
+// ones, so the machine checks about once per interval however many sessions are open. Nothing runs
+// when DISABLE_UPDATES, DISABLE_AUTOUPDATER or CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC is set, as
+// with Claude Code's own plugin auto-update, unless FORCE_AUTOUPDATE_PLUGINS is set too. A data
+// layer outside the plugin cache (a checkout, --plugin-dir, a marketplace added from a local folder,
+// which loads in place) has nothing to update, and its caller doesn't run this.
 
-import { execFile } from "node:child_process";
+import { spawn } from "node:child_process";
 import fs from "node:fs/promises";
 import path from "node:path";
+import { noPromptEnv } from "../handoff/git.js";
 import { readSettings, writeSettings } from "../install/install.js";
+import { installs, type Install } from "../install/state.js";
+import { forkEnv, killTree } from "../runner/claude.js";
 import { alive, releaseLock, takeLock } from "../wake/lock.js";
 
 export const updateRecordPath = (claudeDir: string) => path.join(claudeDir, "isoplan", "update.json");
@@ -32,8 +43,10 @@ export const updateLockPath = (claudeDir: string) => path.join(claudeDir, "isopl
 
 /** A check at session start is skipped when one started this recently. */
 export const START_GAP_MS = 10 * 60000;
-// The most each `claude plugin` command may take; a lock older than both together is stale.
-const COMMAND_TIMEOUT_MS = 5 * 60000;
+/** The most each `claude plugin` command may take. */
+export const COMMAND_TIMEOUT_MS = 5 * 60000;
+// The end of a command's output kept.
+const OUTPUT_CHARS = 8000;
 
 /** The variables that turn updates off, and the one that turns plugin updates back on. */
 export const OFF_VARIABLES = ["DISABLE_UPDATES", "DISABLE_AUTOUPDATER", "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"] as const;
@@ -47,25 +60,70 @@ export function updatesOffBy(env: Record<string, string | undefined>): string | 
   return OFF_VARIABLES.find((name) => isSet(env[name])) ?? null;
 }
 
-/** What a command run said: its exit code (null when it couldn't run or timed out) and its output. */
+/**
+ * The environment the commands run with: this one's without the session's own variables (as the
+ * runner's fork, claude.ts), and nothing that can prompt (as a handoff's git, handoff/git.ts). The
+ * askpass is node, which takes git's prompt for a script it can't find and fails, so git gives up
+ * at once instead of asking.
+ */
+export function commandEnv(env: Record<string, string | undefined>, node = process.execPath): Record<string, string> {
+  return { ...noPromptEnv(forkEnv(env)), GIT_ASKPASS: node, SSH_ASKPASS: node, SSH_ASKPASS_REQUIRE: "never" };
+}
+
+/** What a command run said: its exit code and the end of its output, or why it didn't run to the end. */
 export interface Ran {
   code: number | null;
   output: string;
+  /** It couldn't start, or ran past its time and was stopped. */
+  error?: string;
+}
+
+export type Run = (argv: string[], cwd: string) => Promise<Ran>;
+
+/**
+ * Runs a command by argv, with no shell and no window, and keeps the end of what it printed. Past
+ * `timeoutMs` it is stopped with everything it started (on Windows taskkill /T; elsewhere its
+ * process group, which it leads).
+ */
+export function runHidden(argv: string[], cwd: string, { env = commandEnv(process.env), timeoutMs = COMMAND_TIMEOUT_MS }: { env?: Record<string, string>; timeoutMs?: number } = {}): Promise<Ran> {
+  return new Promise((resolve) => {
+    let output = "";
+    let timedOut = false;
+    const keep = (piece: string) => (output = (output + piece).slice(-OUTPUT_CHARS));
+    const child = spawn(argv[0]!, argv.slice(1), { cwd, env, stdio: ["pipe", "pipe", "pipe"], windowsHide: true, detached: process.platform !== "win32" });
+    child.stdin.end();
+    child.stdout.setEncoding("utf8").on("data", keep);
+    child.stderr.setEncoding("utf8").on("data", keep);
+    const timer = setTimeout(() => {
+      timedOut = true;
+      killTree(child);
+    }, timeoutMs);
+    child.on("error", (err) => {
+      clearTimeout(timer);
+      resolve({ code: null, output, error: `couldn't start ${argv[0]}: ${err.message}` });
+    });
+    child.on("close", (code) => {
+      clearTimeout(timer);
+      resolve(timedOut ? { code: null, output, error: `didn't finish within ${Math.round(timeoutMs / 1000)} s, so it was stopped` } : { code, output });
+    });
+  });
 }
 
 export interface UpdateOptions {
   claudeDir: string;
   /** The user's settings.json, which declares the marketplace. */
   settings: string;
+  /** Claude Code's plugins folder, with installed_plugins.json. */
+  plugins: string;
   /** The plugin's id, `<plugin>@<marketplace>`. */
   id: string;
-  /** The folder the commands run in: the session's project, so `plugin update` finds a project-scope install. */
+  /** Where the commands run when no install names a folder: the session's project. */
   cwd: string;
   /** What runs `claude`: the binary, or node and its cli.js (claude-binary.ts). */
   claude: string[];
   /** Skipped when a check started this recently, on any session. */
   gapMs: number;
-  run?: (argv: string[], cwd: string) => Promise<Ran>;
+  run?: Run;
   now?: () => number;
   isAlive?: (pid: number) => boolean;
 }
@@ -87,41 +145,58 @@ export async function turnOnAutoUpdate(settings: string, marketplace: string): P
   return `turned on Claude Code's auto-update for the ${marketplace} marketplace in ${settings}`;
 }
 
+/**
+ * The `claude plugin update` runs for the plugin `id`: one per install recorded (scope and project
+ * folder), each with its scope; one with no scope, in `cwd`, when the record can't be read.
+ */
+export function updateRuns(list: Install[] | null, id: string, cwd: string): { args: string[]; cwd: string }[] {
+  const mine = (list ?? []).filter((i) => i.id === id);
+  if (!list || !mine.length) return [{ args: ["plugin", "update", id], cwd }];
+  const runs = new Map<string, { args: string[]; cwd: string }>();
+  for (const install of mine) {
+    const inProject = (install.scope === "project" || install.scope === "local") && install.projectPath;
+    const at = inProject ? install.projectPath! : cwd;
+    const key = `${install.scope}|${inProject ? install.projectPath : ""}`;
+    if (!runs.has(key)) runs.set(key, { args: ["plugin", "update", id, ...(install.scope ? ["--scope", install.scope] : [])], cwd: at });
+  }
+  return [...runs.values()];
+}
+
 /** One check (see above), unless another is running or one started within `gapMs`. */
-export async function checkForUpdate({ claudeDir, settings, id, cwd, claude, gapMs, run = runHidden, now = Date.now, isAlive = alive }: UpdateOptions): Promise<Checked> {
+export async function checkForUpdate({ claudeDir, settings, plugins, id, cwd, claude, gapMs, run = runHidden, now = Date.now, isAlive = alive }: UpdateOptions): Promise<Checked> {
   const lock = updateLockPath(claudeDir);
-  if (!(await takeLock(lock, process.pid, isAlive, false, now(), { freshMs: 2 * COMMAND_TIMEOUT_MS + 60000 }))) return { ran: false, said: [] };
+  // Stale after both commands and every scope could have timed out, with time to spare.
+  if (!(await takeLock(lock, process.pid, isAlive, false, now(), { freshMs: 10 * COMMAND_TIMEOUT_MS }))) return { ran: false, said: [] };
   try {
-    const record = updateRecordPath(claudeDir);
-    const last = await fs.readFile(record, "utf8").then((text) => (JSON.parse(text) as { checkedAt?: unknown }).checkedAt, () => null);
-    if (typeof last === "number" && now() - last < gapMs) return { ran: false, said: [] };
-    await fs.writeFile(record, JSON.stringify({ checkedAt: now() }) + "\n");
+    const recordFile = updateRecordPath(claudeDir);
+    const record = await fs.readFile(recordFile, "utf8").then((text) => JSON.parse(text) as Record<string, unknown>, () => ({}) as Record<string, unknown>);
+    if (typeof record.checkedAt === "number" && now() - record.checkedAt < gapMs) return { ran: false, said: [] };
     const marketplace = id.slice(id.lastIndexOf("@") + 1);
+    const write = () => fs.writeFile(recordFile, JSON.stringify(record) + "\n");
+    record.checkedAt = now();
+    await write();
     const said: string[] = [];
     const turnedOn = await turnOnAutoUpdate(settings, marketplace).catch((err: unknown) => `couldn't turn on Claude Code's auto-update for ${marketplace}: ${(err as Error).message}`);
     if (turnedOn) said.push(turnedOn);
-    for (const args of [["plugin", "marketplace", "update", marketplace], ["plugin", "update", id]]) {
-      const [file, ...rest] = [...claude, ...args];
-      const r = await run([file!, ...rest], cwd);
-      const tail = lastLine(r.output);
-      const failed = r.code === null ? "didn't finish" : r.code !== 0 ? `failed with exit code ${r.code}` : null;
-      said.push(`claude ${args.join(" ")}: ${[failed, tail].filter(Boolean).join(": ")}`);
-      if (r.code !== 0) break;
+    if (turnedOn?.startsWith("turned on")) {
+      record.autoUpdateOn = marketplace;
+      await write();
+    }
+    const say = async (args: string[], at: string) => {
+      const r = await run([...claude, ...args], at);
+      const failed = r.error ?? (r.code === null ? "didn't finish" : r.code !== 0 ? `failed with exit code ${r.code}` : null);
+      said.push(`claude ${args.join(" ")}: ${[failed, lastLine(r.output)].filter(Boolean).join(": ")}`);
+      return !failed;
+    };
+    if (!(await say(["plugin", "marketplace", "update", marketplace], cwd))) return { ran: true, said };
+    for (const step of updateRuns(await installs(plugins), id, cwd)) {
+      if (await fs.stat(step.cwd).then((s) => s.isDirectory(), () => false)) await say(step.args, step.cwd);
+      else said.push(`claude ${step.args.join(" ")}: skipped, its project folder ${step.cwd} isn't there`);
     }
     return { ran: true, said };
   } finally {
     await releaseLock(lock, process.pid).catch(() => {});
   }
-}
-
-// Runs a command by argv, with no shell and no window, and collects what it printed.
-function runHidden(argv: string[], cwd: string): Promise<Ran> {
-  return new Promise((resolve) => {
-    execFile(argv[0]!, argv.slice(1), { cwd, windowsHide: true, timeout: COMMAND_TIMEOUT_MS, maxBuffer: 1024 * 1024 }, (err, stdout, stderr) => {
-      const code = !err ? 0 : typeof (err as { code?: unknown }).code === "number" && !(err as { killed?: boolean }).killed ? ((err as { code: number }).code) : null;
-      resolve({ code, output: `${stdout}\n${stderr}` });
-    });
-  });
 }
 
 // The last line a command printed that says something, without the terminal's colour codes.

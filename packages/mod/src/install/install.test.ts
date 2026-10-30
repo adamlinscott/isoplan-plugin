@@ -112,7 +112,7 @@ test("uninstall: takes out the hooks and everything the plugin wrote, and keeps 
   const s = setup({ model: "opus", hooks: { Stop: [other] } });
   await s.install();
   const dir = path.join(s.claudeDir, "isoplan");
-  for (const file of ["live/s1.json", "logs/runner.log", "titles/s1.json", "released/s1.json", "pairing.json", "pairing.lock", "pairing.write.lock", "update.json", "update.lock", "runner/ledger.json", "runner/environment.json", "config.json", "runner.json", "secret-patterns.json"]) {
+  for (const file of ["live/s1.json", "logs/runner.log", "titles/s1.json", "released/s1.json", "pairing.json", "pairing.lock", "pairing.write.lock", "update.json", "update.lock", "waits/s1/q1.json", "runner/ledger.json", "runner/environment.json", "config.json", "runner.json", "secret-patterns.json"]) {
     fs.mkdirSync(path.dirname(path.join(dir, file)), { recursive: true });
     fs.writeFileSync(path.join(dir, file), "{}");
   }
@@ -249,25 +249,52 @@ test("uninstall in the background: holds a lock, says why it failed and holds of
   s.record(["other@market"]);
   fs.writeFileSync(s.paths.settings, "{ broken");
   expect(await isUninstalling(s.claudeDir)).toBe(false);
-  await uninstallInBackground(s.paths);
+  await uninstallInBackground(s.paths, { recheckMs: 0 });
   expect(fs.readFileSync(uninstallLogPath(s.claudeDir), "utf8")).toMatch(/isn't valid JSON; left it alone\. Trying again in a day/);
   expect(await isUninstalling(s.claudeDir)).toBe(true);
   expect(fs.existsSync(wakeScriptPath(s.claudeDir))).toBe(true);
   // Held off: nothing happens until the day is out.
   fs.writeFileSync(s.paths.settings, "{}");
-  await uninstallInBackground(s.paths);
+  await uninstallInBackground(s.paths, { recheckMs: 0 });
   expect(fs.existsSync(wakeScriptPath(s.claudeDir))).toBe(true);
-  await uninstallInBackground(s.paths, { now: () => Date.now() + 25 * 3600000 });
+  await uninstallInBackground(s.paths, { now: () => Date.now() + 25 * 3600000, recheckMs: 0 });
   expect(fs.existsSync(path.join(s.claudeDir, "isoplan"))).toBe(false);
 
   // Installed again before it starts: it stops at once, leaves no log, and lets go of its lock.
   const t = marketplace();
   await t.auto();
   t.record(["isoplan@isoplan"]);
-  await uninstallInBackground(t.paths);
+  await uninstallInBackground(t.paths, { recheckMs: 0 });
   expect(fs.existsSync(uninstallLogPath(t.claudeDir))).toBe(false);
   expect(await isUninstalling(t.claudeDir)).toBe(false);
   expect(t.read().hooks.Stop).toEqual([{ hooks: [t.wake] }]);
+});
+
+test("uninstall in the background: an uninstalled reading that doesn't hold a few seconds later (an update rewriting the record) removes nothing", async () => {
+  const s = marketplace();
+  await s.auto();
+  s.record(["other@market"]);
+  const running = uninstallInBackground(s.paths, { recheckMs: 300 });
+  s.record(["isoplan@isoplan"]);
+  await running;
+  expect(fs.existsSync(wakeScriptPath(s.claudeDir))).toBe(true);
+  expect(s.read().hooks.Stop).toEqual([{ hooks: [s.wake] }]);
+  expect(await isUninstalling(s.claudeDir)).toBe(false);
+});
+
+test("uninstall: takes out the auto-update the plugin turned on, and leaves a person's own setting", async () => {
+  const source = { source: "github", repo: "adamlinscott/isoplan-plugin" };
+  const s = setup({ extraKnownMarketplaces: { isoplan: { source, autoUpdate: true }, other: { source, autoUpdate: true } } });
+  await s.install();
+  fs.writeFileSync(path.join(s.claudeDir, "isoplan", "update.json"), JSON.stringify({ checkedAt: 1, autoUpdateOn: "isoplan" }));
+  expect((await uninstall(s.paths)).changes).toContain(`took out the auto-update the plugin turned on for the isoplan marketplace in ${s.paths.settings}`);
+  expect(s.read()).toEqual({ extraKnownMarketplaces: { isoplan: { source }, other: { source, autoUpdate: true } } });
+
+  // Not recorded as the plugin's: left as it is.
+  const t = setup({ extraKnownMarketplaces: { isoplan: { source, autoUpdate: true } } });
+  await t.install();
+  await uninstall(t.paths);
+  expect(t.read()).toEqual({ extraKnownMarketplaces: { isoplan: { source, autoUpdate: true } } });
 });
 
 test("install: copies the runner and its defaults out of the plugin's folder, and records the copy", async () => {
