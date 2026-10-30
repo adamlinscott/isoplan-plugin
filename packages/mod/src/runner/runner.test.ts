@@ -191,6 +191,14 @@ test("runner: a brief the fork can't write still goes, marked fallback, with the
   expect(rejected.sent).toEqual([{ type: "refusal", v: PROTOCOL_VERSION, id: "b3", reason: "unavailable", detail: "the remote rejected the handoff's branch" }]);
 });
 
+test("runner: a brief that falls back because a cap is reached names the cap", async () => {
+  const repos: HandoffRepo[] = [{ path: ".", remote: "origin", branch: "isoplan/handoff/h-1", commit: "a".repeat(40) }];
+  const t = await setup({ settings: { answersPerMachinePerDay: 1 }, entries: [{ at: NOW - 1000, room: "a", usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } }], prepareBrief: async () => ({ files: [], note: "The note." }), push: async () => repos });
+  t.runner.take(brief("b1"));
+  await t.runner.settled();
+  expect(t.sent).toEqual([{ type: "reply", v: PROTOCOL_VERSION, id: "b1", kind: "write-brief", fallback: true, cap: "owner-day", handoff: { id: "h-1", brief: "No brief was written by the session: the owner-day cap is reached.\n\nThe note.", repos } }]);
+});
+
 test("runner: a commit with a possible secret holds the push, naming the file; the owner's release pushes that exact commit, and one held after it in another repo keeps it", async () => {
   const repos: HandoffRepo[] = [
     { path: ".", remote: "origin", branch: "isoplan/handoff/h-1", commit: "c".repeat(40) },

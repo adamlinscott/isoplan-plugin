@@ -23,10 +23,10 @@
 //
 // A brief (#48) is asked for with the session's untracked files named (`prepareBrief`), and ends
 // with the runner's note of what was pushed. When the fork can't write it (it failed, or a cap is
-// reached), the reply still goes, marked `fallback`, with the note alone, and the server writes the
-// rest from the room's feed. Its branch is pushed (`push`) only once the brief has cleared the scan
-// or been released. The push scans what it would send: on a match nothing is pushed, the refusal is
-// `withheld` naming the files, in every repo (never the pattern), and the files it couldn't read, and the owner's
+// reached), the reply still goes, marked `fallback` (and with the `cap`, when one is why), with the
+// note alone, and the server writes the rest from the room's feed. Its branch is pushed (`push`)
+// only once the brief has cleared the scan or been released. The push scans what it would send: on
+// a match nothing is pushed, the refusal is `withheld` naming the files, in every repo (never the pattern), and the files it couldn't read, and the owner's
 // release pushes that exact commit anyway. A push that fails is refused `unavailable` with the
 // reason. Without `push` a write-brief is refused before the fork runs. A `drop` of a request still
 // waiting in its room's line, or for a fork, takes it out: it never runs, and its estimate is never
@@ -232,7 +232,7 @@ export function createRunner({ answerer, ledger, settings, prompts, scan, send, 
         hold(id, () => pushAndReply({ ...pushAnyway, ...commits }));
         return { type: "refusal", v: PROTOCOL_VERSION, id, reason: "withheld", file, ...(unchecked.length ? { unchecked } : {}) };
       }
-      return { type: "reply", v: PROTOCOL_VERSION, id, kind: "write-brief", handoff: { id: (request as Extract<Ask, { kind: "write-brief" }>).handoff, brief: body, repos: pushed }, ...(isFallback ? { fallback: true as const } : {}) };
+      return { type: "reply", v: PROTOCOL_VERSION, id, kind: "write-brief", handoff: { id: (request as Extract<Ask, { kind: "write-brief" }>).handoff, brief: body, repos: pushed }, ...(isFallback ? { fallback: true as const } : {}), ...(cap ? { cap } : {}) };
     };
     const reply: () => Promise<Outgoing> = isBrief ? () => pushAndReply(null) : async () => ({ type: "reply", v: PROTOCOL_VERSION, id, kind: "answer-question", answer: body });
     const matched = await scan(body);

@@ -424,6 +424,16 @@ test("a missing repo is cloned only from https, ssh or host:path, with Git LFS's
   for (const [, env] of moves) expect(env).toEqual({ GIT_LFS_SKIP_SMUDGE: "1" });
 }, SLOW);
 
+test("a missing repo whose clone fails is reported as the clone step; the others are still cloned", async () => {
+  const t = await severalHandedOver("w3", { parent: false });
+  const plain = path.join(t.root, "plain");
+  fs.mkdirSync(plain);
+  const folder = path.join(t.claudeDir, "isoplan", "handoffs", "w3");
+  const handoff = { ...t.handoff, repos: t.handoff.repos.map((r) => (r.path === "api" ? { ...r, remote: path.join(t.root, "gone.git") } : r)) };
+  expect((await checkoutHere(run, plain, handoff, folder, 30000, LOCAL)).failures).toEqual([{ step: "clone", repo: "api", output: expect.stringContaining("git clone") }]);
+  expect(onBranch(path.join(plain, "web"), "w3")).toBe(true);
+}, SLOW);
+
 test("a path Windows reads as .git, in any spelling, one with a colon (an NTFS stream), and one with an empty, . or .. part, are refused", async () => {
   const t = await severalHandedOver("w2", { parent: false });
   const plain = path.join(t.root, "plain");
