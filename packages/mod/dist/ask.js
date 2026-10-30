@@ -5919,6 +5919,12 @@ const ChangesMessageSchema = object({
 	upsert: FactUpsertSchema,
 	remove: FactRemoveSchema
 });
+/** A cap on the answers a machine gives: a room's per hour, the owner's per day, or the owner's tokens per day. */
+const CapSchema = _enum([
+	"room-hour",
+	"owner-day",
+	"owner-tokens"
+]);
 /** The answer to a request, carrying the request's id and kind. */
 const ReplyMessageSchema = discriminatedUnion("kind", [
 	object({
@@ -5934,7 +5940,8 @@ const ReplyMessageSchema = discriminatedUnion("kind", [
 		id: RequestId,
 		kind: literal("write-brief"),
 		handoff: HandoffSchema,
-		fallback: literal(true).optional()
+		fallback: literal(true).optional(),
+		cap: CapSchema.optional()
 	}),
 	object({
 		type: literal("reply"),
@@ -5957,11 +5964,7 @@ const RefusalMessageSchema = discriminatedUnion("reason", [
 		v: Version,
 		id: RequestId,
 		reason: literal("over-cap"),
-		cap: _enum([
-			"room-hour",
-			"owner-day",
-			"owner-tokens"
-		])
+		cap: CapSchema
 	}),
 	object({
 		type: literal("refusal"),
@@ -6010,6 +6013,7 @@ const TakeMessageSchema = object({
 * was for and the end of its output; a failed setup step doesn't stop the session opening. From a runner, `session` is the
 * session it opened, which joins the room; without one no session opened (no clone to work in, or
 * no terminal), so the handoff is still there to take. From a session, the session itself joins.
+* `clone` is a missing repo under the folder whose git clone failed.
 */
 const TakenMessageSchema = object({
 	type: literal("taken"),
@@ -6019,6 +6023,7 @@ const TakenMessageSchema = object({
 	failures: array(object({
 		step: _enum([
 			"worktree",
+			"clone",
 			"setup",
 			"checkout",
 			"open"

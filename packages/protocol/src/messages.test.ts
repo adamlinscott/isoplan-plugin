@@ -315,6 +315,16 @@ test("an owner-answer reply parses with closed or late, and not with either fals
   expect(parseDataLayerMessage({ ...valid["reply owner-answer"], late: false })).toMatchObject({ ok: false, kind: "invalid" });
 });
 
+test("a fallback brief parses with the cap that caused it, and not with a cap of another name", () => {
+  expect(parseDataLayerMessage({ ...valid["reply write-brief fallback"], cap: "room-hour" })).toMatchObject({ ok: true });
+  expect(parseDataLayerMessage({ ...valid["reply write-brief fallback"], cap: "per-week" })).toMatchObject({ ok: false, kind: "invalid" });
+});
+
+test("a taken message parses with a failed clone of a repo under the folder", () => {
+  const taken = { ...valid.taken, failures: [{ step: "clone", repo: "libs/core", output: "fatal: repository not found" }] };
+  expect(parseDataLayerMessage(taken)).toEqual({ ok: true, message: taken });
+});
+
 test("a question parses with answerable or withheld, and not with either false", () => {
   const [question] = facts.questions!;
   expect(parseDataLayerMessage({ ...valid.full, facts: { ...facts, questions: [{ ...question, answerable: true }] } })).toMatchObject({ ok: true });

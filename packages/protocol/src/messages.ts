@@ -125,12 +125,16 @@ export const ChangesMessageSchema = z.object({
   remove: FactRemoveSchema,
 });
 
+/** A cap on the answers a machine gives: a room's per hour, the owner's per day, or the owner's tokens per day. */
+export const CapSchema = z.enum(["room-hour", "owner-day", "owner-tokens"]);
+
 /** The answer to a request, carrying the request's id and kind. */
 export const ReplyMessageSchema = z.discriminatedUnion("kind", [
   z.object({ type: z.literal("reply"), v: Version, id: RequestId, kind: z.literal("answer-question"), answer: z.string().min(1) }),
   // `fallback`: the fork couldn't write the brief, so `brief` is only the runner's note of what was
   // pushed, and the server writes the rest from the room's feed. The branch is pushed either way.
-  z.object({ type: z.literal("reply"), v: Version, id: RequestId, kind: z.literal("write-brief"), handoff: HandoffSchema, fallback: z.literal(true).optional() }),
+  // `cap`: the cap that stopped the fork running, when that is why, named as in an over-cap refusal.
+  z.object({ type: z.literal("reply"), v: Version, id: RequestId, kind: z.literal("write-brief"), handoff: HandoffSchema, fallback: z.literal(true).optional(), cap: CapSchema.optional() }),
   // The owner's answer reached the question that was waiting for it. `closed`: the session never said
   // whether it took the answer, but the question has closed, by this answer or the terminal's. `late`:
   // it took the answer after this request was refused for taking too long, so this reply follows that
@@ -150,7 +154,7 @@ export const RefusalMessageSchema = z.discriminatedUnion("reason", [
     v: Version,
     id: RequestId,
     reason: z.literal("over-cap"),
-    cap: z.enum(["room-hour", "owner-day", "owner-tokens"]),
+    cap: CapSchema,
   }),
   // `file`: what was withheld is the handoff's commit, whose added lines in that file matched (the
   // pattern itself stays on the machine); without it, the brief or answer. With several matches, or
@@ -201,6 +205,7 @@ export const TakeMessageSchema = z.object({
  * was for and the end of its output; a failed setup step doesn't stop the session opening. From a runner, `session` is the
  * session it opened, which joins the room; without one no session opened (no clone to work in, or
  * no terminal), so the handoff is still there to take. From a session, the session itself joins.
+ * `clone` is a missing repo under the folder whose git clone failed.
  */
 export const TakenMessageSchema = z.object({
   type: z.literal("taken"),
@@ -209,7 +214,7 @@ export const TakenMessageSchema = z.object({
   session: z.string().min(1).optional(),
   failures: z.array(
     z.object({
-      step: z.enum(["worktree", "setup", "checkout", "open"]),
+      step: z.enum(["worktree", "clone", "setup", "checkout", "open"]),
       repo: z.string().min(1).optional(),
       output: z.string(),
     }),

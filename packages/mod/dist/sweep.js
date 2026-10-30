@@ -6021,37 +6021,51 @@ const HandoffSchema = object({
 * machine reports as `forged-hello`. A server that signs nobody in ignores it.
 */
 const Token = string().min(1).max(200).optional();
+/** The first message on a connection: who is reporting, from where, about which session. */
+const HelloMessageSchema = object({
+	type: literal("hello"),
+	v: Version,
+	source: SourceSchema,
+	account: Account,
+	machine: Machine,
+	session: string().min(1),
+	project: ProjectSchema,
+	token: Token
+});
+/** The first message on a runner's link: the one link per machine that answers requests for its rooms. */
+const RunnerHelloMessageSchema = object({
+	type: literal("runner"),
+	v: Version,
+	account: Account,
+	machine: Machine,
+	token: Token
+});
+/** All of the session's facts. Sent on connect and on repair. */
+const FullMessageSchema = object({
+	type: literal("full"),
+	v: Version,
+	seq: Seq,
+	facts: FactsSchema
+});
+/** What changed since the last message. `seq` goes up by one per message, so a gap shows. */
+const ChangesMessageSchema = object({
+	type: literal("changes"),
+	v: Version,
+	seq: Seq,
+	upsert: FactUpsertSchema,
+	remove: FactRemoveSchema
+});
+/** A cap on the answers a machine gives: a room's per hour, the owner's per day, or the owner's tokens per day. */
+const CapSchema = _enum([
+	"room-hour",
+	"owner-day",
+	"owner-tokens"
+]);
 discriminatedUnion("type", [
-	object({
-		type: literal("hello"),
-		v: Version,
-		source: SourceSchema,
-		account: Account,
-		machine: Machine,
-		session: string().min(1),
-		project: ProjectSchema,
-		token: Token
-	}),
-	object({
-		type: literal("runner"),
-		v: Version,
-		account: Account,
-		machine: Machine,
-		token: Token
-	}),
-	object({
-		type: literal("full"),
-		v: Version,
-		seq: Seq,
-		facts: FactsSchema
-	}),
-	object({
-		type: literal("changes"),
-		v: Version,
-		seq: Seq,
-		upsert: FactUpsertSchema,
-		remove: FactRemoveSchema
-	}),
+	HelloMessageSchema,
+	RunnerHelloMessageSchema,
+	FullMessageSchema,
+	ChangesMessageSchema,
 	discriminatedUnion("kind", [
 		object({
 			type: literal("reply"),
@@ -6066,7 +6080,8 @@ discriminatedUnion("type", [
 			id: RequestId,
 			kind: literal("write-brief"),
 			handoff: HandoffSchema,
-			fallback: literal(true).optional()
+			fallback: literal(true).optional(),
+			cap: CapSchema.optional()
 		}),
 		object({
 			type: literal("reply"),
@@ -6083,11 +6098,7 @@ discriminatedUnion("type", [
 			v: Version,
 			id: RequestId,
 			reason: literal("over-cap"),
-			cap: _enum([
-				"room-hour",
-				"owner-day",
-				"owner-tokens"
-			])
+			cap: CapSchema
 		}),
 		object({
 			type: literal("refusal"),
@@ -6130,6 +6141,7 @@ discriminatedUnion("type", [
 		failures: array(object({
 			step: _enum([
 				"worktree",
+				"clone",
 				"setup",
 				"checkout",
 				"open"
