@@ -27,6 +27,10 @@ export interface Config {
   gitCacheSeconds: number;
   /** A session folder git can't place is a workspace when it holds between one and this many repos directly. */
   workspaceRepos: number;
+  /** How often the list of repos the office takes is checked again (approved.ts). */
+  approvedRefreshMinutes: number;
+  /** A copy of that list not confirmed by the server for this long approves nothing. */
+  approvedMaxAgeMinutes: number;
 }
 
 export interface ConfigIo {

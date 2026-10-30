@@ -3,9 +3,9 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { realpath, statSync } from "node:fs";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import http from "node:http";
+import { realpath, statSync } from "node:fs";
 import { promisify } from "node:util";
 //#region ../../node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/core/util.js
 function getEnumValues(entries) {
@@ -6306,502 +6306,21 @@ async function readJson(io, p, optional = false) {
 	}
 }
 //#endregion
-//#region src/data-layer/git.ts
-/** True for a Windows-shaped path: a drive letter, a UNC prefix, or any backslash. */
-function isWindowsPath(p) {
-	return /^[A-Za-z]:([\\/]|$)/.test(p) || p.startsWith("\\\\") || p.includes("\\");
-}
-function isAbsolute(p) {
-	return /^[A-Za-z]:[\\/]/.test(p) || p.startsWith("/") || p.startsWith("\\");
-}
-/**
-* Forward slashes, "." and ".." folded away, no trailing slash, drive letter upper-cased.
-* The root keeps its slash ("C:/", "/").
-*/
-function normalize(p) {
-	let s = p.replace(/\\/g, "/");
-	let prefix = "";
-	const drive = /^([A-Za-z]):(\/|$)/.exec(s);
-	if (drive) {
-		prefix = drive[1].toUpperCase() + ":/";
-		s = s.slice(drive[0].length);
-	} else if (s.startsWith("//")) {
-		prefix = "//";
-		s = s.slice(2);
-	} else if (s.startsWith("/")) {
-		prefix = "/";
-		s = s.slice(1);
-	}
-	const out = [];
-	for (const part of s.split("/")) {
-		if (part === "" || part === ".") continue;
-		if (part === ".." && out.length && out[out.length - 1] !== "..") out.pop();
-		else if (part !== ".." || !prefix) out.push(part);
-	}
-	return prefix + out.join("/") || ".";
-}
-/** A comparison key: normalised, and case-folded for Windows paths (case-insensitive there). */
-function pathKey(p) {
-	const n = normalize(p);
-	return isWindowsPath(p) || /^[A-Z]:\//.test(n) ? n.toLowerCase() : n;
-}
-function join(base, rel) {
-	return isAbsolute(rel) ? normalize(rel) : normalize(base + "/" + rel);
-}
-function dirname(p) {
-	const n = normalize(p);
-	const i = n.lastIndexOf("/");
-	if (i < 0) return ".";
-	if (i === 0) return "/";
-	if (/^[A-Z]:$/.test(n.slice(0, i))) return n.slice(0, i + 1);
-	return n.slice(0, i);
-}
-/**
-* `p` relative to `root` with forward slashes, or null when `p` is not inside `root`. Windows
-* paths compare case-insensitively; the relative part keeps `p`'s own spelling, so whoever
-* matches files by name compares them case-insensitively too.
-*/
-function relativeTo(root, p) {
-	const win = isWindowsPath(root) || isWindowsPath(p);
-	const r = normalize(root);
-	const n = normalize(p);
-	const rk = win ? r.toLowerCase() : r;
-	const nk = win ? n.toLowerCase() : n;
-	const base = rk.endsWith("/") ? rk : rk + "/";
-	if (!nk.startsWith(base)) return null;
-	return n.slice(base.length);
-}
-//#endregion
-//#region src/data-layer/claude-paths.ts
-/**
-* Claude Code's config folder and its .claude.json: both in $CLAUDE_CONFIG_DIR when it is set,
-* else ~/.claude and ~/.claude.json, where Claude Code itself looks.
-*/
-function claudePaths(env, home) {
-	const custom = env.CLAUDE_CONFIG_DIR;
-	return custom ? {
-		dir: normalize(custom),
-		json: join(custom, ".claude.json")
-	} : {
-		dir: join(home, ".claude"),
-		json: join(home, ".claude.json")
-	};
-}
-//#endregion
-//#region src/data-layer/identity.ts
-/** `claudeJson` is the path of .claude.json (`claudePaths`); git runs in `cwd`. */
-async function accountOf(io, claudeJson, cwd) {
-	const config = asObject(parseJson(await io.readText(claudeJson)));
-	const oauth = asObject(config.oauthAccount);
-	const gitName = async () => {
-		const r = io.run ? await Promise.resolve(io.run([
-			"git",
-			"config",
-			"user.name"
-		], { cwd })).catch(() => null) : null;
-		return r && r.code === 0 && r.stdout.trim() ? r.stdout.trim() : null;
-	};
-	if (nonEmpty(oauth.accountUuid)) return {
-		id: `claude:${oauth.accountUuid}`,
-		name: nonEmpty(oauth.displayName) ? oauth.displayName : await gitName() ?? ""
-	};
-	const name = await gitName();
-	if (nonEmpty(config.userID)) return {
-		id: `claude-install:${config.userID}`,
-		name: name ?? ""
-	};
-	return {
-		id: `git:${name ?? "unknown"}`,
-		name: name ?? ""
-	};
-}
-function parseJson(text) {
+//#region src/data-layer/approved-file.ts
+const approvedPath = (claudeDir) => path.join(claudeDir, "isoplan", "approved.json");
+const isFile$1 = (v) => !!v && typeof v.server === "string" && typeof v.version === "string" && typeof v.fetched === "number" && typeof v.checked === "number" && Array.isArray(v.repos) && v.repos.every((r) => typeof r === "string");
+/** approved.json, for `server` when given; null when there is none, or it is another server's. */
+async function readApproved(file, server) {
 	try {
-		return text === null ? null : JSON.parse(text);
+		const value = JSON.parse(await fs.readFile(file, "utf8"));
+		return isFile$1(value) && (server === void 0 || value.server === server) ? value : null;
 	} catch {
 		return null;
 	}
 }
-function asObject(value) {
-	return value && typeof value === "object" && !Array.isArray(value) ? value : {};
-}
-const nonEmpty = (v) => typeof v === "string" && v.trim() !== "";
-//#endregion
-//#region src/data-layer/io.ts
-function nodeIo({ run = runCommand } = {}) {
-	return {
-		run,
-		async listDir(dir) {
-			try {
-				return (await fs.readdir(dir, { withFileTypes: true })).map((e) => ({
-					name: e.name,
-					isDir: e.isDirectory()
-				}));
-			} catch {
-				return [];
-			}
-		},
-		async stat(p) {
-			try {
-				const s = await fs.stat(p);
-				return {
-					isDir: s.isDirectory(),
-					mtimeMs: s.mtimeMs,
-					size: s.size
-				};
-			} catch {
-				return null;
-			}
-		},
-		realpath: (p) => fs.realpath(p),
-		isDirSync: (p) => {
-			try {
-				return statSync(p).isDirectory();
-			} catch {
-				return false;
-			}
-		},
-		async read(p, start, end) {
-			if (start === void 0 || end === void 0) return fs.readFile(p, "utf8");
-			const fh = await fs.open(p, "r");
-			try {
-				const buf = Buffer.alloc(Math.max(0, end - start));
-				const { bytesRead } = await fh.read(buf, 0, buf.length, start);
-				return buf.subarray(0, bytesRead).toString("utf8");
-			} finally {
-				await fh.close();
-			}
-		}
-	};
-}
-function runCommand([cmd, ...args], { cwd }) {
-	return new Promise((resolve) => {
-		execFile(cmd, args, {
-			cwd,
-			encoding: "utf8",
-			timeout: 1e4,
-			windowsHide: true
-		}, (err, stdout) => {
-			resolve({
-				code: err ? typeof err.code === "number" ? err.code : 1 : 0,
-				stdout: stdout || ""
-			});
-		});
-	});
-}
-//#endregion
-//#region src/data-layer/changes.ts
-/** null when nothing changed. */
-function diffFacts(before, after, answered) {
-	const upsert = {};
-	const remove = {};
-	if (!same(before.session, after.session)) upsert.session = after.session;
-	const agents = diff(before.agents, after.agents, (a) => a.id);
-	if (agents.upsert.length) upsert.agents = agents.upsert;
-	if (agents.remove.length) remove.agents = agents.remove.map((a) => a.id);
-	for (const list of ["edits", "reads"]) {
-		const d = diff(before[list], after[list], (f) => key(f.agent, f.file, f.project?.id ?? ""));
-		if (d.upsert.length) upsert[list] = d.upsert;
-		if (d.remove.length) remove[list] = d.remove.map(({ agent, file, project }) => ({
-			agent,
-			file,
-			...project ? { project } : {}
-		}));
-	}
-	const waits = diff(before.waits, after.waits, (w) => key(w.waiter, w.on));
-	if (waits.upsert.length) upsert.waits = waits.upsert;
-	if (waits.remove.length) remove.waits = waits.remove.map(({ waiter, on }) => ({
-		waiter,
-		on
-	}));
-	const reports = diff(before.reports, after.reports, (r) => r.agent);
-	if (reports.upsert.length) upsert.reports = reports.upsert;
-	if (reports.remove.length) remove.reports = reports.remove.map((r) => r.agent);
-	const questions = diff(before.questions ?? [], after.questions ?? [], (q) => q.id);
-	if (questions.upsert.length) upsert.questions = questions.upsert;
-	if (questions.remove.length) {
-		remove.questions = questions.remove.map((q) => q.id);
-		if (answered) remove.questionOutcomes = Object.fromEntries(remove.questions.map((id) => [id, answered(id) ? "answered" : "abandoned"]));
-	}
-	return Object.keys(upsert).length || Object.keys(remove).length ? {
-		upsert,
-		remove
-	} : null;
-}
-function diff(before, after, keyOf) {
-	const old = new Map(before.map((r) => [keyOf(r), r]));
-	const now = new Set(after.map(keyOf));
-	return {
-		upsert: after.filter((r) => !same(old.get(keyOf(r)), r)),
-		remove: before.filter((r) => !now.has(keyOf(r)))
-	};
-}
-const key = (...parts) => JSON.stringify(parts);
-const same = (a, b) => a !== void 0 && JSON.stringify(a) === JSON.stringify(b);
-//#endregion
-//#region src/data-layer/link.ts
-const STABLE_MS$1 = 3e4;
-const OUTBOX_MAX = 100;
-const OUTBOX_MAX_AGE_MS = 36e5;
-function createLink({ url, hello, emit, minIntervalMs = 1e3, retryBaseMs = 1e3, retryCapMs = 3e4, notWantedRetryMs = 36e5, takenRetryMs = 36e5, onNotWanted, onPairingEnded, onMessage, filter = (facts) => facts, answered, pairing, pairPollMs = 5e3, random = Math.random }) {
-	const outbox = [];
-	let latest = null;
-	let socket = null;
-	let isOpen = false;
-	let sent = null;
-	let seq = 0;
-	let sentAt = -Infinity;
-	let failures = 0;
-	let pacing = null;
-	let retry = null;
-	let isClosed = false;
-	let isUnwanted = false;
-	let sentToken;
-	let refusing = Promise.resolve();
-	let isRefused = false;
-	let refusedFor = null;
-	let isTaken = false;
-	let refusals = 0;
-	let projects = null;
-	let stable = null;
-	function connect() {
-		retry = null;
-		if (!pairing) return open(void 0);
-		refusing.then(() => pairing.token()).then((token) => {
-			if (isClosed) return;
-			if (token !== null) return open(token);
-			emit({
-				type: "status",
-				server: url,
-				state: "pairing"
-			});
-			retry = setTimeout(connect, pairPollMs);
-		}, (err) => {
-			if (isClosed) return;
-			emit({
-				type: "log",
-				text: `couldn't pair with the office server: ${String(err?.message ?? err)}`
-			});
-			dropped();
-		});
-	}
-	function open(token) {
-		emit({
-			type: "status",
-			server: url,
-			state: "connecting"
-		});
-		const ws = new WebSocket(url);
-		socket = ws;
-		sentToken = token;
-		ws.onopen = () => {
-			if (socket !== ws) return;
-			failures = 0;
-			isOpen = true;
-			seq = 0;
-			projects = null;
-			stable = setTimeout(() => refusals = 0, STABLE_MS$1);
-			send(token ? {
-				...hello,
-				token
-			} : hello);
-			for (const { message, at } of outbox.splice(0)) if (Date.now() - at < OUTBOX_MAX_AGE_MS) send(message);
-			sendFull();
-			emit({
-				type: "status",
-				server: url,
-				state: "connected"
-			});
-		};
-		ws.onmessage = (event) => {
-			if (socket === ws) receive(event.data);
-		};
-		ws.onerror = () => {
-			if (socket !== ws) return;
-			dropped();
-			try {
-				ws.close();
-			} catch {}
-		};
-		ws.onclose = () => {
-			if (socket === ws) dropped();
-		};
-	}
-	function dropped() {
-		socket = null;
-		isOpen = false;
-		projects = null;
-		sent = null;
-		if (pacing) clearTimeout(pacing);
-		pacing = null;
-		if (stable) clearTimeout(stable);
-		stable = null;
-		if (isClosed) return;
-		if (isTaken) {
-			isTaken = false;
-			emit({
-				type: "status",
-				server: url,
-				state: "taken"
-			});
-			retry = setTimeout(connect, takenRetryMs);
-			return;
-		}
-		if (isRefused) {
-			isRefused = false;
-			if (refusedFor === "token-expired" && refusals === 0) {
-				refusals++;
-				retry = setTimeout(connect, 0);
-				return;
-			}
-			const delay = Math.min(retryCapMs, retryBaseMs * 2 ** refusals++);
-			emit({
-				type: "status",
-				server: url,
-				state: "disconnected",
-				retryInMs: delay
-			});
-			retry = setTimeout(connect, delay);
-			return;
-		}
-		if (isUnwanted) {
-			isUnwanted = false;
-			failures = 0;
-			emit({
-				type: "status",
-				server: url,
-				state: "not-wanted"
-			});
-			retry = setTimeout(connect, notWantedRetryMs);
-			return;
-		}
-		const delay = Math.min(retryCapMs, retryBaseMs * 2 ** failures++);
-		const retryInMs = Math.round(delay / 2 + random() * delay / 2);
-		emit({
-			type: "status",
-			server: url,
-			state: "disconnected",
-			retryInMs
-		});
-		retry = setTimeout(connect, retryInMs);
-	}
-	function send(message) {
-		socket.send(JSON.stringify(message));
-	}
-	function sendFull() {
-		if (!latest) return;
-		const facts = filter(latest, projects);
-		send({
-			type: "full",
-			v: 1,
-			seq: seq++,
-			facts
-		});
-		sent = facts;
-		sentAt = Date.now();
-	}
-	function flush() {
-		pacing = null;
-		if (!isOpen || !latest || !sent) return;
-		const facts = filter(latest, projects);
-		const changed = diffFacts(sent, facts, answered);
-		if (!changed) return;
-		const wait = sentAt + minIntervalMs - Date.now();
-		if (wait > 0) {
-			pacing = setTimeout(flush, wait);
-			return;
-		}
-		send({
-			type: "changes",
-			v: 1,
-			seq: seq++,
-			...changed
-		});
-		sent = facts;
-		sentAt = Date.now();
-	}
-	function receive(data) {
-		let value;
-		try {
-			value = JSON.parse(String(data));
-		} catch {
-			emit({
-				type: "log",
-				text: "the office server sent a message that isn't JSON"
-			});
-			return;
-		}
-		const parsed = parseOfficeServerMessage(value);
-		if (!parsed.ok) {
-			emit({
-				type: "log",
-				text: `the office server sent a message this data layer can't read (${parsed.kind}): ${parsed.error}`
-			});
-			return;
-		}
-		const message = parsed.message;
-		if (message.type === "welcome") {
-			projects = new Set(message.projects.map((p) => p.toLowerCase()));
-			if (!pacing) flush();
-		} else if (message.type === "repair") {
-			if (pacing) clearTimeout(pacing);
-			pacing = null;
-			sendFull();
-		} else if (message.type === "conflict" && !latest?.agents.some((a) => a.id === message.agent)) emit({
-			type: "log",
-			text: `the office server sent a note for ${message.agent}, not an agent of this session`
-		});
-		else if (pairing && message.type === "error" && (message.code === "not-paired" || message.code === "pairing-ended" || message.code === "token-expired")) {
-			isRefused = true;
-			refusedFor = message.code;
-			refusing = pairing.refused(message.code, sentToken).catch(() => {});
-			if (message.code === "pairing-ended" && onPairingEnded) refusing.then(onPairingEnded);
-			emit(message.code === "token-expired" ? {
-				type: "log",
-				text: "the office server says this machine's token has expired; renewing it"
-			} : message);
-		} else if (message.type === "error" && message.code === "forged-hello") {
-			isTaken = true;
-			emit(message);
-		} else if (message.type === "conflict" || message.type === "error" || message.type === "asked" || message.type === "ask-rights") {
-			emit(message);
-			if (message.type === "error" && message.code === "not-wanted") {
-				isUnwanted = true;
-				onNotWanted?.();
-			}
-		} else if (onMessage && (message.type === "request" || message.type === "release" || message.type === "handoff" || message.type === "drop")) onMessage(message);
-		else emit({
-			type: "log",
-			text: `the office server sent a ${message.type} message, which this data layer doesn't handle yet`
-		});
-	}
-	connect();
-	return {
-		update(facts) {
-			latest = facts;
-			if (isOpen && !sent) sendFull();
-			else if (!pacing) flush();
-		},
-		send(message) {
-			if (isOpen && socket.readyState === WebSocket.OPEN) send(message);
-			else {
-				outbox.push({
-					message,
-					at: Date.now()
-				});
-				if (outbox.length > OUTBOX_MAX) outbox.shift();
-			}
-		},
-		projects: () => projects,
-		close() {
-			isClosed = true;
-			if (pacing) clearTimeout(pacing);
-			if (retry) clearTimeout(retry);
-			if (stable) clearTimeout(stable);
-			pairing?.close();
-			socket?.close();
-		}
-	};
+/** The approved repos' ids, lower case, while the copy is younger than `maxAgeMs`; null after, or with none. */
+function freshRepos(copy, maxAgeMs, now) {
+	return copy && now - copy.checked <= maxAgeMs ? new Set(copy.repos.map((r) => r.toLowerCase())) : null;
 }
 //#endregion
 //#region src/wake/lock.ts
@@ -7280,6 +6799,839 @@ function createPairing({ file, lock, writeLock, server, account, machine, emit, 
 			});
 		},
 		close: stopAnswering
+	};
+}
+//#endregion
+//#region src/data-layer/approved.ts
+const getJson = async (url, headers) => {
+	const response = await fetch(url, {
+		headers,
+		signal: AbortSignal.timeout(15e3)
+	});
+	return {
+		status: response.status,
+		body: response.status === 200 || response.status === 401 ? await response.json().catch(() => null) : null
+	};
+};
+/** While the machine waits to be paired the list is asked for again this soon, and after a failure this soon. */
+const PAIR_POLL_MS = 5e3;
+const RETRY_MS = 3e4;
+/** A rename the file system refuses for a moment (a scanner holding the file, on Windows) is tried this often. */
+const RENAME_TRIES = 5;
+const isList = (value) => {
+	const v = value;
+	return !!v && typeof v.version === "string" && Array.isArray(v.repos) && v.repos.every((r) => typeof r === "string");
+};
+/** Whether `a` is a later list than `b`: a newer version, by when it was first had, or the same one confirmed later. */
+const later = (a, b) => !b || (a.version !== b.version ? a.fetched > b.fetched : a.checked > b.checked);
+/** Written whole, through a temp file, so a reader never sees half of it; owner-only. A refused rename is tried again, then thrown. */
+async function writeFile(file, value) {
+	await fs.mkdir(path.dirname(file), { recursive: true });
+	const temp = `${file}.${process.pid}.${randomBytes(4).toString("hex")}`;
+	await fs.writeFile(temp, JSON.stringify(value, null, 2) + "\n", { mode: 384 });
+	for (let i = 0;; i++) try {
+		await fs.rename(temp, file);
+		return;
+	} catch (err) {
+		const code = err.code;
+		if (i + 1 < RENAME_TRIES && (code === "EPERM" || code === "EBUSY" || code === "EACCES")) {
+			await new Promise((r) => setTimeout(r, 25 * 2 ** i));
+			continue;
+		}
+		await fs.rm(temp, { force: true }).catch(() => {});
+		throw err;
+	}
+}
+function createApproved({ server, file, pairing, refreshMs, maxAgeMs, log, get = (url, headers) => getJson(url, headers), now = Date.now }) {
+	let list = null;
+	let problem = "unreachable";
+	let nextAt = -Infinity;
+	let busy = null;
+	let queued = null;
+	let said = "";
+	const take = (value) => {
+		list = value;
+		problem = null;
+		nextAt = value.checked + refreshMs;
+	};
+	const tell = (text) => {
+		if (text !== said) log(text);
+		said = text;
+	};
+	async function keep(mine) {
+		const theirs = await readApproved(file, server);
+		const kept = theirs && !later(mine, theirs) ? theirs.version === mine.version ? {
+			...theirs,
+			checked: Math.max(theirs.checked, mine.checked)
+		} : theirs : mine;
+		take(kept);
+		if (kept === theirs) return;
+		await writeFile(file, kept).catch((err) => tell(`couldn't keep the office's list of repos in ${file}: ${String(err?.message ?? err)}`));
+	}
+	async function check() {
+		const shared = await readApproved(file, server);
+		if (shared && later(shared, list)) take(shared);
+		if (list && now() < nextAt) return;
+		let token;
+		try {
+			token = pairing ? await pairing.token() : void 0;
+		} catch (err) {
+			tell(`couldn't read which repos the office takes: ${String(err?.message ?? err)}`);
+			problem = "unreachable";
+			nextAt = now() + RETRY_MS;
+			return;
+		}
+		if (token === null) {
+			problem = "pairing";
+			nextAt = now() + PAIR_POLL_MS;
+			return;
+		}
+		const headers = {};
+		if (token) headers.authorization = `Bearer ${token}`;
+		if (list) headers["if-none-match"] = `"${list.version}"`;
+		let answer;
+		try {
+			answer = await get(httpUrl(server, "/repos"), headers);
+		} catch (err) {
+			answer = {
+				status: 0,
+				body: String(err?.message ?? err)
+			};
+		}
+		const code = answer.body?.code;
+		const at = now();
+		if (answer.status === 304 && list) {
+			said = "";
+			await keep({
+				...list,
+				checked: at
+			});
+		} else if (answer.status === 200 && isList(answer.body)) {
+			said = "";
+			const same = list?.version === answer.body.version;
+			await keep({
+				server,
+				version: answer.body.version,
+				repos: answer.body.repos,
+				fetched: same ? list.fetched : at,
+				checked: at
+			});
+		} else if (answer.status === 401 && pairing && (code === "not-paired" || code === "pairing-ended" || code === "token-expired")) {
+			await pairing.refused(code, token).catch(() => {});
+			problem = "pairing";
+			nextAt = at + (code === "token-expired" || !token ? 0 : PAIR_POLL_MS);
+		} else if (answer.status === 404) {
+			tell(`${server} is too old to say which repos its office takes, so nothing is sent to it; it needs updating`);
+			list = null;
+			problem = "too-old";
+			nextAt = at + refreshMs;
+		} else {
+			tell(`couldn't read which repos the office takes from ${server}: ${answer.status ? `it answered ${answer.status}` : String(answer.body)}`);
+			problem = "unreachable";
+			nextAt = at + RETRY_MS;
+		}
+	}
+	function refresh(force = false) {
+		if (force) nextAt = -Infinity;
+		if (busy) {
+			if (!force) return busy;
+			queued ??= busy.then(() => {
+				queued = null;
+				return refresh(true);
+			});
+			return queued;
+		}
+		if (now() < nextAt) return Promise.resolve();
+		busy = check().catch((err) => tell(`couldn't read which repos the office takes: ${String(err?.message ?? err)}`)).finally(() => busy = null);
+		return busy;
+	}
+	return {
+		repos: () => freshRepos(list, maxAgeMs, now()),
+		version: () => list?.version ?? null,
+		problem: () => list && !freshRepos(list, maxAgeMs, now()) ? "unreachable" : list ? null : problem,
+		refresh
+	};
+}
+//#endregion
+//#region src/data-layer/git.ts
+/** True for a Windows-shaped path: a drive letter, a UNC prefix, or any backslash. */
+function isWindowsPath(p) {
+	return /^[A-Za-z]:([\\/]|$)/.test(p) || p.startsWith("\\\\") || p.includes("\\");
+}
+function isAbsolute(p) {
+	return /^[A-Za-z]:[\\/]/.test(p) || p.startsWith("/") || p.startsWith("\\");
+}
+/**
+* Forward slashes, "." and ".." folded away, no trailing slash, drive letter upper-cased.
+* The root keeps its slash ("C:/", "/").
+*/
+function normalize(p) {
+	let s = p.replace(/\\/g, "/");
+	let prefix = "";
+	const drive = /^([A-Za-z]):(\/|$)/.exec(s);
+	if (drive) {
+		prefix = drive[1].toUpperCase() + ":/";
+		s = s.slice(drive[0].length);
+	} else if (s.startsWith("//")) {
+		prefix = "//";
+		s = s.slice(2);
+	} else if (s.startsWith("/")) {
+		prefix = "/";
+		s = s.slice(1);
+	}
+	const out = [];
+	for (const part of s.split("/")) {
+		if (part === "" || part === ".") continue;
+		if (part === ".." && out.length && out[out.length - 1] !== "..") out.pop();
+		else if (part !== ".." || !prefix) out.push(part);
+	}
+	return prefix + out.join("/") || ".";
+}
+/** A comparison key: normalised, and case-folded for Windows paths (case-insensitive there). */
+function pathKey(p) {
+	const n = normalize(p);
+	return isWindowsPath(p) || /^[A-Z]:\//.test(n) ? n.toLowerCase() : n;
+}
+function join(base, rel) {
+	return isAbsolute(rel) ? normalize(rel) : normalize(base + "/" + rel);
+}
+function dirname(p) {
+	const n = normalize(p);
+	const i = n.lastIndexOf("/");
+	if (i < 0) return ".";
+	if (i === 0) return "/";
+	if (/^[A-Z]:$/.test(n.slice(0, i))) return n.slice(0, i + 1);
+	return n.slice(0, i);
+}
+/**
+* `p` relative to `root` with forward slashes, or null when `p` is not inside `root`. Windows
+* paths compare case-insensitively; the relative part keeps `p`'s own spelling, so whoever
+* matches files by name compares them case-insensitively too.
+*/
+function relativeTo(root, p) {
+	const win = isWindowsPath(root) || isWindowsPath(p);
+	const r = normalize(root);
+	const n = normalize(p);
+	const rk = win ? r.toLowerCase() : r;
+	const nk = win ? n.toLowerCase() : n;
+	const base = rk.endsWith("/") ? rk : rk + "/";
+	if (!nk.startsWith(base)) return null;
+	return n.slice(base.length);
+}
+/**
+* Answers are cached per folder and looked up again once older than `maxAgeMs` at `now`, so
+* worktrees added or removed and branches switched show up. Calls that pass the same `now` share
+* one answer per folder. Without options an answer is kept for the life of the returned object. A
+* folder git can't place resolves to null.
+*/
+function createGit(io) {
+	const cache = /* @__PURE__ */ new Map();
+	return { resolve(dir, { now = 0, maxAgeMs = Infinity } = {}) {
+		const key = pathKey(dir);
+		const hit = cache.get(key);
+		if (hit && now - hit.at <= maxAgeMs) return hit.result;
+		const result = resolveUncached(io, dir).catch(() => null);
+		cache.set(key, {
+			at: now,
+			result
+		});
+		return result;
+	} };
+}
+async function resolveUncached(io, dir) {
+	if (io.run) {
+		const viaCommand = await fromCommand(io.run, dir).catch(() => null);
+		if (viaCommand) return viaCommand;
+	}
+	return fromFiles(io, dir);
+}
+async function fromCommand(run, dir) {
+	const where = await run([
+		"git",
+		"rev-parse",
+		"--path-format=absolute",
+		"--show-toplevel",
+		"--git-common-dir"
+	], { cwd: dir });
+	if (!where || where.code !== 0) return null;
+	const [toplevel, commonDir] = where.stdout.split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
+	if (!toplevel || !commonDir) return null;
+	const head = await Promise.resolve().then(() => run([
+		"git",
+		"rev-parse",
+		"--abbrev-ref",
+		"HEAD"
+	], { cwd: dir })).catch(() => null);
+	const name = head && head.code === 0 ? head.stdout.trim() : "";
+	return {
+		toplevel: normalize(toplevel),
+		commonDir: normalize(commonDir),
+		branch: name && name !== "HEAD" ? name : null
+	};
+}
+async function fromFiles(io, dir) {
+	const self = await io.stat(dir);
+	if (!self || !self.isDir) return null;
+	let at = normalize(dir);
+	for (;;) {
+		const dotGit = join(at, ".git");
+		const s = await io.stat(dotGit);
+		if (s) {
+			let gitDir = dotGit;
+			let commonDir = dotGit;
+			if (!s.isDir) {
+				const pointer = /^gitdir:\s*(.+?)\s*$/m.exec(await io.read(dotGit));
+				if (!pointer) return null;
+				gitDir = join(at, pointer[1]);
+				const common = await readOptional(io, join(gitDir, "commondir"));
+				commonDir = common ? join(gitDir, common.trim()) : gitDir;
+			}
+			const head = await readOptional(io, join(gitDir, "HEAD")) || "";
+			const ref = /^ref:\s*refs\/heads\/(.+?)\s*$/m.exec(head);
+			return {
+				toplevel: at,
+				commonDir,
+				branch: ref ? ref[1] : null
+			};
+		}
+		const up = dirname(at);
+		if (up === at) return null;
+		at = up;
+	}
+}
+async function readOptional(io, p) {
+	try {
+		return await io.stat(p) ? await io.read(p) : null;
+	} catch {
+		return null;
+	}
+}
+//#endregion
+//#region src/data-layer/claude-paths.ts
+/**
+* Claude Code's config folder and its .claude.json: both in $CLAUDE_CONFIG_DIR when it is set,
+* else ~/.claude and ~/.claude.json, where Claude Code itself looks.
+*/
+function claudePaths(env, home) {
+	const custom = env.CLAUDE_CONFIG_DIR;
+	return custom ? {
+		dir: normalize(custom),
+		json: join(custom, ".claude.json")
+	} : {
+		dir: join(home, ".claude"),
+		json: join(home, ".claude.json")
+	};
+}
+//#endregion
+//#region src/data-layer/identity.ts
+/** `claudeJson` is the path of .claude.json (`claudePaths`); git runs in `cwd`. */
+async function accountOf(io, claudeJson, cwd) {
+	const config = asObject(parseJson(await io.readText(claudeJson)));
+	const oauth = asObject(config.oauthAccount);
+	const gitName = async () => {
+		const r = io.run ? await Promise.resolve(io.run([
+			"git",
+			"config",
+			"user.name"
+		], { cwd })).catch(() => null) : null;
+		return r && r.code === 0 && r.stdout.trim() ? r.stdout.trim() : null;
+	};
+	if (nonEmpty(oauth.accountUuid)) return {
+		id: `claude:${oauth.accountUuid}`,
+		name: nonEmpty(oauth.displayName) ? oauth.displayName : await gitName() ?? ""
+	};
+	const name = await gitName();
+	if (nonEmpty(config.userID)) return {
+		id: `claude-install:${config.userID}`,
+		name: name ?? ""
+	};
+	return {
+		id: `git:${name ?? "unknown"}`,
+		name: name ?? ""
+	};
+}
+/**
+* The project the session's folder belongs to: its git remote's, or for a repo with no usable
+* remote, the main checkout's folder on this machine (so every worktree of one repo is one
+* project). A folder git can't place is its own local project. On a file system that ignores case
+* (Windows, macOS) a local project's id is lower-cased, so one folder reached in two spellings is
+* one project, in the hello and in every edit alike.
+*/
+async function projectOf(run, where, cwd, machine, caseless = process.platform === "win32" || process.platform === "darwin") {
+	let remote = null;
+	if (run && where) {
+		const r = await Promise.resolve(run([
+			"git",
+			"remote",
+			"get-url",
+			"origin"
+		], { cwd: where.toplevel })).catch(() => null);
+		if (r && r.code === 0 && r.stdout.trim()) remote = r.stdout.trim();
+	}
+	const root = !where ? normalize(cwd) : /\/\.git$/.test(where.commonDir) ? dirname(where.commonDir) : where.toplevel;
+	const project = projectId(remote, {
+		machine,
+		root
+	});
+	return caseless && project.id.startsWith("local:") ? {
+		...project,
+		id: project.id.toLowerCase()
+	} : project;
+}
+function parseJson(text) {
+	try {
+		return text === null ? null : JSON.parse(text);
+	} catch {
+		return null;
+	}
+}
+function asObject(value) {
+	return value && typeof value === "object" && !Array.isArray(value) ? value : {};
+}
+const nonEmpty = (v) => typeof v === "string" && v.trim() !== "";
+//#endregion
+//#region src/data-layer/io.ts
+function nodeIo({ run = runCommand } = {}) {
+	return {
+		run,
+		async listDir(dir) {
+			try {
+				return (await fs.readdir(dir, { withFileTypes: true })).map((e) => ({
+					name: e.name,
+					isDir: e.isDirectory()
+				}));
+			} catch {
+				return [];
+			}
+		},
+		async stat(p) {
+			try {
+				const s = await fs.stat(p);
+				return {
+					isDir: s.isDirectory(),
+					mtimeMs: s.mtimeMs,
+					size: s.size
+				};
+			} catch {
+				return null;
+			}
+		},
+		realpath: (p) => fs.realpath(p),
+		isDirSync: (p) => {
+			try {
+				return statSync(p).isDirectory();
+			} catch {
+				return false;
+			}
+		},
+		async read(p, start, end) {
+			if (start === void 0 || end === void 0) return fs.readFile(p, "utf8");
+			const fh = await fs.open(p, "r");
+			try {
+				const buf = Buffer.alloc(Math.max(0, end - start));
+				const { bytesRead } = await fh.read(buf, 0, buf.length, start);
+				return buf.subarray(0, bytesRead).toString("utf8");
+			} finally {
+				await fh.close();
+			}
+		}
+	};
+}
+function runCommand([cmd, ...args], { cwd }) {
+	return new Promise((resolve) => {
+		execFile(cmd, args, {
+			cwd,
+			encoding: "utf8",
+			timeout: 1e4,
+			windowsHide: true
+		}, (err, stdout) => {
+			resolve({
+				code: err ? typeof err.code === "number" ? err.code : 1 : 0,
+				stdout: stdout || ""
+			});
+		});
+	});
+}
+//#endregion
+//#region src/data-layer/home.ts
+/** The projects `folder` may report as, and whether it is a workspace. */
+async function candidatesOf(folder, io) {
+	const where = await io.resolve(folder);
+	if (where) return {
+		projects: [await io.projectOf(where, folder)],
+		workspace: false
+	};
+	const tooWide = pathKey(folder) === pathKey(io.home) || relativeTo(folder, io.home) !== null;
+	const st = await io.stat(folder);
+	const repos = [];
+	if (!tooWide && st?.isDir) {
+		for (const e of await io.listDir(folder)) if (e.isDir && await io.stat(join(folder, `${e.name}/.git`))) repos.push(join(folder, e.name));
+	}
+	if (!repos.length || repos.length > io.workspaceRepos) return {
+		projects: [await io.projectOf(null, folder)],
+		workspace: false
+	};
+	const projects = [];
+	for (const dir of repos.sort()) {
+		const at = await io.resolve(dir);
+		if (at) projects.push(await io.projectOf(at, dir));
+	}
+	return {
+		projects,
+		workspace: true
+	};
+}
+/** The first of `folder`'s candidates on `repos`: what a session there reports as. Null when none is, or there is no list. */
+async function approvedHome(folder, io, repos) {
+	if (!repos) return null;
+	const { projects } = await candidatesOf(folder, io);
+	return projects.find((p) => repos.has(p.id.toLowerCase())) ?? null;
+}
+/** Whether the repo whose top is `dir` is on `repos`, for a handoff's prepare (handoff/git.ts). */
+const takesFrom = (io, repos) => async (dir) => {
+	const where = repos && await io.resolve(dir);
+	return !!where && repos.has((await io.projectOf(where, dir)).id.toLowerCase());
+};
+/** A HomeIo on this machine, for the runner and the commands. */
+function machineHomeIo(workspaceRepos, machine = os.hostname()) {
+	const io = nodeIo();
+	const git = createGit(io);
+	return {
+		resolve: (dir) => git.resolve(dir),
+		projectOf: (where, dir) => projectOf(io.run, where, dir, machine),
+		stat: (p) => Promise.resolve(io.stat(p)),
+		listDir: (d) => io.listDir(d),
+		home: os.homedir(),
+		workspaceRepos
+	};
+}
+//#endregion
+//#region src/data-layer/changes.ts
+/** null when nothing changed. */
+function diffFacts(before, after, answered) {
+	const upsert = {};
+	const remove = {};
+	if (!same(before.session, after.session)) upsert.session = after.session;
+	const agents = diff(before.agents, after.agents, (a) => a.id);
+	if (agents.upsert.length) upsert.agents = agents.upsert;
+	if (agents.remove.length) remove.agents = agents.remove.map((a) => a.id);
+	for (const list of ["edits", "reads"]) {
+		const d = diff(before[list], after[list], (f) => key(f.agent, f.file, f.project?.id ?? ""));
+		if (d.upsert.length) upsert[list] = d.upsert;
+		if (d.remove.length) remove[list] = d.remove.map(({ agent, file, project }) => ({
+			agent,
+			file,
+			...project ? { project } : {}
+		}));
+	}
+	const waits = diff(before.waits, after.waits, (w) => key(w.waiter, w.on));
+	if (waits.upsert.length) upsert.waits = waits.upsert;
+	if (waits.remove.length) remove.waits = waits.remove.map(({ waiter, on }) => ({
+		waiter,
+		on
+	}));
+	const reports = diff(before.reports, after.reports, (r) => r.agent);
+	if (reports.upsert.length) upsert.reports = reports.upsert;
+	if (reports.remove.length) remove.reports = reports.remove.map((r) => r.agent);
+	const questions = diff(before.questions ?? [], after.questions ?? [], (q) => q.id);
+	if (questions.upsert.length) upsert.questions = questions.upsert;
+	if (questions.remove.length) {
+		remove.questions = questions.remove.map((q) => q.id);
+		if (answered) remove.questionOutcomes = Object.fromEntries(remove.questions.map((id) => [id, answered(id) ? "answered" : "abandoned"]));
+	}
+	return Object.keys(upsert).length || Object.keys(remove).length ? {
+		upsert,
+		remove
+	} : null;
+}
+function diff(before, after, keyOf) {
+	const old = new Map(before.map((r) => [keyOf(r), r]));
+	const now = new Set(after.map(keyOf));
+	return {
+		upsert: after.filter((r) => !same(old.get(keyOf(r)), r)),
+		remove: before.filter((r) => !now.has(keyOf(r)))
+	};
+}
+const key = (...parts) => JSON.stringify(parts);
+const same = (a, b) => a !== void 0 && JSON.stringify(a) === JSON.stringify(b);
+//#endregion
+//#region src/data-layer/link.ts
+const STABLE_MS$1 = 3e4;
+const OUTBOX_MAX = 100;
+const OUTBOX_MAX_AGE_MS = 36e5;
+function createLink({ url, hello, emit, minIntervalMs = 1e3, retryBaseMs = 1e3, retryCapMs = 3e4, notWantedRetryMs = 36e5, takenRetryMs = 36e5, onNotWanted, onPairingEnded, onMessage, filter = (facts) => facts, answered, pairing, pairPollMs = 5e3, admit, random = Math.random }) {
+	const outbox = [];
+	let latest = null;
+	let socket = null;
+	let isOpen = false;
+	let sent = null;
+	let seq = 0;
+	let sentAt = -Infinity;
+	let failures = 0;
+	let pacing = null;
+	let retry = null;
+	let isClosed = false;
+	let isUnwanted = false;
+	let sentToken;
+	let refusing = Promise.resolve();
+	let isRefused = false;
+	let refusedFor = null;
+	let isTaken = false;
+	let refusals = 0;
+	let projects = null;
+	let stable = null;
+	function connect() {
+		retry = null;
+		if (!admit) return proceed();
+		admit().then((ok) => {
+			if (isClosed) return;
+			if (ok) return proceed();
+			emit({
+				type: "status",
+				server: url,
+				state: "not-approved"
+			});
+			retry = setTimeout(connect, retryCapMs);
+		}, () => {
+			if (!isClosed) retry = setTimeout(connect, retryCapMs);
+		});
+	}
+	function proceed() {
+		if (!pairing) return open(void 0);
+		refusing.then(() => pairing.token()).then((token) => {
+			if (isClosed) return;
+			if (token !== null) return open(token);
+			emit({
+				type: "status",
+				server: url,
+				state: "pairing"
+			});
+			retry = setTimeout(connect, pairPollMs);
+		}, (err) => {
+			if (isClosed) return;
+			emit({
+				type: "log",
+				text: `couldn't pair with the office server: ${String(err?.message ?? err)}`
+			});
+			dropped();
+		});
+	}
+	function open(token) {
+		emit({
+			type: "status",
+			server: url,
+			state: "connecting"
+		});
+		const ws = new WebSocket(url);
+		socket = ws;
+		sentToken = token;
+		ws.onopen = () => {
+			if (socket !== ws) return;
+			failures = 0;
+			isOpen = true;
+			seq = 0;
+			projects = null;
+			stable = setTimeout(() => refusals = 0, STABLE_MS$1);
+			send(token ? {
+				...hello,
+				token
+			} : hello);
+			for (const { message, at } of outbox.splice(0)) if (Date.now() - at < OUTBOX_MAX_AGE_MS) send(message);
+			sendFull();
+			emit({
+				type: "status",
+				server: url,
+				state: "connected"
+			});
+		};
+		ws.onmessage = (event) => {
+			if (socket === ws) receive(event.data);
+		};
+		ws.onerror = () => {
+			if (socket !== ws) return;
+			dropped();
+			try {
+				ws.close();
+			} catch {}
+		};
+		ws.onclose = () => {
+			if (socket === ws) dropped();
+		};
+	}
+	function dropped() {
+		socket = null;
+		isOpen = false;
+		projects = null;
+		sent = null;
+		if (pacing) clearTimeout(pacing);
+		pacing = null;
+		if (stable) clearTimeout(stable);
+		stable = null;
+		if (isClosed) return;
+		if (isTaken) {
+			isTaken = false;
+			emit({
+				type: "status",
+				server: url,
+				state: "taken"
+			});
+			retry = setTimeout(connect, takenRetryMs);
+			return;
+		}
+		if (isRefused) {
+			isRefused = false;
+			if (refusedFor === "token-expired" && refusals === 0) {
+				refusals++;
+				retry = setTimeout(connect, 0);
+				return;
+			}
+			const delay = Math.min(retryCapMs, retryBaseMs * 2 ** refusals++);
+			emit({
+				type: "status",
+				server: url,
+				state: "disconnected",
+				retryInMs: delay
+			});
+			retry = setTimeout(connect, delay);
+			return;
+		}
+		if (isUnwanted) {
+			isUnwanted = false;
+			failures = 0;
+			emit({
+				type: "status",
+				server: url,
+				state: "not-wanted"
+			});
+			retry = setTimeout(connect, notWantedRetryMs);
+			return;
+		}
+		const delay = Math.min(retryCapMs, retryBaseMs * 2 ** failures++);
+		const retryInMs = Math.round(delay / 2 + random() * delay / 2);
+		emit({
+			type: "status",
+			server: url,
+			state: "disconnected",
+			retryInMs
+		});
+		retry = setTimeout(connect, retryInMs);
+	}
+	function send(message) {
+		socket.send(JSON.stringify(message));
+	}
+	function sendFull() {
+		if (!latest) return;
+		const facts = filter(latest, projects);
+		send({
+			type: "full",
+			v: 1,
+			seq: seq++,
+			facts
+		});
+		sent = facts;
+		sentAt = Date.now();
+	}
+	function flush() {
+		pacing = null;
+		if (!isOpen || !latest || !sent) return;
+		const facts = filter(latest, projects);
+		const changed = diffFacts(sent, facts, answered);
+		if (!changed) return;
+		const wait = sentAt + minIntervalMs - Date.now();
+		if (wait > 0) {
+			pacing = setTimeout(flush, wait);
+			return;
+		}
+		send({
+			type: "changes",
+			v: 1,
+			seq: seq++,
+			...changed
+		});
+		sent = facts;
+		sentAt = Date.now();
+	}
+	function receive(data) {
+		let value;
+		try {
+			value = JSON.parse(String(data));
+		} catch {
+			emit({
+				type: "log",
+				text: "the office server sent a message that isn't JSON"
+			});
+			return;
+		}
+		const parsed = parseOfficeServerMessage(value);
+		if (!parsed.ok) {
+			emit({
+				type: "log",
+				text: `the office server sent a message this data layer can't read (${parsed.kind}): ${parsed.error}`
+			});
+			return;
+		}
+		const message = parsed.message;
+		if (message.type === "welcome") {
+			projects = new Set(message.projects.map((p) => p.toLowerCase()));
+			if (!pacing) flush();
+		} else if (message.type === "repair") {
+			if (pacing) clearTimeout(pacing);
+			pacing = null;
+			sendFull();
+		} else if (message.type === "conflict" && !latest?.agents.some((a) => a.id === message.agent)) emit({
+			type: "log",
+			text: `the office server sent a note for ${message.agent}, not an agent of this session`
+		});
+		else if (pairing && message.type === "error" && (message.code === "not-paired" || message.code === "pairing-ended" || message.code === "token-expired")) {
+			isRefused = true;
+			refusedFor = message.code;
+			refusing = pairing.refused(message.code, sentToken).catch(() => {});
+			if (message.code === "pairing-ended" && onPairingEnded) refusing.then(onPairingEnded);
+			emit(message.code === "token-expired" ? {
+				type: "log",
+				text: "the office server says this machine's token has expired; renewing it"
+			} : message);
+		} else if (message.type === "error" && message.code === "forged-hello") {
+			isTaken = true;
+			emit(message);
+		} else if (message.type === "conflict" || message.type === "error" || message.type === "asked" || message.type === "ask-rights") {
+			emit(message);
+			if (message.type === "error" && message.code === "not-wanted") {
+				isUnwanted = true;
+				onNotWanted?.();
+			}
+		} else if (onMessage && (message.type === "request" || message.type === "release" || message.type === "handoff" || message.type === "drop")) onMessage(message);
+		else emit({
+			type: "log",
+			text: `the office server sent a ${message.type} message, which this data layer doesn't handle yet`
+		});
+	}
+	connect();
+	return {
+		update(facts) {
+			latest = facts;
+			if (isOpen && !sent) sendFull();
+			else if (!pacing) flush();
+		},
+		send(message) {
+			if (isOpen && socket.readyState === WebSocket.OPEN) send(message);
+			else {
+				outbox.push({
+					message,
+					at: Date.now()
+				});
+				if (outbox.length > OUTBOX_MAX) outbox.shift();
+			}
+		},
+		projects: () => projects,
+		close() {
+			isClosed = true;
+			if (pacing) clearTimeout(pacing);
+			if (retry) clearTimeout(retry);
+			if (stable) clearTimeout(stable);
+			pairing?.close();
+			socket?.close();
+		}
 	};
 }
 //#endregion
@@ -9151,6 +9503,7 @@ const GIT_FAILED = {
 	"not-a-repo": "the session's folder isn't in a git repo, and has none in it",
 	"too-wide": "the session's folder is the home folder or a drive's root, too wide a folder to hand over from",
 	"no-work": "none of the repos in the session's folder has work that isn't on its default branch",
+	"not-in-office": "none of the repos with work in the session's folder is one the office takes",
 	"no-commit": "the session's repo has no commit to hand over from",
 	"no-remote": "the session's repo has no remote to push the handoff's branch to",
 	lfs: "the session's repo uses Git LFS, whose files a handoff can't push yet",
@@ -9499,7 +9852,7 @@ const slug = (p) => p.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$
 * with where each pushes, their untracked files and what is left out. The folder's own repo failing
 * throws a HandoffGitError; a repo under it that git can't read is left out, with why.
 */
-async function prepare(run, cwd, timeoutMs, depth = 3, home = os.homedir()) {
+async function prepare(run, cwd, timeoutMs, depth = 3, home = os.homedir(), takes) {
 	const top = await run(["rev-parse", "--show-toplevel"], {
 		cwd,
 		timeoutMs
@@ -9513,6 +9866,8 @@ async function prepare(run, cwd, timeoutMs, depth = 3, home = os.homedir()) {
 	const dirOf = (p) => p === "." ? toplevel : path.join(toplevel, p);
 	const from = inRepo ? await branchOf(run, toplevel, timeoutMs, ".") : null;
 	const repos = [];
+	const notInOffice = [];
+	if (inRepo && takes && !await takes(toplevel)) throw new HandoffGitError("not-in-office", `${toplevel} isn't a repo the office takes`);
 	if (inRepo) {
 		const { remote, remotes } = await pushRemote(run, toplevel, from, timeoutMs, ".");
 		if (!remote) throw new HandoffGitError("no-remote", `${toplevel} has ${remotes.length ? `several remotes and none is origin: ${remotes.join(", ")}` : "no remote"}`);
@@ -9531,38 +9886,46 @@ async function prepare(run, cwd, timeoutMs, depth = 3, home = os.homedir()) {
 	}
 	const left = [...skipped];
 	const listedRepos = inRepo ? ["."] : [];
-	for (const sub of found) try {
-		const above = [...inRepo ? ["."] : [], ...found].filter((p) => p === "." || sub.startsWith(`${p}/`)).sort((a, b) => a.length - b.length).at(-1);
-		if (above) {
-			const inside = above === "." ? sub : sub.slice(above.length + 1);
-			if ((await gitIn(run, dirOf(above), timeoutMs, above).git([
-				"--literal-pathspecs",
-				"ls-files",
-				"--stage",
-				"--",
-				inside
-			])).stdout.startsWith("160000 ")) {
-				left.push({
-					path: sub,
-					why: WHY.submodule
-				});
-				continue;
-			}
+	for (const sub of found) {
+		if (notInOffice.some((p) => sub.startsWith(`${p}/`))) continue;
+		if (takes && !await takes(dirOf(sub))) {
+			notInOffice.push(sub);
+			continue;
 		}
-		const state = await inspect(run, dirOf(sub), sub, timeoutMs);
-		if (typeof state === "string") left.push({
-			path: sub,
-			why: WHY[state]
-		});
-		else if (state) repos.push(state);
-		if (state !== "unreadable") listedRepos.push(sub);
-	} catch (err) {
-		if (!(err instanceof HandoffGitError)) throw err;
-		left.push({
-			path: sub,
-			why: err.kind === "timed-out" ? WHY.slow : WHY.unreadable
-		});
+		try {
+			const above = [...inRepo ? ["."] : [], ...found].filter((p) => p === "." || sub.startsWith(`${p}/`)).sort((a, b) => a.length - b.length).at(-1);
+			if (above) {
+				const inside = above === "." ? sub : sub.slice(above.length + 1);
+				if ((await gitIn(run, dirOf(above), timeoutMs, above).git([
+					"--literal-pathspecs",
+					"ls-files",
+					"--stage",
+					"--",
+					inside
+				])).stdout.startsWith("160000 ")) {
+					left.push({
+						path: sub,
+						why: WHY.submodule
+					});
+					continue;
+				}
+			}
+			const state = await inspect(run, dirOf(sub), sub, timeoutMs);
+			if (typeof state === "string") left.push({
+				path: sub,
+				why: WHY[state]
+			});
+			else if (state) repos.push(state);
+			if (state !== "unreadable") listedRepos.push(sub);
+		} catch (err) {
+			if (!(err instanceof HandoffGitError)) throw err;
+			left.push({
+				path: sub,
+				why: err.kind === "timed-out" ? WHY.slow : WHY.unreadable
+			});
+		}
 	}
+	if (!repos.length && notInOffice.length) throw new HandoffGitError("not-in-office", `none of the repos with work under ${toplevel} is one the office takes: ${notInOffice.join(", ")}`);
 	if (!repos.length) throw new HandoffGitError("no-work", `none of the repos under ${toplevel} has work that isn't on its remote's default branch`);
 	const suffixes = /* @__PURE__ */ new Set();
 	const prepared = repos.map((r, i) => {
@@ -9578,7 +9941,7 @@ async function prepare(run, cwd, timeoutMs, depth = 3, home = os.homedir()) {
 			suffix
 		};
 	});
-	let files = [...loose];
+	let files = takes && !inRepo ? [] : [...loose];
 	for (const p of listedRepos) {
 		const own = await untracked(run, dirOf(p), timeoutMs);
 		if (own === null) {
@@ -9588,12 +9951,18 @@ async function prepare(run, cwd, timeoutMs, depth = 3, home = os.homedir()) {
 		const full = own.map((f) => p === "." ? f : `${p}/${f}`);
 		files.push(...full.filter((f) => !found.some((sub) => f === `${sub}/`)));
 	}
+	const taken = (p) => {
+		const owner = [...repos.map((r) => r.path), ...notInOffice].filter((r) => r === "." || p === r || p.startsWith(`${r}/`)).sort((a, b) => b.length - a.length)[0];
+		return owner !== void 0 && !notInOffice.includes(owner);
+	};
+	const kept = takes ? left.filter((l) => taken(l.path)) : left;
 	return {
 		toplevel,
 		from,
 		files: files && files.sort(),
 		repos: prepared,
-		left
+		left: kept,
+		notInOffice
 	};
 }
 /**
@@ -9634,8 +10003,8 @@ const IDENTITY = {
 * records names its push URL, where the branch is. Nothing is pushed until every repo's commit is
 * made and scanned. A push that fails after others went names them. Throws a HandoffGitError.
 */
-async function pushHandoff(run, cwd, id, timeoutMs, { scan, pushAnyway = {}, depth, prepared } = {}) {
-	const { repos } = prepared ?? await prepare(run, cwd, timeoutMs, depth);
+async function pushHandoff(run, cwd, id, timeoutMs, { scan, pushAnyway = {}, depth, prepared, takes } = {}) {
+	const { repos } = prepared ?? await prepare(run, cwd, timeoutMs, depth, void 0, takes);
 	const temp = await fs.mkdtemp(path.join(os.tmpdir(), "isoplan-handoff-"));
 	const ready = [];
 	try {
@@ -11083,6 +11452,38 @@ async function worker() {
 		return new PushFailed(gitFailed(err));
 	};
 	const scanText = async (text) => scan(text, await loadPatterns(path.join(appDir, "secret-patterns.json"), path.join(isoplanDir, "secret-patterns.json"), log));
+	const account = await accountOf({
+		readText: (p) => fs.readFile(p, "utf8").catch(() => null),
+		run: io.run
+	}, claudeJson, os.homedir());
+	const emit = (line) => {
+		if (line.type === "log") log(line.text);
+		else if (line.type === "error") log(`the office server says: ${line.message} (${line.code})`);
+		else if (line.type === "pair") log(`to answer for this machine's rooms through ${line.server}, pair it: click ${line.url} on this computer and approve it in the office (it works until ${line.expires})`);
+	};
+	const pairing = createPairing({
+		file: pairingPath(claudeDir),
+		lock: pairingLockPath(claudeDir),
+		writeLock: pairingWriteLockPath(claudeDir),
+		server: first.server,
+		account,
+		machine: os.hostname(),
+		emit,
+		allowPlainWs: first.allowPlainWs
+	});
+	const approved = createApproved({
+		server: first.server,
+		file: approvedPath(claudeDir),
+		pairing,
+		refreshMs: first.approvedRefreshMinutes * 6e4,
+		maxAgeMs: first.approvedMaxAgeMinutes * 6e4,
+		log
+	});
+	const homeIo = machineHomeIo(first.workspaceRepos);
+	const takes = async () => {
+		await approved.refresh();
+		return takesFrom(homeIo, approved.repos());
+	};
 	let send = () => {};
 	const preparedFor = /* @__PURE__ */ new Map();
 	const runner = createRunner({
@@ -11098,10 +11499,13 @@ async function worker() {
 			const id = forkableId(session);
 			const lock = id ? await readLock(lockPath(claudeDir, id)) : null;
 			if (!id || lock && lock.pid === null && lock.until !== null && lock.until > Date.now()) return false;
-			return Date.now() - lead.lastActive <= askableMs(await config().catch(() => first));
+			if (Date.now() - lead.lastActive > askableMs(await config().catch(() => first))) return false;
+			await approved.refresh();
+			return await approvedHome(lead.cwd, homeIo, approved.repos()) !== null;
 		},
 		prepareBrief: async (lead, handoff) => {
-			const ready = await prepare(git, lead.cwd, await gitMs(), (await settings()).repoSearchDepth).catch((err) => Promise.reject(told(err)));
+			const ready = await prepare(git, lead.cwd, await gitMs(), (await settings()).repoSearchDepth, void 0, await takes()).catch((err) => Promise.reject(told(err)));
+			if (ready.notInOffice.length) log(`handoff ${handoff}: left out, not in the office: ${ready.notInOffice.join(", ")}`);
 			preparedFor.set(handoff, ready);
 			if (preparedFor.size > MAX_PREPARED) preparedFor.delete(preparedFor.keys().next().value);
 			const { from, files, repos, left } = ready;
@@ -11122,6 +11526,7 @@ async function worker() {
 				scan: scanText,
 				depth: (await settings()).repoSearchDepth,
 				prepared: preparedFor.get(handoff),
+				takes: await takes(),
 				...pushAnyway ? { pushAnyway } : {}
 			}).catch((err) => Promise.reject(told(err)));
 			return "held" in pushed ? pushed : pushed.repos;
@@ -11143,28 +11548,10 @@ async function worker() {
 	let notWanted = false;
 	let unpaired = false;
 	let wake = () => {};
-	const account = await accountOf({
-		readText: (p) => fs.readFile(p, "utf8").catch(() => null),
-		run: io.run
-	}, claudeJson, os.homedir());
-	const emit = (line) => {
-		if (line.type === "log") log(line.text);
-		else if (line.type === "error") log(`the office server says: ${line.message} (${line.code})`);
-		else if (line.type === "pair") log(`to answer for this machine's rooms through ${line.server}, pair it: click ${line.url} on this computer and approve it in the office (it works until ${line.expires})`);
-	};
 	const link = createLink({
 		url: first.server,
 		emit,
-		pairing: createPairing({
-			file: pairingPath(claudeDir),
-			lock: pairingLockPath(claudeDir),
-			writeLock: pairingWriteLockPath(claudeDir),
-			server: first.server,
-			account,
-			machine: os.hostname(),
-			emit,
-			allowPlainWs: first.allowPlainWs
-		}),
+		pairing,
 		onMessage: (message) => runner.take(message),
 		onNotWanted: () => {
 			notWanted = true;

@@ -14,5 +14,7 @@
   "streamSeconds": 1,
   "tailBytes": 1048576,
   "gitCacheSeconds": 60,
-  "workspaceRepos": 12
+  "workspaceRepos": 12,
+  "approvedRefreshMinutes": 5,
+  "approvedMaxAgeMinutes": 15
 }

@@ -305,6 +305,12 @@ function statusText(line: StatusLine): string {
       return `Isoplan: connected to ${line.server}`;
     case "not-wanted":
       return `Isoplan: this repo isn't in any office on ${line.server}`;
+    case "not-approved":
+      return line.workspace
+        ? `Isoplan: no repo in this folder is in the office on ${line.server}, so nothing of this session is sent`
+        : `Isoplan: this repo isn't in the office on ${line.server}, so nothing of this session is sent`;
+    case "no-list":
+      return `Isoplan: can't tell yet which repos ${line.server} takes, so nothing of this session is sent`;
     case "taken":
       return "Isoplan: this session belongs to someone else on the office, so it isn't reported";
     case "insecure":

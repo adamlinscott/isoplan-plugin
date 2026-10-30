@@ -55,7 +55,7 @@ export const newHandoffId = () => randomBytes(5).toString("hex");
 export const handoffBranch = (id: string) => `isoplan/handoff/${id}`;
 
 /** Why git couldn't hand the work over, as a kind the server is told and a detail for the local log. */
-export type GitFailure = "not-a-repo" | "too-wide" | "no-work" | "no-commit" | "no-remote" | "lfs" | "timed-out" | "rejected" | "failed";
+export type GitFailure = "not-a-repo" | "too-wide" | "no-work" | "not-in-office" | "no-commit" | "no-remote" | "lfs" | "timed-out" | "rejected" | "failed";
 
 export class HandoffGitError extends Error {
   constructor(
@@ -75,6 +75,7 @@ export const GIT_FAILED: Record<GitFailure, string> = {
   "not-a-repo": "the session's folder isn't in a git repo, and has none in it",
   "too-wide": "the session's folder is the home folder or a drive's root, too wide a folder to hand over from",
   "no-work": "none of the repos in the session's folder has work that isn't on its default branch",
+  "not-in-office": "none of the repos with work in the session's folder is one the office takes",
   "no-commit": "the session's repo has no commit to hand over from",
   "no-remote": "the session's repo has no remote to push the handoff's branch to",
   lfs: "the session's repo uses Git LFS, whose files a handoff can't push yet",
@@ -260,7 +261,15 @@ export interface Prepared {
   repos: PreparedRepo[];
   /** The repos under the folder that aren't handed over, and folders that couldn't be looked in. */
   left: Left[];
+  /**
+   * The repos in the folder the office doesn't take (#91), by path: never handed over, and named
+   * nowhere that leaves the machine (not in `left`, `files` or the note), only to the sender here.
+   */
+  notInOffice: string[];
 }
+
+/** Whether the office takes the repo whose top is `dir` (#91); without one, every repo goes. */
+export type Takes = (dir: string) => Promise<boolean>;
 
 /** How many folders down from the session's folder repos are looked for, unless runner.json says. */
 export const REPO_DEPTH = 3;
@@ -385,7 +394,7 @@ const slug = (p: string) => p.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(
  * with where each pushes, their untracked files and what is left out. The folder's own repo failing
  * throws a HandoffGitError; a repo under it that git can't read is left out, with why.
  */
-export async function prepare(run: RunGit, cwd: string, timeoutMs: number, depth = REPO_DEPTH, home = os.homedir()): Promise<Prepared> {
+export async function prepare(run: RunGit, cwd: string, timeoutMs: number, depth = REPO_DEPTH, home = os.homedir(), takes?: Takes): Promise<Prepared> {
   const top = await run(["rev-parse", "--show-toplevel"], { cwd, timeoutMs });
   if (top.timedOut) throw new HandoffGitError("timed-out", `git rev-parse in ${cwd} took longer than ${Math.round(timeoutMs / 1000)} s`);
   const inRepo = top.code === 0;
@@ -397,6 +406,8 @@ export async function prepare(run: RunGit, cwd: string, timeoutMs: number, depth
   const dirOf = (p: string) => (p === "." ? toplevel : path.join(toplevel, p));
   const from = inRepo ? await branchOf(run, toplevel, timeoutMs, ".") : null;
   const repos: Found[] = [];
+  const notInOffice: string[] = [];
+  if (inRepo && takes && !(await takes(toplevel))) throw new HandoffGitError("not-in-office", `${toplevel} isn't a repo the office takes`);
   if (inRepo) {
     const { remote, remotes } = await pushRemote(run, toplevel, from, timeoutMs, ".");
     if (!remote) throw new HandoffGitError("no-remote", `${toplevel} has ${remotes.length ? `several remotes and none is origin: ${remotes.join(", ")}` : "no remote"}`);
@@ -405,6 +416,12 @@ export async function prepare(run: RunGit, cwd: string, timeoutMs: number, depth
   const left: Left[] = [...skipped];
   const listedRepos = inRepo ? ["."] : [];
   for (const sub of found) {
+    // A repo the office doesn't take, and everything under it, stays on this machine (#91).
+    if (notInOffice.some((p) => sub.startsWith(`${p}/`))) continue;
+    if (takes && !(await takes(dirOf(sub)))) {
+      notInOffice.push(sub);
+      continue;
+    }
     try {
       // A submodule is a gitlink in the repo it sits in, the nearest one above it.
       const above = [...(inRepo ? ["."] : []), ...found].filter((p) => p === "." || sub.startsWith(`${p}/`)).sort((a, b) => a.length - b.length).at(-1);
@@ -425,6 +442,7 @@ export async function prepare(run: RunGit, cwd: string, timeoutMs: number, depth
       left.push({ path: sub, why: err.kind === "timed-out" ? WHY.slow : WHY.unreadable });
     }
   }
+  if (!repos.length && notInOffice.length) throw new HandoffGitError("not-in-office", `none of the repos with work under ${toplevel} is one the office takes: ${notInOffice.join(", ")}`);
   if (!repos.length) throw new HandoffGitError("no-work", `none of the repos under ${toplevel} has work that isn't on its remote's default branch`);
 
   // Repos that push to one remote can't share a branch there: each after the first has its own.
@@ -437,8 +455,9 @@ export async function prepare(run: RunGit, cwd: string, timeoutMs: number, depth
     return { ...r, suffix };
   });
 
-  // Each repo's untracked files by path in the folder, less the repos under it, which git lists as folders.
-  let files: string[] | null = [...loose];
+  // Each repo's untracked files by path in the folder, less the repos under it, which git lists as
+  // folders. With the office's list, a plain folder's own files, outside every repo, stay unnamed.
+  let files: string[] | null = takes && !inRepo ? [] : [...loose];
   for (const p of listedRepos) {
     const own = await untracked(run, dirOf(p), timeoutMs);
     if (own === null) {
@@ -448,7 +467,13 @@ export async function prepare(run: RunGit, cwd: string, timeoutMs: number, depth
     const full = own.map((f) => (p === "." ? f : `${p}/${f}`));
     files.push(...full.filter((f) => !found.some((sub) => f === `${sub}/`)));
   }
-  return { toplevel, from, files: files && files.sort(), repos: prepared, left };
+  // What is left out is named only inside a repo the office takes.
+  const taken = (p: string) => {
+    const owner = [...repos.map((r) => r.path), ...notInOffice].filter((r) => r === "." || p === r || p.startsWith(`${r}/`)).sort((a, b) => b.length - a.length)[0];
+    return owner !== undefined && !notInOffice.includes(owner);
+  };
+  const kept = takes ? left.filter((l) => taken(l.path)) : left;
+  return { toplevel, from, files: files && files.sort(), repos: prepared, left: kept, notInOffice };
 }
 
 /**
@@ -484,6 +509,8 @@ export interface PushOptions {
   depth?: number;
   /** What `prepare` found already, so the folder isn't looked through twice. */
   prepared?: Prepared;
+  /** Which repos the office takes, for a prepare made here. */
+  takes?: Takes;
 }
 
 /**
@@ -509,8 +536,8 @@ interface Ready extends PreparedRepo {
  * records names its push URL, where the branch is. Nothing is pushed until every repo's commit is
  * made and scanned. A push that fails after others went names them. Throws a HandoffGitError.
  */
-export async function pushHandoff(run: RunGit, cwd: string, id: string, timeoutMs: number, { scan, pushAnyway = {}, depth, prepared }: PushOptions = {}): Promise<Pushed> {
-  const { repos } = prepared ?? (await prepare(run, cwd, timeoutMs, depth));
+export async function pushHandoff(run: RunGit, cwd: string, id: string, timeoutMs: number, { scan, pushAnyway = {}, depth, prepared, takes }: PushOptions = {}): Promise<Pushed> {
+  const { repos } = prepared ?? (await prepare(run, cwd, timeoutMs, depth, undefined, takes));
   const temp = await fs.mkdtemp(path.join(os.tmpdir(), "isoplan-handoff-"));
   const ready: Ready[] = [];
   try {

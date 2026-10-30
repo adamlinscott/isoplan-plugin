@@ -2,10 +2,10 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { execFile } from "node:child_process";
-import { statSync } from "node:fs";
 import { createHash, randomBytes } from "node:crypto";
 import http from "node:http";
+import { execFile } from "node:child_process";
+import { statSync } from "node:fs";
 //#region ../../node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/core/util.js
 function getEnumValues(entries) {
 	const numericValues = Object.values(entries).filter((v) => typeof v === "number");
@@ -6336,289 +6336,21 @@ async function readJson(io, p, optional = false) {
 	}
 }
 //#endregion
-//#region src/data-layer/git.ts
-/** True for a Windows-shaped path: a drive letter, a UNC prefix, or any backslash. */
-function isWindowsPath(p) {
-	return /^[A-Za-z]:([\\/]|$)/.test(p) || p.startsWith("\\\\") || p.includes("\\");
-}
-function isAbsolute(p) {
-	return /^[A-Za-z]:[\\/]/.test(p) || p.startsWith("/") || p.startsWith("\\");
-}
-/**
-* Forward slashes, "." and ".." folded away, no trailing slash, drive letter upper-cased.
-* The root keeps its slash ("C:/", "/").
-*/
-function normalize(p) {
-	let s = p.replace(/\\/g, "/");
-	let prefix = "";
-	const drive = /^([A-Za-z]):(\/|$)/.exec(s);
-	if (drive) {
-		prefix = drive[1].toUpperCase() + ":/";
-		s = s.slice(drive[0].length);
-	} else if (s.startsWith("//")) {
-		prefix = "//";
-		s = s.slice(2);
-	} else if (s.startsWith("/")) {
-		prefix = "/";
-		s = s.slice(1);
-	}
-	const out = [];
-	for (const part of s.split("/")) {
-		if (part === "" || part === ".") continue;
-		if (part === ".." && out.length && out[out.length - 1] !== "..") out.pop();
-		else if (part !== ".." || !prefix) out.push(part);
-	}
-	return prefix + out.join("/") || ".";
-}
-/** A comparison key: normalised, and case-folded for Windows paths (case-insensitive there). */
-function pathKey(p) {
-	const n = normalize(p);
-	return isWindowsPath(p) || /^[A-Z]:\//.test(n) ? n.toLowerCase() : n;
-}
-function join(base, rel) {
-	return isAbsolute(rel) ? normalize(rel) : normalize(base + "/" + rel);
-}
-function dirname(p) {
-	const n = normalize(p);
-	const i = n.lastIndexOf("/");
-	if (i < 0) return ".";
-	if (i === 0) return "/";
-	if (/^[A-Z]:$/.test(n.slice(0, i))) return n.slice(0, i + 1);
-	return n.slice(0, i);
-}
-/**
-* Answers are cached per folder and looked up again once older than `maxAgeMs` at `now`, so
-* worktrees added or removed and branches switched show up. Calls that pass the same `now` share
-* one answer per folder. Without options an answer is kept for the life of the returned object. A
-* folder git can't place resolves to null.
-*/
-function createGit(io) {
-	const cache = /* @__PURE__ */ new Map();
-	return { resolve(dir, { now = 0, maxAgeMs = Infinity } = {}) {
-		const key = pathKey(dir);
-		const hit = cache.get(key);
-		if (hit && now - hit.at <= maxAgeMs) return hit.result;
-		const result = resolveUncached(io, dir).catch(() => null);
-		cache.set(key, {
-			at: now,
-			result
-		});
-		return result;
-	} };
-}
-async function resolveUncached(io, dir) {
-	if (io.run) {
-		const viaCommand = await fromCommand(io.run, dir).catch(() => null);
-		if (viaCommand) return viaCommand;
-	}
-	return fromFiles(io, dir);
-}
-async function fromCommand(run, dir) {
-	const where = await run([
-		"git",
-		"rev-parse",
-		"--path-format=absolute",
-		"--show-toplevel",
-		"--git-common-dir"
-	], { cwd: dir });
-	if (!where || where.code !== 0) return null;
-	const [toplevel, commonDir] = where.stdout.split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
-	if (!toplevel || !commonDir) return null;
-	const head = await Promise.resolve().then(() => run([
-		"git",
-		"rev-parse",
-		"--abbrev-ref",
-		"HEAD"
-	], { cwd: dir })).catch(() => null);
-	const name = head && head.code === 0 ? head.stdout.trim() : "";
-	return {
-		toplevel: normalize(toplevel),
-		commonDir: normalize(commonDir),
-		branch: name && name !== "HEAD" ? name : null
-	};
-}
-async function fromFiles(io, dir) {
-	const self = await io.stat(dir);
-	if (!self || !self.isDir) return null;
-	let at = normalize(dir);
-	for (;;) {
-		const dotGit = join(at, ".git");
-		const s = await io.stat(dotGit);
-		if (s) {
-			let gitDir = dotGit;
-			let commonDir = dotGit;
-			if (!s.isDir) {
-				const pointer = /^gitdir:\s*(.+?)\s*$/m.exec(await io.read(dotGit));
-				if (!pointer) return null;
-				gitDir = join(at, pointer[1]);
-				const common = await readOptional(io, join(gitDir, "commondir"));
-				commonDir = common ? join(gitDir, common.trim()) : gitDir;
-			}
-			const head = await readOptional(io, join(gitDir, "HEAD")) || "";
-			const ref = /^ref:\s*refs\/heads\/(.+?)\s*$/m.exec(head);
-			return {
-				toplevel: at,
-				commonDir,
-				branch: ref ? ref[1] : null
-			};
-		}
-		const up = dirname(at);
-		if (up === at) return null;
-		at = up;
-	}
-}
-async function readOptional(io, p) {
+//#region src/data-layer/approved-file.ts
+const approvedPath = (claudeDir) => path.join(claudeDir, "isoplan", "approved.json");
+const isFile = (v) => !!v && typeof v.server === "string" && typeof v.version === "string" && typeof v.fetched === "number" && typeof v.checked === "number" && Array.isArray(v.repos) && v.repos.every((r) => typeof r === "string");
+/** approved.json, for `server` when given; null when there is none, or it is another server's. */
+async function readApproved(file, server) {
 	try {
-		return await io.stat(p) ? await io.read(p) : null;
+		const value = JSON.parse(await fs.readFile(file, "utf8"));
+		return isFile(value) && (server === void 0 || value.server === server) ? value : null;
 	} catch {
 		return null;
 	}
 }
-//#endregion
-//#region src/data-layer/claude-paths.ts
-/**
-* Claude Code's config folder and its .claude.json: both in $CLAUDE_CONFIG_DIR when it is set,
-* else ~/.claude and ~/.claude.json, where Claude Code itself looks.
-*/
-function claudePaths(env, home) {
-	const custom = env.CLAUDE_CONFIG_DIR;
-	return custom ? {
-		dir: normalize(custom),
-		json: join(custom, ".claude.json")
-	} : {
-		dir: join(home, ".claude"),
-		json: join(home, ".claude.json")
-	};
-}
-//#endregion
-//#region src/data-layer/identity.ts
-/** `claudeJson` is the path of .claude.json (`claudePaths`); git runs in `cwd`. */
-async function accountOf(io, claudeJson, cwd) {
-	const config = asObject(parseJson(await io.readText(claudeJson)));
-	const oauth = asObject(config.oauthAccount);
-	const gitName = async () => {
-		const r = io.run ? await Promise.resolve(io.run([
-			"git",
-			"config",
-			"user.name"
-		], { cwd })).catch(() => null) : null;
-		return r && r.code === 0 && r.stdout.trim() ? r.stdout.trim() : null;
-	};
-	if (nonEmpty(oauth.accountUuid)) return {
-		id: `claude:${oauth.accountUuid}`,
-		name: nonEmpty(oauth.displayName) ? oauth.displayName : await gitName() ?? ""
-	};
-	const name = await gitName();
-	if (nonEmpty(config.userID)) return {
-		id: `claude-install:${config.userID}`,
-		name: name ?? ""
-	};
-	return {
-		id: `git:${name ?? "unknown"}`,
-		name: name ?? ""
-	};
-}
-/**
-* The project the session's folder belongs to: its git remote's, or for a repo with no usable
-* remote, the main checkout's folder on this machine (so every worktree of one repo is one
-* project). A folder git can't place is its own local project. On a file system that ignores case
-* (Windows, macOS) a local project's id is lower-cased, so one folder reached in two spellings is
-* one project, in the hello and in every edit alike.
-*/
-async function projectOf(run, where, cwd, machine, caseless = process.platform === "win32" || process.platform === "darwin") {
-	let remote = null;
-	if (run && where) {
-		const r = await Promise.resolve(run([
-			"git",
-			"remote",
-			"get-url",
-			"origin"
-		], { cwd: where.toplevel })).catch(() => null);
-		if (r && r.code === 0 && r.stdout.trim()) remote = r.stdout.trim();
-	}
-	const root = !where ? normalize(cwd) : /\/\.git$/.test(where.commonDir) ? dirname(where.commonDir) : where.toplevel;
-	const project = projectId(remote, {
-		machine,
-		root
-	});
-	return caseless && project.id.startsWith("local:") ? {
-		...project,
-		id: project.id.toLowerCase()
-	} : project;
-}
-function parseJson(text) {
-	try {
-		return text === null ? null : JSON.parse(text);
-	} catch {
-		return null;
-	}
-}
-function asObject(value) {
-	return value && typeof value === "object" && !Array.isArray(value) ? value : {};
-}
-const nonEmpty = (v) => typeof v === "string" && v.trim() !== "";
-//#endregion
-//#region src/data-layer/io.ts
-function nodeIo({ run = runCommand } = {}) {
-	return {
-		run,
-		async listDir(dir) {
-			try {
-				return (await fs.readdir(dir, { withFileTypes: true })).map((e) => ({
-					name: e.name,
-					isDir: e.isDirectory()
-				}));
-			} catch {
-				return [];
-			}
-		},
-		async stat(p) {
-			try {
-				const s = await fs.stat(p);
-				return {
-					isDir: s.isDirectory(),
-					mtimeMs: s.mtimeMs,
-					size: s.size
-				};
-			} catch {
-				return null;
-			}
-		},
-		realpath: (p) => fs.realpath(p),
-		isDirSync: (p) => {
-			try {
-				return statSync(p).isDirectory();
-			} catch {
-				return false;
-			}
-		},
-		async read(p, start, end) {
-			if (start === void 0 || end === void 0) return fs.readFile(p, "utf8");
-			const fh = await fs.open(p, "r");
-			try {
-				const buf = Buffer.alloc(Math.max(0, end - start));
-				const { bytesRead } = await fh.read(buf, 0, buf.length, start);
-				return buf.subarray(0, bytesRead).toString("utf8");
-			} finally {
-				await fh.close();
-			}
-		}
-	};
-}
-function runCommand([cmd, ...args], { cwd }) {
-	return new Promise((resolve) => {
-		execFile(cmd, args, {
-			cwd,
-			encoding: "utf8",
-			timeout: 1e4,
-			windowsHide: true
-		}, (err, stdout) => {
-			resolve({
-				code: err ? typeof err.code === "number" ? err.code : 1 : 0,
-				stdout: stdout || ""
-			});
-		});
-	});
+/** The approved repos' ids, lower case, while the copy is younger than `maxAgeMs`; null after, or with none. */
+function freshRepos(copy, maxAgeMs, now) {
+	return copy && now - copy.checked <= maxAgeMs ? new Set(copy.repos.map((r) => r.toLowerCase())) : null;
 }
 //#endregion
 //#region src/wake/lock.ts
@@ -7090,6 +6822,370 @@ function createPairing({ file, lock, writeLock, server, account, machine, emit, 
 	};
 }
 //#endregion
+//#region src/data-layer/approved.ts
+/**
+* The approved repos as approved.json has them from `server`, for a command that only reads (the
+* handoff and ask-the-room commands); null with no copy, or one past `maxAgeMs`.
+*/
+async function cachedRepos(file, server, maxAgeMs, now = Date.now()) {
+	return freshRepos(await readApproved(file, server), maxAgeMs, now);
+}
+//#endregion
+//#region src/data-layer/git.ts
+/** True for a Windows-shaped path: a drive letter, a UNC prefix, or any backslash. */
+function isWindowsPath(p) {
+	return /^[A-Za-z]:([\\/]|$)/.test(p) || p.startsWith("\\\\") || p.includes("\\");
+}
+function isAbsolute(p) {
+	return /^[A-Za-z]:[\\/]/.test(p) || p.startsWith("/") || p.startsWith("\\");
+}
+/**
+* Forward slashes, "." and ".." folded away, no trailing slash, drive letter upper-cased.
+* The root keeps its slash ("C:/", "/").
+*/
+function normalize(p) {
+	let s = p.replace(/\\/g, "/");
+	let prefix = "";
+	const drive = /^([A-Za-z]):(\/|$)/.exec(s);
+	if (drive) {
+		prefix = drive[1].toUpperCase() + ":/";
+		s = s.slice(drive[0].length);
+	} else if (s.startsWith("//")) {
+		prefix = "//";
+		s = s.slice(2);
+	} else if (s.startsWith("/")) {
+		prefix = "/";
+		s = s.slice(1);
+	}
+	const out = [];
+	for (const part of s.split("/")) {
+		if (part === "" || part === ".") continue;
+		if (part === ".." && out.length && out[out.length - 1] !== "..") out.pop();
+		else if (part !== ".." || !prefix) out.push(part);
+	}
+	return prefix + out.join("/") || ".";
+}
+/** A comparison key: normalised, and case-folded for Windows paths (case-insensitive there). */
+function pathKey(p) {
+	const n = normalize(p);
+	return isWindowsPath(p) || /^[A-Z]:\//.test(n) ? n.toLowerCase() : n;
+}
+function join(base, rel) {
+	return isAbsolute(rel) ? normalize(rel) : normalize(base + "/" + rel);
+}
+function dirname(p) {
+	const n = normalize(p);
+	const i = n.lastIndexOf("/");
+	if (i < 0) return ".";
+	if (i === 0) return "/";
+	if (/^[A-Z]:$/.test(n.slice(0, i))) return n.slice(0, i + 1);
+	return n.slice(0, i);
+}
+/**
+* `p` relative to `root` with forward slashes, or null when `p` is not inside `root`. Windows
+* paths compare case-insensitively; the relative part keeps `p`'s own spelling, so whoever
+* matches files by name compares them case-insensitively too.
+*/
+function relativeTo(root, p) {
+	const win = isWindowsPath(root) || isWindowsPath(p);
+	const r = normalize(root);
+	const n = normalize(p);
+	const rk = win ? r.toLowerCase() : r;
+	const nk = win ? n.toLowerCase() : n;
+	const base = rk.endsWith("/") ? rk : rk + "/";
+	if (!nk.startsWith(base)) return null;
+	return n.slice(base.length);
+}
+/**
+* Answers are cached per folder and looked up again once older than `maxAgeMs` at `now`, so
+* worktrees added or removed and branches switched show up. Calls that pass the same `now` share
+* one answer per folder. Without options an answer is kept for the life of the returned object. A
+* folder git can't place resolves to null.
+*/
+function createGit(io) {
+	const cache = /* @__PURE__ */ new Map();
+	return { resolve(dir, { now = 0, maxAgeMs = Infinity } = {}) {
+		const key = pathKey(dir);
+		const hit = cache.get(key);
+		if (hit && now - hit.at <= maxAgeMs) return hit.result;
+		const result = resolveUncached(io, dir).catch(() => null);
+		cache.set(key, {
+			at: now,
+			result
+		});
+		return result;
+	} };
+}
+async function resolveUncached(io, dir) {
+	if (io.run) {
+		const viaCommand = await fromCommand(io.run, dir).catch(() => null);
+		if (viaCommand) return viaCommand;
+	}
+	return fromFiles(io, dir);
+}
+async function fromCommand(run, dir) {
+	const where = await run([
+		"git",
+		"rev-parse",
+		"--path-format=absolute",
+		"--show-toplevel",
+		"--git-common-dir"
+	], { cwd: dir });
+	if (!where || where.code !== 0) return null;
+	const [toplevel, commonDir] = where.stdout.split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
+	if (!toplevel || !commonDir) return null;
+	const head = await Promise.resolve().then(() => run([
+		"git",
+		"rev-parse",
+		"--abbrev-ref",
+		"HEAD"
+	], { cwd: dir })).catch(() => null);
+	const name = head && head.code === 0 ? head.stdout.trim() : "";
+	return {
+		toplevel: normalize(toplevel),
+		commonDir: normalize(commonDir),
+		branch: name && name !== "HEAD" ? name : null
+	};
+}
+async function fromFiles(io, dir) {
+	const self = await io.stat(dir);
+	if (!self || !self.isDir) return null;
+	let at = normalize(dir);
+	for (;;) {
+		const dotGit = join(at, ".git");
+		const s = await io.stat(dotGit);
+		if (s) {
+			let gitDir = dotGit;
+			let commonDir = dotGit;
+			if (!s.isDir) {
+				const pointer = /^gitdir:\s*(.+?)\s*$/m.exec(await io.read(dotGit));
+				if (!pointer) return null;
+				gitDir = join(at, pointer[1]);
+				const common = await readOptional(io, join(gitDir, "commondir"));
+				commonDir = common ? join(gitDir, common.trim()) : gitDir;
+			}
+			const head = await readOptional(io, join(gitDir, "HEAD")) || "";
+			const ref = /^ref:\s*refs\/heads\/(.+?)\s*$/m.exec(head);
+			return {
+				toplevel: at,
+				commonDir,
+				branch: ref ? ref[1] : null
+			};
+		}
+		const up = dirname(at);
+		if (up === at) return null;
+		at = up;
+	}
+}
+async function readOptional(io, p) {
+	try {
+		return await io.stat(p) ? await io.read(p) : null;
+	} catch {
+		return null;
+	}
+}
+//#endregion
+//#region src/data-layer/claude-paths.ts
+/**
+* Claude Code's config folder and its .claude.json: both in $CLAUDE_CONFIG_DIR when it is set,
+* else ~/.claude and ~/.claude.json, where Claude Code itself looks.
+*/
+function claudePaths(env, home) {
+	const custom = env.CLAUDE_CONFIG_DIR;
+	return custom ? {
+		dir: normalize(custom),
+		json: join(custom, ".claude.json")
+	} : {
+		dir: join(home, ".claude"),
+		json: join(home, ".claude.json")
+	};
+}
+//#endregion
+//#region src/data-layer/identity.ts
+/** `claudeJson` is the path of .claude.json (`claudePaths`); git runs in `cwd`. */
+async function accountOf(io, claudeJson, cwd) {
+	const config = asObject(parseJson(await io.readText(claudeJson)));
+	const oauth = asObject(config.oauthAccount);
+	const gitName = async () => {
+		const r = io.run ? await Promise.resolve(io.run([
+			"git",
+			"config",
+			"user.name"
+		], { cwd })).catch(() => null) : null;
+		return r && r.code === 0 && r.stdout.trim() ? r.stdout.trim() : null;
+	};
+	if (nonEmpty(oauth.accountUuid)) return {
+		id: `claude:${oauth.accountUuid}`,
+		name: nonEmpty(oauth.displayName) ? oauth.displayName : await gitName() ?? ""
+	};
+	const name = await gitName();
+	if (nonEmpty(config.userID)) return {
+		id: `claude-install:${config.userID}`,
+		name: name ?? ""
+	};
+	return {
+		id: `git:${name ?? "unknown"}`,
+		name: name ?? ""
+	};
+}
+/**
+* The project the session's folder belongs to: its git remote's, or for a repo with no usable
+* remote, the main checkout's folder on this machine (so every worktree of one repo is one
+* project). A folder git can't place is its own local project. On a file system that ignores case
+* (Windows, macOS) a local project's id is lower-cased, so one folder reached in two spellings is
+* one project, in the hello and in every edit alike.
+*/
+async function projectOf(run, where, cwd, machine, caseless = process.platform === "win32" || process.platform === "darwin") {
+	let remote = null;
+	if (run && where) {
+		const r = await Promise.resolve(run([
+			"git",
+			"remote",
+			"get-url",
+			"origin"
+		], { cwd: where.toplevel })).catch(() => null);
+		if (r && r.code === 0 && r.stdout.trim()) remote = r.stdout.trim();
+	}
+	const root = !where ? normalize(cwd) : /\/\.git$/.test(where.commonDir) ? dirname(where.commonDir) : where.toplevel;
+	const project = projectId(remote, {
+		machine,
+		root
+	});
+	return caseless && project.id.startsWith("local:") ? {
+		...project,
+		id: project.id.toLowerCase()
+	} : project;
+}
+function parseJson(text) {
+	try {
+		return text === null ? null : JSON.parse(text);
+	} catch {
+		return null;
+	}
+}
+function asObject(value) {
+	return value && typeof value === "object" && !Array.isArray(value) ? value : {};
+}
+const nonEmpty = (v) => typeof v === "string" && v.trim() !== "";
+//#endregion
+//#region src/data-layer/io.ts
+function nodeIo({ run = runCommand } = {}) {
+	return {
+		run,
+		async listDir(dir) {
+			try {
+				return (await fs.readdir(dir, { withFileTypes: true })).map((e) => ({
+					name: e.name,
+					isDir: e.isDirectory()
+				}));
+			} catch {
+				return [];
+			}
+		},
+		async stat(p) {
+			try {
+				const s = await fs.stat(p);
+				return {
+					isDir: s.isDirectory(),
+					mtimeMs: s.mtimeMs,
+					size: s.size
+				};
+			} catch {
+				return null;
+			}
+		},
+		realpath: (p) => fs.realpath(p),
+		isDirSync: (p) => {
+			try {
+				return statSync(p).isDirectory();
+			} catch {
+				return false;
+			}
+		},
+		async read(p, start, end) {
+			if (start === void 0 || end === void 0) return fs.readFile(p, "utf8");
+			const fh = await fs.open(p, "r");
+			try {
+				const buf = Buffer.alloc(Math.max(0, end - start));
+				const { bytesRead } = await fh.read(buf, 0, buf.length, start);
+				return buf.subarray(0, bytesRead).toString("utf8");
+			} finally {
+				await fh.close();
+			}
+		}
+	};
+}
+function runCommand([cmd, ...args], { cwd }) {
+	return new Promise((resolve) => {
+		execFile(cmd, args, {
+			cwd,
+			encoding: "utf8",
+			timeout: 1e4,
+			windowsHide: true
+		}, (err, stdout) => {
+			resolve({
+				code: err ? typeof err.code === "number" ? err.code : 1 : 0,
+				stdout: stdout || ""
+			});
+		});
+	});
+}
+//#endregion
+//#region src/data-layer/home.ts
+/** The projects `folder` may report as, and whether it is a workspace. */
+async function candidatesOf(folder, io) {
+	const where = await io.resolve(folder);
+	if (where) return {
+		projects: [await io.projectOf(where, folder)],
+		workspace: false
+	};
+	const tooWide = pathKey(folder) === pathKey(io.home) || relativeTo(folder, io.home) !== null;
+	const st = await io.stat(folder);
+	const repos = [];
+	if (!tooWide && st?.isDir) {
+		for (const e of await io.listDir(folder)) if (e.isDir && await io.stat(join(folder, `${e.name}/.git`))) repos.push(join(folder, e.name));
+	}
+	if (!repos.length || repos.length > io.workspaceRepos) return {
+		projects: [await io.projectOf(null, folder)],
+		workspace: false
+	};
+	const projects = [];
+	for (const dir of repos.sort()) {
+		const at = await io.resolve(dir);
+		if (at) projects.push(await io.projectOf(at, dir));
+	}
+	return {
+		projects,
+		workspace: true
+	};
+}
+/** A HomeIo on this machine, for the runner and the commands. */
+function machineHomeIo(workspaceRepos, machine = os.hostname()) {
+	const io = nodeIo();
+	const git = createGit(io);
+	return {
+		resolve: (dir) => git.resolve(dir),
+		projectOf: (where, dir) => projectOf(io.run, where, dir, machine),
+		stat: (p) => Promise.resolve(io.stat(p)),
+		listDir: (d) => io.listDir(d),
+		home: os.homedir(),
+		workspaceRepos
+	};
+}
+/**
+* What a command (hand-over, ask the room) may say hello as: the session's home, by this machine's
+* copy of the office's list, which the session's data layer keeps fresh; or, when there is none, or
+* no fresh copy, why nothing is sent.
+*/
+async function commandHome(folder, io, list) {
+	const repos = await cachedRepos(list.file, list.server, list.maxAgeMs, list.now);
+	if (!repos) return { refused: `Can't tell which repos ${list.server} takes (this machine's copy of its list is missing or older than ${Math.round(list.maxAgeMs / 6e4)} minutes), so nothing is sent. A Claude Code session with the Isoplan plugin reads it again within a few minutes.` };
+	const { projects, workspace } = await candidatesOf(folder, io);
+	const home = projects.find((p) => repos.has(p.id.toLowerCase()));
+	if (home) return { home };
+	return { refused: `${workspace ? "No repo in this folder is" : "This repo isn't"} one the office at ${list.server} takes, so nothing of it is sent there. An admin adds it under Repos on the floor.` };
+}
+//#endregion
 //#region src/handoff/connection.ts
 async function openSideLink(url, hello, timeoutMs) {
 	const ws = new WebSocket(url);
@@ -7241,9 +7337,8 @@ const flag = (argv, name) => {
 	return i >= 0 && argv[i + 1] !== void 0 ? argv[i + 1] : null;
 };
 const readText = (p) => fs.readFile(p, "utf8").catch(() => null);
-async function hello(session, cwd, token) {
+async function hello(session, cwd, token, project) {
 	const machine = os.hostname();
-	const where = await createGit(io).resolve(cwd);
 	return {
 		type: "hello",
 		v: 1,
@@ -7254,7 +7349,7 @@ async function hello(session, cwd, token) {
 		}, claudeJson, cwd),
 		machine: { name: machine },
 		session: `claude-code:${session}`,
-		project: await projectOf(io.run, where, cwd, machine),
+		project,
 		...token ? { token } : {}
 	};
 }
@@ -7302,12 +7397,18 @@ async function main(argv) {
 	const settings = await loadSettings(io, path.join(modDir, "runner.json"), path.join(isoplanDir, "runner.json"));
 	const config = await loadConfig(io, path.join(modDir, "config.json"), path.join(isoplanDir, "config.json"));
 	if (config.plainRefused) return `The room can't be asked: config.json's server, ${config.plainRefused}, is plain ws:// to another machine. Carry on without the answer.`;
+	const found = await commandHome(cwd, machineHomeIo(config.workspaceRepos), {
+		file: approvedPath(claudeDir),
+		server: config.server,
+		maxAgeMs: config.approvedMaxAgeMinutes * 6e4
+	});
+	if ("refused" in found) return `The room can't be asked: ${found.refused} Carry on without the answer.`;
 	const pairing = await machinePairing(config.server, config.allowPlainWs);
 	const deadline = Date.now() + MAX_WAIT_MS;
 	try {
 		for (let tries = 0;; tries++) {
 			const token = await pairing.token();
-			const link = await openSideLink(config.server, await hello(session, cwd, token), CONNECT_MS);
+			const link = await openSideLink(config.server, await hello(session, cwd, token, found.home), CONNECT_MS);
 			try {
 				if (ack) {
 					link.send({

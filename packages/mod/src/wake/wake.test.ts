@@ -62,3 +62,20 @@ test("lock: a second data layer is refused while the first lives; a stale lock i
   expect(await takeLock(s.lock, OTHER + 1, () => false)).toBe(true);
   expect(JSON.parse(fs.readFileSync(s.lock, "utf8"))).toEqual({ pid: OTHER + 1 });
 });
+
+test("wake: a data layer held off because the office took none of its repos starts again once the list takes one (#91)", async () => {
+  const s = setup();
+  await takeLock(s.lock, OTHER);
+  await holdOff(s.lock, OTHER, Date.now() + HOLD_OFF_MS, { reason: "not-approved", projects: ["github.com/team/app"] });
+  const list = (repos: string[], checked = Date.now()) =>
+    fs.writeFileSync(path.join(s.claudeDir, "isoplan", "approved.json"), JSON.stringify({ server: "ws://127.0.0.1:4747/data-layer", version: "v2", repos, fetched: checked, checked }));
+  expect(await s.run(() => false)).toBe(false);
+  list(["github.com/team/other"]);
+  expect(await s.run(() => false)).toBe(false);
+  // A copy past its maximum age doesn't count.
+  list(["github.com/team/app"], Date.now() - 60 * 60 * 1000);
+  expect(await s.run(() => false)).toBe(false);
+  list(["github.com/team/app"]);
+  expect(await s.run(() => false)).toBe(true);
+  expect(s.spawned).toHaveLength(1);
+});

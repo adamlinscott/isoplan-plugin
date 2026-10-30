@@ -244,6 +244,23 @@ function alive(pid) {
 	}
 }
 //#endregion
+//#region src/data-layer/approved-file.ts
+const approvedPath = (claudeDir) => path.join(claudeDir, "isoplan", "approved.json");
+const isFile = (v) => !!v && typeof v.server === "string" && typeof v.version === "string" && typeof v.fetched === "number" && typeof v.checked === "number" && Array.isArray(v.repos) && v.repos.every((r) => typeof r === "string");
+/** approved.json, for `server` when given; null when there is none, or it is another server's. */
+async function readApproved(file, server) {
+	try {
+		const value = JSON.parse(await fs.readFile(file, "utf8"));
+		return isFile(value) && (server === void 0 || value.server === server) ? value : null;
+	} catch {
+		return null;
+	}
+}
+/** The approved repos' ids, lower case, while the copy is younger than `maxAgeMs`; null after, or with none. */
+function freshRepos(copy, maxAgeMs, now) {
+	return copy && now - copy.checked <= maxAgeMs ? new Set(copy.repos.map((r) => r.toLowerCase())) : null;
+}
+//#endregion
 //#region src/wake/wake.ts
 const wakeRecordPath = (claudeDir) => path.join(claudeDir, "isoplan", "wake.json");
 /**
@@ -253,7 +270,11 @@ const wakeRecordPath = (claudeDir) => path.join(claudeDir, "isoplan", "wake.json
 async function wake(input, { claudeDir, spawn, isAlive = alive, project }) {
 	const { session_id: sessionId, cwd } = JSON.parse(input);
 	if (typeof sessionId !== "string" || !/^[\w-]+$/.test(sessionId) || typeof cwd !== "string" || !cwd) return false;
-	if (await isHeld(lockPath(claudeDir, sessionId), Date.now(), isAlive)) return false;
+	const lock = lockPath(claudeDir, sessionId);
+	if (await isHeld(lock, Date.now(), isAlive)) {
+		if (!await nowApproved(claudeDir, lock)) return false;
+		await fs.rm(lock, { force: true });
+	}
 	const { dataLayer } = JSON.parse(await fs.readFile(wakeRecordPath(claudeDir), "utf8"));
 	if (typeof dataLayer !== "string" || !await fs.stat(dataLayer).then((s) => s.isFile(), () => false)) return false;
 	spawn([
@@ -266,6 +287,14 @@ async function wake(input, { claudeDir, spawn, isAlive = alive, project }) {
 		"--detached"
 	], cwd);
 	return true;
+}
+/** Whether `lock` is a hold-off for repos the office didn't take, one of which a fresh copy of its list now has. */
+async function nowApproved(claudeDir, lock) {
+	const held = await readLock(lock);
+	const projects = held?.extra.projects;
+	if (held?.pid !== null || held.extra.reason !== "not-approved" || !Array.isArray(projects)) return false;
+	const repos = freshRepos(await readApproved(approvedPath(claudeDir)), 9e5, Date.now());
+	return !!repos && projects.some((p) => typeof p === "string" && repos.has(p));
 }
 //#endregion
 //#region src/runner/environment.ts
@@ -513,12 +542,14 @@ const WRITTEN = [
 	"live",
 	"logs",
 	"titles",
-	"released"
+	"released",
+	"approved.json"
 ];
 const SESSION_TRACES = [
 	"live",
 	"titles",
-	"released"
+	"released",
+	"approved.json"
 ];
 /**
 * Takes out everything install and the plugin put in place, in this order: the running runner;
