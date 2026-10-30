@@ -13,6 +13,7 @@ function endText(m, late) {
 const RETRY_CAP_MS = 3e4;
 const STABLE_MS = 6e4;
 const SWITCH_CHECK_MS = 1e3;
+const SUPERSEDED_RECHECK_MS = 6e4;
 const NOTE_MAX = 1e3;
 const ASK_TIMEOUT_MS = 42e4;
 const RUNNING = /* @__PURE__ */ new Set([
@@ -39,6 +40,9 @@ let pairing = null;
 let pairSaid = false;
 const floorWaits = /* @__PURE__ */ new Map();
 let waitsDir = null;
+let shownStatus;
+let updated = false;
+let superseded = null;
 let marking = Promise.resolve();
 function register(on) {
 	on("session.start", async ($, e, next) => {
@@ -127,7 +131,13 @@ async function checkSession($) {
 async function run($) {
 	const script = $.plugin.root.replace(/\\/g, "/") + "/dist/data-layer.js";
 	let failures = 0;
+	const since = await $.clock.now();
 	for (;;) {
+		if (!await isThere($, script)) {
+			updated = true;
+			show($, void 0);
+			return;
+		}
 		const session = await $.session.id();
 		const cwd = await $.session.cwd();
 		if (session !== running) {
@@ -156,7 +166,9 @@ async function run($) {
 					"--session",
 					session,
 					"--cwd",
-					cwd
+					cwd,
+					"--since",
+					String(since)
 				],
 				cwd
 			});
@@ -191,13 +203,21 @@ async function run($) {
 			$.ui.log("isoplan: the data layer could not run: " + message(err), { to: "debug" });
 		}
 		stop = null;
+		if (superseded) {
+			if (superseded === "newer") updated = true;
+			show($, superseded === "newer" ? void 0 : "Isoplan: this session is reported from its other window");
+			superseded = null;
+			failures = 0;
+			await $.clock.sleep(SUPERSEDED_RECHECK_MS);
+			continue;
+		}
 		if (switched) {
 			failures = 0;
 			continue;
 		}
 		failures = await $.clock.now() - startedAt >= STABLE_MS ? 1 : failures + 1;
 		const delay = Math.min(RETRY_CAP_MS, 1e3 * failures);
-		$.ui.status(!began ? "Isoplan needs Node.js on PATH (couldn't start `node`)" : `Isoplan: the data layer stopped${code === null ? "" : ` (node exited with code ${code})`}; restarting in ${Math.round(delay / 1e3)}s`);
+		show($, !began ? "Isoplan needs Node.js on PATH (couldn't start `node`)" : `Isoplan: the data layer stopped${code === null ? "" : ` (node exited with code ${code})`}; restarting in ${Math.round(delay / 1e3)}s`);
 		await $.clock.sleep(delay);
 	}
 }
@@ -211,7 +231,14 @@ function handle($, text) {
 	}
 	switch (line.type) {
 		case "status":
-			$.ui.status(statusText(line));
+			show($, statusText(line));
+			break;
+		case "updated":
+			updated = true;
+			show($, shownStatus);
+			break;
+		case "superseded":
+			superseded = line.reason;
 			break;
 		case "title-ask":
 			writeTitle($, line);
@@ -223,7 +250,7 @@ function handle($, text) {
 			if (!pairSaid) $.ui.log(`Isoplan: to report to ${line.server}, pair this machine: click ${line.url} on this computer and approve it in the office.`);
 			pairSaid = true;
 			pairing = line;
-			$.ui.status(pairText(line));
+			show($, pairText(line));
 			break;
 		case "conflict":
 			addNote(line);
@@ -250,6 +277,11 @@ function handle($, text) {
 		}
 	}
 }
+function show($, text) {
+	shownStatus = text;
+	$.ui.status(updated ? [text, UPDATED_TEXT].filter(Boolean).join(" · ") : text);
+}
+const UPDATED_TEXT = "Isoplan updated: type /reload-plugins";
 function statusText(line) {
 	switch (line.state) {
 		case "waiting": return `Isoplan: ${line.server}, not connected yet (nothing to report)`;
@@ -372,6 +404,13 @@ function writeTitle($, ask) {
 	}).catch((err) => $.ui.log("isoplan: could not write a room title: " + message(err), { to: "debug" })).finally(() => {
 		asking = false;
 	});
+}
+async function isThere($, file) {
+	try {
+		return typeof $.fs.exists !== "function" || await $.fs.exists(file) !== false;
+	} catch {
+		return true;
+	}
 }
 const message = (err) => String(err && err.message || err);
 //#endregion

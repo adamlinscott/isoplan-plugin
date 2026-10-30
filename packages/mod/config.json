@@ -16,5 +16,6 @@
   "gitCacheSeconds": 60,
   "workspaceRepos": 12,
   "approvedRefreshMinutes": 5,
-  "approvedMaxAgeMinutes": 15
+  "approvedMaxAgeMinutes": 15,
+  "updateCheckHours": 6
 }

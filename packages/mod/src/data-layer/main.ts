@@ -16,6 +16,11 @@
 // An office server that signs people in wants the machine paired first: reading that list pairs it,
 // keeping the credential in <claude dir>/isoplan/pairing.json, under the machine's Claude account
 // (src/data-layer/pairing.ts).
+// It keeps the plugin up to date (src/update): as it starts and every `updateCheckHours` it installs
+// a newer version in the background, and once one is on disk it says so in the status line, since
+// the session loads it only at /reload-plugins. An outdated data layer installs nothing, so it never
+// hands the wake hook and the runner back to older code; a detached one stops, leaving its session
+// to the newest one, which the wake hook starts.
 // An agent's open question to its owner is reported too, secret-checked like a report, and
 // answerable from the floor while this data layer's hooks module marks that it waits for it
 // (src/data-layer/owner-answers.ts); a detached one's are read-only.
@@ -32,9 +37,14 @@
 // its data layer exits, then unreachable.
 //
 // One data layer reports a session: each takes <claude dir>/isoplan/live/<session>.json (src/wake/
-// lock.ts). A detached one exits at once if another holds it, and as soon as the plugin's takes it
-// over. The plugin's takes it regardless, takes it back each pass if it was lost, and goes on
-// without it if the folder can't be written.
+// lock.ts), naming its own script, whether it is detached, when its window's hooks module started
+// (`--since`) and that window's Claude Code process, and refreshes it each pass. A detached one
+// exits at once if another holds it, and as soon as the plugin's takes it over. The plugin's takes
+// it regardless, and goes on without it if the folder can't be written. It takes it back each pass,
+// unless the plugin's data layer holding it, with a fresh lock, is the newest copy for this session
+// while this one isn't, or runs the same copy, started later in a window whose Claude Code is still
+// running (a /reload-plugins, or the session opened in a second window): then it says it is
+// `superseded` and exits, never for an older or equal holder.
 
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
@@ -44,14 +54,15 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { PROTOCOL_VERSION, type Facts, type Project } from "@isoplan/protocol";
 import { installWake } from "../install/install.js";
-import { managedDir, pluginDirsOf, pluginState, pluginsDir, type Place } from "../install/state.js";
+import { managedDir, newestDataLayer, normalPath, pluginDirsOf, pluginIdOf, pluginState, pluginsDir, type Place } from "../install/state.js";
 import type { DataLayerLine, TitleReply, WaitMark } from "../lines.js";
-import { findClaude } from "../runner/claude-binary.js";
+import { claudeBinary, claudeCommand, findClaude } from "../runner/claude-binary.js";
 import { loadPatterns, type Pattern } from "../runner/scan.js";
 import { startRunner } from "../runner/start.js";
 import { recentSessions } from "../sweep/find.js";
+import { checkForUpdate, commandEnv, gitChoices, START_GAP_MS, updatesOffBy } from "../update/update.js";
 import { backfill } from "../wake/backfill.js";
-import { alive, HOLD_OFF_MS, holdOff, lockHolder, lockPath, releaseLock, takeLock } from "../wake/lock.js";
+import { alive, HOLD_OFF_MS, holdOff, lockHolder, lockPath, readLock, refreshLock, releaseLock, takeLock } from "../wake/lock.js";
 import { approvedPath, createApproved, createSessionGate, type Dormancy } from "./approved.js";
 import { forOffice } from "./attribution.js";
 import { candidatesOf, inRepos } from "./home.js";
@@ -71,6 +82,9 @@ import { cleanTitle, nextTitle, TITLE_SYSTEM, type TitleCache } from "./titles.j
 const LOG_CAP_BYTES = 64 * 1024;
 // How long a session the office doesn't take waits between passes.
 const DORMANT_MS = 30000;
+// A session lock its holder hasn't refreshed for this long (three of its slowest passes) counts for
+// nothing when a data layer decides whether to give the session up: the pid may have been reused.
+const LOCK_FRESH_MS = 3 * DORMANT_MS;
 
 const value = (argv: string[], flag: string) => {
   const i = argv.indexOf(flag);
@@ -150,9 +164,44 @@ async function main(argv: string[]): Promise<number> {
     emit({ type: "log", text: "Claude Code lists the Isoplan plugin as uninstalled or disabled here, so this session isn't reported" });
     return 0;
   }
+  // When this window's hooks module started: one it starts again keeps its window's place.
+  const since = Number(value(argv, "--since")) || Date.now();
+  const lockExtra = { dataLayer: self, detached, since, parent: process.ppid };
+  // The newest copy of the plugin installed for this session (state.ts): another one means this one is outdated.
+  const newest = () => newestDataLayer(place.plugins, self, project).catch(() => self);
+  const isOutdated = async () => (await newest()) !== self;
+  let outdated = await isOutdated();
+  if (detached && outdated) {
+    emit({ type: "log", text: "a newer version of the Isoplan plugin is installed, so it reports this session instead" });
+    await logging;
+    return 0;
+  }
+
+  // Why this data layer gives the session up to the plugin's data layer holding it (see above), or null.
+  const supersededBy = async (): Promise<"newer" | "window" | null> => {
+    const held = await readLock(lock);
+    if (!held?.pid || held.pid === process.pid || !alive(held.pid) || Date.now() - held.mtimeMs >= LOCK_FRESH_MS) return null;
+    const { dataLayer: other, detached: otherDetached, since: otherSince, parent } = held.extra;
+    if (otherDetached !== false || typeof other !== "string") return null;
+    if (normalPath(other) === normalPath(self)) return typeof otherSince === "number" && otherSince > since && typeof parent === "number" && alive(parent) ? "window" : null;
+    const current = await newest();
+    outdated = current !== self;
+    return outdated && normalPath(current) === normalPath(other) ? "newer" : null;
+  };
+  const leave = (reason: "newer" | "window") => {
+    emit({ type: "log", text: reason === "newer" ? "stopping: the newer version's data layer that a reload started reports this session now" : "stopping: the session's newer window reports it now" });
+    emit({ type: "superseded", reason });
+  };
+  if (!detached) {
+    const reason = await supersededBy();
+    if (reason) {
+      leave(reason);
+      return 0;
+    }
+  }
 
   try {
-    if (!(await takeLock(lock, process.pid, alive, !detached))) {
+    if (!(await takeLock(lock, process.pid, alive, !detached, Date.now(), { extra: lockExtra }))) {
       process.stderr.write(`another data layer already reports session ${sessionId}\n`);
       return 0;
     }
@@ -163,7 +212,7 @@ async function main(argv: string[]): Promise<number> {
 
   const paths = { ...place, settings: path.join(claudeDir, "settings.json") };
   const start = (args: string[], dir: string, env?: Record<string, string>) => spawn(process.execPath, args, { cwd: dir, env, detached: true, stdio: "ignore", windowsHide: true }).on("error", () => {}).unref();
-  const installing = detached
+  const installing = detached || outdated
     ? Promise.resolve([])
     : installWake(paths, path.join(here, "data-layer.js"), path.join(here, "wake.js"), {
         auto: true,
@@ -175,9 +224,34 @@ async function main(argv: string[]): Promise<number> {
       );
   // The machine's runner answers for its rooms; it is started here as well as by the wake hook.
   // Not while the plugin is disabled for the machine, though this session's project enables it.
-  if (!detached) void installing.then(async () => (await pluginState(place, self)) === "enabled" && startRunner({ claudeDir, spawn: start })).catch(() => {});
+  if (!detached && !outdated) void installing.then(async () => (await pluginState(place, self)) === "enabled" && startRunner({ claudeDir, spawn: start })).catch(() => {});
 
   let config: Config = await loadConfig(io, defaultsPath, userConfigPath);
+  if (outdated) emit({ type: "updated" });
+  // The update check (src/update), for a copy in Claude Code's plugin cache: there is nothing to
+  // update in a checkout or a folder loaded in place. One at a time in this process; the machine's
+  // lock and record keep sessions from checking together.
+  const pluginId = pluginIdOf(place.plugins, self);
+  let checking = false;
+  let checkedAt = Date.now(); // the timed checks count from the one at start
+  const checkUpdate = (gapMs: number) => {
+    if (detached || !pluginId || outdated || checking || !config.updateCheckHours) return;
+    checkedAt = Date.now();
+    const off = updatesOffBy(process.env);
+    if (off) return emit({ type: "log", text: `not checking for a newer version of the plugin: ${off} is set (FORCE_AUTOUPDATE_PLUGINS=1 turns plugin updates back on)` });
+    checking = true;
+    void (async () => {
+      if ((await pluginState(place, self).catch(() => "enabled")) !== "enabled") return emit({ type: "log", text: "not checking for a newer version of the plugin: it is disabled for this machine" });
+      const binary = await claudeBinary(claudeDir, process.env, process.platform, os.homedir());
+      if (!binary) return emit({ type: "log", text: "couldn't find the claude binary, so the plugin can't update itself" });
+      const checked = await checkForUpdate({ claudeDir, settings: paths.settings, plugins: place.plugins, id: pluginId, cwd: project, claude: claudeCommand(binary), env: commandEnv(process.env, await gitChoices(project)), gapMs });
+      for (const text of checked.said) emit({ type: "log", text: `update check: ${text}` });
+    })()
+      .catch((err: unknown) => emit({ type: "log", text: `couldn't check for a newer version of the plugin: ${String((err as Error)?.message ?? err)}` }))
+      .finally(() => (checking = false));
+  };
+  // After the wake hook's install, which writes settings.json too: neither then loses the other's change.
+  void installing.then(() => checkUpdate(START_GAP_MS));
   // A hook just installed sees other sessions only on their next turn: they are reported now.
   void installing
     .then(async (changes) => {
@@ -317,8 +391,25 @@ async function main(argv: string[]): Promise<number> {
     const now = Date.now();
     const isFirstPass = passes++ === 0;
     // A detached data layer that stopped may have deleted this one's lock as it went.
-    if (!detached && (await lockHolder(lock)) !== process.pid) await takeLock(lock, process.pid, alive, true).catch(() => {});
+    if (!detached) {
+      if ((await lockHolder(lock)) !== process.pid) {
+        const reason = await supersededBy();
+        if (reason) {
+          leave(reason);
+          break;
+        }
+        await takeLock(lock, process.pid, alive, true, Date.now(), { extra: lockExtra }).catch(() => {});
+      } else await refreshLock(lock, process.pid).catch(() => {});
+    }
     config = await loadConfig(io, defaultsPath, userConfigPath).catch(() => config);
+    if (!outdated && (outdated = await isOutdated())) {
+      if (detached) {
+        emit({ type: "log", text: "stopping: a newer version of the Isoplan plugin is installed, which the wake hook starts next" });
+        break;
+      }
+      emit({ type: "updated" });
+    }
+    if (now - checkedAt >= config.updateCheckHours * 3600000) checkUpdate(config.updateCheckHours * 3600000);
     const gitOpts = { now, maxAgeMs: config.gitCacheSeconds * 1000 };
     const resolve = (dir: string) => git.resolve(dir, gitOpts);
     const projectOfRepo = (where: Where) => {

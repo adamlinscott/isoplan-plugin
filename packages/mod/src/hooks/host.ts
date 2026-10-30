@@ -53,6 +53,8 @@ export interface Host {
   };
   fs: {
     write(path: string, text: string): Promise<void>;
+    /** Not in every Claude Code build: check before calling. */
+    exists?(path: string): Promise<boolean>;
   };
   ui: {
     /** This plugin's one status line under the prompt; undefined clears it. */

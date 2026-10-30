@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { expect, test } from "vitest";
 import { tempRoot } from "../data-layer/fixture.js";
-import { installedPlugins, pluginIdOf, pluginState } from "./state.js";
+import { installedPlugins, newestDataLayer, newestFirst, pluginIdOf, pluginState, type Install } from "./state.js";
 
 const ID = "isoplan@isoplan";
 
@@ -112,4 +112,100 @@ test("project scope: an install counts only for its project's sessions, or every
   expect(await pluginState(s.place, s.dataLayer)).toBe("enabled"); // the machine still has it: nothing is uninstalled
   s.installed({ [ID]: [{ scope: "local" }] });
   expect(await pluginState(s.place, s.dataLayer, other)).toBe("enabled");
+});
+
+// A version folder as Claude Code writes it, with the key files and a plugin.json naming `version`.
+function copy(s: ReturnType<typeof setup>, version: string, manifest: Record<string, unknown> = { name: "isoplan", version }) {
+  const folder = path.join(s.place.plugins, "cache", "isoplan", "isoplan", version);
+  for (const file of ["dist/data-layer.js", "dist/wake.js", "dist/hooks.js"]) s.write(path.join(folder, file), "");
+  s.write(path.join(folder, ".claude-plugin", "plugin.json"), manifest);
+  return { folder, dataLayer: path.join(folder, "dist", "data-layer.js") };
+}
+
+test("versions: an update to a new folder is still the same install, and leaves the old data layer outdated", async () => {
+  const s = setup();
+  const old = copy(s, "0.2.0");
+  const now = copy(s, "0.3.0");
+  s.installed({ [ID]: [{ scope: "user", installPath: old.folder, version: "0.2.0" }] });
+  expect(await newestDataLayer(s.place.plugins, old.dataLayer)).toBe(old.dataLayer);
+  s.installed({ [ID]: [{ scope: "user", installPath: now.folder, version: "0.3.0" }] });
+  expect(await newestDataLayer(s.place.plugins, old.dataLayer)).toBe(now.dataLayer);
+  expect(await newestDataLayer(s.place.plugins, now.dataLayer)).toBe(now.dataLayer);
+  // Uninstall and disable detection go by the id, whichever folder wake.json still records.
+  expect(await pluginState(s.place, old.dataLayer)).toBe("enabled");
+  s.enabled(path.join(s.place.claudeDir, "settings.json"), false);
+  expect(await pluginState(s.place, old.dataLayer)).toBe("disabled");
+  s.installed({});
+  expect(await pluginState(s.place, old.dataLayer)).toBe("uninstalled");
+});
+
+test("newest data layer: a folder still being written, or whose plugin.json names another version, doesn't count", async () => {
+  const s = setup();
+  const old = copy(s, "0.2.0");
+  const now = copy(s, "0.3.0");
+  s.installed({ [ID]: [{ scope: "user", installPath: now.folder, version: "0.3.0" }] });
+  fs.rmSync(path.join(now.folder, "dist", "hooks.js"));
+  expect(await newestDataLayer(s.place.plugins, old.dataLayer)).toBe(old.dataLayer);
+  s.write(path.join(now.folder, "dist", "hooks.js"), "");
+  s.write(path.join(now.folder, ".claude-plugin", "plugin.json"), { name: "isoplan", version: "0.2.9" });
+  expect(await newestDataLayer(s.place.plugins, old.dataLayer)).toBe(old.dataLayer);
+  // A plugin.json that pins no version: its version came from the marketplace or the commit.
+  s.write(path.join(now.folder, ".claude-plugin", "plugin.json"), { name: "isoplan" });
+  expect(await newestDataLayer(s.place.plugins, old.dataLayer)).toBe(now.dataLayer);
+});
+
+test("newest data layer: the newest version recorded at any scope, so a copy another scope still loads is outdated too", async () => {
+  const s = setup();
+  const old = copy(s, "0.2.0");
+  const now = copy(s, "0.3.0");
+  const at = (scope: string, c: { folder: string }, version: string, lastUpdated: string) => ({ scope, installPath: c.folder, version, lastUpdated, ...(scope === "project" && { projectPath: s.project }) });
+  s.installed({ [ID]: [at("project", old, "0.2.0", "2026-10-30T12:00:00Z"), at("user", now, "0.3.0", "2026-10-29T12:00:00Z")] });
+  expect(await newestDataLayer(s.place.plugins, old.dataLayer)).toBe(now.dataLayer);
+  expect(await newestDataLayer(s.place.plugins, now.dataLayer)).toBe(now.dataLayer);
+  // Versions that aren't x.y.z (commit SHAs) go by which was updated last.
+  const a = copy(s, "aaaaaaaaaaaa");
+  const b = copy(s, "bbbbbbbbbbbb");
+  s.installed({ [ID]: [at("user", a, "aaaaaaaaaaaa", "2026-10-30T12:00:00Z"), at("local", b, "bbbbbbbbbbbb", "2026-10-29T12:00:00Z")] });
+  expect(await newestDataLayer(s.place.plugins, b.dataLayer)).toBe(a.dataLayer);
+  // Another id isn't an update of this one; a data layer outside the cache, or no record, is its own newest.
+  s.installed({ "isoplan@other-market": [at("user", now, "0.3.0", "2026-10-30T12:00:00Z")] });
+  expect(await newestDataLayer(s.place.plugins, old.dataLayer)).toBe(old.dataLayer);
+  const checkout = path.join(s.root, "checkout", "dist", "data-layer.js");
+  expect(await newestDataLayer(s.place.plugins, checkout)).toBe(checkout);
+  fs.rmSync(path.join(s.place.plugins, "installed_plugins.json"));
+  expect(await newestDataLayer(s.place.plugins, old.dataLayer)).toBe(old.dataLayer);
+});
+
+test("newest data layer: its own folder, however the record spells it, is never an update of itself", async () => {
+  const s = setup();
+  const own = copy(s, "0.3.0");
+  const spelled = own.folder.replace(/\\/g, "/") + "/";
+  s.installed({ [ID]: [{ scope: "user", installPath: process.platform === "linux" ? spelled : spelled.toUpperCase(), version: "0.3.0" }] });
+  expect(await newestDataLayer(s.place.plugins, own.dataLayer)).toBe(own.dataLayer);
+});
+
+test("newest data layer: only the installs that apply to the session's project count, as for enabled and disabled", async () => {
+  const s = setup();
+  const user = copy(s, "0.3.0");
+  const other = copy(s, "0.4.0");
+  const repoX = path.join(s.root, "x");
+  const repoY = path.join(s.root, "y");
+  s.installed({ [ID]: [{ scope: "user", installPath: user.folder, version: "0.3.0" }, { scope: "project", projectPath: repoX, installPath: other.folder, version: "0.4.0" }] });
+  // A session in repo Y loads the user's 0.3.0, which stays current there; in repo X, 0.4.0 is newer.
+  expect(await newestDataLayer(s.place.plugins, user.dataLayer, repoY)).toBe(user.dataLayer);
+  expect(await newestDataLayer(s.place.plugins, user.dataLayer, repoX)).toBe(other.dataLayer);
+  expect(await newestDataLayer(s.place.plugins, other.dataLayer, repoX)).toBe(other.dataLayer);
+  // A local install for repo X counts only there too.
+  s.installed({ [ID]: [{ scope: "user", installPath: user.folder, version: "0.3.0" }, { scope: "local", projectPath: repoX, installPath: other.folder, version: "0.4.0" }] });
+  expect(await newestDataLayer(s.place.plugins, user.dataLayer, repoY)).toBe(user.dataLayer);
+});
+
+test("newest first: by semantic version, a pre-release below its release, when every version is one; else all by when they were updated", () => {
+  const at = (version: string | null, lastUpdated: string | null): Install => ({ id: ID, scope: "user", projectPath: null, installPath: `/c/${version}`, version, lastUpdated });
+  const order = (list: Install[]) => newestFirst(list).map((i) => i.version);
+  expect(order([at("0.3.0", "3"), at("0.10.0", "1"), at("0.3.0-rc.2", "5"), at("0.3.0-rc.10", "4"), at("0.3.0-beta", "6"), at("0.9.9", "2")])).toEqual(["0.10.0", "0.9.9", "0.3.0", "0.3.0-rc.10", "0.3.0-rc.2", "0.3.0-beta"]);
+  // One commit SHA among them: the whole list goes by lastUpdated, so the order is one order.
+  const mixed = [at("0.3.0", "2026-10-29"), at("a1b2c3d4e5f6", "2026-10-30"), at("0.4.0", "2026-10-28"), at(null, null)];
+  expect(order(mixed)).toEqual(["a1b2c3d4e5f6", "0.3.0", "0.4.0", null]);
+  expect(order([...mixed].reverse())).toEqual(order(mixed));
 });

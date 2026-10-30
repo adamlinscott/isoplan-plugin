@@ -47,6 +47,12 @@ export interface Install {
   id: string;
   scope: string | null;
   projectPath: string | null;
+  /** The folder the install loads from: cache/<marketplace>/<plugin>/<version>. */
+  installPath: string | null;
+  /** The version Claude Code computed for it: plugin.json's, or a commit's SHA when none is pinned. */
+  version: string | null;
+  /** When it was last installed or updated, as an ISO time. */
+  lastUpdated: string | null;
 }
 
 /** Claude Code's plugins folder: $CLAUDE_CODE_PLUGIN_CACHE_DIR when it is set, else <claude dir>/plugins. */
@@ -68,13 +74,101 @@ export function normalPath(p: string, platform: NodeJS.Platform = process.platfo
   return platform === "win32" || platform === "darwin" ? resolved.toLowerCase() : resolved;
 }
 
-/** The id, `<plugin>@<marketplace>`, of the marketplace install `file` is part of; null for a file outside the plugin cache. */
-export function pluginIdOf(plugins: string, file: string): string | null {
-  const relative = path.relative(path.join(plugins, "cache"), path.resolve(file));
+// The parts of `file`'s path below the plugin cache folder `cache`, `<marketplace>/<plugin>/<version>/...`; null outside it.
+function cacheParts(cache: string, file: string): string[] | null {
+  const relative = path.relative(cache, path.resolve(file));
   if (path.isAbsolute(relative)) return null; // another drive
   const parts = relative.split(path.sep);
-  return parts.length >= 4 && parts[0] !== ".." ? `${parts[1]}@${parts[0]}` : null;
+  return parts.length >= 4 && parts[0] !== ".." ? parts : null;
 }
+
+// cacheParts, with both paths resolved through links and short names; and the cache folder so resolved.
+async function realCacheParts(plugins: string, file: string): Promise<{ cache: string; parts: string[] | null }> {
+  const cache = await fs.realpath(path.join(plugins, "cache")).catch(() => path.join(plugins, "cache"));
+  return { cache, parts: cacheParts(cache, await fs.realpath(file).catch(() => file)) };
+}
+
+/** The id, `<plugin>@<marketplace>`, of the marketplace install `file` is part of; null for a file outside the plugin cache. */
+export function pluginIdOf(plugins: string, file: string): string | null {
+  const parts = cacheParts(path.join(plugins, "cache"), file);
+  return parts ? `${parts[1]}@${parts[0]}` : null;
+}
+
+// Whether an install counts for a session in `project`: one at user or managed scope, or at project
+// or local scope for that project (or naming none). Without a project, every install counts.
+const appliesTo = (install: Install, project?: string) =>
+  !project || !(install.scope === "project" || install.scope === "local") || !install.projectPath || normalPath(install.projectPath) === normalPath(project);
+
+// What a version folder must hold before it counts: a copy Claude Code is still writing doesn't.
+const KEY_FILES = [["dist", "data-layer.js"], ["dist", "wake.js"], ["dist", "hooks.js"], [".claude-plugin", "plugin.json"]];
+
+/**
+ * The data layer of the newest copy of its plugin Claude Code records for a session in `project`
+ * (`appliesTo`, as `pluginState` counts installs): by version when every one is x.y.z, else by
+ * which was updated last (`newestFirst`), counting only a folder that holds KEY_FILES and whose
+ * plugin.json names the recorded version (a plugin.json naming none counts, its version came from
+ * elsewhere). `dataLayer` itself when that copy is its own folder, when it is outside the cache, or
+ * when no record reads. A data layer this doesn't return is outdated: an update put another version
+ * on disk, which the session loads at its next start or /reload-plugins.
+ */
+export async function newestDataLayer(plugins: string, dataLayer: string, project?: string): Promise<string> {
+  const { cache, parts } = await realCacheParts(plugins, dataLayer);
+  if (!parts) return dataLayer;
+  const id = `${parts[1]}@${parts[0]}`;
+  const root = await realPath(path.join(cache, ...parts.slice(0, 3)));
+  const recorded = newestFirst(((await installs(plugins)) ?? []).filter((i) => i.id === id && i.installPath && appliesTo(i, project)));
+  for (const install of recorded) {
+    if ((await realPath(install.installPath!)) === root) return dataLayer;
+    if (await isComplete(install)) return path.join(install.installPath!, ...parts.slice(3));
+  }
+  return dataLayer;
+}
+
+/**
+ * Installs newest first, in one order for the whole list: by semantic version when every install's
+ * version is one (a pre-release below its release), else by `lastUpdated`, latest first.
+ */
+export function newestFirst(list: Install[]): Install[] {
+  const versions = list.map((i) => semver(i.version));
+  if (!versions.every(Boolean)) return [...list].sort((a, b) => (b.lastUpdated ?? "").localeCompare(a.lastUpdated ?? ""));
+  return list
+    .map((install, k) => ({ install, v: versions[k]! }))
+    .sort((a, b) => compareSemver(b.v, a.v))
+    .map((x) => x.install);
+}
+
+type Semver = { core: number[]; pre: string[] | null };
+
+const semver = (version: string | null): Semver | null => {
+  const m = version ? /^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?$/.exec(version) : null;
+  return m ? { core: [Number(m[1]), Number(m[2]), Number(m[3])], pre: m[4] ? m[4].split(".") : null } : null;
+};
+
+// Semantic version order: the numbers, then a release above its pre-releases, then the
+// pre-release's parts in turn (numbers by value and below words; more parts above fewer).
+function compareSemver(a: Semver, b: Semver): number {
+  for (let i = 0; i < 3; i++) if (a.core[i] !== b.core[i]) return a.core[i]! - b.core[i]!;
+  if (!a.pre || !b.pre) return (a.pre ? -1 : 0) - (b.pre ? -1 : 0);
+  for (let i = 0; i < Math.min(a.pre.length, b.pre.length); i++) {
+    const [x, y] = [a.pre[i]!, b.pre[i]!];
+    if (x === y) continue;
+    const [nx, ny] = [/^\d+$/.test(x), /^\d+$/.test(y)];
+    if (nx && ny) return Number(x) - Number(y);
+    if (nx !== ny) return nx ? -1 : 1;
+    return x < y ? -1 : 1;
+  }
+  return a.pre.length - b.pre.length;
+}
+
+// Whether an install's folder holds KEY_FILES and its plugin.json agrees with the recorded version.
+async function isComplete(install: Install): Promise<boolean> {
+  for (const file of KEY_FILES) if (!(await fs.stat(path.join(install.installPath!, ...file)).then((s) => s.isFile(), () => false))) return false;
+  const manifest = await readJson(path.join(install.installPath!, ".claude-plugin", "plugin.json"));
+  return !!manifest && (typeof manifest.version !== "string" || manifest.version === install.version);
+}
+
+// A folder as compared: its real path (links and short names resolved) where it exists, in normalPath's form.
+const realPath = async (p: string) => normalPath(await fs.realpath(p).catch(() => p));
 
 const nameOf = (id: string) => id.slice(0, id.lastIndexOf("@"));
 
@@ -86,7 +180,8 @@ export async function installs(plugins: string): Promise<Install[] | null> {
   return Object.entries(list).flatMap(([id, entries]) =>
     (entries as unknown[]).map((entry) => {
       const e = isObject(entry) ? entry : {};
-      return { id, scope: typeof e.scope === "string" ? e.scope : null, projectPath: typeof e.projectPath === "string" ? e.projectPath : null };
+      const text = (key: string) => (typeof e[key] === "string" ? (e[key] as string) : null);
+      return { id, scope: text("scope"), projectPath: text("projectPath"), installPath: text("installPath"), version: text("version"), lastUpdated: text("lastUpdated") };
     }),
   );
 }
@@ -109,15 +204,16 @@ export async function enabledIn(file: string, id: string): Promise<boolean | nul
  * managed files, the user's settings, and every install.
  */
 export async function pluginState(place: Place, dataLayer: string, project?: string): Promise<PluginState> {
-  const id = pluginIdOf(place.plugins, dataLayer);
-  if (!id) return "enabled";
+  const { parts } = await realCacheParts(place.plugins, dataLayer);
+  if (!parts) return "enabled";
+  const id = `${parts[1]}@${parts[0]}`;
   const name = nameOf(id);
   const all = await installs(place.plugins);
   let ids = [id];
   if (all) {
     const mine = all.filter((i) => nameOf(i.id) === name);
     if (!mine.length) return (await isInPluginDirs(place.pluginDirs ?? [], name)) ? "enabled" : "uninstalled";
-    const here = project ? mine.filter((i) => !(i.scope === "project" || i.scope === "local") || !i.projectPath || normalPath(i.projectPath) === normalPath(project)) : mine;
+    const here = mine.filter((i) => appliesTo(i, project));
     // Installed only for other projects: nothing to report for this one.
     if (!here.length) return "disabled";
     ids = [...new Set(here.map((i) => i.id))];

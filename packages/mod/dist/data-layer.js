@@ -1,4 +1,4 @@
-import { execFile, spawn } from "node:child_process";
+import { execFile, spawn, spawnSync } from "node:child_process";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
@@ -125,7 +125,7 @@ function slugify(input) {
 	return input.toLowerCase().trim().replace(/[^\w\s-]/g, "").replace(/[\s_-]+/g, "-").replace(/^-+|-+$/g, "");
 }
 const captureStackTrace = "captureStackTrace" in Error ? Error.captureStackTrace : (..._args) => {};
-function isObject$1(data) {
+function isObject$2(data) {
 	return typeof data === "object" && data !== null && !Array.isArray(data);
 }
 const allowsEval = /* @__PURE__*/ cached(() => {
@@ -139,12 +139,12 @@ const allowsEval = /* @__PURE__*/ cached(() => {
 	}
 });
 function isPlainObject(o) {
-	if (isObject$1(o) === false) return false;
+	if (isObject$2(o) === false) return false;
 	const ctor = o.constructor;
 	if (ctor === void 0) return true;
 	if (typeof ctor !== "function") return true;
 	const prot = ctor.prototype;
-	if (isObject$1(prot) === false) return false;
+	if (isObject$2(prot) === false) return false;
 	if (Object.prototype.hasOwnProperty.call(prot, "isPrototypeOf") === false) return false;
 	return true;
 }
@@ -2091,7 +2091,7 @@ const $ZodObject = /*@__PURE__*/ $constructor("$ZodObject", (inst, def) => {
 		}
 		return propValues;
 	});
-	const isObject = isObject$1;
+	const isObject = isObject$2;
 	const catchall = def.catchall;
 	let value;
 	const memo = globalConfig.memoizer;
@@ -2229,7 +2229,7 @@ const $ZodObjectJIT = /*@__PURE__*/ $constructor("$ZodObjectJIT", (inst, def) =>
 		return doc.compile();
 	};
 	let fastpass;
-	const isObject = isObject$1;
+	const isObject = isObject$2;
 	const jit = !globalConfig.jitless;
 	const fastEnabled = jit && allowsEval.value;
 	const catchall = def.catchall;
@@ -2348,7 +2348,7 @@ const $ZodDiscriminatedUnion = /*@__PURE__*/ $constructor("$ZodDiscriminatedUnio
 	const disc = cached(() => discriminatorMap(def));
 	inst._zod.parse = (payload, ctx) => {
 		const input = payload.value;
-		if (!isObject$1(input)) {
+		if (!isObject$2(input)) {
 			payload.issues.push({
 				code: "invalid_type",
 				expected: "object",
@@ -6273,7 +6273,7 @@ async function loadSettings(io, defaultsPath, userPath) {
 }
 const BYTE_KEYS = /* @__PURE__ */ new Set(["tailBytes"]);
 const FLOORS = /* @__PURE__ */ new Map([["streamSeconds", .25]]);
-const ZERO_OFF = /* @__PURE__ */ new Set(["lightsOffHours"]);
+const ZERO_OFF = /* @__PURE__ */ new Set(["lightsOffHours", "updateCheckHours"]);
 function fits(key, value, fallback) {
 	if (key === "server") return typeof value === "string" && isWebSocketUrl(value);
 	if (typeof fallback === "number") {
@@ -6393,6 +6393,16 @@ async function findClaude(env, platform, home, exists = isFile$1) {
 		if (await exists(join(d, "claude.cmd")) && await exists(cli)) return cli;
 	}
 	return null;
+}
+/** What runs it: the binary itself, or node and the cli.js. */
+const claudeCommand = (binary, node = process.execPath) => binary.endsWith(".js") ? [node, binary] : [binary];
+/** The recorded binary when it is still there, else a fresh lookup. */
+async function claudeBinary(claudeDir, env, platform, home) {
+	try {
+		const recorded = JSON.parse(await fs.readFile(claudeBinaryPath(claudeDir), "utf8")).path;
+		if (typeof recorded === "string" && await isFile$1(recorded)) return recorded;
+	} catch {}
+	return findClaude(env, platform, home);
 }
 //#endregion
 //#region src/wake/lock.ts
@@ -6550,6 +6560,199 @@ function freshRepos(copy, maxAgeMs, now) {
 	return copy && now - copy.checked <= maxAgeMs ? new Set(copy.repos.map((r) => r.toLowerCase())) : null;
 }
 //#endregion
+//#region src/install/state.ts
+/** Claude Code's plugins folder: $CLAUDE_CODE_PLUGIN_CACHE_DIR when it is set, else <claude dir>/plugins. */
+const pluginsDir = (claudeDir, env) => env.CLAUDE_CODE_PLUGIN_CACHE_DIR || path.join(claudeDir, "plugins");
+/** The folders $CLAUDE_CODE_PLUGIN_DIRS names. */
+const pluginDirsOf = (env) => (env.CLAUDE_CODE_PLUGIN_DIRS ?? "").split(path.delimiter).filter(Boolean);
+/** The system folder Claude Code reads managed-settings.json from. */
+function managedDir(platform) {
+	if (platform === "win32") return "C:\\Program Files\\ClaudeCode";
+	if (platform === "darwin") return "/Library/Application Support/ClaudeCode";
+	return "/etc/claude-code";
+}
+/** A path as compared: resolved, with forward slashes, and on Windows and macOS without regard to case. */
+function normalPath(p, platform = process.platform) {
+	const resolved = path.resolve(p).replace(/\\/g, "/");
+	return platform === "win32" || platform === "darwin" ? resolved.toLowerCase() : resolved;
+}
+function cacheParts(cache, file) {
+	const relative = path.relative(cache, path.resolve(file));
+	if (path.isAbsolute(relative)) return null;
+	const parts = relative.split(path.sep);
+	return parts.length >= 4 && parts[0] !== ".." ? parts : null;
+}
+async function realCacheParts(plugins, file) {
+	const cache = await fs.realpath(path.join(plugins, "cache")).catch(() => path.join(plugins, "cache"));
+	return {
+		cache,
+		parts: cacheParts(cache, await fs.realpath(file).catch(() => file))
+	};
+}
+/** The id, `<plugin>@<marketplace>`, of the marketplace install `file` is part of; null for a file outside the plugin cache. */
+function pluginIdOf(plugins, file) {
+	const parts = cacheParts(path.join(plugins, "cache"), file);
+	return parts ? `${parts[1]}@${parts[0]}` : null;
+}
+const appliesTo = (install, project) => !project || !(install.scope === "project" || install.scope === "local") || !install.projectPath || normalPath(install.projectPath) === normalPath(project);
+const KEY_FILES = [
+	["dist", "data-layer.js"],
+	["dist", "wake.js"],
+	["dist", "hooks.js"],
+	[".claude-plugin", "plugin.json"]
+];
+/**
+* The data layer of the newest copy of its plugin Claude Code records for a session in `project`
+* (`appliesTo`, as `pluginState` counts installs): by version when every one is x.y.z, else by
+* which was updated last (`newestFirst`), counting only a folder that holds KEY_FILES and whose
+* plugin.json names the recorded version (a plugin.json naming none counts, its version came from
+* elsewhere). `dataLayer` itself when that copy is its own folder, when it is outside the cache, or
+* when no record reads. A data layer this doesn't return is outdated: an update put another version
+* on disk, which the session loads at its next start or /reload-plugins.
+*/
+async function newestDataLayer(plugins, dataLayer, project) {
+	const { cache, parts } = await realCacheParts(plugins, dataLayer);
+	if (!parts) return dataLayer;
+	const id = `${parts[1]}@${parts[0]}`;
+	const root = await realPath(path.join(cache, ...parts.slice(0, 3)));
+	const recorded = newestFirst((await installs(plugins) ?? []).filter((i) => i.id === id && i.installPath && appliesTo(i, project)));
+	for (const install of recorded) {
+		if (await realPath(install.installPath) === root) return dataLayer;
+		if (await isComplete(install)) return path.join(install.installPath, ...parts.slice(3));
+	}
+	return dataLayer;
+}
+/**
+* Installs newest first, in one order for the whole list: by semantic version when every install's
+* version is one (a pre-release below its release), else by `lastUpdated`, latest first.
+*/
+function newestFirst(list) {
+	const versions = list.map((i) => semver(i.version));
+	if (!versions.every(Boolean)) return [...list].sort((a, b) => (b.lastUpdated ?? "").localeCompare(a.lastUpdated ?? ""));
+	return list.map((install, k) => ({
+		install,
+		v: versions[k]
+	})).sort((a, b) => compareSemver(b.v, a.v)).map((x) => x.install);
+}
+const semver = (version) => {
+	const m = version ? /^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?$/.exec(version) : null;
+	return m ? {
+		core: [
+			Number(m[1]),
+			Number(m[2]),
+			Number(m[3])
+		],
+		pre: m[4] ? m[4].split(".") : null
+	} : null;
+};
+function compareSemver(a, b) {
+	for (let i = 0; i < 3; i++) if (a.core[i] !== b.core[i]) return a.core[i] - b.core[i];
+	if (!a.pre || !b.pre) return (a.pre ? -1 : 0) - (b.pre ? -1 : 0);
+	for (let i = 0; i < Math.min(a.pre.length, b.pre.length); i++) {
+		const [x, y] = [a.pre[i], b.pre[i]];
+		if (x === y) continue;
+		const [nx, ny] = [/^\d+$/.test(x), /^\d+$/.test(y)];
+		if (nx && ny) return Number(x) - Number(y);
+		if (nx !== ny) return nx ? -1 : 1;
+		return x < y ? -1 : 1;
+	}
+	return a.pre.length - b.pre.length;
+}
+async function isComplete(install) {
+	for (const file of KEY_FILES) if (!await fs.stat(path.join(install.installPath, ...file)).then((s) => s.isFile(), () => false)) return false;
+	const manifest = await readJson(path.join(install.installPath, ".claude-plugin", "plugin.json"));
+	return !!manifest && (typeof manifest.version !== "string" || manifest.version === install.version);
+}
+const realPath = async (p) => normalPath(await fs.realpath(p).catch(() => p));
+const nameOf = (id) => id.slice(0, id.lastIndexOf("@"));
+/** Every install installed_plugins.json records; null when it is missing, can't be read, or isn't the shape known. */
+async function installs(plugins) {
+	const record = await readJson(path.join(plugins, "installed_plugins.json"));
+	const list = record?.plugins;
+	if (record?.version !== 2 || !isObject$1(list) || !Object.values(list).every(Array.isArray)) return null;
+	return Object.entries(list).flatMap(([id, entries]) => entries.map((entry) => {
+		const e = isObject$1(entry) ? entry : {};
+		const text = (key) => typeof e[key] === "string" ? e[key] : null;
+		return {
+			id,
+			scope: text("scope"),
+			projectPath: text("projectPath"),
+			installPath: text("installPath"),
+			version: text("version"),
+			lastUpdated: text("lastUpdated")
+		};
+	}));
+}
+/** Whether `enabledPlugins` names the plugin `id` enabled, disabled, or not at all (null). */
+async function enabledIn(file, id) {
+	const value = (await readJson(file))?.enabledPlugins;
+	return isObject$1(value) && typeof value[id] === "boolean" ? value[id] : null;
+}
+/**
+* What Claude Code says of the plugin `dataLayer` belongs to. With `project` (a session's project
+* folder) the project's settings and installs count too; without, only the machine's: the
+* managed files, the user's settings, and every install.
+*/
+async function pluginState(place, dataLayer, project) {
+	const { parts } = await realCacheParts(place.plugins, dataLayer);
+	if (!parts) return "enabled";
+	const id = `${parts[1]}@${parts[0]}`;
+	const name = nameOf(id);
+	const all = await installs(place.plugins);
+	let ids = [id];
+	if (all) {
+		const mine = all.filter((i) => nameOf(i.id) === name);
+		if (!mine.length) return await isInPluginDirs(place.pluginDirs ?? [], name) ? "enabled" : "uninstalled";
+		const here = mine.filter((i) => appliesTo(i, project));
+		if (!here.length) return "disabled";
+		ids = [...new Set(here.map((i) => i.id))];
+	}
+	return (await Promise.all(ids.map((one) => enabledFor(place, one, project)))).includes(true) ? "enabled" : "disabled";
+}
+async function enabledFor(place, id, project) {
+	const managed = await Promise.all((await managedFiles(place.managed)).map((file) => enabledIn(file, id)));
+	if (managed.includes(false)) return false;
+	if (managed.includes(true)) return true;
+	for (const file of await ownFiles(place, project)) {
+		const enabled = await enabledIn(file, id);
+		if (enabled !== null) return enabled;
+	}
+	return true;
+}
+async function isInPluginDirs(dirs, name) {
+	for (const dir of dirs) if ((await readJson(path.join(dir, ".claude-plugin", "plugin.json")))?.name === name) return true;
+	return false;
+}
+async function managedFiles(managed) {
+	const dropIns = await fs.readdir(path.join(managed, "managed-settings.d")).then((names) => names.filter((n) => n.endsWith(".json")).map((n) => path.join(managed, "managed-settings.d", n)), () => []);
+	return [path.join(managed, "managed-settings.json"), ...dropIns];
+}
+async function ownFiles({ claudeDir }, project) {
+	const files = [];
+	if (project) {
+		const root = await gitRoot(project);
+		if (root && normalPath(root) !== normalPath(project)) files.push(path.join(root, ".claude", "settings.local.json"));
+		files.push(path.join(project, ".claude", "settings.local.json"), path.join(project, ".claude", "settings.json"));
+	}
+	files.push(path.join(claudeDir, "settings.json"));
+	return files;
+}
+async function gitRoot(dir) {
+	for (let at = path.resolve(dir);; at = path.dirname(at)) {
+		if (await fs.stat(path.join(at, ".git")).then(() => true, () => false)) return at;
+		if (path.dirname(at) === at) return null;
+	}
+}
+const isObject$1 = (value) => !!value && typeof value === "object" && !Array.isArray(value);
+async function readJson(file) {
+	try {
+		const value = JSON.parse((await fs.readFile(file, "utf8")).replace(/^\uFEFF/, ""));
+		return isObject$1(value) ? value : null;
+	} catch {
+		return null;
+	}
+}
+//#endregion
 //#region src/wake/wake.ts
 const wakeRecordPath = (claudeDir) => path.join(claudeDir, "isoplan", "wake.json");
 //#endregion
@@ -6644,113 +6847,6 @@ async function stopRunner(claudeDir, { isAlive = alive, kill = (pid) => process.
 	} catch {}
 	await releaseLock(runnerLockPath(claudeDir), live.pid);
 	return true;
-}
-//#endregion
-//#region src/install/state.ts
-/** Claude Code's plugins folder: $CLAUDE_CODE_PLUGIN_CACHE_DIR when it is set, else <claude dir>/plugins. */
-const pluginsDir = (claudeDir, env) => env.CLAUDE_CODE_PLUGIN_CACHE_DIR || path.join(claudeDir, "plugins");
-/** The folders $CLAUDE_CODE_PLUGIN_DIRS names. */
-const pluginDirsOf = (env) => (env.CLAUDE_CODE_PLUGIN_DIRS ?? "").split(path.delimiter).filter(Boolean);
-/** The system folder Claude Code reads managed-settings.json from. */
-function managedDir(platform) {
-	if (platform === "win32") return "C:\\Program Files\\ClaudeCode";
-	if (platform === "darwin") return "/Library/Application Support/ClaudeCode";
-	return "/etc/claude-code";
-}
-/** A path as compared: resolved, with forward slashes, and on Windows and macOS without regard to case. */
-function normalPath(p, platform = process.platform) {
-	const resolved = path.resolve(p).replace(/\\/g, "/");
-	return platform === "win32" || platform === "darwin" ? resolved.toLowerCase() : resolved;
-}
-/** The id, `<plugin>@<marketplace>`, of the marketplace install `file` is part of; null for a file outside the plugin cache. */
-function pluginIdOf(plugins, file) {
-	const relative = path.relative(path.join(plugins, "cache"), path.resolve(file));
-	if (path.isAbsolute(relative)) return null;
-	const parts = relative.split(path.sep);
-	return parts.length >= 4 && parts[0] !== ".." ? `${parts[1]}@${parts[0]}` : null;
-}
-const nameOf = (id) => id.slice(0, id.lastIndexOf("@"));
-/** Every install installed_plugins.json records; null when it is missing, can't be read, or isn't the shape known. */
-async function installs(plugins) {
-	const record = await readJson(path.join(plugins, "installed_plugins.json"));
-	const list = record?.plugins;
-	if (record?.version !== 2 || !isObject(list) || !Object.values(list).every(Array.isArray)) return null;
-	return Object.entries(list).flatMap(([id, entries]) => entries.map((entry) => {
-		const e = isObject(entry) ? entry : {};
-		return {
-			id,
-			scope: typeof e.scope === "string" ? e.scope : null,
-			projectPath: typeof e.projectPath === "string" ? e.projectPath : null
-		};
-	}));
-}
-/** Whether `enabledPlugins` names the plugin `id` enabled, disabled, or not at all (null). */
-async function enabledIn(file, id) {
-	const value = (await readJson(file))?.enabledPlugins;
-	return isObject(value) && typeof value[id] === "boolean" ? value[id] : null;
-}
-/**
-* What Claude Code says of the plugin `dataLayer` belongs to. With `project` (a session's project
-* folder) the project's settings and installs count too; without, only the machine's: the
-* managed files, the user's settings, and every install.
-*/
-async function pluginState(place, dataLayer, project) {
-	const id = pluginIdOf(place.plugins, dataLayer);
-	if (!id) return "enabled";
-	const name = nameOf(id);
-	const all = await installs(place.plugins);
-	let ids = [id];
-	if (all) {
-		const mine = all.filter((i) => nameOf(i.id) === name);
-		if (!mine.length) return await isInPluginDirs(place.pluginDirs ?? [], name) ? "enabled" : "uninstalled";
-		const here = project ? mine.filter((i) => !(i.scope === "project" || i.scope === "local") || !i.projectPath || normalPath(i.projectPath) === normalPath(project)) : mine;
-		if (!here.length) return "disabled";
-		ids = [...new Set(here.map((i) => i.id))];
-	}
-	return (await Promise.all(ids.map((one) => enabledFor(place, one, project)))).includes(true) ? "enabled" : "disabled";
-}
-async function enabledFor(place, id, project) {
-	const managed = await Promise.all((await managedFiles(place.managed)).map((file) => enabledIn(file, id)));
-	if (managed.includes(false)) return false;
-	if (managed.includes(true)) return true;
-	for (const file of await ownFiles(place, project)) {
-		const enabled = await enabledIn(file, id);
-		if (enabled !== null) return enabled;
-	}
-	return true;
-}
-async function isInPluginDirs(dirs, name) {
-	for (const dir of dirs) if ((await readJson(path.join(dir, ".claude-plugin", "plugin.json")))?.name === name) return true;
-	return false;
-}
-async function managedFiles(managed) {
-	const dropIns = await fs.readdir(path.join(managed, "managed-settings.d")).then((names) => names.filter((n) => n.endsWith(".json")).map((n) => path.join(managed, "managed-settings.d", n)), () => []);
-	return [path.join(managed, "managed-settings.json"), ...dropIns];
-}
-async function ownFiles({ claudeDir }, project) {
-	const files = [];
-	if (project) {
-		const root = await gitRoot(project);
-		if (root && normalPath(root) !== normalPath(project)) files.push(path.join(root, ".claude", "settings.local.json"));
-		files.push(path.join(project, ".claude", "settings.local.json"), path.join(project, ".claude", "settings.json"));
-	}
-	files.push(path.join(claudeDir, "settings.json"));
-	return files;
-}
-async function gitRoot(dir) {
-	for (let at = path.resolve(dir);; at = path.dirname(at)) {
-		if (await fs.stat(path.join(at, ".git")).then(() => true, () => false)) return at;
-		if (path.dirname(at) === at) return null;
-	}
-}
-const isObject = (value) => !!value && typeof value === "object" && !Array.isArray(value);
-async function readJson(file) {
-	try {
-		const value = JSON.parse((await fs.readFile(file, "utf8")).replace(/^\uFEFF/, ""));
-		return isObject(value) ? value : null;
-	} catch {
-		return null;
-	}
 }
 //#endregion
 //#region src/install/install.ts
@@ -6922,6 +7018,7 @@ async function isOptedOut(claudeDir) {
 		return false;
 	}
 }
+/** The settings as an object; {} when there is no file yet. A leading byte order mark is skipped. Throws when it isn't a JSON object. */
 async function readSettings(file) {
 	let text;
 	try {
@@ -6939,6 +7036,7 @@ async function readSettings(file) {
 	if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(`${file} isn't a JSON object; left it alone`);
 	return value;
 }
+/** Writes the settings whole, as two-space JSON. */
 const writeSettings = (file, settings) => writeWhole(file, JSON.stringify(settings, null, 2) + "\n");
 async function writeIfChanged(file, text) {
 	if (await fs.readFile(file, "utf8").catch(() => null) === text) return false;
@@ -7278,576 +7376,6 @@ async function recentSessions(io, projectsDir, since) {
 	}
 	return out;
 }
-/** Starts a data layer for each session no one reports whose folder is still there; returns how many. */
-async function backfill(found, { claudeDir, dataLayer, spawn, isAlive = alive, pause = (ms) => new Promise((r) => setTimeout(r, ms)) }) {
-	let started = 0;
-	for (const { id, cwd } of found) {
-		if (!/^[\w-]+$/.test(id) || await isHeld(lockPath(claudeDir, id), Date.now(), isAlive)) continue;
-		if (!await fs.stat(cwd).then((s) => s.isDirectory(), () => false)) continue;
-		if (started++) await pause(250);
-		spawn([
-			dataLayer,
-			"--session",
-			id,
-			"--cwd",
-			cwd,
-			"--detached"
-		], cwd);
-	}
-	return started;
-}
-//#endregion
-//#region src/data-layer/pairing.ts
-/** Renewed this long before it runs out. */
-const RENEW_EARLY_MS = 3e5;
-const PAIRING_REFRESH_MS = 2e4;
-/** pairing.write.lock: free once this old, and waited for at most WRITE_WAIT_MS. */
-const WRITE_FRESH_MS = 1e4;
-const WRITE_WAIT_MS = 1e4;
-/** How often the callback tries to write the credential it got before saying it couldn't. */
-const WRITE_TRIES = 4;
-const pairingPath = (claudeDir) => path.join(claudeDir, "isoplan", "pairing.json");
-const pairingLockPath = (claudeDir) => path.join(claudeDir, "isoplan", "pairing.lock");
-const pairingWriteLockPath = (claudeDir) => path.join(claudeDir, "isoplan", "pairing.write.lock");
-const postJson = async (url, body) => {
-	const response = await fetch(url, {
-		method: "POST",
-		headers: { "content-type": "application/json" },
-		body: JSON.stringify(body),
-		signal: AbortSignal.timeout(15e3)
-	});
-	const value = await response.json().catch(() => ({}));
-	return {
-		status: response.status,
-		body: value && typeof value === "object" ? value : {}
-	};
-};
-/** The server's http address for a data-layer path: ws(s)://host/data-layer → http(s)://host/data-layer/<path>. */
-function httpUrl(server, sub) {
-	const url = new URL(server);
-	url.protocol = url.protocol === "wss:" ? "https:" : "http:";
-	url.pathname = url.pathname.replace(/\/$/, "") + sub;
-	url.search = "";
-	return url.toString();
-}
-const LOOPBACK = /* @__PURE__ */ new Set([
-	"127.0.0.1",
-	"[::1]",
-	"localhost"
-]);
-/** Whether `server` is plain ws:// to another machine, where a credential would cross the network unencrypted. */
-const isPlainRemote = (server) => {
-	const url = new URL(server);
-	return url.protocol === "ws:" && !LOOPBACK.has(url.hostname);
-};
-async function readPairing(file) {
-	try {
-		const value = JSON.parse(await fs.readFile(file, "utf8"));
-		return value && typeof value.accounts === "object" && value.accounts ? value : { accounts: {} };
-	} catch {
-		return { accounts: {} };
-	}
-}
-/** Written whole, through a temp file, so a reader never sees half of it; owner-only. */
-async function writePairing(file, value) {
-	await fs.mkdir(path.dirname(file), { recursive: true });
-	const temp = `${file}.${process.pid}.${randomBytes(4).toString("hex")}`;
-	await fs.writeFile(temp, JSON.stringify(value, null, 2) + "\n", { mode: 384 });
-	try {
-		await fs.rename(temp, file);
-	} catch (err) {
-		await fs.rm(temp, { force: true }).catch(() => {});
-		throw err;
-	}
-}
-const queues = /* @__PURE__ */ new Map();
-/** Runs `change` on pairing.json under both locks, and writes what it returns (or nothing, for null). */
-async function locked(file, writeLock, pid, isAlive, change) {
-	const run = async () => {
-		const until = Date.now() + WRITE_WAIT_MS;
-		while (!await takeLock(writeLock, pid, isAlive, false, Date.now(), { freshMs: WRITE_FRESH_MS })) {
-			if (Date.now() > until) throw new Error(`couldn't take ${writeLock} in ${WRITE_WAIT_MS / 1e3} s`);
-			await new Promise((r) => setTimeout(r, 25));
-		}
-		try {
-			const { write, result } = change(await readPairing(file));
-			if (write) await writePairing(file, write);
-			return result;
-		} finally {
-			await releaseLock(writeLock, pid).catch(() => {});
-		}
-	};
-	const next = (queues.get(file) ?? Promise.resolve()).then(run, run);
-	queues.set(file, next.catch(() => {}));
-	return next;
-}
-const page = (worked, text) => `<!doctype html><meta charset="utf-8"><title>Isoplan: ${worked ? "paired" : "not paired"}</title><p style="font:16px system-ui;margin:3em auto;max-width:30em">${text}</p>`;
-const HTML = {
-	"content-type": "text/html; charset=utf-8",
-	connection: "close"
-};
-function createPairing({ file, lock, writeLock, server, account, machine, emit, allowPlainWs = false, post = postJson, now = Date.now, pid = process.pid, isAlive = alive, retryMs = 200 }) {
-	let asked = false;
-	let shown = null;
-	let unreadable = false;
-	let callback = null;
-	const empty = () => ({ server });
-	const entryOf = (all) => {
-		const kept = all.accounts[account.id];
-		return kept && kept.server === server ? kept : empty();
-	};
-	const withEntry = (all, entry) => ({
-		...all,
-		accounts: {
-			...all.accounts,
-			[account.id]: entry
-		}
-	});
-	const mine = async () => entryOf(await readPairing(file));
-	const update = (decide) => locked(file, writeLock, pid, isAlive, (all) => {
-		const { entry, result } = decide(entryOf(all));
-		return {
-			write: entry ? withEntry(all, entry) : null,
-			result
-		};
-	});
-	const drop = ({ credential: _, token: __, tokenExpires: ___, ...rest }) => rest;
-	const show = (waiting) => {
-		if (shown === waiting.url) return;
-		shown = waiting.url;
-		emit({
-			type: "pair",
-			server,
-			url: waiting.url,
-			expires: new Date(waiting.expires).toISOString()
-		});
-	};
-	const plainRefused = () => {
-		if (!allowPlainWs && isPlainRemote(server)) throw new Error(`${server} is plain ws:// to another machine, so this machine's credential isn't sent; use wss://, or set "allowPlainWs": true in config.json`);
-	};
-	async function renew(used) {
-		const answer = await post(httpUrl(server, "/token"), { credential: used });
-		if (answer.status === 200 && typeof answer.body.token === "string") {
-			const token = answer.body.token;
-			const expires = Date.parse(String(answer.body.expires));
-			return update((e) => e.credential === used ? {
-				entry: {
-					...e,
-					token,
-					tokenExpires: Number.isFinite(expires) ? expires : now()
-				},
-				result: token
-			} : {
-				entry: null,
-				result: void 0
-			});
-		}
-		if (answer.status === 401 && answer.body.code === "pairing-ended") {
-			emit({
-				type: "log",
-				text: `the office server says this machine's pairing has ended: ${String(answer.body.error ?? "")}`
-			});
-			asked = true;
-			return update((e) => ({
-				entry: e.credential === used ? drop(e) : null,
-				result: void 0
-			}));
-		}
-		throw new Error(`the office server answered ${answer.status} when renewing this machine's token`);
-	}
-	async function stopAnswering() {
-		if (!callback) return;
-		for (const timer of callback.timers) clearTimeout(timer);
-		callback.server.close();
-		callback = null;
-		await update((e) => ({
-			entry: e.waiting ? (({ waiting: _, ...rest }) => rest)(e) : null,
-			result: void 0
-		})).catch(() => {});
-		await releaseLock(lock, pid).catch(() => {});
-	}
-	async function keep(credential) {
-		for (let i = 0; i < WRITE_TRIES; i++) try {
-			await update((e) => ({
-				entry: (({ waiting: _, ...rest }) => ({
-					...rest,
-					credential
-				}))(e),
-				result: void 0
-			}));
-			return true;
-		} catch (err) {
-			emit({
-				type: "log",
-				text: `couldn't write this machine's credential (try ${i + 1}): ${String(err?.message ?? err)}`
-			});
-			await new Promise((r) => setTimeout(r, retryMs * 2 ** i));
-		}
-		return false;
-	}
-	async function finish(code, verifier, response) {
-		let worked = false;
-		let text = "This machine couldn't be paired: the office server couldn't be reached. Click the link in Claude Code again in a moment.";
-		try {
-			const answer = await post(httpUrl(server, "/pair/token"), {
-				code,
-				verifier
-			});
-			if (answer.status === 200 && typeof answer.body.credential === "string") {
-				worked = await keep(answer.body.credential);
-				text = worked ? "This machine is paired with the office. You can close this tab; Claude Code reports to it within a few seconds." : "The office paired this machine, but its credential couldn't be saved here. Claude Code shows a new link to try again.";
-				emit({
-					type: "log",
-					text: worked ? "this machine is paired with the office server" : "couldn't save this machine's credential; pairing again"
-				});
-			} else {
-				text = "This machine couldn't be paired: the link was used or has expired. Claude Code shows a new one.";
-				emit({
-					type: "log",
-					text: `the office server didn't pair this machine (${answer.status}): ${String(answer.body.error ?? "")}`
-				});
-			}
-		} catch (err) {
-			emit({
-				type: "log",
-				text: `couldn't finish pairing: ${String(err?.message ?? err)}`
-			});
-		}
-		try {
-			response.writeHead(worked ? 200 : 400, HTML).end(page(worked, text));
-		} catch {}
-		await stopAnswering().catch(() => {});
-	}
-	async function startPairing() {
-		const verifier = randomBytes(32).toString("base64url");
-		const challenge = createHash("sha256").update(verifier).digest("base64url");
-		const nonce = randomBytes(16).toString("base64url");
-		let finishing = false;
-		const listener = http.createServer((request, response) => {
-			const url = new URL(request.url ?? "/", "http://127.0.0.1");
-			const code = url.searchParams.get("code");
-			if (request.method !== "GET" || url.pathname !== `/${nonce}` || !code || finishing) {
-				response.writeHead(404, HTML).end(page(false, "Not found."));
-				return;
-			}
-			finishing = true;
-			finish(code, verifier, response);
-		});
-		listener.on("error", () => {});
-		await new Promise((resolve, reject) => listener.once("error", reject).listen(0, "127.0.0.1", () => resolve()));
-		listener.unref();
-		const { port } = listener.address();
-		const refresh = setInterval(() => void refreshLock(lock, pid).catch(() => {}), PAIRING_REFRESH_MS);
-		refresh.unref();
-		callback = {
-			server: listener,
-			timers: [refresh]
-		};
-		try {
-			const machineId = await locked(file, writeLock, pid, isAlive, (all) => {
-				if (all.machine) return {
-					write: null,
-					result: all.machine
-				};
-				const made = randomBytes(16).toString("base64url");
-				return {
-					write: {
-						...all,
-						machine: made
-					},
-					result: made
-				};
-			});
-			const answer = await post(httpUrl(server, "/pair"), {
-				account,
-				machine: {
-					name: machine,
-					id: machineId
-				},
-				callback: `http://127.0.0.1:${port}/${nonce}`,
-				challenge
-			});
-			if (answer.status !== 200 || typeof answer.body.url !== "string") throw new Error(`the office server answered ${answer.status} when asked to pair${answer.body.error ? `: ${String(answer.body.error)}` : ""}`);
-			const waiting = {
-				url: answer.body.url,
-				expires: Date.parse(String(answer.body.expires)) || now()
-			};
-			const expiry = setTimeout(() => void stopAnswering(), Math.max(0, waiting.expires - now()));
-			expiry.unref();
-			callback.timers.push(expiry);
-			await update((e) => ({
-				entry: {
-					...e,
-					waiting
-				},
-				result: void 0
-			}));
-			show(waiting);
-		} catch (err) {
-			await stopAnswering();
-			throw err;
-		}
-	}
-	return {
-		async token() {
-			const entry = await mine();
-			if (entry.token && (entry.tokenExpires ?? 0) - RENEW_EARLY_MS > now()) {
-				plainRefused();
-				return entry.token;
-			}
-			if (entry.credential) {
-				plainRefused();
-				const renewed = await renew(entry.credential);
-				if (renewed) return renewed;
-				const again = await mine();
-				if (again.token && again.token !== entry.token) return again.token;
-			}
-			if (!asked && !entry.waiting) return void 0;
-			if (callback) return null;
-			plainRefused();
-			if (!await takeLock(lock, pid, isAlive, false, Date.now(), { freshMs: 6e4 })) {
-				if (entry.waiting && entry.waiting.expires > now()) show(entry.waiting);
-				return null;
-			}
-			await startPairing();
-			return null;
-		},
-		async refused(code, sent) {
-			if (code !== "token-expired") asked = true;
-			if (code === "not-paired" && sent) {
-				if (!unreadable) emit({
-					type: "log",
-					text: "the office server didn't find this machine's token in its hello; it may be older than pairing. The credential is kept."
-				});
-				unreadable = true;
-				return;
-			}
-			if (!sent) return;
-			await update((e) => {
-				if (e.token !== sent) return {
-					entry: null,
-					result: void 0
-				};
-				if (code === "token-expired") return {
-					entry: {
-						...e,
-						tokenExpires: 0
-					},
-					result: void 0
-				};
-				return {
-					entry: code === "pairing-ended" ? drop(e) : null,
-					result: void 0
-				};
-			});
-		},
-		close: stopAnswering
-	};
-}
-//#endregion
-//#region src/data-layer/approved.ts
-const getJson = async (url, headers) => {
-	const response = await fetch(url, {
-		headers,
-		signal: AbortSignal.timeout(15e3)
-	});
-	return {
-		status: response.status,
-		body: response.status === 200 || response.status === 401 ? await response.json().catch(() => null) : null
-	};
-};
-/** While the machine waits to be paired the list is asked for again this soon, and after a failure this soon. */
-const PAIR_POLL_MS = 5e3;
-const RETRY_MS = 3e4;
-/** A rename the file system refuses for a moment (a scanner holding the file, on Windows) is tried this often. */
-const RENAME_TRIES = 5;
-const isList = (value) => {
-	const v = value;
-	return !!v && typeof v.version === "string" && Array.isArray(v.repos) && v.repos.every((r) => typeof r === "string");
-};
-/** Whether `a` is a later list than `b`: a newer version, by when it was first had, or the same one confirmed later. */
-const later = (a, b) => !b || (a.version !== b.version ? a.fetched > b.fetched : a.checked > b.checked);
-/** Written whole, through a temp file, so a reader never sees half of it; owner-only. A refused rename is tried again, then thrown. */
-async function writeFile(file, value) {
-	await fs.mkdir(path.dirname(file), { recursive: true });
-	const temp = `${file}.${process.pid}.${randomBytes(4).toString("hex")}`;
-	await fs.writeFile(temp, JSON.stringify(value, null, 2) + "\n", { mode: 384 });
-	for (let i = 0;; i++) try {
-		await fs.rename(temp, file);
-		return;
-	} catch (err) {
-		const code = err.code;
-		if (i + 1 < RENAME_TRIES && (code === "EPERM" || code === "EBUSY" || code === "EACCES")) {
-			await new Promise((r) => setTimeout(r, 25 * 2 ** i));
-			continue;
-		}
-		await fs.rm(temp, { force: true }).catch(() => {});
-		throw err;
-	}
-}
-function createApproved({ server, file, pairing, refreshMs, maxAgeMs, log, get = (url, headers) => getJson(url, headers), now = Date.now }) {
-	let list = null;
-	let problem = "unreachable";
-	let nextAt = -Infinity;
-	let busy = null;
-	let queued = null;
-	let said = "";
-	const take = (value) => {
-		list = value;
-		problem = null;
-		nextAt = value.checked + refreshMs;
-	};
-	const tell = (text) => {
-		if (text !== said) log(text);
-		said = text;
-	};
-	async function keep(mine) {
-		const theirs = await readApproved(file, server);
-		const kept = theirs && !later(mine, theirs) ? theirs.version === mine.version ? {
-			...theirs,
-			checked: Math.max(theirs.checked, mine.checked)
-		} : theirs : mine;
-		take(kept);
-		if (kept === theirs) return;
-		await writeFile(file, kept).catch((err) => tell(`couldn't keep the office's list of repos in ${file}: ${String(err?.message ?? err)}`));
-	}
-	async function check() {
-		const shared = await readApproved(file, server);
-		if (shared && later(shared, list)) take(shared);
-		if (list && now() < nextAt) return;
-		let token;
-		try {
-			token = pairing ? await pairing.token() : void 0;
-		} catch (err) {
-			tell(`couldn't read which repos the office takes: ${String(err?.message ?? err)}`);
-			problem = "unreachable";
-			nextAt = now() + RETRY_MS;
-			return;
-		}
-		if (token === null) {
-			problem = "pairing";
-			nextAt = now() + PAIR_POLL_MS;
-			return;
-		}
-		const headers = {};
-		if (token) headers.authorization = `Bearer ${token}`;
-		if (list) headers["if-none-match"] = `"${list.version}"`;
-		let answer;
-		try {
-			answer = await get(httpUrl(server, "/repos"), headers);
-		} catch (err) {
-			answer = {
-				status: 0,
-				body: String(err?.message ?? err)
-			};
-		}
-		const code = answer.body?.code;
-		const at = now();
-		if (answer.status === 304 && list) {
-			said = "";
-			await keep({
-				...list,
-				checked: at
-			});
-		} else if (answer.status === 200 && isList(answer.body)) {
-			said = "";
-			const same = list?.version === answer.body.version;
-			await keep({
-				server,
-				version: answer.body.version,
-				repos: answer.body.repos,
-				fetched: same ? list.fetched : at,
-				checked: at
-			});
-		} else if (answer.status === 401 && pairing && (code === "not-paired" || code === "pairing-ended" || code === "token-expired")) {
-			await pairing.refused(code, token).catch(() => {});
-			problem = "pairing";
-			nextAt = at + (code === "token-expired" || !token ? 0 : PAIR_POLL_MS);
-		} else if (answer.status === 404) {
-			tell(`${server} is too old to say which repos its office takes, so nothing is sent to it; it needs updating`);
-			list = null;
-			problem = "too-old";
-			nextAt = at + refreshMs;
-		} else {
-			tell(`couldn't read which repos the office takes from ${server}: ${answer.status ? `it answered ${answer.status}` : String(answer.body)}`);
-			problem = "unreachable";
-			nextAt = at + RETRY_MS;
-		}
-	}
-	function refresh(force = false) {
-		if (force) nextAt = -Infinity;
-		if (busy) {
-			if (!force) return busy;
-			queued ??= busy.then(() => {
-				queued = null;
-				return refresh(true);
-			});
-			return queued;
-		}
-		if (now() < nextAt) return Promise.resolve();
-		busy = check().catch((err) => tell(`couldn't read which repos the office takes: ${String(err?.message ?? err)}`)).finally(() => busy = null);
-		return busy;
-	}
-	return {
-		repos: () => freshRepos(list, maxAgeMs, now()),
-		version: () => list?.version ?? null,
-		problem: () => list && !freshRepos(list, maxAgeMs, now()) ? "unreachable" : list ? null : problem,
-		refresh
-	};
-}
-function createSessionGate({ approved, open }) {
-	let link = null;
-	let home = null;
-	let linked = null;
-	let unwanted;
-	const shut = () => {
-		link?.close();
-		link = null;
-		linked = null;
-	};
-	const mayConnect = async () => {
-		await approved.refresh(true);
-		const repos = approved.repos();
-		return !!repos && linked !== null && repos.has(linked.toLowerCase());
-	};
-	return {
-		async home(candidates) {
-			await approved.refresh();
-			const repos = approved.repos();
-			home = repos && candidates.find((p) => repos.has(p.id.toLowerCase())) || null;
-			if (!home) {
-				shut();
-				return {
-					home: null,
-					dormancy: repos ? "not-approved" : approved.problem() === "pairing" ? "pairing" : "no-list"
-				};
-			}
-			if (linked !== null && linked !== home.id) shut();
-			if (unwanted !== void 0 && approved.version() !== unwanted) {
-				unwanted = void 0;
-				shut();
-			}
-			return {
-				home,
-				dormancy: null
-			};
-		},
-		link() {
-			if (!link) {
-				link = open(home, mayConnect);
-				linked = home.id;
-			}
-			return link;
-		},
-		current: () => link,
-		drop: shut,
-		notWanted() {
-			unwanted = approved.version();
-			approved.refresh(true);
-		},
-		mayConnect
-	};
-}
 //#endregion
 //#region src/data-layer/attribution.ts
 /** How long what a folder is (there or not, where its links lead) is believed. */
@@ -7952,55 +7480,6 @@ function forOffice(facts, projects, checkouts = {}) {
 		}),
 		edits: files(facts.edits),
 		reads: files(facts.reads)
-	};
-}
-//#endregion
-//#region src/data-layer/home.ts
-/** The projects `folder` may report as, and whether it is a workspace. */
-async function candidatesOf(folder, io) {
-	const where = await io.resolve(folder);
-	if (where) return {
-		projects: [await io.projectOf(where, folder)],
-		workspace: false
-	};
-	const tooWide = pathKey(folder) === pathKey(io.home) || relativeTo(folder, io.home) !== null;
-	const st = await io.stat(folder);
-	const repos = [];
-	if (!tooWide && st?.isDir) {
-		for (const e of await io.listDir(folder)) if (e.isDir && await io.stat(join(folder, `${e.name}/.git`))) repos.push(join(folder, e.name));
-	}
-	if (!repos.length || repos.length > io.workspaceRepos) return {
-		projects: [await io.projectOf(null, folder)],
-		workspace: false
-	};
-	const projects = [];
-	for (const dir of repos.sort()) {
-		const at = await io.resolve(dir);
-		if (at) projects.push(await io.projectOf(at, dir));
-	}
-	return {
-		projects,
-		workspace: true
-	};
-}
-/**
-* A workspace's facts as they may leave the machine: only its work inside a repo, each named by its
-* repo; files outside every repo, and a command's file there, stay on the machine. Which of those
-* repos may go is the link's filter (attribution.ts forOffice), by the server's welcome.
-*/
-function inRepos(facts) {
-	const placed = (list) => list.every((f) => f.project) ? list : list.filter((f) => f.project);
-	return {
-		...facts,
-		edits: placed(facts.edits),
-		reads: placed(facts.reads),
-		agents: facts.agents.map((a) => a.doing && !a.doing.project && a.doing.file !== void 0 ? {
-			...a,
-			doing: {
-				kind: a.doing.kind,
-				since: a.doing.since
-			}
-		} : a)
 	};
 }
 //#endregion
@@ -9390,6 +8869,911 @@ async function doingOf(st, place, fallbackMs, config) {
 	};
 }
 //#endregion
+//#region src/runner/claude.ts
+/**
+* The variables Claude Code sets for the processes it starts, which tie them to that session: its
+* marker and entrypoint, the session's ids, its messaging socket and token, its own path and pid,
+* the session's plugin folders and effort, and its IDE port.
+*/
+const FORK_ENV_DROPPED = [
+	"CLAUDECODE",
+	"CLAUDE_CODE_ENTRYPOINT",
+	"CLAUDE_CODE_SESSION_ID",
+	"CLAUDE_CODE_CHILD_SESSION",
+	"CLAUDE_CODE_SESSION_ATTENDED",
+	"CLAUDE_CODE_MESSAGING_SOCKET",
+	"CLAUDE_CODE_MESSAGING_TOKEN",
+	"CLAUDE_CODE_EXECPATH",
+	"CLAUDE_CODE_PLUGIN_DIRS",
+	"CLAUDE_CODE_SSE_PORT",
+	"CLAUDE_PID",
+	"CLAUDE_EFFORT"
+];
+/** The fork's environment: this one's, less FORK_ENV_DROPPED. */
+function forkEnv(env) {
+	const out = {};
+	for (const [key, value] of Object.entries(env)) if (value !== void 0 && !FORK_ENV_DROPPED.includes(key)) out[key] = value;
+	return out;
+}
+/** Ends a process and everything it started: on Windows `kill` reaches only the process itself. */
+function killTree(child, platform = process.platform) {
+	if (child.exitCode !== null || child.signalCode !== null || child.pid === void 0) return;
+	if (platform === "win32") spawnSync("taskkill", [
+		"/pid",
+		String(child.pid),
+		"/T",
+		"/F"
+	], {
+		windowsHide: true,
+		stdio: "ignore"
+	});
+	else try {
+		process.kill(-child.pid, "SIGKILL");
+	} catch {
+		child.kill("SIGKILL");
+	}
+}
+//#endregion
+//#region src/handoff/git.ts
+const REPO_VARIABLES = [
+	"GIT_DIR",
+	"GIT_WORK_TREE",
+	"GIT_INDEX_FILE",
+	"GIT_COMMON_DIR",
+	"GIT_OBJECT_DIRECTORY",
+	"GIT_NAMESPACE"
+];
+/**
+* The environment git runs with: no terminal prompt and no credential manager window; ssh in batch
+* mode, unless the person chose their own ssh (GIT_SSH_COMMAND, GIT_SSH, or core.sshCommand in the
+* repo's config, `sshCommandSet`); and none of the inherited variables that would point it at
+* another repo.
+*/
+function noPromptEnv(env, sshCommandSet = false) {
+	const out = {};
+	for (const [key, value] of Object.entries(env)) if (value !== void 0 && !REPO_VARIABLES.includes(key.toUpperCase())) out[key] = value;
+	out.GIT_TERMINAL_PROMPT = "0";
+	out.GCM_INTERACTIVE = "never";
+	if (!out.GIT_SSH_COMMAND && !out.GIT_SSH && !sshCommandSet) out.GIT_SSH_COMMAND = "ssh -o BatchMode=yes";
+	return out;
+}
+//#endregion
+//#region src/update/update.ts
+const updateRecordPath = (claudeDir) => path.join(claudeDir, "isoplan", "update.json");
+const updateLockPath = (claudeDir) => path.join(claudeDir, "isoplan", "update.lock");
+/** A check at session start is skipped when one started this recently. */
+const START_GAP_MS = 6e5;
+/** The most each `claude plugin` command may take. */
+const COMMAND_TIMEOUT_MS = 3e5;
+const EXIT_GRACE_MS = 1e3;
+/** The variables that turn updates off, and the one that turns plugin updates back on. */
+const OFF_VARIABLES = [
+	"DISABLE_UPDATES",
+	"DISABLE_AUTOUPDATER",
+	"CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"
+];
+const isSet = (value) => !!value && !/^(0|false|no|off)$/i.test(value.trim());
+/** The variable that turns updates off here; null when none does, or FORCE_AUTOUPDATE_PLUGINS turns them back on. */
+function updatesOffBy(env) {
+	if (isSet(env["FORCE_AUTOUPDATE_PLUGINS"])) return null;
+	return OFF_VARIABLES.find((name) => isSet(env[name])) ?? null;
+}
+/**
+* The environment the commands run with: this one's without the session's own variables (as the
+* runner's fork, claude.ts), and nothing that can prompt (as a handoff's git, handoff/git.ts). The
+* askpass, where the person set none (GIT_ASKPASS, SSH_ASKPASS, core.askPass), is node, which takes
+* git's prompt for a script it can't find and fails, so git gives up at once instead of asking.
+*/
+function commandEnv(env, git = {
+	sshCommand: false,
+	askPass: false
+}, node = process.execPath) {
+	const out = noPromptEnv(forkEnv(env), git.sshCommand);
+	if (!git.askPass && !out.GIT_ASKPASS && !out.SSH_ASKPASS) Object.assign(out, {
+		GIT_ASKPASS: node,
+		SSH_ASKPASS: node,
+		SSH_ASKPASS_REQUIRE: "never"
+	});
+	return out;
+}
+/** What git's config sets for core.sshCommand and core.askPass, as `cwd` sees it; nothing set when git can't say. */
+async function gitChoices(cwd, env = process.env) {
+	const set = async (key) => {
+		const r = await runHidden([
+			"git",
+			"config",
+			"--get",
+			key
+		], cwd, {
+			env: noPromptEnv(forkEnv(env), true),
+			timeoutMs: 15e3
+		});
+		return r.code === 0 && r.output.trim() !== "";
+	};
+	return {
+		sshCommand: await set("core.sshCommand"),
+		askPass: await set("core.askPass")
+	};
+}
+/**
+* Runs a command by argv, with no shell and no window, and keeps the end of what it printed. It is
+* done when the command exits: what it printed by then, and within EXIT_GRACE_MS, is kept, and its
+* pipes are let go even if a process it left behind holds them. Past `timeoutMs` it is stopped with
+* everything it started (on Windows taskkill /T; elsewhere its process group, which it leads).
+*/
+function runHidden(argv, cwd, { env = commandEnv(process.env), timeoutMs = COMMAND_TIMEOUT_MS } = {}) {
+	return new Promise((resolve) => {
+		let output = "";
+		let timedOut = false;
+		const keep = (piece) => output = (output + piece).slice(-8e3);
+		const child = spawn(argv[0], argv.slice(1), {
+			cwd,
+			env,
+			stdio: [
+				"pipe",
+				"pipe",
+				"pipe"
+			],
+			windowsHide: true,
+			detached: process.platform !== "win32"
+		});
+		child.stdin.end();
+		child.stdout.setEncoding("utf8").on("data", keep);
+		child.stderr.setEncoding("utf8").on("data", keep);
+		const timer = setTimeout(() => {
+			timedOut = true;
+			killTree(child);
+		}, timeoutMs);
+		let ended = null;
+		const done = () => {
+			child.stdout.destroy();
+			child.stderr.destroy();
+			resolve({
+				...ended,
+				output
+			});
+		};
+		child.on("error", (err) => {
+			clearTimeout(timer);
+			resolve({
+				code: null,
+				output,
+				error: `couldn't start ${argv[0]}: ${err.message}`
+			});
+		});
+		child.on("exit", (code) => {
+			clearTimeout(timer);
+			ended = timedOut ? {
+				code: null,
+				output,
+				error: `didn't finish within ${Math.round(timeoutMs / 1e3)} s, so it was stopped`
+			} : {
+				code,
+				output
+			};
+			const grace = setTimeout(done, EXIT_GRACE_MS);
+			child.on("close", () => (clearTimeout(grace), done()));
+		});
+	});
+}
+/** Turns on Claude Code's auto-update for `marketplace` in `settings` (see above); what it changed, or null. */
+async function turnOnAutoUpdate(settings, marketplace) {
+	const current = await readSettings(settings);
+	const known = current.extraKnownMarketplaces;
+	const entry = isObject(known) ? known[marketplace] : void 0;
+	if (!isObject(entry) || !isObject(entry.source) || "autoUpdate" in entry) return null;
+	entry.autoUpdate = true;
+	await writeSettings(settings, current);
+	return `turned on Claude Code's auto-update for the ${marketplace} marketplace in ${settings}`;
+}
+/**
+* The `claude plugin update` runs for the plugin `id`: one per install recorded (scope and project
+* folder), each with its scope; one with no scope, in `cwd`, when the record can't be read.
+*/
+function updateRuns(list, id, cwd) {
+	const mine = (list ?? []).filter((i) => i.id === id);
+	if (!list || !mine.length) return [{
+		args: [
+			"plugin",
+			"update",
+			id
+		],
+		cwd
+	}];
+	const runs = /* @__PURE__ */ new Map();
+	for (const install of mine) {
+		const inProject = (install.scope === "project" || install.scope === "local") && install.projectPath;
+		const at = inProject ? install.projectPath : cwd;
+		const key = `${install.scope}|${inProject ? install.projectPath : ""}`;
+		if (!runs.has(key)) runs.set(key, {
+			args: [
+				"plugin",
+				"update",
+				id,
+				...install.scope ? ["--scope", install.scope] : []
+			],
+			cwd: at
+		});
+	}
+	return [...runs.values()];
+}
+/** One check (see above), unless another is running or one started within `gapMs`. */
+async function checkForUpdate({ claudeDir, settings, plugins, id, cwd, claude, env = commandEnv(process.env), gapMs, run = (argv, at, e) => runHidden(argv, at, { env: e }), now = Date.now, isAlive = alive }) {
+	const lock = updateLockPath(claudeDir);
+	if (!await takeLock(lock, process.pid, isAlive, false, now(), { freshMs: 3e6 })) return {
+		ran: false,
+		said: []
+	};
+	try {
+		const recordFile = updateRecordPath(claudeDir);
+		const record = await fs.readFile(recordFile, "utf8").then((text) => JSON.parse(text), () => ({}));
+		if (typeof record.checkedAt === "number" && now() - record.checkedAt < gapMs) return {
+			ran: false,
+			said: []
+		};
+		const marketplace = id.slice(id.lastIndexOf("@") + 1);
+		const write = () => fs.writeFile(recordFile, JSON.stringify(record) + "\n");
+		record.checkedAt = now();
+		await write();
+		const said = [];
+		const turnedOn = await turnOnAutoUpdate(settings, marketplace).catch((err) => `couldn't turn on Claude Code's auto-update for ${marketplace}: ${err.message}`);
+		if (turnedOn) said.push(turnedOn);
+		if (turnedOn?.startsWith("turned on")) {
+			const entry = (await readSettings(settings)).extraKnownMarketplaces[marketplace];
+			record.autoUpdateOn = {
+				marketplace,
+				entry: JSON.stringify(entry),
+				at: now()
+			};
+			await write();
+		}
+		const say = async (args, at) => {
+			const r = await run([...claude, ...args], at, env);
+			const failed = r.error ?? (r.code === null ? "didn't finish" : r.code !== 0 ? `failed with exit code ${r.code}` : null);
+			said.push(`claude ${args.join(" ")}: ${[failed, lastLine(r.output)].filter(Boolean).join(": ")}`);
+			return !failed;
+		};
+		if (!await say([
+			"plugin",
+			"marketplace",
+			"update",
+			marketplace
+		], cwd)) return {
+			ran: true,
+			said
+		};
+		for (const step of updateRuns(await installs(plugins), id, cwd)) if (await fs.stat(step.cwd).then((s) => s.isDirectory(), () => false)) await say(step.args, step.cwd);
+		else said.push(`claude ${step.args.join(" ")}: skipped, its project folder ${step.cwd} isn't there`);
+		return {
+			ran: true,
+			said
+		};
+	} finally {
+		await releaseLock(lock, process.pid).catch(() => {});
+	}
+}
+const lastLine = (output) => output.replace(/\u001b\[[0-9;]*[A-Za-z]/g, "").split(/\r?\n/).map((l) => l.trim()).filter(Boolean).at(-1) ?? "";
+const isObject = (value) => !!value && typeof value === "object" && !Array.isArray(value);
+/** Starts a data layer for each session no one reports whose folder is still there; returns how many. */
+async function backfill(found, { claudeDir, dataLayer, spawn, isAlive = alive, pause = (ms) => new Promise((r) => setTimeout(r, ms)) }) {
+	let started = 0;
+	for (const { id, cwd } of found) {
+		if (!/^[\w-]+$/.test(id) || await isHeld(lockPath(claudeDir, id), Date.now(), isAlive)) continue;
+		if (!await fs.stat(cwd).then((s) => s.isDirectory(), () => false)) continue;
+		if (started++) await pause(250);
+		spawn([
+			dataLayer,
+			"--session",
+			id,
+			"--cwd",
+			cwd,
+			"--detached"
+		], cwd);
+	}
+	return started;
+}
+//#endregion
+//#region src/data-layer/pairing.ts
+/** Renewed this long before it runs out. */
+const RENEW_EARLY_MS = 3e5;
+const PAIRING_REFRESH_MS = 2e4;
+/** pairing.write.lock: free once this old, and waited for at most WRITE_WAIT_MS. */
+const WRITE_FRESH_MS = 1e4;
+const WRITE_WAIT_MS = 1e4;
+/** How often the callback tries to write the credential it got before saying it couldn't. */
+const WRITE_TRIES = 4;
+const pairingPath = (claudeDir) => path.join(claudeDir, "isoplan", "pairing.json");
+const pairingLockPath = (claudeDir) => path.join(claudeDir, "isoplan", "pairing.lock");
+const pairingWriteLockPath = (claudeDir) => path.join(claudeDir, "isoplan", "pairing.write.lock");
+const postJson = async (url, body) => {
+	const response = await fetch(url, {
+		method: "POST",
+		headers: { "content-type": "application/json" },
+		body: JSON.stringify(body),
+		signal: AbortSignal.timeout(15e3)
+	});
+	const value = await response.json().catch(() => ({}));
+	return {
+		status: response.status,
+		body: value && typeof value === "object" ? value : {}
+	};
+};
+/** The server's http address for a data-layer path: ws(s)://host/data-layer → http(s)://host/data-layer/<path>. */
+function httpUrl(server, sub) {
+	const url = new URL(server);
+	url.protocol = url.protocol === "wss:" ? "https:" : "http:";
+	url.pathname = url.pathname.replace(/\/$/, "") + sub;
+	url.search = "";
+	return url.toString();
+}
+const LOOPBACK = /* @__PURE__ */ new Set([
+	"127.0.0.1",
+	"[::1]",
+	"localhost"
+]);
+/** Whether `server` is plain ws:// to another machine, where a credential would cross the network unencrypted. */
+const isPlainRemote = (server) => {
+	const url = new URL(server);
+	return url.protocol === "ws:" && !LOOPBACK.has(url.hostname);
+};
+async function readPairing(file) {
+	try {
+		const value = JSON.parse(await fs.readFile(file, "utf8"));
+		return value && typeof value.accounts === "object" && value.accounts ? value : { accounts: {} };
+	} catch {
+		return { accounts: {} };
+	}
+}
+/** Written whole, through a temp file, so a reader never sees half of it; owner-only. */
+async function writePairing(file, value) {
+	await fs.mkdir(path.dirname(file), { recursive: true });
+	const temp = `${file}.${process.pid}.${randomBytes(4).toString("hex")}`;
+	await fs.writeFile(temp, JSON.stringify(value, null, 2) + "\n", { mode: 384 });
+	try {
+		await fs.rename(temp, file);
+	} catch (err) {
+		await fs.rm(temp, { force: true }).catch(() => {});
+		throw err;
+	}
+}
+const queues = /* @__PURE__ */ new Map();
+/** Runs `change` on pairing.json under both locks, and writes what it returns (or nothing, for null). */
+async function locked(file, writeLock, pid, isAlive, change) {
+	const run = async () => {
+		const until = Date.now() + WRITE_WAIT_MS;
+		while (!await takeLock(writeLock, pid, isAlive, false, Date.now(), { freshMs: WRITE_FRESH_MS })) {
+			if (Date.now() > until) throw new Error(`couldn't take ${writeLock} in ${WRITE_WAIT_MS / 1e3} s`);
+			await new Promise((r) => setTimeout(r, 25));
+		}
+		try {
+			const { write, result } = change(await readPairing(file));
+			if (write) await writePairing(file, write);
+			return result;
+		} finally {
+			await releaseLock(writeLock, pid).catch(() => {});
+		}
+	};
+	const next = (queues.get(file) ?? Promise.resolve()).then(run, run);
+	queues.set(file, next.catch(() => {}));
+	return next;
+}
+const page = (worked, text) => `<!doctype html><meta charset="utf-8"><title>Isoplan: ${worked ? "paired" : "not paired"}</title><p style="font:16px system-ui;margin:3em auto;max-width:30em">${text}</p>`;
+const HTML = {
+	"content-type": "text/html; charset=utf-8",
+	connection: "close"
+};
+function createPairing({ file, lock, writeLock, server, account, machine, emit, allowPlainWs = false, post = postJson, now = Date.now, pid = process.pid, isAlive = alive, retryMs = 200 }) {
+	let asked = false;
+	let shown = null;
+	let unreadable = false;
+	let callback = null;
+	const empty = () => ({ server });
+	const entryOf = (all) => {
+		const kept = all.accounts[account.id];
+		return kept && kept.server === server ? kept : empty();
+	};
+	const withEntry = (all, entry) => ({
+		...all,
+		accounts: {
+			...all.accounts,
+			[account.id]: entry
+		}
+	});
+	const mine = async () => entryOf(await readPairing(file));
+	const update = (decide) => locked(file, writeLock, pid, isAlive, (all) => {
+		const { entry, result } = decide(entryOf(all));
+		return {
+			write: entry ? withEntry(all, entry) : null,
+			result
+		};
+	});
+	const drop = ({ credential: _, token: __, tokenExpires: ___, ...rest }) => rest;
+	const show = (waiting) => {
+		if (shown === waiting.url) return;
+		shown = waiting.url;
+		emit({
+			type: "pair",
+			server,
+			url: waiting.url,
+			expires: new Date(waiting.expires).toISOString()
+		});
+	};
+	const plainRefused = () => {
+		if (!allowPlainWs && isPlainRemote(server)) throw new Error(`${server} is plain ws:// to another machine, so this machine's credential isn't sent; use wss://, or set "allowPlainWs": true in config.json`);
+	};
+	async function renew(used) {
+		const answer = await post(httpUrl(server, "/token"), { credential: used });
+		if (answer.status === 200 && typeof answer.body.token === "string") {
+			const token = answer.body.token;
+			const expires = Date.parse(String(answer.body.expires));
+			return update((e) => e.credential === used ? {
+				entry: {
+					...e,
+					token,
+					tokenExpires: Number.isFinite(expires) ? expires : now()
+				},
+				result: token
+			} : {
+				entry: null,
+				result: void 0
+			});
+		}
+		if (answer.status === 401 && answer.body.code === "pairing-ended") {
+			emit({
+				type: "log",
+				text: `the office server says this machine's pairing has ended: ${String(answer.body.error ?? "")}`
+			});
+			asked = true;
+			return update((e) => ({
+				entry: e.credential === used ? drop(e) : null,
+				result: void 0
+			}));
+		}
+		throw new Error(`the office server answered ${answer.status} when renewing this machine's token`);
+	}
+	async function stopAnswering() {
+		if (!callback) return;
+		for (const timer of callback.timers) clearTimeout(timer);
+		callback.server.close();
+		callback = null;
+		await update((e) => ({
+			entry: e.waiting ? (({ waiting: _, ...rest }) => rest)(e) : null,
+			result: void 0
+		})).catch(() => {});
+		await releaseLock(lock, pid).catch(() => {});
+	}
+	async function keep(credential) {
+		for (let i = 0; i < WRITE_TRIES; i++) try {
+			await update((e) => ({
+				entry: (({ waiting: _, ...rest }) => ({
+					...rest,
+					credential
+				}))(e),
+				result: void 0
+			}));
+			return true;
+		} catch (err) {
+			emit({
+				type: "log",
+				text: `couldn't write this machine's credential (try ${i + 1}): ${String(err?.message ?? err)}`
+			});
+			await new Promise((r) => setTimeout(r, retryMs * 2 ** i));
+		}
+		return false;
+	}
+	async function finish(code, verifier, response) {
+		let worked = false;
+		let text = "This machine couldn't be paired: the office server couldn't be reached. Click the link in Claude Code again in a moment.";
+		try {
+			const answer = await post(httpUrl(server, "/pair/token"), {
+				code,
+				verifier
+			});
+			if (answer.status === 200 && typeof answer.body.credential === "string") {
+				worked = await keep(answer.body.credential);
+				text = worked ? "This machine is paired with the office. You can close this tab; Claude Code reports to it within a few seconds." : "The office paired this machine, but its credential couldn't be saved here. Claude Code shows a new link to try again.";
+				emit({
+					type: "log",
+					text: worked ? "this machine is paired with the office server" : "couldn't save this machine's credential; pairing again"
+				});
+			} else {
+				text = "This machine couldn't be paired: the link was used or has expired. Claude Code shows a new one.";
+				emit({
+					type: "log",
+					text: `the office server didn't pair this machine (${answer.status}): ${String(answer.body.error ?? "")}`
+				});
+			}
+		} catch (err) {
+			emit({
+				type: "log",
+				text: `couldn't finish pairing: ${String(err?.message ?? err)}`
+			});
+		}
+		try {
+			response.writeHead(worked ? 200 : 400, HTML).end(page(worked, text));
+		} catch {}
+		await stopAnswering().catch(() => {});
+	}
+	async function startPairing() {
+		const verifier = randomBytes(32).toString("base64url");
+		const challenge = createHash("sha256").update(verifier).digest("base64url");
+		const nonce = randomBytes(16).toString("base64url");
+		let finishing = false;
+		const listener = http.createServer((request, response) => {
+			const url = new URL(request.url ?? "/", "http://127.0.0.1");
+			const code = url.searchParams.get("code");
+			if (request.method !== "GET" || url.pathname !== `/${nonce}` || !code || finishing) {
+				response.writeHead(404, HTML).end(page(false, "Not found."));
+				return;
+			}
+			finishing = true;
+			finish(code, verifier, response);
+		});
+		listener.on("error", () => {});
+		await new Promise((resolve, reject) => listener.once("error", reject).listen(0, "127.0.0.1", () => resolve()));
+		listener.unref();
+		const { port } = listener.address();
+		const refresh = setInterval(() => void refreshLock(lock, pid).catch(() => {}), PAIRING_REFRESH_MS);
+		refresh.unref();
+		callback = {
+			server: listener,
+			timers: [refresh]
+		};
+		try {
+			const machineId = await locked(file, writeLock, pid, isAlive, (all) => {
+				if (all.machine) return {
+					write: null,
+					result: all.machine
+				};
+				const made = randomBytes(16).toString("base64url");
+				return {
+					write: {
+						...all,
+						machine: made
+					},
+					result: made
+				};
+			});
+			const answer = await post(httpUrl(server, "/pair"), {
+				account,
+				machine: {
+					name: machine,
+					id: machineId
+				},
+				callback: `http://127.0.0.1:${port}/${nonce}`,
+				challenge
+			});
+			if (answer.status !== 200 || typeof answer.body.url !== "string") throw new Error(`the office server answered ${answer.status} when asked to pair${answer.body.error ? `: ${String(answer.body.error)}` : ""}`);
+			const waiting = {
+				url: answer.body.url,
+				expires: Date.parse(String(answer.body.expires)) || now()
+			};
+			const expiry = setTimeout(() => void stopAnswering(), Math.max(0, waiting.expires - now()));
+			expiry.unref();
+			callback.timers.push(expiry);
+			await update((e) => ({
+				entry: {
+					...e,
+					waiting
+				},
+				result: void 0
+			}));
+			show(waiting);
+		} catch (err) {
+			await stopAnswering();
+			throw err;
+		}
+	}
+	return {
+		async token() {
+			const entry = await mine();
+			if (entry.token && (entry.tokenExpires ?? 0) - RENEW_EARLY_MS > now()) {
+				plainRefused();
+				return entry.token;
+			}
+			if (entry.credential) {
+				plainRefused();
+				const renewed = await renew(entry.credential);
+				if (renewed) return renewed;
+				const again = await mine();
+				if (again.token && again.token !== entry.token) return again.token;
+			}
+			if (!asked && !entry.waiting) return void 0;
+			if (callback) return null;
+			plainRefused();
+			if (!await takeLock(lock, pid, isAlive, false, Date.now(), { freshMs: 6e4 })) {
+				if (entry.waiting && entry.waiting.expires > now()) show(entry.waiting);
+				return null;
+			}
+			await startPairing();
+			return null;
+		},
+		async refused(code, sent) {
+			if (code !== "token-expired") asked = true;
+			if (code === "not-paired" && sent) {
+				if (!unreadable) emit({
+					type: "log",
+					text: "the office server didn't find this machine's token in its hello; it may be older than pairing. The credential is kept."
+				});
+				unreadable = true;
+				return;
+			}
+			if (!sent) return;
+			await update((e) => {
+				if (e.token !== sent) return {
+					entry: null,
+					result: void 0
+				};
+				if (code === "token-expired") return {
+					entry: {
+						...e,
+						tokenExpires: 0
+					},
+					result: void 0
+				};
+				return {
+					entry: code === "pairing-ended" ? drop(e) : null,
+					result: void 0
+				};
+			});
+		},
+		close: stopAnswering
+	};
+}
+//#endregion
+//#region src/data-layer/approved.ts
+const getJson = async (url, headers) => {
+	const response = await fetch(url, {
+		headers,
+		signal: AbortSignal.timeout(15e3)
+	});
+	return {
+		status: response.status,
+		body: response.status === 200 || response.status === 401 ? await response.json().catch(() => null) : null
+	};
+};
+/** While the machine waits to be paired the list is asked for again this soon, and after a failure this soon. */
+const PAIR_POLL_MS = 5e3;
+const RETRY_MS = 3e4;
+/** A rename the file system refuses for a moment (a scanner holding the file, on Windows) is tried this often. */
+const RENAME_TRIES = 5;
+const isList = (value) => {
+	const v = value;
+	return !!v && typeof v.version === "string" && Array.isArray(v.repos) && v.repos.every((r) => typeof r === "string");
+};
+/** Whether `a` is a later list than `b`: a newer version, by when it was first had, or the same one confirmed later. */
+const later = (a, b) => !b || (a.version !== b.version ? a.fetched > b.fetched : a.checked > b.checked);
+/** Written whole, through a temp file, so a reader never sees half of it; owner-only. A refused rename is tried again, then thrown. */
+async function writeFile(file, value) {
+	await fs.mkdir(path.dirname(file), { recursive: true });
+	const temp = `${file}.${process.pid}.${randomBytes(4).toString("hex")}`;
+	await fs.writeFile(temp, JSON.stringify(value, null, 2) + "\n", { mode: 384 });
+	for (let i = 0;; i++) try {
+		await fs.rename(temp, file);
+		return;
+	} catch (err) {
+		const code = err.code;
+		if (i + 1 < RENAME_TRIES && (code === "EPERM" || code === "EBUSY" || code === "EACCES")) {
+			await new Promise((r) => setTimeout(r, 25 * 2 ** i));
+			continue;
+		}
+		await fs.rm(temp, { force: true }).catch(() => {});
+		throw err;
+	}
+}
+function createApproved({ server, file, pairing, refreshMs, maxAgeMs, log, get = (url, headers) => getJson(url, headers), now = Date.now }) {
+	let list = null;
+	let problem = "unreachable";
+	let nextAt = -Infinity;
+	let busy = null;
+	let queued = null;
+	let said = "";
+	const take = (value) => {
+		list = value;
+		problem = null;
+		nextAt = value.checked + refreshMs;
+	};
+	const tell = (text) => {
+		if (text !== said) log(text);
+		said = text;
+	};
+	async function keep(mine) {
+		const theirs = await readApproved(file, server);
+		const kept = theirs && !later(mine, theirs) ? theirs.version === mine.version ? {
+			...theirs,
+			checked: Math.max(theirs.checked, mine.checked)
+		} : theirs : mine;
+		take(kept);
+		if (kept === theirs) return;
+		await writeFile(file, kept).catch((err) => tell(`couldn't keep the office's list of repos in ${file}: ${String(err?.message ?? err)}`));
+	}
+	async function check() {
+		const shared = await readApproved(file, server);
+		if (shared && later(shared, list)) take(shared);
+		if (list && now() < nextAt) return;
+		let token;
+		try {
+			token = pairing ? await pairing.token() : void 0;
+		} catch (err) {
+			tell(`couldn't read which repos the office takes: ${String(err?.message ?? err)}`);
+			problem = "unreachable";
+			nextAt = now() + RETRY_MS;
+			return;
+		}
+		if (token === null) {
+			problem = "pairing";
+			nextAt = now() + PAIR_POLL_MS;
+			return;
+		}
+		const headers = {};
+		if (token) headers.authorization = `Bearer ${token}`;
+		if (list) headers["if-none-match"] = `"${list.version}"`;
+		let answer;
+		try {
+			answer = await get(httpUrl(server, "/repos"), headers);
+		} catch (err) {
+			answer = {
+				status: 0,
+				body: String(err?.message ?? err)
+			};
+		}
+		const code = answer.body?.code;
+		const at = now();
+		if (answer.status === 304 && list) {
+			said = "";
+			await keep({
+				...list,
+				checked: at
+			});
+		} else if (answer.status === 200 && isList(answer.body)) {
+			said = "";
+			const same = list?.version === answer.body.version;
+			await keep({
+				server,
+				version: answer.body.version,
+				repos: answer.body.repos,
+				fetched: same ? list.fetched : at,
+				checked: at
+			});
+		} else if (answer.status === 401 && pairing && (code === "not-paired" || code === "pairing-ended" || code === "token-expired")) {
+			await pairing.refused(code, token).catch(() => {});
+			problem = "pairing";
+			nextAt = at + (code === "token-expired" || !token ? 0 : PAIR_POLL_MS);
+		} else if (answer.status === 404) {
+			tell(`${server} is too old to say which repos its office takes, so nothing is sent to it; it needs updating`);
+			list = null;
+			problem = "too-old";
+			nextAt = at + refreshMs;
+		} else {
+			tell(`couldn't read which repos the office takes from ${server}: ${answer.status ? `it answered ${answer.status}` : String(answer.body)}`);
+			problem = "unreachable";
+			nextAt = at + RETRY_MS;
+		}
+	}
+	function refresh(force = false) {
+		if (force) nextAt = -Infinity;
+		if (busy) {
+			if (!force) return busy;
+			queued ??= busy.then(() => {
+				queued = null;
+				return refresh(true);
+			});
+			return queued;
+		}
+		if (now() < nextAt) return Promise.resolve();
+		busy = check().catch((err) => tell(`couldn't read which repos the office takes: ${String(err?.message ?? err)}`)).finally(() => busy = null);
+		return busy;
+	}
+	return {
+		repos: () => freshRepos(list, maxAgeMs, now()),
+		version: () => list?.version ?? null,
+		problem: () => list && !freshRepos(list, maxAgeMs, now()) ? "unreachable" : list ? null : problem,
+		refresh
+	};
+}
+function createSessionGate({ approved, open }) {
+	let link = null;
+	let home = null;
+	let linked = null;
+	let unwanted;
+	const shut = () => {
+		link?.close();
+		link = null;
+		linked = null;
+	};
+	const mayConnect = async () => {
+		await approved.refresh(true);
+		const repos = approved.repos();
+		return !!repos && linked !== null && repos.has(linked.toLowerCase());
+	};
+	return {
+		async home(candidates) {
+			await approved.refresh();
+			const repos = approved.repos();
+			home = repos && candidates.find((p) => repos.has(p.id.toLowerCase())) || null;
+			if (!home) {
+				shut();
+				return {
+					home: null,
+					dormancy: repos ? "not-approved" : approved.problem() === "pairing" ? "pairing" : "no-list"
+				};
+			}
+			if (linked !== null && linked !== home.id) shut();
+			if (unwanted !== void 0 && approved.version() !== unwanted) {
+				unwanted = void 0;
+				shut();
+			}
+			return {
+				home,
+				dormancy: null
+			};
+		},
+		link() {
+			if (!link) {
+				link = open(home, mayConnect);
+				linked = home.id;
+			}
+			return link;
+		},
+		current: () => link,
+		drop: shut,
+		notWanted() {
+			unwanted = approved.version();
+			approved.refresh(true);
+		},
+		mayConnect
+	};
+}
+//#endregion
+//#region src/data-layer/home.ts
+/** The projects `folder` may report as, and whether it is a workspace. */
+async function candidatesOf(folder, io) {
+	const where = await io.resolve(folder);
+	if (where) return {
+		projects: [await io.projectOf(where, folder)],
+		workspace: false
+	};
+	const tooWide = pathKey(folder) === pathKey(io.home) || relativeTo(folder, io.home) !== null;
+	const st = await io.stat(folder);
+	const repos = [];
+	if (!tooWide && st?.isDir) {
+		for (const e of await io.listDir(folder)) if (e.isDir && await io.stat(join(folder, `${e.name}/.git`))) repos.push(join(folder, e.name));
+	}
+	if (!repos.length || repos.length > io.workspaceRepos) return {
+		projects: [await io.projectOf(null, folder)],
+		workspace: false
+	};
+	const projects = [];
+	for (const dir of repos.sort()) {
+		const at = await io.resolve(dir);
+		if (at) projects.push(await io.projectOf(at, dir));
+	}
+	return {
+		projects,
+		workspace: true
+	};
+}
+/**
+* A workspace's facts as they may leave the machine: only its work inside a repo, each named by its
+* repo; files outside every repo, and a command's file there, stay on the machine. Which of those
+* repos may go is the link's filter (attribution.ts forOffice), by the server's welcome.
+*/
+function inRepos(facts) {
+	const placed = (list) => list.every((f) => f.project) ? list : list.filter((f) => f.project);
+	return {
+		...facts,
+		edits: placed(facts.edits),
+		reads: placed(facts.reads),
+		agents: facts.agents.map((a) => a.doing && !a.doing.project && a.doing.file !== void 0 ? {
+			...a,
+			doing: {
+				kind: a.doing.kind,
+				since: a.doing.since
+			}
+		} : a)
+	};
+}
+//#endregion
 //#region src/data-layer/detached.ts
 const LINK_DOWN_MS = 3e5;
 /**
@@ -9980,6 +10364,7 @@ const cmp = (a, b) => a < b ? -1 : a > b ? 1 : 0;
 //#region src/data-layer/main.ts
 const LOG_CAP_BYTES = 65536;
 const DORMANT_MS = 3e4;
+const LOCK_FRESH_MS = 3 * DORMANT_MS;
 const value = (argv, flag) => {
 	const i = argv.indexOf(flag);
 	return i >= 0 && argv[i + 1] && !argv[i + 1].startsWith("--") ? argv[i + 1] : null;
@@ -10051,8 +10436,53 @@ async function main(argv) {
 		});
 		return 0;
 	}
+	const since = Number(value(argv, "--since")) || Date.now();
+	const lockExtra = {
+		dataLayer: self,
+		detached,
+		since,
+		parent: process.ppid
+	};
+	const newest = () => newestDataLayer(place.plugins, self, project).catch(() => self);
+	const isOutdated = async () => await newest() !== self;
+	let outdated = await isOutdated();
+	if (detached && outdated) {
+		emit({
+			type: "log",
+			text: "a newer version of the Isoplan plugin is installed, so it reports this session instead"
+		});
+		await logging;
+		return 0;
+	}
+	const supersededBy = async () => {
+		const held = await readLock(lock);
+		if (!held?.pid || held.pid === process.pid || !alive(held.pid) || Date.now() - held.mtimeMs >= LOCK_FRESH_MS) return null;
+		const { dataLayer: other, detached: otherDetached, since: otherSince, parent } = held.extra;
+		if (otherDetached !== false || typeof other !== "string") return null;
+		if (normalPath(other) === normalPath(self)) return typeof otherSince === "number" && otherSince > since && typeof parent === "number" && alive(parent) ? "window" : null;
+		const current = await newest();
+		outdated = current !== self;
+		return outdated && normalPath(current) === normalPath(other) ? "newer" : null;
+	};
+	const leave = (reason) => {
+		emit({
+			type: "log",
+			text: reason === "newer" ? "stopping: the newer version's data layer that a reload started reports this session now" : "stopping: the session's newer window reports it now"
+		});
+		emit({
+			type: "superseded",
+			reason
+		});
+	};
+	if (!detached) {
+		const reason = await supersededBy();
+		if (reason) {
+			leave(reason);
+			return 0;
+		}
+	}
 	try {
-		if (!await takeLock(lock, process.pid, alive, !detached)) {
+		if (!await takeLock(lock, process.pid, alive, !detached, Date.now(), { extra: lockExtra })) {
 			process.stderr.write(`another data layer already reports session ${sessionId}\n`);
 			return 0;
 		}
@@ -10074,7 +10504,7 @@ async function main(argv) {
 		stdio: "ignore",
 		windowsHide: true
 	}).on("error", () => {}).unref();
-	const installing = detached ? Promise.resolve([]) : installWake(paths, path.join(here, "data-layer.js"), path.join(here, "wake.js"), {
+	const installing = detached || outdated ? Promise.resolve([]) : installWake(paths, path.join(here, "data-layer.js"), path.join(here, "wake.js"), {
 		auto: true,
 		runnerFrom: path.join(here, ".."),
 		findClaude: () => findClaude(process.env, process.platform, os.homedir())
@@ -10085,11 +10515,54 @@ async function main(argv) {
 		type: "log",
 		text: `couldn't install the wake hook: ${String(err?.message ?? err)}`
 	}), []));
-	if (!detached) installing.then(async () => await pluginState(place, self) === "enabled" && startRunner({
+	if (!detached && !outdated) installing.then(async () => await pluginState(place, self) === "enabled" && startRunner({
 		claudeDir,
 		spawn: start
 	})).catch(() => {});
 	let config = await loadConfig(io, defaultsPath, userConfigPath);
+	if (outdated) emit({ type: "updated" });
+	const pluginId = pluginIdOf(place.plugins, self);
+	let checking = false;
+	let checkedAt = Date.now();
+	const checkUpdate = (gapMs) => {
+		if (detached || !pluginId || outdated || checking || !config.updateCheckHours) return;
+		checkedAt = Date.now();
+		const off = updatesOffBy(process.env);
+		if (off) return emit({
+			type: "log",
+			text: `not checking for a newer version of the plugin: ${off} is set (FORCE_AUTOUPDATE_PLUGINS=1 turns plugin updates back on)`
+		});
+		checking = true;
+		(async () => {
+			if (await pluginState(place, self).catch(() => "enabled") !== "enabled") return emit({
+				type: "log",
+				text: "not checking for a newer version of the plugin: it is disabled for this machine"
+			});
+			const binary = await claudeBinary(claudeDir, process.env, process.platform, os.homedir());
+			if (!binary) return emit({
+				type: "log",
+				text: "couldn't find the claude binary, so the plugin can't update itself"
+			});
+			const checked = await checkForUpdate({
+				claudeDir,
+				settings: paths.settings,
+				plugins: place.plugins,
+				id: pluginId,
+				cwd: project,
+				claude: claudeCommand(binary),
+				env: commandEnv(process.env, await gitChoices(project)),
+				gapMs
+			});
+			for (const text of checked.said) emit({
+				type: "log",
+				text: `update check: ${text}`
+			});
+		})().catch((err) => emit({
+			type: "log",
+			text: `couldn't check for a newer version of the plugin: ${String(err?.message ?? err)}`
+		})).finally(() => checking = false);
+	};
+	installing.then(() => checkUpdate(START_GAP_MS));
 	installing.then(async (changes) => {
 		if (!changes.length) return;
 		const started = await backfill(await recentSessions(io, path.join(claudeDir, "projects"), Date.now() - config.lightsOffHours * 36e5), {
@@ -10262,8 +10735,28 @@ async function main(argv) {
 	do {
 		const now = Date.now();
 		const isFirstPass = passes++ === 0;
-		if (!detached && await lockHolder(lock) !== process.pid) await takeLock(lock, process.pid, alive, true).catch(() => {});
+		if (!detached) {
+			if (await lockHolder(lock) !== process.pid) {
+				const reason = await supersededBy();
+				if (reason) {
+					leave(reason);
+					break;
+				}
+				await takeLock(lock, process.pid, alive, true, Date.now(), { extra: lockExtra }).catch(() => {});
+			} else await refreshLock(lock, process.pid).catch(() => {});
+		}
 		config = await loadConfig(io, defaultsPath, userConfigPath).catch(() => config);
+		if (!outdated && (outdated = await isOutdated())) {
+			if (detached) {
+				emit({
+					type: "log",
+					text: "stopping: a newer version of the Isoplan plugin is installed, which the wake hook starts next"
+				});
+				break;
+			}
+			emit({ type: "updated" });
+		}
+		if (now - checkedAt >= config.updateCheckHours * 36e5) checkUpdate(config.updateCheckHours * 36e5);
 		const gitOpts = {
 			now,
 			maxAgeMs: config.gitCacheSeconds * 1e3

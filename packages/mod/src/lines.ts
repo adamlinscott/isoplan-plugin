@@ -82,6 +82,24 @@ export interface AnswerTaken {
   taken: boolean;
 }
 
+/**
+ * A newer version of the plugin is in Claude Code's plugin cache than the one this session loaded
+ * (src/update): it loads at /reload-plugins, or the next session.
+ */
+export interface UpdatedLine {
+  type: "updated";
+}
+
+/**
+ * The plugin's data layer of another window took over this session, and this one stops: `newer`, a
+ * newer version's (a /reload-plugins started it), or `window`, this version's in a window that
+ * started later. The hooks module tries again a while later.
+ */
+export interface SupersededLine {
+  type: "superseded";
+  reason: "newer" | "window";
+}
+
 /** A problem worth a line in the debug log. */
 export interface LogLine {
   type: "log";
@@ -99,4 +117,4 @@ export interface TitleReply {
  * `asked` is the end of a question the session's agent asked the room, arriving after it stopped
  * waiting, and `ask-rights` whether the session may ask its room (#49).
  */
-export type DataLayerLine = StatusLine | TitleAskLine | PairLine | WaitsLine | OwnerAnswerLine | LogLine | ConflictMessage | ErrorMessage | AskedMessage | AskRightsMessage;
+export type DataLayerLine = StatusLine | TitleAskLine | PairLine | WaitsLine | OwnerAnswerLine | UpdatedLine | SupersededLine | LogLine | ConflictMessage | ErrorMessage | AskedMessage | AskRightsMessage;

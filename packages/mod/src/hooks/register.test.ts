@@ -31,6 +31,7 @@ function host(lines: DataLayerLine[], { wakes = 0, runMs = 0, stays = false, noN
   // The session's agents, as $.agent.list answers.
   const agents: { id: string; status: string }[] = [];
   const session = { id: "s1" };
+  const folder = { gone: false }; // this copy's folder, which Claude Code may clean up
   let now = 0;
   const $: Host = {
     plugin: { root: "C:\\plugins\\isoplan" },
@@ -59,7 +60,7 @@ function host(lines: DataLayerLine[], { wakes = 0, runMs = 0, stays = false, noN
     tool: { register: async (tool) => (tools.push(tool.name), { tool: `mcp__plugin_isoplan__${tool.name}` }) },
     agent: { list: async () => agents },
     model: { complete: async () => ({ isAnswered: true, text: "Fixing the wizard" }) },
-    fs: { write: async (p, text) => void written.push([p, text]) },
+    fs: { write: async (p, text) => void written.push([p, text]), exists: async () => !folder.gone },
     ui: { status: (text) => void status.push(text), log: (text, options) => void (options?.to !== "debug" && logged.push(text)) },
     clock: {
       now: async () => now,
@@ -67,7 +68,7 @@ function host(lines: DataLayerLine[], { wakes = 0, runMs = 0, stays = false, noN
       after: (_ms, fn) => (fn(), { cancel: () => {} }),
     },
   };
-  return { $, status, written, spawned, spawnedIn, slept, session, logged, ran, tools, agents };
+  return { $, status, written, spawned, spawnedIn, slept, session, logged, ran, tools, agents, folder };
 }
 
 let hooks: Hooks;
@@ -99,8 +100,67 @@ const connected: DataLayerLine = { type: "status", server: "ws://127.0.0.1:4747/
 test("hooks: starts the data layer for its session and shows the link's state, then that it stopped", async () => {
   const h = await start([connected]);
   await stopped(h);
-  expect(h.spawned).toEqual([["node", "C:/plugins/isoplan/dist/data-layer.js", "--session", "s1", "--cwd", "C:/w/repo"]]);
+  expect(h.spawned).toEqual([["node", "C:/plugins/isoplan/dist/data-layer.js", "--session", "s1", "--cwd", "C:/w/repo", "--since", "0"]]);
   expect(h.status).toEqual(["Isoplan: connected to ws://127.0.0.1:4747/data-layer", "Isoplan: the data layer stopped (node exited with code 0); restarting in 1s"]);
+});
+
+test("hooks: once a newer version is on disk, the status line says to reload, beside the link's state", async () => {
+  const h = await start([connected, { type: "updated" }, { type: "status", server: "ws://127.0.0.1:4747/data-layer", state: "disconnected", retryInMs: 2000 }]);
+  await stopped(h);
+  expect(h.status).toEqual([
+    "Isoplan: connected to ws://127.0.0.1:4747/data-layer",
+    "Isoplan: connected to ws://127.0.0.1:4747/data-layer · Isoplan updated: type /reload-plugins",
+    "Isoplan: can't reach ws://127.0.0.1:4747/data-layer; retrying in 2s · Isoplan updated: type /reload-plugins",
+    "Isoplan: the data layer stopped (node exited with code 0); restarting in 1s · Isoplan updated: type /reload-plugins",
+  ]);
+  // Before any other status, the note stands alone.
+  vi.resetModules();
+  const { register } = await import("./register.js");
+  register(((event: keyof Hooks, hook: Function) => ((hooks[event] = hook), { catch: () => {} })) as unknown as On);
+  const first = await start([{ type: "updated" }], { stays: true });
+  await vi.waitFor(() => expect(first.status.at(-1)).toBe("Isoplan updated: type /reload-plugins"));
+});
+
+test("hooks: a data layer that hands the session to a reloaded one is tried again only a minute later, and the status line asks for the reload", async () => {
+  const h = await start([connected, { type: "superseded", reason: "newer" }], { wakes: 1 });
+  await vi.waitFor(() => expect(h.spawned).toHaveLength(2));
+  expect(h.slept[0]).toBe(60000);
+  expect(h.status).toContain("Isoplan updated: type /reload-plugins");
+  // Each run keeps the time this window's module started, so it never counts as the later window.
+  expect(h.spawned[1]).toEqual(h.spawned[0]);
+});
+
+test("hooks: one that gives the session to its other window says so, not that there is an update", async () => {
+  const h = await start([{ type: "superseded", reason: "window" }]);
+  await vi.waitFor(() => expect(h.status.at(-1)).toBe("Isoplan: this session is reported from its other window"));
+  expect(h.slept).toEqual([60000]);
+});
+
+test("hooks: a host with no $.fs.exists, or one that throws, still starts the data layer", async () => {
+  const none = host([connected]);
+  delete (none.$.fs as { exists?: unknown }).exists;
+  await hooks["session.start"]!(none.$, { cwd: "C:/w/repo" }, async () => ({ cwd: "C:/w/repo" }));
+  await vi.waitFor(() => expect(none.spawned).toHaveLength(1));
+
+  vi.resetModules();
+  const { register } = await import("./register.js");
+  register(((event: keyof Hooks, hook: Function) => ((hooks[event] = hook), { catch: () => {} })) as unknown as On);
+  const throwing = host([connected]);
+  throwing.$.fs.exists = () => {
+    throw new Error("not in this build");
+  };
+  await hooks["session.start"]!(throwing.$, { cwd: "C:/w/repo" }, async () => ({ cwd: "C:/w/repo" }));
+  await vi.waitFor(() => expect(throwing.spawned).toHaveLength(1));
+});
+
+test("hooks: once this copy's folder has gone, nothing is started again, and the status line asks for a reload", async () => {
+  const h = host([connected]);
+  // Claude Code cleans the old version up while the data layer is down, waiting to restart.
+  h.$.clock.sleep = async (ms) => void (h.slept.push(ms), (h.folder.gone = true));
+  await hooks["session.start"]!(h.$, { cwd: "C:/w/repo" }, async () => ({ cwd: "C:/w/repo" }));
+  await vi.waitFor(() => expect(h.status.at(-1)).toBe("Isoplan updated: type /reload-plugins"));
+  expect(h.spawned).toHaveLength(1);
+  expect(h.slept).toHaveLength(1);
 });
 
 test("hooks: a data layer that keeps dying soon after starting backs off, whatever it wrote; one that stayed up a minute starts over", async () => {

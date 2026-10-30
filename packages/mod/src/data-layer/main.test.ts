@@ -1,7 +1,8 @@
 // The data layer's main loop, run as it ships (dist/data-layer.js, rebuilt with every change), in
 // detached mode so it installs nothing and starts no runner, against a stand-in office server, with
 // a throwaway Claude config folder: what it sends for a session in a repo the office doesn't take,
-// and when the copy of the office's list is too old (adamlinscott/isoplan#91).
+// and when the copy of the office's list is too old (adamlinscott/isoplan#91); and what a copy in
+// the plugin cache does once Claude Code has installed a newer one (adamlinscott/isoplan#96).
 
 import { execFileSync, spawn, type ChildProcess } from "node:child_process";
 import fs from "node:fs";
@@ -41,10 +42,8 @@ async function office() {
   return { state, url: `ws://127.0.0.1:${(server.address() as AddressInfo).port}/data-layer` };
 }
 
-/** A repo with a remote, a session in it with a fresh transcript, and the data layer started for it, detached. */
-function start(url: string, config: Record<string, unknown> = {}) {
-  const root = tempRoot();
-  const claudeDir = path.join(root, "claude");
+/** A repo with a remote, and session s1 in it with a fresh transcript; the repo's folder. */
+function session(claudeDir: string, root: string): string {
   const repo = path.join(root, "app");
   fs.mkdirSync(repo);
   execFileSync("git", ["init", "-q"], { cwd: repo });
@@ -54,6 +53,14 @@ function start(url: string, config: Record<string, unknown> = {}) {
   fs.mkdirSync(path.dirname(transcript), { recursive: true });
   fs.writeFileSync(transcript, [{ type: "user", cwd: repo, timestamp: now, message: { role: "user", content: "hi" } }, { type: "assistant", cwd: repo, timestamp: now, message: { role: "assistant", content: [{ type: "text", text: "ok" }] } }].map((l) => JSON.stringify(l)).join("\n") + "\n");
   fs.mkdirSync(path.join(claudeDir, "isoplan"), { recursive: true });
+  return repo;
+}
+
+/** session(), and the data layer started for it, detached. */
+function start(url: string, config: Record<string, unknown> = {}) {
+  const root = tempRoot();
+  const claudeDir = path.join(root, "claude");
+  const repo = session(claudeDir, root);
   fs.writeFileSync(path.join(claudeDir, "isoplan", "config.json"), JSON.stringify({ server: url, ...config }));
   const child = spawn(process.execPath, [path.join(modDir, "dist", "data-layer.js"), "--session", "s1", "--cwd", repo, "--detached"], {
     cwd: repo,
@@ -105,4 +112,117 @@ test("an approved session connects; once its copy of the list is past its maximu
   // The server answers again: the list is checked, and only then does it reconnect.
   o.state.status = 200;
   await until(() => o.state.connections.length === 2 && o.state.connections[1]!.messages.some((m) => m.type === "hello"));
+});
+
+/** Two versions of the plugin in a throwaway plugin cache, Claude Code's record naming the newer, and a way to start either for session s1. */
+function versions(server = "ws://127.0.0.1:9/data-layer") {
+  const root = tempRoot();
+  const claudeDir = path.join(root, "claude");
+  const plugins = path.join(claudeDir, "plugins");
+  const folder = (version: string) => path.join(plugins, "cache", "isoplan", "isoplan", version);
+  for (const version of ["0.2.0", "0.3.0"]) {
+    fs.mkdirSync(path.join(folder(version), "dist"), { recursive: true });
+    fs.mkdirSync(path.join(folder(version), ".claude-plugin"), { recursive: true });
+    for (const file of ["data-layer.js", "wake.js", "hooks.js"]) fs.copyFileSync(path.join(modDir, "dist", file), path.join(folder(version), "dist", file));
+    fs.copyFileSync(path.join(modDir, "config.json"), path.join(folder(version), "config.json"));
+    fs.writeFileSync(path.join(folder(version), ".claude-plugin", "plugin.json"), JSON.stringify({ name: "isoplan", version }));
+  }
+  fs.writeFileSync(path.join(plugins, "installed_plugins.json"), JSON.stringify({ version: 2, plugins: { "isoplan@isoplan": [{ scope: "user", installPath: folder("0.3.0"), version: "0.3.0" }] } }));
+  const repo = session(claudeDir, root);
+  fs.writeFileSync(path.join(claudeDir, "isoplan", "config.json"), JSON.stringify({ server }));
+  const lock = path.join(claudeDir, "isoplan", "live", "s1.json");
+  const run = (version: string, ...flags: string[]) => {
+    const child = spawn(process.execPath, [path.join(folder(version), "dist", "data-layer.js"), "--session", "s1", "--cwd", repo, ...flags], {
+      cwd: repo,
+      // No update check runs against a real Claude Code here.
+      env: { ...process.env, CLAUDE_CONFIG_DIR: claudeDir, CLAUDE_CODE_PLUGIN_CACHE_DIR: "", DISABLE_AUTOUPDATER: "1", FORCE_AUTOUPDATE_PLUGINS: "" },
+      stdio: ["ignore", "pipe", "ignore"],
+      windowsHide: true,
+    });
+    children.push(child);
+    let out = "";
+    child.stdout!.on("data", (piece) => (out += piece));
+    let code: number | null | undefined;
+    const exited = new Promise<number | null>((resolve) => child.on("exit", (c) => resolve((code = c))));
+    return { pid: child.pid!, hasExited: () => code !== undefined, lines: () => out.split("\n").filter(Boolean).map((l) => JSON.parse(l) as { type: string; text?: string }), exited };
+  };
+  // A lock as another window's plugin data layer writes it, by this test's own (live) pid.
+  const held = (version: string, since: number, ageMs = 0) => {
+    fs.mkdirSync(path.dirname(lock), { recursive: true });
+    fs.writeFileSync(lock, JSON.stringify({ pid: process.pid, dataLayer: path.join(folder(version), "dist", "data-layer.js"), detached: false, since, parent: process.pid }));
+    const t = new Date(Date.now() - ageMs);
+    fs.utimesSync(lock, t, t);
+  };
+  return { claudeDir, lock, run, held, holder: () => (fs.existsSync(lock) ? (JSON.parse(fs.readFileSync(lock, "utf8")).pid as number) : null) };
+}
+
+test("a copy in the plugin cache that an update left behind says so, installs nothing and checks for nothing; a detached one leaves the session to the new one", async () => {
+  const v = versions();
+  const loaded = v.run("0.2.0");
+  await until(() => loaded.lines().some((l) => l.type === "updated"));
+  await wait(1500);
+  expect(fs.existsSync(path.join(v.claudeDir, "isoplan", "wake.json"))).toBe(false);
+  expect(fs.existsSync(path.join(v.claudeDir, "isoplan", "update.json"))).toBe(false);
+  expect(loaded.lines().filter((l) => l.type === "updated")).toHaveLength(1);
+  children.splice(0).forEach((c) => c.kill());
+
+  fs.rmSync(path.join(v.claudeDir, "isoplan", "live"), { recursive: true, force: true }); // the killed one's lock
+  const detached = v.run("0.2.0", "--detached");
+  expect(await detached.exited).toBe(0);
+  expect(fs.existsSync(v.lock)).toBe(false);
+  expect(fs.readFileSync(path.join(v.claudeDir, "isoplan", "logs", "s1.log"), "utf8")).toMatch(/a newer version of the Isoplan plugin is installed/);
+});
+
+test("after /reload-plugins the old version's data layer leaves the session to the new one's, and of one version the later start keeps it", async () => {
+  // A session the office takes, so each data layer makes a pass every second.
+  const o = await office();
+  o.state.repos = ["github.com/team/app"];
+  const v = versions(o.url);
+  const old = v.run("0.2.0");
+  await until(() => fs.existsSync(v.lock) && v.holder() === old.pid);
+  const reloaded = v.run("0.3.0");
+  expect(await old.exited).toBe(0);
+  expect(old.lines().some((l) => l.text?.includes("a reload started reports this session now"))).toBe(true);
+  expect(old.lines().at(-1)).toEqual({ type: "superseded", reason: "newer" });
+  await wait(2500);
+  expect(reloaded.hasExited()).toBe(false);
+  expect(v.holder()).toBe(reloaded.pid);
+  expect(reloaded.lines().some((l) => l.type === "updated")).toBe(false);
+  // The old version started again (its hooks module wasn't unloaded) leaves at once, without taking the session.
+  const restarted = v.run("0.2.0");
+  expect(await restarted.exited).toBe(0);
+  expect(restarted.lines()).toContainEqual({ type: "superseded", reason: "newer" });
+  expect(v.holder()).toBe(reloaded.pid);
+
+  // A reload with no new version, or the session opened in a second window: the later start keeps it.
+  const again = v.run("0.3.0");
+  expect(await reloaded.exited).toBe(0);
+  expect(reloaded.lines().at(-1)).toEqual({ type: "superseded", reason: "window" });
+  await wait(2500);
+  expect(again.hasExited()).toBe(false);
+  expect(v.holder()).toBe(again.pid);
+});
+
+test("a data layer never gives the session up to an older or equal holder, nor to one whose lock went stale", async () => {
+  const v = versions();
+  const gaveUp = (r: ReturnType<typeof v.run>) => r.lines().some((l) => l.type === "superseded");
+  // Outdated (0.2.0 here), but the holder is no newer: an older or equal window's data layer that started first.
+  v.held("0.2.0", Date.now() - 60000);
+  const equal = v.run("0.2.0");
+  await until(() => v.holder() === equal.pid);
+  expect(gaveUp(equal)).toBe(false);
+  children.splice(0).forEach((c) => c.kill());
+
+  // The newest copy and a later window, but its lock hasn't been refreshed for five minutes: its pid may be another process's.
+  v.held("0.3.0", Date.now() + 60000, 5 * 60000);
+  const stale = v.run("0.2.0");
+  await until(() => v.holder() === stale.pid);
+  expect(gaveUp(stale)).toBe(false);
+  children.splice(0).forEach((c) => c.kill());
+
+  // The same holder, fresh: it is given the session.
+  v.held("0.3.0", Date.now() + 60000);
+  const fresh = v.run("0.2.0");
+  expect(await fresh.exited).toBe(0);
+  expect(fresh.lines()).toContainEqual({ type: "superseded", reason: "newer" });
 });

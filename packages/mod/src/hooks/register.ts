@@ -1,6 +1,7 @@
 // Isoplan's hooks module: Claude Code loads it through hooks/hooks.json. It draws nothing. It
 // starts the data layer (dist/data-layer.js) for the session and keeps it running, shows the link
-// in one status line, writes the room titles the data layer asks for on the owner's own login,
+// in one status line, with "Isoplan updated: type /reload-plugins" beside it once the data layer says
+// a newer version of the plugin is on disk (src/update), writes the room titles the data layer asks for on the owner's own login,
 // and adds the office server's conflict notes to the agent's next tool result. When the office
 // server wants the machine paired, a "Pair this machine" link is in the status line while it waits,
 // and in the transcript once per session start, so nobody types a command or is nagged.
@@ -28,7 +29,13 @@
 // The data layer talks back as JSON lines on stdout (src/lines.ts). Claude Code closes the child's
 // stdin at launch, so what goes the other way, a title, goes through a file the line names. A data
 // layer that ends is started again, backing off while it keeps failing; one running for a session
-// id the process has left (a /clear, a resume) is started again for the new id.
+// id the process has left (a /clear, a resume) is started again for the new id. It passes the
+// time this module started (`--since`), so the data layers of a window that started later win the
+// session. Once this copy's folder has gone (Claude Code cleans up a version some time after an
+// update), nothing is started again, and the status line asks for /reload-plugins. A data layer
+// that says another reports the session (a `superseded` line: a newer version's after a reload, or
+// another window's) is started again only SUPERSEDED_RECHECK_MS later, and goes on if the session
+// is free by then.
 
 import type { AskedMessage, ConflictMessage } from "@isoplan/protocol";
 import { endText, MAX_WAIT_MS } from "../ask/text.js";
@@ -41,6 +48,8 @@ const STABLE_MS = 60000;
 // After a session ends, the process may go on under a new id (a /clear, a resume) with no
 // session.start; the id is looked at again this long after.
 const SWITCH_CHECK_MS = 1000;
+// How long after its data layer handed the session over this module tries again.
+const SUPERSEDED_RECHECK_MS = 60000;
 // The most of a server's note that reaches the model, and of a late reply from the room.
 const NOTE_MAX = 1000;
 // The script's whole wait fits in MAX_WAIT_MS (five minutes) whatever runner.json says, and
@@ -75,6 +84,9 @@ let pairSaid = false; // a link was put in the transcript since the session star
 // The questions waiting for an answer from the floor too, by their call's id: each ends its call.
 const floorWaits = new Map<string, (answers: Record<string, string>) => void>();
 let waitsDir: string | null = null; // where the waits are marked, as the data layer said
+let shownStatus: string | undefined; // the status line, without the update note
+let updated = false; // a newer version of the plugin is on disk, loaded at /reload-plugins
+let superseded: "newer" | "window" | null = null; // the data layer said another reports this session now, and why
 let marking: Promise<unknown> = Promise.resolve(); // the marks, written in order
 
 export function register(on: On): void {
@@ -170,7 +182,13 @@ async function checkSession($: Host): Promise<void> {
 async function run($: Host): Promise<void> {
   const script = $.plugin.root.replace(/\\/g, "/") + "/dist/data-layer.js";
   let failures = 0;
+  const since = await $.clock.now();
   for (;;) {
+    if (!(await isThere($, script))) {
+      updated = true;
+      show($, undefined);
+      return;
+    }
     const session = await $.session.id();
     const cwd = await $.session.cwd();
     if (session !== running) {
@@ -193,7 +211,7 @@ async function run($: Host): Promise<void> {
     let code: number | null = null;
     const startedAt = await $.clock.now();
     try {
-      const child = $.process.spawn({ argv: ["node", script, "--session", session, "--cwd", cwd], cwd });
+      const child = $.process.spawn({ argv: ["node", script, "--session", session, "--cwd", cwd, "--since", String(since)], cwd });
       let buffer = "";
       for (;;) {
         const piece = await Promise.race([child.next(), switching]);
@@ -223,6 +241,14 @@ async function run($: Host): Promise<void> {
       $.ui.log("isoplan: the data layer could not run: " + message(err), { to: "debug" });
     }
     stop = null;
+    if (superseded) {
+      if (superseded === "newer") updated = true;
+      show($, superseded === "newer" ? undefined : "Isoplan: this session is reported from its other window");
+      superseded = null;
+      failures = 0;
+      await $.clock.sleep(SUPERSEDED_RECHECK_MS);
+      continue;
+    }
     if (switched) {
       failures = 0;
       continue;
@@ -231,7 +257,8 @@ async function run($: Host): Promise<void> {
     // backs off, however many lines it wrote first.
     failures = (await $.clock.now()) - startedAt >= STABLE_MS ? 1 : failures + 1;
     const delay = Math.min(RETRY_CAP_MS, 1000 * failures);
-    $.ui.status(
+    show(
+      $,
       !began
         ? "Isoplan needs Node.js on PATH (couldn't start `node`)"
         : `Isoplan: the data layer stopped${code === null ? "" : ` (node exited with code ${code})`}; restarting in ${Math.round(delay / 1000)}s`,
@@ -251,7 +278,14 @@ function handle($: Host, text: string): void {
   }
   switch (line.type) {
     case "status":
-      $.ui.status(statusText(line));
+      show($, statusText(line));
+      break;
+    case "updated":
+      updated = true;
+      show($, shownStatus);
+      break;
+    case "superseded":
+      superseded = line.reason;
       break;
     case "title-ask":
       writeTitle($, line);
@@ -264,7 +298,7 @@ function handle($: Host, text: string): void {
       if (!pairSaid) $.ui.log(`Isoplan: to report to ${line.server}, pair this machine: click ${line.url} on this computer and approve it in the office.`);
       pairSaid = true;
       pairing = line;
-      $.ui.status(pairText(line));
+      show($, pairText(line));
       break;
     case "conflict":
       addNote(line);
@@ -293,6 +327,15 @@ function handle($: Host, text: string): void {
     }
   }
 }
+
+// The status line: `text`, with the update note beside it once there is one. The mod reloads with
+// the plugin, so a reload clears the note.
+function show($: Host, text: string | undefined): void {
+  shownStatus = text;
+  $.ui.status(updated ? [text, UPDATED_TEXT].filter(Boolean).join(" · ") : text);
+}
+
+const UPDATED_TEXT = "Isoplan updated: type /reload-plugins";
 
 function statusText(line: StatusLine): string {
   switch (line.state) {
@@ -412,6 +455,15 @@ function writeTitle($: Host, ask: TitleAskLine): void {
     .finally(() => {
       asking = false;
     });
+}
+
+// Whether a file is there; true when the host can't say (no $.fs.exists, or it throws).
+async function isThere($: Host, file: string): Promise<boolean> {
+  try {
+    return typeof $.fs.exists !== "function" || (await $.fs.exists(file)) !== false;
+  } catch {
+    return true;
+  }
 }
 
 const message = (err: unknown) => String((err && (err as Error).message) || err);
