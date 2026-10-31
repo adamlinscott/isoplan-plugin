@@ -270,6 +270,7 @@ function handle($, text) {
 			for (const question of floorWaits.keys()) mark($, question, true);
 			break;
 		case "error": {
+			if (line.code === "not-wanted") break;
 			const said = `Isoplan: the office server says: ${line.message} (${line.code})`;
 			if (said !== lastError) $.ui.log(said);
 			lastError = said;
@@ -289,9 +290,9 @@ function statusText(line) {
 		case "connected":
 			lastError = null;
 			return `Isoplan: connected to ${line.server}`;
-		case "not-wanted": return `Isoplan: this repo isn't in any office on ${line.server}`;
-		case "not-approved": return line.workspace ? `Isoplan: no repo in this folder is in the office on ${line.server}, so nothing of this session is sent` : `Isoplan: this repo isn't in the office on ${line.server}, so nothing of this session is sent`;
-		case "no-list": return `Isoplan: can't tell yet which repos ${line.server} takes, so nothing of this session is sent`;
+		case "not-wanted":
+		case "not-approved":
+		case "no-list": return;
 		case "taken": return "Isoplan: this session belongs to someone else on the office, so it isn't reported";
 		case "insecure": return `Isoplan: not reporting: ${line.server} is plain ws:// to another machine; use wss://, or set "allowPlainWs": true in config.json`;
 		case "pairing": return pairing ? pairText(pairing) : `Isoplan: waiting for this machine to be paired with ${line.server}`;

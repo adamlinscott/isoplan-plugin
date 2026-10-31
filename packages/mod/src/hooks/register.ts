@@ -319,7 +319,9 @@ function handle($: Host, text: string): void {
       for (const question of floorWaits.keys()) mark($, question, true);
       break;
     case "error": {
-      // Shown once in the transcript (never to the model), not on every reconnect.
+      // Shown once in the transcript (never to the model), not on every reconnect. A repo the office
+      // doesn't take shows nothing at all: Isoplan stays invisible outside the office.
+      if (line.code === "not-wanted") break;
       const said = `Isoplan: the office server says: ${line.message} (${line.code})`;
       if (said !== lastError) $.ui.log(said);
       lastError = said;
@@ -337,7 +339,7 @@ function show($: Host, text: string | undefined): void {
 
 const UPDATED_TEXT = "Isoplan updated: type /reload-plugins";
 
-function statusText(line: StatusLine): string {
+function statusText(line: StatusLine): string | undefined {
   switch (line.state) {
     case "waiting":
       return `Isoplan: ${line.server}, not connected yet (nothing to report)`;
@@ -346,14 +348,12 @@ function statusText(line: StatusLine): string {
     case "connected":
       lastError = null;
       return `Isoplan: connected to ${line.server}`;
+    // Outside the office Isoplan shows nothing: nothing of the session is sent, and the developer's
+    // own work isn't interrupted. The data layer's log still says why.
     case "not-wanted":
-      return `Isoplan: this repo isn't in any office on ${line.server}`;
     case "not-approved":
-      return line.workspace
-        ? `Isoplan: no repo in this folder is in the office on ${line.server}, so nothing of this session is sent`
-        : `Isoplan: this repo isn't in the office on ${line.server}, so nothing of this session is sent`;
     case "no-list":
-      return `Isoplan: can't tell yet which repos ${line.server} takes, so nothing of this session is sent`;
+      return undefined;
     case "taken":
       return "Isoplan: this session belongs to someone else on the office, so it isn't reported";
     case "insecure":
