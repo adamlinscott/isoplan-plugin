@@ -6888,6 +6888,8 @@ const WRITTEN = [
 	"titles",
 	"released",
 	"waits",
+	"answers",
+	"handoffs",
 	"approved.json",
 	"update.json",
 	"update.lock"
@@ -6897,6 +6899,7 @@ const SESSION_TRACES = [
 	"titles",
 	"released",
 	"waits",
+	"answers",
 	"approved.json",
 	"update.json",
 	"update.lock"
