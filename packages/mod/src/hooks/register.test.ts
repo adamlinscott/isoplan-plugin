@@ -104,6 +104,19 @@ test("hooks: starts the data layer for its session and shows the link's state, t
   expect(h.status).toEqual(["Isoplan: connected to ws://127.0.0.1:4747/data-layer", "Isoplan: the data layer stopped (node exited with code 0); restarting in 1s"]);
 });
 
+test("hooks: in a repo the office doesn't take, Isoplan shows nothing: no status line and nothing in the transcript", async () => {
+  const server = "ws://127.0.0.1:4747/data-layer";
+  const h = await start([
+    { type: "status", server, state: "not-approved" },
+    { type: "status", server, state: "no-list" },
+    { type: "status", server, state: "not-wanted" },
+    { type: "error", code: "not-wanted", message: "this project isn't in any office on this server" },
+  ] as DataLayerLine[]);
+  await stopped(h);
+  expect(h.status.slice(0, -1)).toEqual([undefined, undefined, undefined]);
+  expect(h.logged).toEqual([]);
+});
+
 test("hooks: once a newer version is on disk, the status line says to reload, beside the link's state", async () => {
   const h = await start([connected, { type: "updated" }, { type: "status", server: "ws://127.0.0.1:4747/data-layer", state: "disconnected", retryInMs: 2000 }]);
   await stopped(h);
