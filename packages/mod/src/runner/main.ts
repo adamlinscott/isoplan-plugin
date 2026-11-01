@@ -47,11 +47,12 @@ import { createLink } from "../data-layer/link.js";
 import { createPairing, pairingEntry, pairingLockPath, pairingPath, pairingWriteLockPath, readPairing } from "../data-layer/pairing.js";
 import { HOLD_OFF_MS, alive, holdOff, lockPath, readLock, refreshLock, releaseLock, takeLock } from "../wake/lock.js";
 import { openLedger } from "./caps.js";
-import { createClaudeAnswerer, forkableId } from "./claude.js";
+import { createClaudeAnswerer, forkableId, forkEnv } from "./claude.js";
 import { claudeBinary } from "./claude-binary.js";
 import { anyRoomSince, askableMs, NOT_WANTED_CODE, supervise, UNPAIRED_CODE } from "./lifecycle.js";
 import { loadPrompts } from "./prompts.js";
 import { createRunGit, gitFailed, handoffBranch, handoffNote, HandoffGitError, prepare, pushHandoff, type Prepared } from "../handoff/git.js";
+import { findOrca, orcaRunner } from "../handoff/orca.js";
 import { takeHandoff, type TakeSettings } from "../handoff/take.js";
 import { recordTakenOffice } from "../handoff/taken-office.js";
 import { answerOffices } from "./offices.js";
@@ -167,6 +168,9 @@ async function worker(): Promise<number> {
     else if (line.type === "error") log(`the office server at ${server} says: ${line.message} (${line.code})`);
     else if (line.type === "pair") log(`to answer for this machine's rooms through ${line.server}, pair it: click ${line.url} on this computer and approve it in the office (it works until ${line.expires})`);
   };
+  // Orca's CLI, as the runner starts: the office offers a take into Orca only where it is.
+  const orca = () => findOrca(process.env, process.platform, os.homedir());
+  const hasOrca = (await orca()) !== null;
   const homeIo = machineHomeIo(first.workspaceRepos);
   const ledger = await openLedger(path.join(isoplanDir, "runner", "ledger.json"));
   // What each brief's prepare found, by handoff, for its push and any push anyway after it.
@@ -249,6 +253,10 @@ async function worker(): Promise<number> {
           claudeJson,
           scan: scanText,
           log,
+          orca: async () => {
+            const bin = await orca();
+            return bin ? orcaRunner(bin, forkEnv(process.env)) : null;
+          },
         });
         if (taken.session) await recordTakenOffice(claudeDir, taken.session, server).catch(() => {});
         return taken;
@@ -279,6 +287,7 @@ async function worker(): Promise<number> {
           v: PROTOCOL_VERSION,
           account,
           machine: { name: os.hostname() },
+          ...(hasOrca ? { orca: true } : {}),
         },
       });
     },

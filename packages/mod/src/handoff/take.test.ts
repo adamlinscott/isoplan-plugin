@@ -5,7 +5,8 @@ import { expect, test, vi } from "vitest";
 import { tempRoot } from "../data-layer/fixture.js";
 import { nodeIo } from "../data-layer/io.js";
 import { createRunGit, pushHandoff, type RunGit } from "./git.js";
-import { git, remoteAndClone, workspace } from "./fixture.js";
+import { fakeOrca, git, remoteAndClone, workspace } from "./fixture.js";
+import { orcaRunner } from "./orca.js";
 import { checkoutHere, findClone, findWorkspace, launch, onTheWire, parseSetup, sessionArgv, takeHandoff, trustFolder, trustKey, type Background, type Launch, type TakeOptions } from "./take.js";
 
 // Every test here drives real git, a few dozen spawns each, which is slow on Windows under load.
@@ -109,6 +110,71 @@ test("headless: a session claude agents doesn't list is reported, not taken", as
   const taken = await takeHandoff({ handoff: t.handoff, mode: "headless", session: SESSION }, { ...t.options, agents: async () => [] });
   expect(taken.session).toBe(undefined);
   expect(taken.failures).toEqual([{ step: "open", output: expect.stringContaining("doesn't list session") }]);
+});
+
+// A take into Orca with the fake Orca CLI: what it was asked, and the take's options that use it.
+function intoOrca(t: Awaited<ReturnType<typeof handedOver>>, setup: Parameters<typeof fakeOrca>[1] = {}) {
+  const orca = fakeOrca(t.root, setup);
+  return { orca, options: { ...t.options, orca: async () => orcaRunner(orca.bin, { ...process.env } as Record<string, string>) } };
+}
+
+test("into Orca: the clone added to Orca, Orca's own worktree on the handoff's branch, setup, then Claude Code in an Orca terminal in front, under the server's session id", async () => {
+  const t = await handedOver("h2o", { command: "node -e \"require('fs').writeFileSync('setup-ran.txt', 'yes')\"" });
+  const { orca, options } = intoOrca(t);
+  const taken = await takeHandoff({ handoff: t.handoff, mode: "orca", session: SESSION }, options);
+  expect(taken).toEqual({ type: "taken", v: 1, handoff: "h2o", session: `claude-code:${SESSION}`, failures: [] });
+  const dir = path.join(orca.workspaces, "handoff-h2o");
+  expect(git(dir, "branch", "--show-current")).toBe("isoplan/handoff/h2o");
+  expect(git(dir, "rev-parse", "--abbrev-ref", "@{upstream}")).toBe("origin/isoplan/handoff/h2o");
+  expect(fs.readFileSync(path.join(dir, "app.js"), "utf8")).toBe("console.log('handed over');\n");
+  expect(fs.readFileSync(path.join(dir, "setup-ran.txt"), "utf8")).toBe("yes");
+  expect(fs.existsSync(`${t.receiver.clone}-handoff-h2o`)).toBe(false);
+  const launcher = path.join(t.claudeDir, "isoplan", "handoffs", "h2o", "open.cmd");
+  expect(orca.calls()).toEqual([
+    ["repo", "show", "--repo", `path:${t.receiver.clone}`],
+    ["repo", "add", "--path", t.receiver.clone],
+    ["worktree", "create", "--repo", `path:${t.receiver.clone}`, "--name", "handoff-h2o", "--branch", "isoplan/handoff/h2o", "--base-branch", "origin/isoplan/handoff/h2o", "--no-parent", "--setup", "skip", "--comment", "Isoplan handoff h2o"],
+    ["terminal", "create", "--worktree", `path:${dir}`, "--title", "Isoplan handoff h2o", "--command", `"${launcher}"`, "--shell", "cmd.exe", "--focus"],
+  ]);
+  expect(fs.readFileSync(launcher, "utf8")).toMatch(new RegExp(`"--session-id" "${SESSION}" "--name" "Isoplan handoff h2o"`));
+  expect(JSON.parse(fs.readFileSync(t.claudeJson, "utf8")).projects[trustKey(dir, "win32")]).toEqual({ hasTrustDialogAccepted: true });
+  // No window of Isoplan's own, and no background session.
+  expect(t.opened).toEqual([]);
+  expect(t.started).toEqual([]);
+
+  // Taken again: Orca's worktree moves to the branch as handed over now, and Orca makes no other.
+  fs.writeFileSync(path.join(t.sender.clone, "app.js"), "console.log('again');\n");
+  const repo = await pushed(t.sender.clone, "h2o");
+  expect((await takeHandoff({ handoff: { ...t.handoff, repos: [repo] }, mode: "orca", session: SESSION }, options)).failures).toEqual([]);
+  expect(fs.readFileSync(path.join(dir, "app.js"), "utf8")).toBe("console.log('again');\n");
+  expect(orca.calls().slice(4).map((c) => c.slice(0, 2).join(" "))).toEqual(["repo show", "worktree show", "terminal create"]);
+});
+
+test("into Orca, a clone whose core.hooksPath is set gets the take's own worktree, with hooks off, which Orca finds by its path", async () => {
+  const t = await handedOver("h2p");
+  git(t.receiver.clone, "config", "core.hooksPath", ".githooks");
+  const { orca, options } = intoOrca(t, { repos: [t.receiver.clone] });
+  expect((await takeHandoff({ handoff: t.handoff, mode: "orca", session: SESSION }, options)).failures).toEqual([]);
+  const dir = `${t.receiver.clone}-handoff-h2p`;
+  expect(git(dir, "branch", "--show-current")).toBe("isoplan/handoff/h2p");
+  expect(orca.calls().map((c) => c.slice(0, 2).join(" "))).toEqual(["repo show", "worktree show", "terminal create"]);
+  expect(orca.calls()[1]).toEqual(["worktree", "show", "--worktree", `path:${dir}`]);
+});
+
+test("into Orca without Orca on the machine: nothing is made or opened, and the take says so", async () => {
+  const t = await handedOver("h2q");
+  const taken = await takeHandoff({ handoff: t.handoff, mode: "orca", session: SESSION }, { ...t.options, orca: async () => null });
+  expect(taken).toEqual({ type: "taken", v: 1, handoff: "h2q", failures: [{ step: "open", output: "Orca wasn't found on sam-laptop, so nothing was made or opened: take it again from the floor another way." }] });
+  expect(git(t.receiver.clone, "worktree", "list")).not.toContain("handoff-h2q");
+  expect(t.opened).toEqual([]);
+});
+
+test("into Orca, a terminal Orca won't open is reported, and no session is taken", async () => {
+  const t = await handedOver("h2r");
+  const { options } = intoOrca(t, { repos: [t.receiver.clone], fail: { "terminal create": "runtime_unavailable" } });
+  const taken = await takeHandoff({ handoff: t.handoff, mode: "orca", session: SESSION }, options);
+  expect(taken.session).toBe(undefined);
+  expect(taken.failures).toEqual([{ step: "open", output: expect.stringMatching(/^Orca couldn't open Claude Code in .*handoff-h2r: runtime_unavailable$/) }]);
 });
 
 test("a handoff that doesn't say how to open its session is refused, and opens nothing", async () => {

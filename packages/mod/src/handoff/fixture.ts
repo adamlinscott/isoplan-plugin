@@ -73,3 +73,53 @@ export function workspace(root: string, name: string, { parent = true, ignores =
   }
   return { dir, remotes };
 }
+
+/**
+ * A fake Orca CLI at <root>/fake-orca.mjs, run with node: it logs each command's arguments, keeps
+ * its projects in a state file, makes a worktree in <root>/orca-workspaces with git as Orca would,
+ * and answers as Orca's --json does. `fail` makes a command (such as "terminal create") answer an
+ * error. Nothing it does opens a window.
+ */
+export function fakeOrca(root: string, { repos = [] as string[], fail = {} as Record<string, string> } = {}) {
+  const bin = path.join(root, "fake-orca.mjs");
+  const state = path.join(root, "fake-orca.json");
+  const log = path.join(root, "fake-orca.log");
+  const workspaces = path.join(root, "orca-workspaces");
+  fs.writeFileSync(state, JSON.stringify({ repos, fail, workspaces, log }));
+  fs.writeFileSync(
+    bin,
+    `import fs from "node:fs";
+import path from "node:path";
+import { execFileSync } from "node:child_process";
+const file = ${JSON.stringify(state)};
+const state = JSON.parse(fs.readFileSync(file, "utf8"));
+const args = process.argv.slice(2).filter((a) => a !== "--json");
+fs.appendFileSync(state.log, JSON.stringify(args) + "\\n");
+const flag = (name) => args[args.indexOf(name) + 1];
+const key = (p) => path.resolve(p).toLowerCase();
+const answer = (body, code = 0) => (process.stdout.write(JSON.stringify(body)), process.exit(code));
+const command = args.slice(0, 2).join(" ");
+if (state.fail[command]) answer({ ok: false, error: { code: "failed", message: state.fail[command] } }, 1);
+if (command === "repo show") {
+  const at = flag("--repo").slice("path:".length);
+  if (!state.repos.some((r) => key(r) === key(at))) answer({ ok: false, error: { code: "repo_not_found", message: "repo_not_found" } }, 1);
+  answer({ ok: true, result: { repo: { path: at } } });
+}
+if (command === "repo add") {
+  state.repos.push(flag("--path"));
+  fs.writeFileSync(file, JSON.stringify(state));
+  answer({ ok: true, result: { repo: { path: flag("--path") } } });
+}
+if (command === "worktree create") {
+  const dir = path.join(state.workspaces, flag("--name"));
+  execFileSync("git", ["worktree", "add", "-q", "-b", flag("--branch"), dir, flag("--base-branch")], { cwd: flag("--repo").slice("path:".length), stdio: "ignore", windowsHide: true });
+  answer({ ok: true, result: { worktree: { path: dir.replace(/\\\\/g, "/"), branch: "refs/heads/" + flag("--branch") } } });
+}
+if (command === "worktree show") answer({ ok: true, result: { worktree: { path: flag("--worktree").slice("path:".length) } } });
+if (command === "terminal create") answer({ ok: true, result: { terminal: { handle: "term_1" } } });
+answer({ ok: false, error: { code: "unknown_command", message: "unknown command " + command } }, 1);
+`,
+  );
+  const calls = () => (fs.existsSync(log) ? fs.readFileSync(log, "utf8").trim().split("\n").filter(Boolean).map((line) => JSON.parse(line) as string[]) : []);
+  return { bin, workspaces, calls };
+}
