@@ -485,9 +485,10 @@ function writeTitle($: Host, ask: TitleAskLine): void {
 }
 
 // Whether a file is there; true when the host can't say (no $.fs.exists, or it throws).
+// Always called, never read: the host refuses a hooks module that reads $.fs.exists as a value.
 async function isThere($: Host, file: string): Promise<boolean> {
   try {
-    return typeof $.fs.exists !== "function" || (await $.fs.exists(file)) !== false;
+    return (await $.fs.exists!(file)) !== false; // throws when the host has no exists
   } catch {
     return true;
   }

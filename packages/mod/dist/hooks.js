@@ -434,7 +434,7 @@ function writeTitle($, ask) {
 }
 async function isThere($, file) {
 	try {
-		return typeof $.fs.exists !== "function" || await $.fs.exists(file) !== false;
+		return await $.fs.exists(file) !== false;
 	} catch {
 		return true;
 	}
