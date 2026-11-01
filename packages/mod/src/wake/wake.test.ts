@@ -96,6 +96,29 @@ test("wake: with several offices, any office's list that takes one of the repos 
   expect(await s.run(() => false)).toBe(true);
 });
 
+test("wake: the list of an office that didn't want the session, or of one no longer configured, never starts it again; another's does, and the lock keeps the office that didn't (#105)", async () => {
+  const s = setup();
+  const internal = "wss://isoplan-internal.example/data-layer";
+  const dev = "ws://127.0.0.1:4747/data-layer";
+  const gone = "wss://old.example/data-layer";
+  const until = Date.now() + HOLD_OFF_MS;
+  await takeLock(s.lock, OTHER);
+  await holdOff(s.lock, OTHER, until, { reason: "not-approved", projects: ["github.com/team/app"], offices: [internal, dev], notWanted: { [internal]: until } });
+  const list = (server: string, repos: string[]) => {
+    const file = approvedPath(s.claudeDir, server);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, JSON.stringify({ server, version: "v1", repos, fetched: Date.now(), checked: Date.now() }));
+  };
+  // The office that didn't want it takes the repo, as it did all along; a folder of one taken out of config.json does too.
+  list(internal, ["github.com/team/app"]);
+  list(gone, ["github.com/team/app"]);
+  expect(await s.run(() => false)).toBe(false);
+  // The other office takes it now: the session starts again, told to leave the first alone.
+  list(dev, ["github.com/team/app"]);
+  expect(await s.run(() => false)).toBe(true);
+  expect(JSON.parse(fs.readFileSync(s.lock, "utf8"))).toEqual({ notWanted: { [internal]: until } });
+});
+
 test("wake: starts the newest data layer Claude Code has installed, not an older one wake.json still records", async () => {
   const root = tempRoot();
   const claudeDir = path.join(root, ".claude");

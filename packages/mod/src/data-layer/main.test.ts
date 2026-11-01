@@ -22,11 +22,15 @@ afterEach(async () => {
   for (const close of servers.splice(0)) await close();
 });
 
-/** A stand-in office server: GET /data-layer/repos answers `list` (or `status`), and every data-layer socket is kept. */
+/**
+ * A stand-in office server: GET /data-layer/repos answers `list` (or `status`, or nothing while it
+ * `hangs`), and every data-layer socket is kept; with `notWanted` a hello is told the project isn't wanted.
+ */
 async function office() {
-  const state = { repos: [] as string[], version: 1, status: 200, connections: [] as { messages: { type: string }[]; closed: boolean; close(): void }[] };
+  const state = { repos: [] as string[], version: 1, status: 200, hangs: false, notWanted: false, connections: [] as { messages: { type: string }[]; closed: boolean; close(): void }[] };
   const server = http.createServer((request, response) => {
     if (!request.url?.startsWith("/data-layer/repos")) return void response.writeHead(404).end();
+    if (state.hangs) return;
     if (state.status !== 200) return void response.writeHead(state.status).end("{}");
     response.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ version: `v${state.version}`, repos: state.repos }));
   });
@@ -34,11 +38,15 @@ async function office() {
   wss.on("connection", (ws) => {
     const c = { messages: [] as { type: string }[], closed: false, close: () => ws.close() };
     state.connections.push(c);
-    ws.on("message", (data) => c.messages.push(JSON.parse(String(data))));
+    ws.on("message", (data) => {
+      const message = JSON.parse(String(data)) as { type: string };
+      c.messages.push(message);
+      if (message.type === "hello" && state.notWanted) ws.send(JSON.stringify({ type: "error", v: 1, code: "not-wanted", message: "this project isn't in any office on this server" }));
+    });
     ws.on("close", () => (c.closed = true));
   });
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
-  servers.push(() => new Promise((resolve) => (wss.close(), server.close(resolve))));
+  servers.push(() => new Promise((resolve) => (wss.close(), server.closeAllConnections(), server.close(resolve))));
   return { state, url: `ws://127.0.0.1:${(server.address() as AddressInfo).port}/data-layer` };
 }
 
@@ -148,6 +156,44 @@ test("a session reports to every office whose list takes its repo, each on its o
   // Each office's copy of its list is its own.
   const lists = fs.readdirSync(path.join(claudeDir, "isoplan", "offices")).map((id) => JSON.parse(fs.readFileSync(path.join(claudeDir, "isoplan", "offices", id, "approved.json"), "utf8")).server);
   expect(lists.sort()).toEqual([internal.url, dev.url].sort());
+});
+
+test("a slow office's list never holds up another's: the one that answers gets the session at once (#105)", async () => {
+  const slow = await office();
+  const fast = await office();
+  slow.state.hangs = true;
+  fast.state.repos = ["github.com/team/app"];
+  const began = Date.now();
+  start("ws://127.0.0.1:9/data-layer", { servers: [{ label: "slow", server: slow.url }, { label: "fast", server: fast.url }] });
+  await until(() => fast.state.connections[0]?.messages.some((m) => m.type === "hello") ?? false);
+  // The slow one's list is asked for with a 15 s timeout; the fast one doesn't wait for it.
+  expect(Date.now() - began).toBeLessThan(10000);
+  expect(slow.state.connections).toEqual([]);
+});
+
+test("one office not wanting the session while no other takes its repo holds it off naming that office; started again, it leaves that office alone (#105)", async () => {
+  const internal = await office();
+  const dev = await office();
+  internal.state.repos = ["github.com/team/app"];
+  internal.state.notWanted = true;
+  const servers = [{ label: "internal", server: internal.url }, { label: "dev", server: dev.url }];
+  const { claudeDir, exited, lock } = start("ws://127.0.0.1:9/data-layer", { servers, approvedRefreshMinutes: 0.01 });
+  await exited;
+  const held = JSON.parse(fs.readFileSync(lock, "utf8"));
+  expect(held).toMatchObject({ pid: 0, reason: "not-approved", projects: ["github.com/team/app"], offices: [internal.url, dev.url] });
+  expect(held.notWanted[internal.url]).toBeGreaterThan(Date.now());
+
+  // The wake hook starts it again once dev takes the repo, leaving the not-wanted office in the lock.
+  dev.state.repos = ["github.com/team/app"];
+  dev.state.version++;
+  fs.writeFileSync(lock, JSON.stringify({ notWanted: held.notWanted }));
+  const asked = internal.state.connections.length;
+  const repo = path.join(path.dirname(claudeDir), "app");
+  const child = spawn(process.execPath, [path.join(modDir, "dist", "data-layer.js"), "--session", "s1", "--cwd", repo, "--detached"], { cwd: repo, env: { ...process.env, CLAUDE_CONFIG_DIR: claudeDir }, stdio: "ignore", windowsHide: true });
+  children.push(child);
+  await until(() => dev.state.connections[0]?.messages.some((m) => m.type === "hello") ?? false);
+  await wait(1500);
+  expect(internal.state.connections).toHaveLength(asked);
 });
 
 /** Two versions of the plugin in a throwaway plugin cache, Claude Code's record naming the newer, and a way to start either for session s1. */

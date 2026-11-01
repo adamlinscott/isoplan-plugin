@@ -6295,29 +6295,30 @@ async function loadConfig(io, defaultsPath, userPath) {
 	return config;
 }
 /**
-* The offices to report to: each usable entry of `servers` (a wss:// address, or ws://, which goes
-* only to this machine unless allowPlainWs, else it is kept to say why it isn't used), once per
-* address; with none, `server` alone. An entry without a label is labelled by its host.
+* The offices to report to: each entry of `servers` with a ws:// or wss:// address (ws:// goes only
+* to this machine unless allowPlainWs; to another it is kept, to say why it isn't used), once per
+* address; with none, `server` alone. An entry without a label is labelled by its host, and a label
+* already taken gets -2, -3 and so on, so each names one office.
 */
 function officesOf(config) {
 	const offices = [];
+	const add = (server, label, refused) => {
+		let unique = label;
+		for (let n = 2; offices.some((o) => o.label.toLowerCase() === unique.toLowerCase()); n++) unique = `${label}-${n}`;
+		offices.push({
+			label: unique,
+			server,
+			...refused && { plainRefused: true },
+			...server === config.server && { legacy: true }
+		});
+	};
 	for (const entry of config.servers) {
 		const { label, server } = entry ?? {};
 		if (typeof server !== "string" || !URL.canParse(server) || !["ws:", "wss:"].includes(new URL(server).protocol) || offices.some((o) => o.server === server)) continue;
-		const refused = !config.allowPlainWs && !isWebSocketUrl(server);
-		offices.push({
-			label: typeof label === "string" && label.trim() || new URL(server).host,
-			server,
-			...refused && { plainRefused: true }
-		});
+		add(server, typeof label === "string" && label.trim() || new URL(server).host, !config.allowPlainWs && !isWebSocketUrl(server));
 	}
-	if (offices.length) return offices;
-	const server = config.plainRefused ?? config.server;
-	return [{
-		label: new URL(server).host,
-		server,
-		...config.plainRefused && { plainRefused: true }
-	}];
+	if (!offices.length) add(config.plainRefused ?? config.server, new URL(config.plainRefused ?? config.server).host, !!config.plainRefused);
+	return offices;
 }
 /** The same per-key override for any settings file of the mod's, such as the runner's runner.json. */
 async function loadSettings(io, defaultsPath, userPath) {
@@ -6511,13 +6512,14 @@ const WRITE_WAIT_MS = 1e4;
 /** How often the callback tries to write the credential it got before saying it couldn't. */
 const WRITE_TRIES = 4;
 const pairingPath = (claudeDir) => path.join(claudeDir, "isoplan", "pairing.json");
-const pairingLockPath = (claudeDir, server) => path.join(officeDir(claudeDir, server), "pairing.lock");
-/** The account's entry for `server`, or undefined. */
+/** The office's pairing lock; for the server a version before #105 reports to, the one it uses, so the two never answer one pairing at once. */
+const pairingLockPath = (claudeDir, office) => office.legacy ? path.join(claudeDir, "isoplan", "pairing.lock") : path.join(officeDir(claudeDir, office.server), "pairing.lock");
+/** The account's entry for `server`, or undefined: the one under `offices`, else the one under `accounts` when it is that server's. */
 function pairingEntry(all, server, account) {
 	const first = all.accounts[account];
-	return first?.server === server ? first : all.offices?.[server]?.[account];
+	return all.offices?.[server]?.[account] ?? (first?.server === server ? first : void 0);
 }
-/** `all` with the account's entry for `server` set: where it is now, else under `accounts` while that holds no other server's. */
+/** `all` with the account's entry for `server` set, where pairingEntry reads it; a new one under `accounts` while that holds no other server's. */
 function withPairingEntry(all, server, account, entry) {
 	const first = all.accounts[account];
 	if (!all.offices?.[server]?.[account] && (!first || first.server === server)) return {
@@ -7284,6 +7286,20 @@ async function openSideLink(url, hello, timeoutMs) {
 	};
 }
 //#endregion
+//#region src/handoff/taken-office.ts
+const SAFE = /^[\w-]{1,200}$/;
+const recordPath = (claudeDir, session) => path.join(claudeDir, "isoplan", "handoffs", "sessions", `${session}.json`);
+/** The office server the session took its handoff through, or null when none is recorded. */
+async function takenOffice(claudeDir, session) {
+	if (!SAFE.test(session)) return null;
+	try {
+		const { server } = JSON.parse(await fs.readFile(recordPath(claudeDir, session), "utf8"));
+		return typeof server === "string" ? server : null;
+	} catch {
+		return null;
+	}
+}
+//#endregion
 //#region src/ask/text.ts
 /** The longest the ask script waits in all, checks included, whatever runner.json says. */
 const MAX_WAIT_MS = 3e5;
@@ -7367,6 +7383,16 @@ async function askRoom(link, question, s, { key, deadline = Date.now() + MAX_WAI
 	return over(latest) ? endText(latest, false) : waitText(latest);
 }
 const over = (m) => m.state === "answered" || m.state === "dropped";
+/**
+* The offices to ask in, in turn, until one's list takes the session's repo (#105): those that gave
+* the session its rights (`granted`, by address), or every one with none named, in config.json's
+* order, with the one the session took its handoff through (`taken`) first.
+*/
+function askOffices(offices, granted, taken) {
+	const named = granted.length ? offices.filter((o) => granted.includes(o.server)) : [...offices];
+	const first = named.find((o) => o.server === taken);
+	return first ? [first, ...named.filter((o) => o !== first)] : named;
+}
 //#endregion
 //#region src/ask/main.ts
 const CONNECT_MS = 2e4;
@@ -7379,6 +7405,7 @@ const flag = (argv, name) => {
 	const i = argv.indexOf(name);
 	return i >= 0 && argv[i + 1] !== void 0 ? argv[i + 1] : null;
 };
+const flags = (argv, name) => argv.flatMap((arg, i) => arg === name && argv[i + 1] !== void 0 ? [argv[i + 1]] : []);
 const readText = (p) => fs.readFile(p, "utf8").catch(() => null);
 async function hello(session, cwd, token, project) {
 	const machine = os.hostname();
@@ -7396,7 +7423,8 @@ async function hello(session, cwd, token, project) {
 		...token ? { token } : {}
 	};
 }
-async function machinePairing(server, allowPlainWs) {
+async function machinePairing(office, allowPlainWs) {
+	const { server } = office;
 	const account = await accountOf({
 		readText,
 		run: io.run
@@ -7404,7 +7432,7 @@ async function machinePairing(server, allowPlainWs) {
 	const file = pairingPath(claudeDir);
 	const pairing = createPairing({
 		file,
-		lock: pairingLockPath(claudeDir, server),
+		lock: pairingLockPath(claudeDir, office),
 		writeLock: pairingWriteLockPath(claudeDir),
 		server,
 		account,
@@ -7432,28 +7460,29 @@ async function main(argv) {
 	const cwd = flag(argv, "--cwd");
 	const ack = flag(argv, "--ack");
 	const key = flag(argv, "--key") ?? void 0;
-	const asked = flag(argv, "--server");
+	const granted = flags(argv, "--server");
 	if (!session || !cwd) return "usage: ask.js --session <id> --cwd <folder> [--key <id>], with the question on stdin; or --ack <question>";
 	const question = ack ? "" : (await readStdin()).trim();
 	if (!ack && !question) return "Give the question to ask the room.";
 	if (question.length > 4e3) return `That question is too long to ask the room: keep it under ${MAX_QUESTION_LENGTH} characters.`;
 	const settings = await loadSettings(io, path.join(modDir, "runner.json"), path.join(isoplanDir, "runner.json"));
 	const config = await loadConfig(io, path.join(modDir, "config.json"), path.join(isoplanDir, "config.json"));
-	const offices = officesOf(config).filter((o) => !asked || o.server === asked);
-	if (!offices.length) return `The room can't be asked: ${asked} isn't one of the office servers in config.json. Carry on without the answer.`;
+	const offices = askOffices(officesOf(config), granted, await takenOffice(claudeDir, session));
+	if (!offices.length) return `The room can't be asked: ${granted.join(", ")} isn't one of the office servers in config.json. Carry on without the answer.`;
 	let found = { refused: "" };
-	let server = "";
-	for (const office of offices) {
-		found = office.plainRefused ? { refused: `config.json's server ${office.server} is plain ws:// to another machine.` } : await commandHome(cwd, machineHomeIo(config.workspaceRepos), {
-			file: approvedPath(claudeDir, office.server),
-			server: office.server,
+	let office = offices[0];
+	for (const each of offices) {
+		found = each.plainRefused ? { refused: `config.json's server ${each.server} is plain ws:// to another machine.` } : await commandHome(cwd, machineHomeIo(config.workspaceRepos), {
+			file: approvedPath(claudeDir, each.server),
+			server: each.server,
 			maxAgeMs: config.approvedMaxAgeMinutes * 6e4
 		});
-		server = office.server;
+		office = each;
 		if ("home" in found) break;
 	}
 	if ("refused" in found) return `The room can't be asked: ${found.refused} Carry on without the answer.`;
-	const pairing = await machinePairing(server, config.allowPlainWs);
+	const { server } = office;
+	const pairing = await machinePairing(office, config.allowPlainWs);
 	const deadline = Date.now() + MAX_WAIT_MS;
 	try {
 		for (let tries = 0;; tries++) {

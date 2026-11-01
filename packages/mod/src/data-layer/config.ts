@@ -63,24 +63,39 @@ export interface Office {
   server: string;
   /** Plain ws:// to another machine without allowPlainWs: not used, and said why. */
   plainRefused?: true;
+  /**
+   * The server a version before #105 reports to (config.json's `server`): its pairing lock and
+   * released reports stay where that version keeps them, so the two never pair it at once.
+   */
+  legacy?: true;
 }
 
 /**
- * The offices to report to: each usable entry of `servers` (a wss:// address, or ws://, which goes
- * only to this machine unless allowPlainWs, else it is kept to say why it isn't used), once per
- * address; with none, `server` alone. An entry without a label is labelled by its host.
+ * The offices to report to: each entry of `servers` with a ws:// or wss:// address (ws:// goes only
+ * to this machine unless allowPlainWs; to another it is kept, to say why it isn't used), once per
+ * address; with none, `server` alone. An entry without a label is labelled by its host, and a label
+ * already taken gets -2, -3 and so on, so each names one office.
  */
 export function officesOf(config: Config): Office[] {
   const offices: Office[] = [];
+  const add = (server: string, label: string, refused: boolean) => {
+    let unique = label;
+    for (let n = 2; offices.some((o) => o.label.toLowerCase() === unique.toLowerCase()); n++) unique = `${label}-${n}`;
+    offices.push({ label: unique, server, ...(refused && { plainRefused: true as const }), ...(server === config.server && { legacy: true as const }) });
+  };
   for (const entry of config.servers) {
     const { label, server } = (entry ?? {}) as { label?: unknown; server?: unknown };
     if (typeof server !== "string" || !URL.canParse(server) || !["ws:", "wss:"].includes(new URL(server).protocol) || offices.some((o) => o.server === server)) continue;
-    const refused = !config.allowPlainWs && !isWebSocketUrl(server);
-    offices.push({ label: (typeof label === "string" && label.trim()) || new URL(server).host, server, ...(refused && { plainRefused: true as const }) });
+    add(server, (typeof label === "string" && label.trim()) || new URL(server).host, !config.allowPlainWs && !isWebSocketUrl(server));
   }
-  if (offices.length) return offices;
-  const server = config.plainRefused ?? config.server;
-  return [{ label: new URL(server).host, server, ...(config.plainRefused && { plainRefused: true as const }) }];
+  if (!offices.length) add(config.plainRefused ?? config.server, new URL(config.plainRefused ?? config.server).host, !!config.plainRefused);
+  return offices;
+}
+
+/** The office `--office` names: by its label (in any case), its address, or its address's host. */
+export function officeNamed(offices: readonly Office[], name: string): Office | undefined {
+  const n = name.trim();
+  return offices.find((o) => o.label.toLowerCase() === n.toLowerCase()) ?? offices.find((o) => o.server === n || new URL(o.server).host === n.toLowerCase());
 }
 
 /** The same per-key override for any settings file of the mod's, such as the runner's runner.json. */

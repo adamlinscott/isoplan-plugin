@@ -20,11 +20,10 @@
 // Claude account (src/data-layer/pairing.ts; a link to approve goes to the log, and the data layers
 // show the same one in Claude Code), and stays up while any session on the machine is inside its
 // lights-off window. Each office's link answers for that office alone: only for sessions in a repo
-// it takes, from the same list the data layers read (src/data-layer/approved.ts). The forks, the
-// ledger and its caps are the machine's, shared by every office. A server that doesn't want this
-// machine's runner closes its own link, which is opened again after HOLD_OFF_MS; one that says the
-// machine's pairing has ended closes its link until the data layers have paired the machine again.
-// Once no office's link is left, the worker ends: a runner none wants holds off starting again for
+// it takes, from the same list the data layers read (src/data-layer/approved.ts). The forks, their
+// cap (`maxForks`, one for the machine), the ledger and its caps are shared by every office. When a
+// server doesn't want this machine's runner, or says its pairing has ended, only that office's link
+// closes, and opens again later (offices.ts); a runner none wants holds off starting again for
 // HOLD_OFF_MS. The worker exits when its supervisor has gone too, since its stdin closes then, and
 // ends its forks as it goes.
 //
@@ -44,7 +43,7 @@ import { approvedPath, createApproved } from "../data-layer/approved.js";
 import { approvedHome, machineHomeIo, takesFrom } from "../data-layer/home.js";
 import { accountOf, claudePaths } from "../data-layer/identity.js";
 import { nodeIo } from "../data-layer/io.js";
-import { createLink, type Link } from "../data-layer/link.js";
+import { createLink } from "../data-layer/link.js";
 import { createPairing, pairingEntry, pairingLockPath, pairingPath, pairingWriteLockPath, readPairing } from "../data-layer/pairing.js";
 import { HOLD_OFF_MS, alive, holdOff, lockPath, readLock, refreshLock, releaseLock, takeLock } from "../wake/lock.js";
 import { openLedger } from "./caps.js";
@@ -54,7 +53,9 @@ import { anyRoomSince, askableMs, NOT_WANTED_CODE, supervise, UNPAIRED_CODE } fr
 import { loadPrompts } from "./prompts.js";
 import { createRunGit, gitFailed, handoffBranch, handoffNote, HandoffGitError, prepare, pushHandoff, type Prepared } from "../handoff/git.js";
 import { takeHandoff, type TakeSettings } from "../handoff/take.js";
-import { createRunner, PushFailed, type RunnerSettings } from "./runner.js";
+import { recordTakenOffice } from "../handoff/taken-office.js";
+import { answerOffices } from "./offices.js";
+import { createForkSlots, createRunner, PushFailed, type RunnerSettings } from "./runner.js";
 import { loadPatterns, scan } from "./scan.js";
 import { runnerEnvPath } from "./environment.js";
 import { applyClaudeDir, LOCK_REFRESH_MS, RUNNER_FRESH_MS, runnerCode, runnerLockPath } from "./start.js";
@@ -170,19 +171,22 @@ async function worker(): Promise<number> {
   const ledger = await openLedger(path.join(isoplanDir, "runner", "ledger.json"));
   // What each brief's prepare found, by handoff, for its push and any push anyway after it.
   const preparedFor = new Map<string, Prepared>();
-  let wake: () => void = () => {};
+  // One fork cap for the machine, whichever office asks.
+  const forks = createForkSlots();
+  const answering = offices.filter((o) => !o.plainRefused);
+  let send = (_index: number): Parameters<typeof createRunner>[0]["send"] => () => {};
 
-  // One office's link, and the runner answering what it asks, for that office alone.
-  const answerFor = ({ server }: Office) => {
-    const emit = emitFor(server);
+  // The runner answering what one office asks, for that office alone; it outlives its office's link.
+  const runnerFor = (office: Office, index: number) => {
+    const { server } = office;
     const pairing = createPairing({
       file: pairingPath(claudeDir),
-      lock: pairingLockPath(claudeDir, server),
+      lock: pairingLockPath(claudeDir, office),
       writeLock: pairingWriteLockPath(claudeDir),
       server,
       account,
       machine: os.hostname(),
-      emit,
+      emit: emitFor(server),
       allowPlainWs: first.allowPlainWs,
     });
     // The repos the office takes (src/data-layer/approved.ts): the runner answers only for sessions in them.
@@ -192,14 +196,14 @@ async function worker(): Promise<number> {
       await approved.refresh();
       return takesFrom(homeIo, approved.repos());
     };
-    let send: Parameters<typeof createRunner>[0]["send"] = () => {};
     const runner = createRunner({
       answerer,
       ledger,
+      forks,
       settings,
       prompts: () => loadPrompts(path.join(appDir, "prompts")),
       scan: scanText,
-      send: (message) => send(message),
+      send: (message) => send(index)(message),
       log,
       isDir: (p) => fs.stat(p).then((s) => s.isDirectory(), () => false),
       // Only the rooms the data layer would report: inside the askable window, and not held off,
@@ -230,8 +234,9 @@ async function worker(): Promise<number> {
         const pushed = await pushHandoff(git, lead.cwd, handoff, await gitMs(), { scan: scanText, depth: (await settings()).repoSearchDepth, prepared: preparedFor.get(handoff), takes: await takes(), ...(pushAnyway ? { pushAnyway } : {}) }).catch((err) => Promise.reject(told(err)));
         return "held" in pushed ? pushed : pushed.repos;
       },
-      take: (message) =>
-        takeHandoff(message, {
+      // The session it opens asks the room in this office (handoff/taken-office.ts).
+      take: async (message) => {
+        const taken = await takeHandoff(message, {
           run: git,
           io,
           claudeDir,
@@ -243,67 +248,50 @@ async function worker(): Promise<number> {
           claudeJson,
           scan: scanText,
           log,
-        }),
-    });
-    const state = { runner, link: null as Link | null, notWanted: false, unpaired: false };
-    state.link = createLink({
-      url: server,
-      emit,
-      pairing,
-      onMessage: (message) => runner.take(message),
-      onNotWanted: () => {
-        state.notWanted = true;
-        wake();
-      },
-      // A revoked or lapsed pairing closes this link: its data layers pair the machine again.
-      onPairingEnded: () => {
-        state.unpaired = true;
-        wake();
-      },
-      hello: {
-        type: "runner",
-        v: PROTOCOL_VERSION,
-        account,
-        machine: { name: os.hostname() },
+        });
+        if (taken.session) await recordTakenOffice(claudeDir, taken.session, server).catch(() => {});
+        return taken;
       },
     });
-    send = (message) => state.link?.send(message);
-    log(`the runner's worker ${process.pid} is answering for this machine through ${server}`);
-    return state;
+    return { pairing, runner };
   };
-  type Answering = ReturnType<typeof answerFor>;
-  const answering = new Map<Office, Answering & { closedAt?: number }>();
-  for (const office of offices.filter((o) => !o.plainRefused)) answering.set(office, answerFor(office));
-  // Whether the office's link, closed for `state`'s reason, may open again now.
-  const mayReopen = async (office: Office, state: Answering & { closedAt?: number }) =>
-    state.notWanted ? Date.now() - state.closedAt! >= HOLD_OFF_MS : !!pairingEntry(await readPairing(pairingPath(claudeDir)), office.server, account.id)?.credential;
+  const answerers = answering.map(runnerFor);
 
   // The supervisor holds stdin open; it closes when the supervisor has gone.
-  let orphaned = false;
-  const gone = new Promise<void>((resolve) => process.stdin.on("end", resolve).on("error", resolve).resume()).then(() => (orphaned = true));
-  let stopped: "done" | "not-wanted" | "unpaired" = "done";
-  for (;;) {
-    await Promise.race([new Promise<void>((r) => ((wake = r), setTimeout(r, CHECK_MS))), gone]);
-    if (orphaned) break;
-    for (const [office, state] of answering) {
-      if (state.link && (state.notWanted || state.unpaired)) {
-        log(`the runner stopped answering through ${office.server}: ${state.notWanted ? `it doesn't want this machine's runner; asking again in ${HOLD_OFF_MS / 60000} minutes` : "it says this machine's pairing has ended; answering again once it is paired"}`);
-        state.link.close();
-        state.link = null;
-        state.closedAt = Date.now();
-      } else if (!state.link && (await mayReopen(office, state))) answering.set(office, answerFor(office));
-    }
-    const open = [...answering.values()].filter((s) => s.link);
-    if (!open.length) {
-      stopped = [...answering.values()].some((s) => s.notWanted) ? "not-wanted" : "unpaired";
-      break;
-    }
-    if (!open.every((s) => s.runner.idle())) continue;
-    const window = askableMs(await config().catch(() => first));
-    if (!(await anyRoomSince(io, path.join(claudeDir, "projects"), Date.now() - window))) break;
-  }
-  for (const state of answering.values()) state.link?.close();
-  return stopped === "not-wanted" ? NOT_WANTED_CODE : stopped === "unpaired" ? UNPAIRED_CODE : 0;
+  const gone = new Promise<void>((resolve) => process.stdin.on("end", resolve).on("error", resolve).resume());
+  const links = answerOffices({
+    offices: answering,
+    name: (office) => office.server,
+    open: (office, said) => {
+      const { pairing, runner } = answerers[answering.indexOf(office)]!;
+      log(`the runner's worker ${process.pid} is answering for this machine through ${office.server}`);
+      return createLink({
+        url: office.server,
+        emit: emitFor(office.server),
+        pairing,
+        onMessage: (message) => runner.take(message),
+        onNotWanted: said.notWanted,
+        // A revoked or lapsed pairing closes this link: its data layers pair the machine again.
+        onPairingEnded: said.unpaired,
+        hello: {
+          type: "runner",
+          v: PROTOCOL_VERSION,
+          account,
+          machine: { name: os.hostname() },
+        },
+      });
+    },
+    paired: async (office) => !!pairingEntry(await readPairing(pairingPath(claudeDir)), office.server, account.id)?.credential,
+    idle: () => answerers.every((a) => a.runner.idle()),
+    lit: async () => anyRoomSince(io, path.join(claudeDir, "projects"), Date.now() - askableMs(await config().catch(() => first))),
+    gone,
+    log,
+    checkMs: CHECK_MS,
+    holdOffMs: HOLD_OFF_MS,
+  });
+  send = links.sender;
+  const ended = await links.ended;
+  return ended === "not-wanted" ? NOT_WANTED_CODE : ended === "unpaired" ? UNPAIRED_CODE : 0;
 }
 
 process.exitCode = await (process.argv.includes("--worker") ? worker() : supervisor());

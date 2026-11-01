@@ -19,6 +19,8 @@ export interface StatusLine {
   state: "waiting" | "connecting" | "connected" | "disconnected" | "not-wanted" | "not-approved" | "no-list" | "pairing" | "taken" | "insecure";
   /** The office's short name from config.json (#105), for the status line. */
   label?: string;
+  /** With `insecure`: there is no list of this office's to tell whether it takes the session's repo. */
+  unchecked?: true;
   /** With `not-approved`: the session's folder is a workspace, none of whose repos the office takes. */
   workspace?: true;
   /** With `disconnected`: when the next try is. */

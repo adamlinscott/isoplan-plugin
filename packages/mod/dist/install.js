@@ -66,29 +66,30 @@ async function loadConfig(io, defaultsPath, userPath) {
 	return config;
 }
 /**
-* The offices to report to: each usable entry of `servers` (a wss:// address, or ws://, which goes
-* only to this machine unless allowPlainWs, else it is kept to say why it isn't used), once per
-* address; with none, `server` alone. An entry without a label is labelled by its host.
+* The offices to report to: each entry of `servers` with a ws:// or wss:// address (ws:// goes only
+* to this machine unless allowPlainWs; to another it is kept, to say why it isn't used), once per
+* address; with none, `server` alone. An entry without a label is labelled by its host, and a label
+* already taken gets -2, -3 and so on, so each names one office.
 */
 function officesOf(config) {
 	const offices = [];
+	const add = (server, label, refused) => {
+		let unique = label;
+		for (let n = 2; offices.some((o) => o.label.toLowerCase() === unique.toLowerCase()); n++) unique = `${label}-${n}`;
+		offices.push({
+			label: unique,
+			server,
+			...refused && { plainRefused: true },
+			...server === config.server && { legacy: true }
+		});
+	};
 	for (const entry of config.servers) {
 		const { label, server } = entry ?? {};
 		if (typeof server !== "string" || !URL.canParse(server) || !["ws:", "wss:"].includes(new URL(server).protocol) || offices.some((o) => o.server === server)) continue;
-		const refused = !config.allowPlainWs && !isWebSocketUrl(server);
-		offices.push({
-			label: typeof label === "string" && label.trim() || new URL(server).host,
-			server,
-			...refused && { plainRefused: true }
-		});
+		add(server, typeof label === "string" && label.trim() || new URL(server).host, !config.allowPlainWs && !isWebSocketUrl(server));
 	}
-	if (offices.length) return offices;
-	const server = config.plainRefused ?? config.server;
-	return [{
-		label: new URL(server).host,
-		server,
-		...config.plainRefused && { plainRefused: true }
-	}];
+	if (!offices.length) add(config.plainRefused ?? config.server, new URL(config.plainRefused ?? config.server).host, !!config.plainRefused);
+	return offices;
 }
 /** The same per-key override for any settings file of the mod's, such as the runner's runner.json. */
 async function loadSettings(io, defaultsPath, userPath) {

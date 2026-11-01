@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { expect, test } from "vitest";
-import { loadConfig, officesOf } from "./config.js";
+import { loadConfig, officeNamed, officesOf } from "./config.js";
 import { nodeIo } from "./io.js";
 import { defaults, modDir, tempRoot } from "./fixture.js";
 
@@ -50,10 +50,11 @@ test("config: a person's own lightsOffHours 0 turns lights-off rooms off", async
   expect((await withUser({ lightsOffHours: 0 })).lightsOffHours).toBe(0);
 });
 
-test("config: the offices are each usable entry of servers, labelled, once each; without one, server alone, labelled by its host (#105)", async () => {
+test("config: the offices are the entries of servers with a ws:// or wss:// address, labelled, once each; without one, server alone, labelled by its host (#105)", async () => {
   const single = await withUser({ server: "wss://office.example.com/data-layer" });
-  expect(officesOf(single)).toEqual([{ label: "office.example.com", server: "wss://office.example.com/data-layer" }]);
-  expect(officesOf(defaults)).toEqual([{ label: "127.0.0.1:4747", server: "ws://127.0.0.1:4747/data-layer" }]);
+  // The server a version before #105 reports to is marked, so its pairing lock and releases stay put.
+  expect(officesOf(single)).toEqual([{ label: "office.example.com", server: "wss://office.example.com/data-layer", legacy: true }]);
+  expect(officesOf(defaults)).toEqual([{ label: "127.0.0.1:4747", server: "ws://127.0.0.1:4747/data-layer", legacy: true }]);
 
   const both = await withUser({
     servers: [
@@ -63,17 +64,29 @@ test("config: the offices are each usable entry of servers, labelled, once each;
       { label: "plain", server: "ws://10.0.0.5:4747/data-layer" },
       { label: "web", server: "https://office.example.com" },
       { server: "wss://other.example:8443/data-layer" },
+      { label: "Internal", server: "wss://second.example/data-layer" },
       "not an entry",
     ],
   });
   expect(officesOf(both)).toEqual([
     { label: "internal", server: "wss://isoplan-internal.example/data-layer" },
-    { label: "dev", server: "ws://127.0.0.1:4747/data-layer" },
+    { label: "dev", server: "ws://127.0.0.1:4747/data-layer", legacy: true },
     { label: "plain", server: "ws://10.0.0.5:4747/data-layer", plainRefused: true },
     { label: "other.example:8443", server: "wss://other.example:8443/data-layer" },
+    // A label already taken, in any case, is made unique.
+    { label: "Internal-2", server: "wss://second.example/data-layer" },
   ]);
   expect(officesOf({ ...both, allowPlainWs: true })[2]).toEqual({ label: "plain", server: "ws://10.0.0.5:4747/data-layer" });
   // A plain ws:// server to another machine, alone, is kept to say why it isn't used.
   expect(officesOf(await withUser({ server: "ws://10.0.0.5:4747/data-layer" }))).toEqual([{ label: "10.0.0.5:4747", server: "ws://10.0.0.5:4747/data-layer", plainRefused: true }]);
   expect(officesOf(await withUser({ servers: [{ server: "nope" }] }))).toEqual(officesOf(defaults));
+});
+
+test("config: --office names an office by its label in any case, its address or its host (#105)", async () => {
+  const offices = officesOf(await withUser({ servers: [{ label: "internal", server: "wss://isoplan-internal.example/data-layer" }, { label: "dev", server: "ws://127.0.0.1:4747/data-layer" }] }));
+  expect(officeNamed(offices, "DEV")?.label).toBe("dev");
+  expect(officeNamed(offices, "wss://isoplan-internal.example/data-layer")?.label).toBe("internal");
+  expect(officeNamed(offices, "isoplan-internal.example")?.label).toBe("internal");
+  expect(officeNamed(offices, "127.0.0.1:4747")?.label).toBe("dev");
+  expect(officeNamed(offices, "elsewhere")).toBeUndefined();
 });

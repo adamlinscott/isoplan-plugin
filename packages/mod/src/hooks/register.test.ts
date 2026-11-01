@@ -333,6 +333,34 @@ test("hooks: with several offices, the room is asked, and a late reply acked, th
   await vi.waitFor(() => expect(h.ran[1]).toEqual({ argv: ["node", "C:/plugins/isoplan/dist/ask.js", "--session", "s1", "--cwd", "C:/w/repo", "--server", internal, "--ack", "q-2"], stdin: undefined }));
 });
 
+test("hooks: with rights from two offices, the ask script is given both, to pick the session's own office", async () => {
+  const internal = "wss://isoplan-internal.example/data-layer";
+  const dev = "ws://127.0.0.1:4747/data-layer";
+  const h = await start([connected, { ...rightsLine(true), server: internal } as DataLayerLine, { ...rightsLine(true), server: dev } as DataLayerLine], { stays: true });
+  await vi.waitFor(() => expect(h.tools).toEqual(["ask_room"]));
+  await new Promise((r) => setTimeout(r, 10));
+  await hooks["tool.call"]!(h.$, { tool: ASK, tool_use_id: "toolu_03", question: "Why?" }, vi.fn());
+  expect(h.ran[0]!.argv).toEqual(["node", "C:/plugins/isoplan/dist/ask.js", "--session", "s1", "--cwd", "C:/w/repo", "--server", internal, "--server", dev, "--key", "toolu_03"]);
+});
+
+test("hooks: an office's pairing link goes once it stops pairing, and a plain ws:// office says when whether it takes the repo can't be checked", async () => {
+  const team = "wss://office.team.example/data-layer";
+  const plain = "ws://10.0.0.5:4747/data-layer";
+  const h = await start([
+    { type: "pair", server: team, label: "team", url: "https://office.team.example/#pair=r1", expires: "2026-10-20T09:10:00.000Z" },
+    { type: "status", server: team, label: "team", state: "connected" },
+    { type: "status", server: team, label: "team", state: "pairing" },
+    { type: "status", server: plain, label: "plain", state: "insecure", unchecked: true },
+  ]);
+  await stopped(h);
+  expect(h.status.slice(0, 4)).toEqual([
+    "Isoplan: team: Pair this machine: https://office.team.example/#pair=r1",
+    "Isoplan: team ✓",
+    "Isoplan: team waiting for this machine to be paired",
+    `Isoplan: team waiting for this machine to be paired · plain: not reporting: ${plain} is plain ws:// to another machine (whether its office takes this repo can't be checked); use wss://, or set "allowPlainWs": true in config.json`,
+  ]);
+});
+
 test("hooks: once the rights go, the tool answers that asking is off and runs nothing; a new session id starts without rights", async () => {
   const off = await start([connected, rightsLine(true), rightsLine(false)], { stays: true });
   await vi.waitFor(() => expect(off.tools).toEqual(["ask_room"]));

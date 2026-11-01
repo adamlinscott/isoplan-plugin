@@ -298,3 +298,18 @@ test("each office server has its own pairing: the first account entry stays wher
   expect(after.offices?.[DEV]?.[ADA.id]?.credential).toBe(CREDENTIAL);
   expect(await other.token()).toBe(token(1));
 });
+
+test("with an entry for one server in both places (an older version wrote under accounts), the one under offices is read and renewed there, and the other left alone (#105)", async () => {
+  const { file, make } = setUp();
+  const DEV = "ws://127.0.0.1:4747/data-layer";
+  await writePairing(file, {
+    accounts: { [ADA.id]: { server: DEV, credential: "old" + "-cred", token: token(8), tokenExpires: clock + 60 * 60000 } },
+    offices: { [DEV]: { [ADA.id]: { server: DEV, credential: CREDENTIAL, token: token(9), tokenExpires: clock + 60 * 60000 } } },
+  });
+  const dev = make(ADA, DEV);
+  expect(await dev.token()).toBe(token(9));
+  await dev.refused("token-expired", token(9));
+  const kept = await readPairing(file);
+  expect(kept.offices?.[DEV]?.[ADA.id]?.tokenExpires).toBe(0);
+  expect(kept.accounts[ADA.id]?.tokenExpires).toBe(clock + 60 * 60000);
+});

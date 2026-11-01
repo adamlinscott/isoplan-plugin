@@ -28,9 +28,10 @@
 // Everything is kept in <claude dir>/isoplan/pairing.json, readable by its owner only (on Windows
 // it takes the folder's permissions): the machine's id, and one entry per Claude account and office
 // server (#105). The first server an account pairs with keeps its entry under `accounts`, where a
-// version before #105 looks; any other server's is under `offices`, by its address. Each server's
-// pairing.lock is its own, in <claude dir>/isoplan/offices/<id>/, so pairing with one office never
-// waits on another. Every change to it is read, decided and written under <claude dir>/isoplan/pairing.write.lock,
+// version before #105 looks; any other server's is under `offices`, by its address, which is read
+// first. Each server's pairing.lock is its own, in <claude dir>/isoplan/offices/<id>/, so pairing
+// with one office never waits on another; the server config.json's `server` names keeps
+// <claude dir>/isoplan/pairing.lock, which a version before #105 takes for it. Every change to it is read, decided and written under <claude dir>/isoplan/pairing.write.lock,
 // so one process never undoes what another has just written. A server that signs nobody in never
 // refuses, so nothing is paired. With no browser on the machine (a headless box) there is no way to
 // pair yet.
@@ -75,15 +76,17 @@ export interface PairingFile {
 }
 
 export const pairingPath = (claudeDir: string) => path.join(claudeDir, "isoplan", "pairing.json");
-export const pairingLockPath = (claudeDir: string, server: string) => path.join(officeDir(claudeDir, server), "pairing.lock");
+/** The office's pairing lock; for the server a version before #105 reports to, the one it uses, so the two never answer one pairing at once. */
+export const pairingLockPath = (claudeDir: string, office: { server: string; legacy?: boolean }) =>
+  office.legacy ? path.join(claudeDir, "isoplan", "pairing.lock") : path.join(officeDir(claudeDir, office.server), "pairing.lock");
 
-/** The account's entry for `server`, or undefined. */
+/** The account's entry for `server`, or undefined: the one under `offices`, else the one under `accounts` when it is that server's. */
 export function pairingEntry(all: PairingFile, server: string, account: string): PairingEntry | undefined {
   const first = all.accounts[account];
-  return first?.server === server ? first : all.offices?.[server]?.[account];
+  return all.offices?.[server]?.[account] ?? (first?.server === server ? first : undefined);
 }
 
-/** `all` with the account's entry for `server` set: where it is now, else under `accounts` while that holds no other server's. */
+/** `all` with the account's entry for `server` set, where pairingEntry reads it; a new one under `accounts` while that holds no other server's. */
 function withPairingEntry(all: PairingFile, server: string, account: string, entry: PairingEntry): PairingFile {
   const first = all.accounts[account];
   if (!all.offices?.[server]?.[account] && (!first || first.server === server)) return { ...all, accounts: { ...all.accounts, [account]: entry } };

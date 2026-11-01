@@ -234,6 +234,7 @@ function handle($, text) {
 	}
 	switch (line.type) {
 		case "status":
+			if (line.state !== "pairing") pairings.delete(line.server);
 			offices.set(line.server, officeText(line));
 			show($, statusText());
 			break;
@@ -304,7 +305,7 @@ function officeText(line) {
 		case "not-approved":
 		case "no-list": return;
 		case "taken": return `${label}: this session belongs to someone else on the office, so it isn't reported`;
-		case "insecure": return `${label}: not reporting: ${line.server} is plain ws:// to another machine; use wss://, or set "allowPlainWs": true in config.json`;
+		case "insecure": return `${label}: not reporting: ${line.server} is plain ws:// to another machine${line.unchecked ? " (whether its office takes this repo can't be checked)" : ""}; use wss://, or set "allowPlainWs": true in config.json`;
 		case "pairing": {
 			const pairing = pairings.get(line.server);
 			return pairing ? pairText(pairing) : `${label} waiting for this machine to be paired`;
@@ -375,8 +376,8 @@ function addTool($) {
 	});
 }
 async function askRoom($, e) {
-	const granted = [...mayAsk].find(([, may]) => may);
-	if (!granted) return { result: "Asking this room is off now: its owner turned it off, the handoff was dismissed, or this session took no handoff. Carry on without asking." };
+	const granted = [...mayAsk].filter(([, may]) => may).map(([server]) => server);
+	if (!granted.length) return { result: "Asking this room is off now: its owner turned it off, the handoff was dismissed, or this session took no handoff. Carry on without asking." };
 	const question = typeof e.question === "string" ? e.question.trim() : "";
 	if (!question) return { result: "Give the question to ask the room as `question`." };
 	askedBy.set(e.tool_use_id, e.agentId ?? null);
@@ -390,7 +391,7 @@ async function askRoom($, e) {
 			session,
 			"--cwd",
 			cwd,
-			...serverArgs(granted[0]),
+			...granted.flatMap(serverArgs),
 			"--key",
 			e.tool_use_id
 		], {

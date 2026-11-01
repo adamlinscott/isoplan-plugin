@@ -464,8 +464,10 @@ async function wake(input, { claudeDir, spawn, isAlive = alive, project, plugins
 	if (typeof sessionId !== "string" || !/^[\w-]+$/.test(sessionId) || typeof cwd !== "string" || !cwd) return false;
 	const lock = lockPath(claudeDir, sessionId);
 	if (await isHeld(lock, Date.now(), isAlive)) {
-		if (!await nowApproved(claudeDir, lock)) return false;
-		await fs.rm(lock, { force: true });
+		const notWanted = await nowApproved(claudeDir, lock);
+		if (!notWanted) return false;
+		if (Object.keys(notWanted).length) await fs.writeFile(lock, JSON.stringify({ notWanted }));
+		else await fs.rm(lock, { force: true });
 	}
 	const { dataLayer: recorded } = JSON.parse(await fs.readFile(wakeRecordPath(claudeDir), "utf8"));
 	if (typeof recorded !== "string") return false;
@@ -482,16 +484,25 @@ async function wake(input, { claudeDir, spawn, isAlive = alive, project, plugins
 	], cwd);
 	return true;
 }
-/** Whether `lock` is a hold-off for repos no office took, one of which a fresh copy of any office's list now has. */
+/**
+* Whether `lock` is a hold-off for repos no office took, one of which a fresh copy of an office's
+* list now has: then the offices that didn't want the session, each until when, else null. Only the
+* lists of the offices the data layer reported to count (a folder left by a server since taken out
+* of config.json doesn't), and never one of an office that didn't want the session.
+*/
 async function nowApproved(claudeDir, lock) {
 	const held = await readLock(lock);
-	const projects = held?.extra.projects;
-	if (held?.pid !== null || held.extra.reason !== "not-approved" || !Array.isArray(projects)) return false;
+	const { projects, offices, notWanted: said } = held?.extra ?? {};
+	if (held?.pid !== null || held.extra.reason !== "not-approved" || !Array.isArray(projects)) return null;
+	const now = Date.now();
+	const notWanted = Object.fromEntries(Object.entries(said && typeof said === "object" ? said : {}).filter(([, until]) => typeof until === "number" && until > now));
 	for (const file of await approvedFiles(claudeDir)) {
-		const repos = freshRepos(await readApproved(file), 9e5, Date.now());
-		if (repos && projects.some((p) => typeof p === "string" && repos.has(p))) return true;
+		const copy = await readApproved(file);
+		if (!copy || Array.isArray(offices) && !offices.includes(copy.server) || copy.server in notWanted) continue;
+		const repos = freshRepos(copy, 9e5, now);
+		if (repos && projects.some((p) => typeof p === "string" && repos.has(p))) return notWanted;
 	}
-	return false;
+	return null;
 }
 //#endregion
 //#region src/runner/environment.ts

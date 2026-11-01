@@ -9,7 +9,8 @@
 //
 // It also gives the session's agent the ask_room tool (#49), once the office server says this
 // session may ask its room (an `ask-rights` line): the session took a handoff, and its owner hasn't
-// turned asking off. It asks through the office whose line granted it. A tool can't be taken away again, so once the rights go (turned off, the
+// turned asking off. With rights from more than one office it asks in the office the session took its
+// handoff through, else in the first of them in config.json's order (dist/ask.js decides). A tool can't be taken away again, so once the rights go (turned off, the
 // handoff dismissed, another session id) it answers that asking is off, without running anything. The tool asks the room's lead a question through the office server
 // (dist/ask.js), with no one typing anything; the script waits only as long as runner.json says,
 // then tells the agent to carry on. The end of a question that comes after that arrives as an
@@ -287,6 +288,8 @@ function handle($: Host, text: string): void {
   }
   switch (line.type) {
     case "status":
+      // A link to pair is shown only while the office waits for it.
+      if (line.state !== "pairing") pairings.delete(line.server);
       offices.set(line.server, officeText(line));
       show($, statusText());
       break;
@@ -376,7 +379,7 @@ function officeText(line: StatusLine): string | undefined {
     case "taken":
       return `${label}: this session belongs to someone else on the office, so it isn't reported`;
     case "insecure":
-      return `${label}: not reporting: ${line.server} is plain ws:// to another machine; use wss://, or set "allowPlainWs": true in config.json`;
+      return `${label}: not reporting: ${line.server} is plain ws:// to another machine${line.unchecked ? " (whether its office takes this repo can't be checked)" : ""}; use wss://, or set "allowPlainWs": true in config.json`;
     case "pairing": {
       const pairing = pairings.get(line.server);
       return pairing ? pairText(pairing) : `${label} waiting for this machine to be paired`;
@@ -447,15 +450,15 @@ function addTool($: Host): void {
 // The ask_room tool: the script asks as this session, under the tool call's id so a retry is the
 // same question, and prints what the agent is told.
 async function askRoom($: Host, e: ToolCallInput): Promise<ToolCallResult> {
-  const granted = [...mayAsk].find(([, may]) => may);
-  if (!granted) return { result: "Asking this room is off now: its owner turned it off, the handoff was dismissed, or this session took no handoff. Carry on without asking." };
+  const granted = [...mayAsk].filter(([, may]) => may).map(([server]) => server);
+  if (!granted.length) return { result: "Asking this room is off now: its owner turned it off, the handoff was dismissed, or this session took no handoff. Carry on without asking." };
   const question = typeof e.question === "string" ? e.question.trim() : "";
   if (!question) return { result: "Give the question to ask the room as `question`." };
   askedBy.set(e.tool_use_id, e.agentId ?? null);
   try {
     const session = await $.session.id();
     const cwd = await $.session.cwd();
-    const r = await $.process.run(["node", askScript($), "--session", session, "--cwd", cwd, ...serverArgs(granted[0]), "--key", e.tool_use_id], { cwd, stdin: question, timeoutMs: ASK_TIMEOUT_MS });
+    const r = await $.process.run(["node", askScript($), "--session", session, "--cwd", cwd, ...granted.flatMap(serverArgs), "--key", e.tool_use_id], { cwd, stdin: question, timeoutMs: ASK_TIMEOUT_MS });
     if (r.stdout.trim()) return { result: r.stdout.trim() };
     $.ui.log("isoplan: ask_room: " + (r.stderr.trim() || `node exited with code ${r.exitCode}`), { to: "debug" });
     return { result: "The room couldn't be asked here. Carry on without the answer." };

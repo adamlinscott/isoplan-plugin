@@ -6265,29 +6265,30 @@ async function loadConfig(io, defaultsPath, userPath) {
 	return config;
 }
 /**
-* The offices to report to: each usable entry of `servers` (a wss:// address, or ws://, which goes
-* only to this machine unless allowPlainWs, else it is kept to say why it isn't used), once per
-* address; with none, `server` alone. An entry without a label is labelled by its host.
+* The offices to report to: each entry of `servers` with a ws:// or wss:// address (ws:// goes only
+* to this machine unless allowPlainWs; to another it is kept, to say why it isn't used), once per
+* address; with none, `server` alone. An entry without a label is labelled by its host, and a label
+* already taken gets -2, -3 and so on, so each names one office.
 */
 function officesOf(config) {
 	const offices = [];
+	const add = (server, label, refused) => {
+		let unique = label;
+		for (let n = 2; offices.some((o) => o.label.toLowerCase() === unique.toLowerCase()); n++) unique = `${label}-${n}`;
+		offices.push({
+			label: unique,
+			server,
+			...refused && { plainRefused: true },
+			...server === config.server && { legacy: true }
+		});
+	};
 	for (const entry of config.servers) {
 		const { label, server } = entry ?? {};
 		if (typeof server !== "string" || !URL.canParse(server) || !["ws:", "wss:"].includes(new URL(server).protocol) || offices.some((o) => o.server === server)) continue;
-		const refused = !config.allowPlainWs && !isWebSocketUrl(server);
-		offices.push({
-			label: typeof label === "string" && label.trim() || new URL(server).host,
-			server,
-			...refused && { plainRefused: true }
-		});
+		add(server, typeof label === "string" && label.trim() || new URL(server).host, !config.allowPlainWs && !isWebSocketUrl(server));
 	}
-	if (offices.length) return offices;
-	const server = config.plainRefused ?? config.server;
-	return [{
-		label: new URL(server).host,
-		server,
-		...config.plainRefused && { plainRefused: true }
-	}];
+	if (!offices.length) add(config.plainRefused ?? config.server, new URL(config.plainRefused ?? config.server).host, !!config.plainRefused);
+	return offices;
 }
 /** The same per-key override for any settings file of the mod's, such as the runner's runner.json. */
 async function loadSettings(io, defaultsPath, userPath) {
@@ -6491,13 +6492,14 @@ const WRITE_WAIT_MS = 1e4;
 /** How often the callback tries to write the credential it got before saying it couldn't. */
 const WRITE_TRIES = 4;
 const pairingPath = (claudeDir) => path.join(claudeDir, "isoplan", "pairing.json");
-const pairingLockPath = (claudeDir, server) => path.join(officeDir(claudeDir, server), "pairing.lock");
-/** The account's entry for `server`, or undefined. */
+/** The office's pairing lock; for the server a version before #105 reports to, the one it uses, so the two never answer one pairing at once. */
+const pairingLockPath = (claudeDir, office) => office.legacy ? path.join(claudeDir, "isoplan", "pairing.lock") : path.join(officeDir(claudeDir, office.server), "pairing.lock");
+/** The account's entry for `server`, or undefined: the one under `offices`, else the one under `accounts` when it is that server's. */
 function pairingEntry(all, server, account) {
 	const first = all.accounts[account];
-	return first?.server === server ? first : all.offices?.[server]?.[account];
+	return all.offices?.[server]?.[account] ?? (first?.server === server ? first : void 0);
 }
-/** `all` with the account's entry for `server` set: where it is now, else under `accounts` while that holds no other server's. */
+/** `all` with the account's entry for `server` set, where pairingEntry reads it; a new one under `accounts` while that holds no other server's. */
 function withPairingEntry(all, server, account, entry) {
 	const first = all.accounts[account];
 	if (!all.offices?.[server]?.[account] && (!first || first.server === server)) return {
@@ -7400,7 +7402,7 @@ const same = (a, b) => a !== void 0 && JSON.stringify(a) === JSON.stringify(b);
 //#endregion
 //#region src/data-layer/link.ts
 const STABLE_MS$1 = 3e4;
-const OUTBOX_MAX = 100;
+const OUTBOX_MAX$1 = 100;
 const OUTBOX_MAX_AGE_MS = 36e5;
 function createLink({ url, hello, emit, minIntervalMs = 1e3, retryBaseMs = 1e3, retryCapMs = 3e4, notWantedRetryMs = 36e5, takenRetryMs = 36e5, onNotWanted, onPairingEnded, onMessage, filter = (facts) => facts, answered, pairing, pairPollMs = 5e3, admit, random = Math.random }) {
 	const outbox = [];
@@ -7663,7 +7665,7 @@ function createLink({ url, hello, emit, minIntervalMs = 1e3, retryBaseMs = 1e3, 
 					message,
 					at: Date.now()
 				});
-				if (outbox.length > OUTBOX_MAX) outbox.shift();
+				if (outbox.length > OUTBOX_MAX$1) outbox.shift();
 			}
 		},
 		projects: () => projects,
@@ -11038,9 +11040,95 @@ async function worktreeFor(run, clone, remote, branch, id, exempt, timeoutMs) {
 	return { error: `${base} and the next eight names beside it are taken by other folders` };
 }
 //#endregion
+//#region src/handoff/taken-office.ts
+const SAFE = /^[\w-]{1,200}$/;
+const recordPath = (claudeDir, session) => path.join(claudeDir, "isoplan", "handoffs", "sessions", `${session}.json`);
+async function recordTakenOffice(claudeDir, session, server) {
+	if (!SAFE.test(session)) return;
+	const file = recordPath(claudeDir, session);
+	await fs.mkdir(path.dirname(file), { recursive: true });
+	await fs.writeFile(file, JSON.stringify({ server }) + "\n");
+}
+function answerOffices(o) {
+	const now = o.now ?? Date.now;
+	let wake = () => {};
+	const states = o.offices.map(() => ({
+		link: null,
+		notWanted: false,
+		unpaired: false,
+		closedAt: 0,
+		outbox: []
+	}));
+	const start = (i) => {
+		const s = states[i];
+		s.notWanted = s.unpaired = false;
+		s.link = o.open(o.offices[i], {
+			notWanted: () => (s.notWanted = true, wake()),
+			unpaired: () => (s.unpaired = true, wake())
+		});
+		for (const message of s.outbox.splice(0)) s.link.send(message);
+	};
+	let orphaned = false;
+	o.gone.then(() => (orphaned = true, wake()));
+	async function run() {
+		o.offices.forEach((_, i) => start(i));
+		for (;;) {
+			if (!orphaned) await new Promise((r) => (wake = r, setTimeout(r, o.checkMs)));
+			if (orphaned) return "orphaned";
+			for (const [i, s] of states.entries()) {
+				const office = o.offices[i];
+				if (s.link && (s.notWanted || s.unpaired)) {
+					o.log(`the runner stopped answering through ${o.name(office)}: ${s.notWanted ? `it doesn't want this machine's runner; asking again in ${o.holdOffMs / 6e4} minutes` : "it says this machine's pairing has ended; answering again once it is paired"}`);
+					s.link.close();
+					s.link = null;
+					s.closedAt = now();
+				} else if (!s.link && (s.notWanted ? now() - s.closedAt >= o.holdOffMs : await o.paired(office))) {
+					o.log(`the runner is answering through ${o.name(office)} again`);
+					start(i);
+				}
+			}
+			if (!o.idle()) continue;
+			if (!states.some((s) => s.link)) return states.some((s) => s.notWanted) ? "not-wanted" : "unpaired";
+			if (!await o.lit()) return "done";
+		}
+	}
+	return {
+		sender: (i) => (message) => {
+			const s = states[i];
+			if (s.link) return s.link.send(message);
+			s.outbox.push(message);
+			if (s.outbox.length > 100) {
+				s.outbox.shift();
+				o.log(`dropped the oldest of the runner's replies for ${o.name(o.offices[i])}: more than 100 waited for its link`);
+			}
+		},
+		ended: run().finally(() => {
+			for (const [i, s] of states.entries()) {
+				s.link?.close();
+				if (s.outbox.length) o.log(`dropped ${s.outbox.length} of the runner's replies for ${o.name(o.offices[i])}: its link was closed when the runner ended`);
+			}
+		})
+	};
+}
+//#endregion
 //#region src/runner/runner.ts
 /** A push that failed, with what the server is told; anything else thrown is told only that it failed. */
 var PushFailed = class extends Error {};
+function createForkSlots() {
+	let forking = 0;
+	const waiting = [];
+	return {
+		async take(max) {
+			while (forking >= max) await new Promise((resolve) => waiting.push(resolve));
+			forking++;
+			return () => {
+				forking--;
+				waiting.shift()?.();
+			};
+		},
+		running: () => forking
+	};
+}
 const REMEMBER = 200;
 const COMPACTED_NOTE = "Note from Isoplan: this session was compacted, so its earlier work survives only as a summary and the details may be thin.";
 /** What the server is told for each kind of fork failure. */
@@ -11050,7 +11138,7 @@ const FAILED = {
 	"not-set-up": "this machine can't run the fork; its owner can see why in the runner's log"
 };
 const REMEMBER_DROPPED = 200;
-function createRunner({ answerer, ledger, settings, prompts, scan, send, log, isDir, isReported, push, prepareBrief, take, now = Date.now }) {
+function createRunner({ answerer, ledger, settings, prompts, scan, send, log, isDir, isReported, push, prepareBrief, take, forks = createForkSlots(), now = Date.now }) {
 	const rooms = /* @__PURE__ */ new Map();
 	const running = /* @__PURE__ */ new Set();
 	const finished = /* @__PURE__ */ new Map();
@@ -11060,16 +11148,6 @@ function createRunner({ answerer, ledger, settings, prompts, scan, send, log, is
 	const taking = /* @__PURE__ */ new Set();
 	const takes = /* @__PURE__ */ new Set();
 	const dropping = /* @__PURE__ */ new Set();
-	let forking = 0;
-	const waiting = [];
-	async function forkSlot(max) {
-		while (forking >= max) await new Promise((resolve) => waiting.push(resolve));
-		forking++;
-		return () => {
-			forking--;
-			waiting.shift()?.();
-		};
-	}
 	const unavailable = (id, detail) => ({
 		type: "refusal",
 		v: 1,
@@ -11147,7 +11225,7 @@ function createRunner({ answerer, ledger, settings, prompts, scan, send, log, is
 				from: request.from.name || request.from.id,
 				question: request.question
 			});
-			const free = await forkSlot(s.maxForks);
+			const free = await forks.take(s.maxForks);
 			if (dropping.has(id)) {
 				free();
 				await reservation.cancel().catch((err) => log(`couldn't record ${id} in the ledger: ${err.message}`));
@@ -11506,17 +11584,19 @@ async function worker() {
 	const homeIo = machineHomeIo(first.workspaceRepos);
 	const ledger = await openLedger(path.join(isoplanDir, "runner", "ledger.json"));
 	const preparedFor = /* @__PURE__ */ new Map();
-	let wake = () => {};
-	const answerFor = ({ server }) => {
-		const emit = emitFor(server);
+	const forks = createForkSlots();
+	const answering = offices.filter((o) => !o.plainRefused);
+	let send = (_index) => () => {};
+	const runnerFor = (office, index) => {
+		const { server } = office;
 		const pairing = createPairing({
 			file: pairingPath(claudeDir),
-			lock: pairingLockPath(claudeDir, server),
+			lock: pairingLockPath(claudeDir, office),
 			writeLock: pairingWriteLockPath(claudeDir),
 			server,
 			account,
 			machine: os.hostname(),
-			emit,
+			emit: emitFor(server),
 			allowPlainWs: first.allowPlainWs
 		});
 		const approved = createApproved({
@@ -11531,122 +11611,107 @@ async function worker() {
 			await approved.refresh();
 			return takesFrom(homeIo, approved.repos());
 		};
-		let send = () => {};
-		const runner = createRunner({
-			answerer,
-			ledger,
-			settings,
-			prompts: () => loadPrompts(path.join(appDir, "prompts")),
-			scan: scanText,
-			send: (message) => send(message),
-			log,
-			isDir: (p) => fs.stat(p).then((s) => s.isDirectory(), () => false),
-			isReported: async (session, lead) => {
-				const id = forkableId(session);
-				const lock = id ? await readLock(lockPath(claudeDir, id)) : null;
-				if (!id || lock && lock.pid === null && lock.until !== null && lock.until > Date.now()) return false;
-				if (Date.now() - lead.lastActive > askableMs(await config().catch(() => first))) return false;
-				await approved.refresh();
-				return await approvedHome(lead.cwd, homeIo, approved.repos()) !== null;
-			},
-			prepareBrief: async (lead, handoff) => {
-				const ready = await prepare(git, lead.cwd, await gitMs(), (await settings()).repoSearchDepth, void 0, await takes()).catch((err) => Promise.reject(told(err)));
-				if (ready.notInOffice.length) log(`handoff ${handoff}: left out, not in the office: ${ready.notInOffice.join(", ")}`);
-				preparedFor.set(handoff, ready);
-				if (preparedFor.size > MAX_PREPARED) preparedFor.delete(preparedFor.keys().next().value);
-				const { from, files, repos, left } = ready;
-				return {
-					files,
-					note: handoffNote({
-						branch: handoffBranch(handoff),
-						from,
-						files,
-						at: /* @__PURE__ */ new Date(),
-						repos,
-						left
-					})
-				};
-			},
-			push: async (_session, lead, handoff, pushAnyway) => {
-				const pushed = await pushHandoff(git, lead.cwd, handoff, await gitMs(), {
-					scan: scanText,
-					depth: (await settings()).repoSearchDepth,
-					prepared: preparedFor.get(handoff),
-					takes: await takes(),
-					...pushAnyway ? { pushAnyway } : {}
-				}).catch((err) => Promise.reject(told(err)));
-				return "held" in pushed ? pushed : pushed.repos;
-			},
-			take: (message) => takeHandoff(message, {
-				run: git,
-				io,
-				claudeDir,
-				machine: os.hostname(),
-				platform: process.platform,
-				env: process.env,
-				settings,
-				claude: () => claudeBinary(claudeDir, process.env, process.platform, os.homedir()),
-				claudeJson,
-				scan: scanText,
-				log
-			})
-		});
-		const state = {
-			runner,
-			link: null,
-			notWanted: false,
-			unpaired: false
-		};
-		state.link = createLink({
-			url: server,
-			emit,
+		return {
 			pairing,
-			onMessage: (message) => runner.take(message),
-			onNotWanted: () => {
-				state.notWanted = true;
-				wake();
-			},
-			onPairingEnded: () => {
-				state.unpaired = true;
-				wake();
-			},
-			hello: {
-				type: "runner",
-				v: 1,
-				account,
-				machine: { name: os.hostname() }
-			}
-		});
-		send = (message) => state.link?.send(message);
-		log(`the runner's worker ${process.pid} is answering for this machine through ${server}`);
-		return state;
+			runner: createRunner({
+				answerer,
+				ledger,
+				forks,
+				settings,
+				prompts: () => loadPrompts(path.join(appDir, "prompts")),
+				scan: scanText,
+				send: (message) => send(index)(message),
+				log,
+				isDir: (p) => fs.stat(p).then((s) => s.isDirectory(), () => false),
+				isReported: async (session, lead) => {
+					const id = forkableId(session);
+					const lock = id ? await readLock(lockPath(claudeDir, id)) : null;
+					if (!id || lock && lock.pid === null && lock.until !== null && lock.until > Date.now()) return false;
+					if (Date.now() - lead.lastActive > askableMs(await config().catch(() => first))) return false;
+					await approved.refresh();
+					return await approvedHome(lead.cwd, homeIo, approved.repos()) !== null;
+				},
+				prepareBrief: async (lead, handoff) => {
+					const ready = await prepare(git, lead.cwd, await gitMs(), (await settings()).repoSearchDepth, void 0, await takes()).catch((err) => Promise.reject(told(err)));
+					if (ready.notInOffice.length) log(`handoff ${handoff}: left out, not in the office: ${ready.notInOffice.join(", ")}`);
+					preparedFor.set(handoff, ready);
+					if (preparedFor.size > MAX_PREPARED) preparedFor.delete(preparedFor.keys().next().value);
+					const { from, files, repos, left } = ready;
+					return {
+						files,
+						note: handoffNote({
+							branch: handoffBranch(handoff),
+							from,
+							files,
+							at: /* @__PURE__ */ new Date(),
+							repos,
+							left
+						})
+					};
+				},
+				push: async (_session, lead, handoff, pushAnyway) => {
+					const pushed = await pushHandoff(git, lead.cwd, handoff, await gitMs(), {
+						scan: scanText,
+						depth: (await settings()).repoSearchDepth,
+						prepared: preparedFor.get(handoff),
+						takes: await takes(),
+						...pushAnyway ? { pushAnyway } : {}
+					}).catch((err) => Promise.reject(told(err)));
+					return "held" in pushed ? pushed : pushed.repos;
+				},
+				take: async (message) => {
+					const taken = await takeHandoff(message, {
+						run: git,
+						io,
+						claudeDir,
+						machine: os.hostname(),
+						platform: process.platform,
+						env: process.env,
+						settings,
+						claude: () => claudeBinary(claudeDir, process.env, process.platform, os.homedir()),
+						claudeJson,
+						scan: scanText,
+						log
+					});
+					if (taken.session) await recordTakenOffice(claudeDir, taken.session, server).catch(() => {});
+					return taken;
+				}
+			})
+		};
 	};
-	const answering = /* @__PURE__ */ new Map();
-	for (const office of offices.filter((o) => !o.plainRefused)) answering.set(office, answerFor(office));
-	const mayReopen = async (office, state) => state.notWanted ? Date.now() - state.closedAt >= HOLD_OFF_MS : !!pairingEntry(await readPairing(pairingPath(claudeDir)), office.server, account.id)?.credential;
-	let orphaned = false;
-	const gone = new Promise((resolve) => process.stdin.on("end", resolve).on("error", resolve).resume()).then(() => orphaned = true);
-	let stopped = "done";
-	for (;;) {
-		await Promise.race([new Promise((r) => (wake = r, setTimeout(r, CHECK_MS))), gone]);
-		if (orphaned) break;
-		for (const [office, state] of answering) if (state.link && (state.notWanted || state.unpaired)) {
-			log(`the runner stopped answering through ${office.server}: ${state.notWanted ? `it doesn't want this machine's runner; asking again in ${HOLD_OFF_MS / 6e4} minutes` : "it says this machine's pairing has ended; answering again once it is paired"}`);
-			state.link.close();
-			state.link = null;
-			state.closedAt = Date.now();
-		} else if (!state.link && await mayReopen(office, state)) answering.set(office, answerFor(office));
-		const open = [...answering.values()].filter((s) => s.link);
-		if (!open.length) {
-			stopped = [...answering.values()].some((s) => s.notWanted) ? "not-wanted" : "unpaired";
-			break;
-		}
-		if (!open.every((s) => s.runner.idle())) continue;
-		const window = askableMs(await config().catch(() => first));
-		if (!await anyRoomSince(io, path.join(claudeDir, "projects"), Date.now() - window)) break;
-	}
-	for (const state of answering.values()) state.link?.close();
-	return stopped === "not-wanted" ? 3 : stopped === "unpaired" ? 4 : 0;
+	const answerers = answering.map(runnerFor);
+	const links = answerOffices({
+		offices: answering,
+		name: (office) => office.server,
+		open: (office, said) => {
+			const { pairing, runner } = answerers[answering.indexOf(office)];
+			log(`the runner's worker ${process.pid} is answering for this machine through ${office.server}`);
+			return createLink({
+				url: office.server,
+				emit: emitFor(office.server),
+				pairing,
+				onMessage: (message) => runner.take(message),
+				onNotWanted: said.notWanted,
+				onPairingEnded: said.unpaired,
+				hello: {
+					type: "runner",
+					v: 1,
+					account,
+					machine: { name: os.hostname() }
+				}
+			});
+		},
+		paired: async (office) => !!pairingEntry(await readPairing(pairingPath(claudeDir)), office.server, account.id)?.credential,
+		idle: () => answerers.every((a) => a.runner.idle()),
+		lit: async () => anyRoomSince(io, path.join(claudeDir, "projects"), Date.now() - askableMs(await config().catch(() => first))),
+		gone: new Promise((resolve) => process.stdin.on("end", resolve).on("error", resolve).resume()),
+		log,
+		checkMs: CHECK_MS,
+		holdOffMs: HOLD_OFF_MS
+	});
+	send = links.sender;
+	const ended = await links.ended;
+	return ended === "not-wanted" ? 3 : ended === "unpaired" ? 4 : 0;
 }
 process.exitCode = await (process.argv.includes("--worker") ? worker() : supervisor());
 await logging;
