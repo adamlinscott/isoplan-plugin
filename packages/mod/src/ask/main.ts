@@ -131,13 +131,15 @@ async function main(argv: string[]): Promise<string> {
   try {
     for (let tries = 0; ; tries++) {
       const token = await pairing.token();
-      const link = await openSideLink(server, await hello(session, cwd, token, found.home), CONNECT_MS);
+      const said = await hello(session, cwd, token, found.home);
+      const link = await openSideLink(server, said, CONNECT_MS);
       try {
         if (ack) {
           link.send({ type: "asked-ack", v: PROTOCOL_VERSION, question: ack });
           return `acked ${ack}`;
         }
-        return await askRoom(link, question, settings, { key, deadline });
+        // Named so an answer from this person's own session reads as that (#109).
+        return await askRoom(link, question, settings, { key, deadline, me: said.account.name || undefined });
       } catch (err) {
         if (!(err instanceof TokenExpired) || tries > 0) throw err;
         await pairing.expired(token);

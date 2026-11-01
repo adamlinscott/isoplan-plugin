@@ -28,6 +28,10 @@
 // `--push-anyway <repo>=<commit>` for a repo under the folder, one per held repo. The brief's
 // folder (isoplan/handoffs/out/<id>) goes once it is sent, and any left by a prepare that wasn't
 // followed up goes after a day.
+//
+// `--to me` (or `myself`) hands the room to a new session of the person's own (adamlinscott/isoplan#109):
+// the office server takes it as the sender when nobody in the office is called that, the brief is
+// asked for as written for that new session, and what is printed says so.
 
 import fs from "node:fs/promises";
 import os from "node:os";
@@ -194,9 +198,11 @@ const CODE = /^[A-HJ-NP-Z2-9]{4}-?[A-HJ-NP-Z2-9]{4}$/i;
 const NAME = /^[\p{L}\p{N}][\p{L}\p{N} ._@-]{0,79}$/u;
 const nameOf = (argv: string[]) => {
   const to = (flag(argv, "--to") ?? "").trim();
-  if (!NAME.test(to)) stop(`"${to}" isn't a name to hand over to: use their name or account id, in letters, digits, spaces and . _ @ - only.`);
+  if (!NAME.test(to)) stop(`"${to}" isn't a name to hand over to: use their name or account id, in letters, digits, spaces and . _ @ - only, or "me" for a new session of yours.`);
   return to;
 };
+/** Whether the name is "me": a new session of the person's own. */
+const toSelf = (to: string) => /^(me|myself)$/i.test(to);
 
 async function prepareCommand(argv: string[]): Promise<string> {
   const to = nameOf(argv);
@@ -207,7 +213,7 @@ async function prepareCommand(argv: string[]): Promise<string> {
   const id = newHandoffId();
   const folder = outDir(id);
   await fs.mkdir(folder, { recursive: true });
-  const brief = fill((await loadPrompts(path.join(modDir, "prompts"))).brief, { to, untracked: untrackedLine(prepared.files) });
+  const brief = fill((await loadPrompts(path.join(modDir, "prompts"))).brief, { to: toSelf(to) ? "a new Claude Code session of this same person's" : to, untracked: untrackedLine(prepared.files) });
   const subs = prepared.repos.filter((r) => r.path !== ".");
   const repos = subs.length ? [`Repos, by path in this folder: ${prepared.repos.map((r) => `${r.path} (${repoBranch(id, r)}${r.from ? `, from ${r.from}` : ""})`).join(", ")}`] : [];
   const left = prepared.left.length ? [`Left out: ${prepared.left.map((l) => `${l.path} (${l.why})`).join("; ")}`] : [];
@@ -279,6 +285,7 @@ async function handOverCommand(argv: string[]): Promise<string> {
     const name = (answer as HandedOverMessage).to.name || (answer as HandedOverMessage).to.id;
     if (path.resolve(path.dirname(file)) === path.resolve(outDir(id))) await fs.rm(outDir(id), { recursive: true, force: true }).catch(() => {});
     const inRepos = sent.some((r) => r.path !== ".") ? ` in ${sent.map((r) => (r.branch === branch ? r.path : `${r.path} (as ${r.branch})`)).join(", ")}` : "";
+    if (toSelf(to)) return `Handed over to a new session of yours, on ${branch}${inRepos}. Open it from its room on the floor with Take handoff, or copy its prompt there into a session you have.`;
     return `Handed over to ${name}, on ${branch}${inRepos}. They will see a Take handoff button in the room on the floor.`;
   } finally {
     await link.close();
