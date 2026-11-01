@@ -5905,13 +5905,17 @@ const HelloMessageSchema = object({
 	project: ProjectSchema,
 	token: Token
 });
-/** The first message on a runner's link: the one link per machine that answers requests for its rooms. */
+/**
+* The first message on a runner's link: the one link per machine that answers requests for its rooms.
+* `orca`: Orca's CLI is on this machine, so a handoff can be taken into Orca (mode `orca`).
+*/
 const RunnerHelloMessageSchema = object({
 	type: literal("runner"),
 	v: Version,
 	account: Account,
 	machine: Machine,
-	token: Token
+	token: Token,
+	orca: boolean().optional()
 });
 /** All of the session's facts. Sent on connect and on repair. */
 const FullMessageSchema = object({
@@ -6138,7 +6142,11 @@ const HandoffMessageSchema = object({
 	type: literal("handoff"),
 	v: Version,
 	handoff: HandoffSchema,
-	mode: _enum(["terminal", "headless"]).optional(),
+	mode: _enum([
+		"terminal",
+		"headless",
+		"orca"
+	]).optional(),
 	session: string().uuid().optional()
 });
 /** A hand-over-check passed: `to` is the receiver the server found for the name given. */
@@ -6336,12 +6344,12 @@ async function readJson(io, p, optional = false) {
 /** The folder of what is kept for one office server alone: its list, and its pairing's lock. Named by a hash of its address. */
 const officeDir = (claudeDir, server) => path.join(claudeDir, "isoplan", "offices", createHash("sha256").update(server).digest("hex").slice(0, 12));
 const approvedPath = (claudeDir, server) => path.join(officeDir(claudeDir, server), "approved.json");
-const isFile$1 = (v) => !!v && typeof v.server === "string" && typeof v.version === "string" && typeof v.fetched === "number" && typeof v.checked === "number" && Array.isArray(v.repos) && v.repos.every((r) => typeof r === "string");
+const isFile$2 = (v) => !!v && typeof v.server === "string" && typeof v.version === "string" && typeof v.fetched === "number" && typeof v.checked === "number" && Array.isArray(v.repos) && v.repos.every((r) => typeof r === "string");
 /** approved.json, for `server` when given; null when there is none, or it is another server's. */
 async function readApproved(file, server) {
 	try {
 		const value = JSON.parse(await fs.readFile(file, "utf8"));
-		return isFile$1(value) && (server === void 0 || value.server === server) ? value : null;
+		return isFile$2(value) && (server === void 0 || value.server === server) ? value : null;
 	} catch {
 		return null;
 	}
@@ -9219,13 +9227,13 @@ async function doingOf(st, place, fallbackMs, config) {
 //#endregion
 //#region src/runner/claude-binary.ts
 const claudeBinaryPath = (claudeDir) => path.join(claudeDir, "isoplan", "claude-binary.json");
-const isFile = (p) => fs.stat(p).then((s) => s.isFile(), () => false);
+const isFile$1 = (p) => fs.stat(p).then((s) => s.isFile(), () => false);
 /**
 * The `claude` binary's path: PATH first, then where Claude Code's installers put it. On Windows
 * an npm install leaves only a claude.cmd shim, which can't be run without a shell, so its cli.js
 * is used instead (run with node). Null when none is found.
 */
-async function findClaude(env, platform, home, exists = isFile) {
+async function findClaude(env, platform, home, exists = isFile$1) {
 	const windows = platform === "win32";
 	const join = windows ? path.win32.join : path.posix.join;
 	const dirs = (Object.entries(env).find(([key]) => key.toUpperCase() === "PATH")?.[1] ?? "").split(windows ? ";" : ":").filter(Boolean);
@@ -9249,7 +9257,7 @@ const claudeCommand = (binary, node = process.execPath) => binary.endsWith(".js"
 async function claudeBinary(claudeDir, env, platform, home) {
 	try {
 		const recorded = JSON.parse(await fs.readFile(claudeBinaryPath(claudeDir), "utf8")).path;
-		if (typeof recorded === "string" && await isFile(recorded)) return recorded;
+		if (typeof recorded === "string" && await isFile$1(recorded)) return recorded;
 	} catch {}
 	return findClaude(env, platform, home);
 }
@@ -10200,6 +10208,83 @@ async function commitIn(run, repo, id, index, timeoutMs, pushAnyway, scan) {
 	return ready(commit, held, binary.map(inFolder));
 }
 //#endregion
+//#region src/handoff/orca.ts
+const isFile = (p) => fs.stat(p).then((s) => s.isFile(), () => false);
+/**
+* Orca's CLI: PATH first, then where Orca's installer puts it (Windows: %LOCALAPPDATA%\Programs\orca,
+* a Mac: Orca.app in /Applications or ~/Applications). Null when none is found, and always on any
+* other platform.
+*/
+async function findOrca(env, platform, home, exists = isFile) {
+	if (platform !== "win32" && platform !== "darwin") return null;
+	const windows = platform === "win32";
+	const join = windows ? path.win32.join : path.posix.join;
+	const dirs = (Object.entries(env).find(([key]) => key.toUpperCase() === "PATH")?.[1] ?? "").split(windows ? ";" : ":").filter(Boolean);
+	const localAppData = Object.entries(env).find(([key]) => key.toUpperCase() === "LOCALAPPDATA")?.[1] ?? join(home, "AppData", "Local");
+	const candidates = windows ? [...dirs.map((d) => join(d, "orca.exe")), join(localAppData, "Programs", "orca", "resources", "bin", "orca.exe")] : [
+		...dirs.map((d) => join(d, "orca")),
+		"/Applications/Orca.app/Contents/Resources/bin/orca",
+		join(home, "Applications", "Orca.app", "Contents", "Resources", "bin", "orca")
+	];
+	for (const candidate of candidates) if (await exists(candidate)) return candidate;
+	return null;
+}
+/**
+* Runs the CLI at `bin` hidden, with no window of its own, and reads its JSON answer. A .js or .mjs
+* `bin` is run with node (a test's fake Orca).
+*/
+function orcaRunner(bin, env, timeoutMs = 6e4) {
+	const command = /\.m?js$/.test(bin) ? [process.execPath, bin] : [bin];
+	return (args) => new Promise((resolve) => {
+		let stdout = "";
+		let stderr = "";
+		const child = spawn(command[0], [
+			...command.slice(1),
+			...args,
+			"--json"
+		], {
+			env,
+			stdio: [
+				"ignore",
+				"pipe",
+				"pipe"
+			],
+			windowsHide: true
+		});
+		child.stdout.setEncoding("utf8").on("data", (piece) => stdout += piece);
+		child.stderr.setEncoding("utf8").on("data", (piece) => stderr = (stderr + piece).slice(-2e3));
+		const timer = setTimeout(() => killTree(child), timeoutMs);
+		child.on("error", (err) => (clearTimeout(timer), resolve({
+			ok: false,
+			error: err.message,
+			code: null
+		})));
+		child.on("close", (code) => {
+			clearTimeout(timer);
+			try {
+				const answer = JSON.parse(stdout);
+				if (answer.ok === true) return resolve({
+					ok: true,
+					result: answer.result ?? {}
+				});
+				const steps = Array.isArray(answer.error?.data?.nextSteps) ? ` ${answer.error.data.nextSteps.join(" ")}` : "";
+				const said = typeof answer.error?.code === "string" ? answer.error.code : null;
+				return resolve({
+					ok: false,
+					error: `${String(answer.error?.message ?? said ?? "it failed")}${steps}`,
+					code: said
+				});
+			} catch {
+				resolve({
+					ok: false,
+					error: (stderr || stdout).trim() || `orca exited with code ${code}`,
+					code: null
+				});
+			}
+		});
+	});
+}
+//#endregion
 //#region src/handoff/take.ts
 /** The repo's own labelled settings file, at its top. */
 const REPO_CONFIG = "isoplan.json";
@@ -10611,6 +10696,7 @@ const noHooks = async () => ["-c", `core.hooksPath=${await (emptyHooks ??= fs.mk
 async function takeHandoff(message, o) {
 	const { handoff } = message;
 	const headless = message.mode === "headless";
+	let orca = null;
 	const failures = [];
 	const done = (session) => ({
 		type: "taken",
@@ -10627,11 +10713,18 @@ async function takeHandoff(message, o) {
 			output: matched ? `The end of its output is withheld here: it matches a secret pattern. It is on ${o.machine}.` : tail(output)
 		});
 	};
-	if (message.mode !== "terminal" && message.mode !== "headless") {
+	if (message.mode !== "terminal" && message.mode !== "headless" && message.mode !== "orca") {
 		await fail("open", "The office server didn't say how to open the session, so none was opened: take it again from the floor.");
 		return done();
 	}
 	try {
+		if (message.mode === "orca") {
+			orca = await o.orca?.() ?? null;
+			if (!orca) {
+				await fail("open", `Orca wasn't found on ${o.machine}, so nothing was made or opened: take it again from the floor another way.`);
+				return done();
+			}
+		}
 		const s = await o.settings();
 		const timeoutMs = s.gitTimeoutSeconds * 1e3;
 		const repo = handoff.repos.find((r) => r.path === ".");
@@ -10660,7 +10753,8 @@ async function takeHandoff(message, o) {
 				await fail("worktree", `git fetch ${clone.remote} ${branch} in ${clone.dir} failed${fetched.timedOut ? " (it took too long)" : ""}:\n${fetched.stderr}`);
 				return done();
 			}
-			const made = await worktreeFor(o.run, clone.dir, clone.remote, branch, handoff.id, await takenBefore(folder), timeoutMs);
+			const exempt = await takenBefore(folder);
+			const made = orca ? await orcaWorktree(orca, o.run, clone, branch, handoff.id, exempt, timeoutMs) : await worktreeFor(o.run, clone.dir, clone.remote, branch, handoff.id, exempt, timeoutMs);
 			if (typeof made !== "string") {
 				await fail("worktree", made.error);
 				return done();
@@ -10668,6 +10762,10 @@ async function takeHandoff(message, o) {
 			dir = made;
 			await recordTaken(folder, await resolved(o.run, dir, "HEAD", timeoutMs) ?? repo.commit);
 		} else {
+			if (orca) {
+				await fail("open", "This handoff is of a folder above several repos, not one repo, so Orca can't open it: take it again from the floor another way.");
+				return done();
+			}
 			const workspace = await findWorkspace(o.io, o.run, projects, subs, since, timeoutMs);
 			if (!workspace) {
 				await fail("worktree", `No folder holding a clone of ${subs.map((r) => r.remote).join(" or ")} at its path in the handoff (${subs.map((r) => r.path).join(", ")}) was found on ${o.machine}: none of its Claude Code sessions from the last ${s.cloneSearchDays} days ran in one. Open Claude Code once in your folder of these repos, then take the handoff again, or copy its prompt into a session there.`);
@@ -10764,6 +10862,34 @@ async function takeHandoff(message, o) {
 		if (!l) {
 			await fail("open", `Opening a terminal isn't supported on ${o.platform} yet. The worktree is ${dir} and the brief is ${briefFile}: open Claude Code there yourself.`);
 			return done();
+		}
+		if (orca) {
+			try {
+				await trustFolder(o.claudeJson, dir, o.platform);
+				await fs.writeFile(l.file, l.text, { mode: 493 });
+			} catch (err) {
+				await fail("open", `The session couldn't be readied for Orca: ${err.message}. The worktree is ${dir}.`);
+				return done();
+			}
+			const command = o.platform === "win32" ? `"${l.file.replace(/"/g, "")}"` : shQuote(l.file);
+			const opened = await orca([
+				"terminal",
+				"create",
+				"--worktree",
+				`path:${dir}`,
+				"--title",
+				name,
+				"--command",
+				command,
+				...o.platform === "win32" ? ["--shell", "cmd.exe"] : [],
+				"--focus"
+			]);
+			if (!opened.ok) {
+				await fail("open", `Orca couldn't open Claude Code in ${dir}: ${opened.error}`);
+				return done();
+			}
+			o.log(`handoff ${handoff.id}: opened Claude Code session ${id} in Orca, in ${dir}`);
+			return done(`claude-code:${id}`);
 		}
 		try {
 			await (o.open ?? openLaunch)(l, env);
@@ -10974,9 +11100,34 @@ async function repoAt(run, base, repo, folder, timeoutMs, cloneFrom) {
 	const { error } = await checkoutIn(run, target, repo, repo.branch, folder, timeoutMs);
 	return error ? refused(error) : null;
 }
-async function worktreeFor(run, clone, remote, branch, id, exempt, timeoutMs) {
+async function worktreeFor(run, clone, remote, branch, id, exempt, timeoutMs, existing = null) {
 	const tip = `refs/remotes/${remote}/${branch}`;
 	const hooksOff = await noHooks();
+	const move = async (dir) => {
+		const dirty = (await run([
+			"status",
+			"--porcelain",
+			"--untracked-files=no"
+		], {
+			cwd: dir,
+			timeoutMs
+		})).stdout.trim() !== "";
+		const extra = await ahead(run, dir, tip, exempt, "HEAD", timeoutMs);
+		if (dirty || extra !== 0) return { error: `${dir}, this handoff's worktree from before, has work that isn't in the handoff as handed over now (${dirty ? "uncommitted changes" : `${extra ?? "some"} commit(s)`}), so it was left as it is. Commit and push it, or move it aside, then take the handoff again.` };
+		const moved = await run([
+			...hooksOff,
+			"reset",
+			"-q",
+			"--keep",
+			tip
+		], {
+			cwd: dir,
+			timeoutMs,
+			env: NO_LFS
+		});
+		return moved.code === 0 ? dir : { error: `${dir} couldn't be moved to the handoff as handed over now:\n${moved.stderr}` };
+	};
+	if (existing) return move(existing);
 	const base = path.join(path.dirname(clone), `${path.basename(clone)}-handoff-${id}`);
 	for (let n = 1; n < 10; n++) {
 		const dir = n === 1 ? base : `${base}-${n}`;
@@ -10990,28 +11141,7 @@ async function worktreeFor(run, clone, remote, branch, id, exempt, timeoutMs) {
 				timeoutMs
 			});
 			if (head.code !== 0 || head.stdout.trim() !== branch) continue;
-			const dirty = (await run([
-				"status",
-				"--porcelain",
-				"--untracked-files=no"
-			], {
-				cwd: dir,
-				timeoutMs
-			})).stdout.trim() !== "";
-			const extra = await ahead(run, dir, tip, exempt, "HEAD", timeoutMs);
-			if (dirty || extra !== 0) return { error: `${dir}, this handoff's worktree from before, has work that isn't in the handoff as handed over now (${dirty ? "uncommitted changes" : `${extra ?? "some"} commit(s)`}), so it was left as it is. Commit and push it, or move it aside, then take the handoff again.` };
-			const moved = await run([
-				...hooksOff,
-				"reset",
-				"-q",
-				"--keep",
-				tip
-			], {
-				cwd: dir,
-				timeoutMs,
-				env: NO_LFS
-			});
-			return moved.code === 0 ? dir : { error: `${dir} couldn't be moved to the handoff as handed over now:\n${moved.stderr}` };
+			return move(dir);
 		}
 		if ((await run([
 			"rev-parse",
@@ -11042,6 +11172,108 @@ async function worktreeFor(run, clone, remote, branch, id, exempt, timeoutMs) {
 		return r.code === 0 ? dir : { error: `git worktree add ${dir} failed${r.timedOut ? " (it took too long)" : ""}:\n${r.stderr}` };
 	}
 	return { error: `${base} and the next eight names beside it are taken by other folders` };
+}
+async function worktreeOn(run, clone, branch, timeoutMs) {
+	const listed = await run([
+		"worktree",
+		"list",
+		"--porcelain"
+	], {
+		cwd: clone,
+		timeoutMs
+	});
+	if (listed.code !== 0) return null;
+	const at = listed.stdout.split(/\r?\n\r?\n/).slice(1).map((b) => b.split(/\r?\n/)).find((lines) => lines.includes(`branch refs/heads/${branch}`))?.find((line) => line.startsWith("worktree "));
+	return at ? path.resolve(at.slice(9)) : null;
+}
+async function inOrca(orca, dir) {
+	const shown = await orca([
+		"repo",
+		"show",
+		"--repo",
+		`path:${dir}`
+	]);
+	if (shown.ok) return null;
+	if (shown.code !== "repo_not_found") return `Orca couldn't be asked about ${dir}: ${shown.error}`;
+	const added = await orca([
+		"repo",
+		"add",
+		"--path",
+		dir
+	]);
+	return added.ok ? null : `Orca couldn't add ${dir}: ${added.error}`;
+}
+/**
+* The worktree for a take into Orca: made by Orca, on the handoff's branch from the remote's, when
+* this machine has no worktree on it, no local branch of its name and no core.hooksPath in the
+* clone; else the take's own (worktreeFor), which Orca finds by its path. Either way the clone is a
+* repo in Orca, added when it isn't.
+*/
+async function orcaWorktree(orca, run, clone, branch, id, exempt, timeoutMs) {
+	const git = (args, cwd = clone.dir) => run(args, {
+		cwd,
+		timeoutMs
+	});
+	const unknown = await inOrca(orca, clone.dir);
+	if (unknown) return { error: unknown };
+	const existing = await worktreeOn(run, clone.dir, branch, timeoutMs);
+	const local = (await git([
+		"rev-parse",
+		"--verify",
+		"-q",
+		`refs/heads/${branch}`
+	])).code === 0;
+	const hooks = (await git([
+		"config",
+		"--get",
+		"core.hooksPath"
+	])).code === 0;
+	if (!existing && !local && !hooks) {
+		const created = await orca([
+			"worktree",
+			"create",
+			"--repo",
+			`path:${clone.dir}`,
+			"--name",
+			`handoff-${id}`,
+			"--branch",
+			branch,
+			"--base-branch",
+			`${clone.remote}/${branch}`,
+			"--no-parent",
+			"--setup",
+			"skip",
+			"--comment",
+			`Isoplan handoff ${id}`
+		]);
+		if (!created.ok) return { error: `Orca couldn't make the handoff's worktree: ${created.error}` };
+		const made = created.result.worktree?.path;
+		if (typeof made !== "string") return { error: "Orca made a worktree but didn't say where." };
+		const dir = path.resolve(made);
+		const head = (await git([
+			"rev-parse",
+			"--abbrev-ref",
+			"HEAD"
+		], dir)).stdout.trim();
+		if (head !== branch) return { error: `Orca made ${dir} on ${head || "no branch"}, not ${branch}, so nothing was opened there.` };
+		const tip = await resolved(run, clone.dir, `refs/remotes/${clone.remote}/${branch}`, timeoutMs);
+		if (!tip || await resolved(run, dir, "HEAD", timeoutMs) !== tip) return { error: `Orca made ${dir}, but not at the handoff as handed over now, so nothing was opened there.` };
+		const tracked = await git([
+			"branch",
+			`--set-upstream-to=${clone.remote}/${branch}`,
+			branch
+		], dir);
+		return tracked.code === 0 ? dir : { error: `${branch} in ${dir} couldn't be set to track ${clone.remote}/${branch}:\n${tracked.stderr}` };
+	}
+	const dir = await worktreeFor(run, clone.dir, clone.remote, branch, id, exempt, timeoutMs, existing);
+	if (typeof dir !== "string") return dir;
+	const seen = await orca([
+		"worktree",
+		"show",
+		"--worktree",
+		`path:${dir}`
+	]);
+	return seen.ok ? dir : { error: `Orca doesn't see ${dir} as a worktree of ${clone.dir}: ${seen.error}` };
 }
 //#endregion
 //#region src/handoff/taken-office.ts
@@ -11593,6 +11825,8 @@ async function worker() {
 		else if (line.type === "error") log(`the office server at ${server} says: ${line.message} (${line.code})`);
 		else if (line.type === "pair") log(`to answer for this machine's rooms through ${line.server}, pair it: click ${line.url} on this computer and approve it in the office (it works until ${line.expires})`);
 	};
+	const orca = () => findOrca(process.env, process.platform, os.homedir());
+	const hasOrca = await orca() !== null;
 	const homeIo = machineHomeIo(first.workspaceRepos);
 	const ledger = await openLedger(path.join(isoplanDir, "runner", "ledger.json"));
 	const preparedFor = /* @__PURE__ */ new Map();
@@ -11684,7 +11918,11 @@ async function worker() {
 						claude: () => claudeBinary(claudeDir, process.env, process.platform, os.homedir()),
 						claudeJson,
 						scan: scanText,
-						log
+						log,
+						orca: async () => {
+							const bin = await orca();
+							return bin ? orcaRunner(bin, forkEnv(process.env)) : null;
+						}
 					});
 					if (taken.session) await recordTakenOffice(claudeDir, taken.session, server).catch(() => {});
 					return taken;
@@ -11710,7 +11948,8 @@ async function worker() {
 					type: "runner",
 					v: 1,
 					account,
-					machine: { name: os.hostname() }
+					machine: { name: os.hostname() },
+					...hasOrca ? { orca: true } : {}
 				}
 			});
 		},

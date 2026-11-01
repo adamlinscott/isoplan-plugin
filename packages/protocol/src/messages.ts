@@ -99,13 +99,17 @@ export const HelloMessageSchema = z.object({
   token: Token,
 });
 
-/** The first message on a runner's link: the one link per machine that answers requests for its rooms. */
+/**
+ * The first message on a runner's link: the one link per machine that answers requests for its rooms.
+ * `orca`: Orca's CLI is on this machine, so a handoff can be taken into Orca (mode `orca`).
+ */
 export const RunnerHelloMessageSchema = z.object({
   type: z.literal("runner"),
   v: Version,
   account: Account,
   machine: Machine,
   token: Token,
+  orca: z.boolean().optional(),
 });
 
 /** All of the session's facts. Sent on connect and on repair. */
@@ -382,9 +386,10 @@ export const HandoffMessageSchema = z.object({
   type: z.literal("handoff"),
   v: Version,
   handoff: HandoffSchema,
-  // To a runner: how to open the session (a terminal, by default, or headless, with no window), and
-  // the session id to open it under, which is the one the server will let join the room.
-  mode: z.enum(["terminal", "headless"]).optional(),
+  // To a runner: how to open the session (a terminal, by default, headless, with no window, or in
+  // Orca, sent only to a runner that said `orca`), and the session id to open it under, which is the
+  // one the server will let join the room.
+  mode: z.enum(["terminal", "headless", "orca"]).optional(),
   session: z.string().uuid().optional(),
 });
 

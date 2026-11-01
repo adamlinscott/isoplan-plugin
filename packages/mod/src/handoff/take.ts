@@ -42,6 +42,16 @@
 //      trusted in .claude.json first: the floor told the receiver it would be. The session is
 //      confirmed through `claude agents --json`; the receiver opens it with `claude attach`, and a
 //      harness that shows the repo's worktrees (Orca, for example) finds the worktree.
+//    - `orca`: in the receiver's own Orca app (orca.ts), the one other path that shows anything, and
+//      only for that click. The clone is added to Orca when it isn't there. A worktree new to this
+//      machine is made by Orca, `orca worktree create` on the handoff's branch from the remote's,
+//      with Orca's own setup skipped, so it is one of Orca's in the repo's Orca workspace; one made
+//      before, a local branch of the handoff's name, or a clone whose core.hooksPath is set (whose
+//      hooks could be the handoff branch's own, and Orca's checkout doesn't turn them off) gets the
+//      take's own worktree instead, which Orca finds by its path. The worktree is trusted as for
+//      headless, then `orca terminal create` opens a terminal in it, in front, that runs the launcher.
+//      Without Orca's CLI nothing is made, and the take says so; nor for a handoff of a plain folder
+//      above several repos, which Orca can't hold.
 //
 // A failed setup script or repo checkout doesn't stop the rest: the session still opens, and the step is reported
 // with the end of its output. Output leaves the machine only after the secret scan.
@@ -59,6 +69,7 @@ import type { NodeIo } from "../data-layer/io.js";
 import { claudeCommand } from "../runner/claude-binary.js";
 import { forkEnv, killTree } from "../runner/claude.js";
 import { handoffBranch, remotesOf, sameRemote, type RunGit } from "./git.js";
+import type { RunOrca } from "./orca.js";
 
 /** The repo's own labelled settings file, at its top. */
 export const REPO_CONFIG = "isoplan.json";
@@ -114,6 +125,8 @@ export interface TakeOptions {
   newSession?: () => string;
   /** Which remotes a missing repo under the folder may be cloned from: by default `onTheWire`. */
   cloneFrom?: (remote: string) => boolean;
+  /** Orca's CLI, for a take into Orca, or null when Orca isn't on this machine. */
+  orca?: () => Promise<RunOrca | null>;
 }
 
 /** The handoff's folder on this machine: its brief, launcher and setup log. */
@@ -428,6 +441,7 @@ const noHooks = async () => ["-c", `core.hooksPath=${await (emptyHooks ??= fs.mk
 export async function takeHandoff(message: Pick<HandoffMessage, "handoff" | "mode" | "session">, o: TakeOptions): Promise<TakenMessage> {
   const { handoff } = message;
   const headless = message.mode === "headless";
+  let orca: RunOrca | null = null;
   const failures: Failure[] = [];
   const done = (session?: string): TakenMessage => ({ type: "taken", v: PROTOCOL_VERSION, handoff: handoff.id, ...(session ? { session } : {}), failures });
   const fail = async (step: Failure["step"], output: string, repo?: string) => {
@@ -435,11 +449,18 @@ export async function takeHandoff(message: Pick<HandoffMessage, "handoff" | "mod
     failures.push({ step, ...(repo ? { repo } : {}), output: matched ? `The end of its output is withheld here: it matches a secret pattern. It is on ${o.machine}.` : tail(output) });
   };
   // A window opens only when the receiver asked for a terminal: a handoff that doesn't say is refused.
-  if (message.mode !== "terminal" && message.mode !== "headless") {
+  if (message.mode !== "terminal" && message.mode !== "headless" && message.mode !== "orca") {
     await fail("open", "The office server didn't say how to open the session, so none was opened: take it again from the floor.");
     return done();
   }
   try {
+    if (message.mode === "orca") {
+      orca = (await o.orca?.()) ?? null;
+      if (!orca) {
+        await fail("open", `Orca wasn't found on ${o.machine}, so nothing was made or opened: take it again from the floor another way.`);
+        return done();
+      }
+    }
     const s = await o.settings();
     const timeoutMs = s.gitTimeoutSeconds * 1000;
     const repo = handoff.repos.find((r) => r.path === ".");
@@ -463,7 +484,8 @@ export async function takeHandoff(message: Pick<HandoffMessage, "handoff" | "mod
         await fail("worktree", `git fetch ${clone.remote} ${branch} in ${clone.dir} failed${fetched.timedOut ? " (it took too long)" : ""}:\n${fetched.stderr}`);
         return done();
       }
-      const made = await worktreeFor(o.run, clone.dir, clone.remote, branch, handoff.id, await takenBefore(folder), timeoutMs);
+      const exempt = await takenBefore(folder);
+      const made = orca ? await orcaWorktree(orca, o.run, clone, branch, handoff.id, exempt, timeoutMs) : await worktreeFor(o.run, clone.dir, clone.remote, branch, handoff.id, exempt, timeoutMs);
       if (typeof made !== "string") {
         await fail("worktree", made.error);
         return done();
@@ -471,6 +493,11 @@ export async function takeHandoff(message: Pick<HandoffMessage, "handoff" | "mod
       dir = made;
       await recordTaken(folder, (await resolved(o.run, dir, "HEAD", timeoutMs)) ?? repo.commit);
     } else {
+      // Orca opens a terminal only in a repo it holds, and this folder isn't one.
+      if (orca) {
+        await fail("open", "This handoff is of a folder above several repos, not one repo, so Orca can't open it: take it again from the floor another way.");
+        return done();
+      }
       // A handoff from a plain folder above its repos: a plain folder beside the receiver's own.
       const workspace = await findWorkspace(o.io, o.run, projects, subs, since, timeoutMs);
       if (!workspace) {
@@ -551,6 +578,25 @@ export async function takeHandoff(message: Pick<HandoffMessage, "handoff" | "mod
     if (!l) {
       await fail("open", `Opening a terminal isn't supported on ${o.platform} yet. The worktree is ${dir} and the brief is ${briefFile}: open Claude Code there yourself.`);
       return done();
+    }
+    if (orca) {
+      try {
+        // The floor told the receiver: this trusts the worktree, so its settings, hooks and scripts run.
+        await trustFolder(o.claudeJson, dir, o.platform);
+        await fs.writeFile(l.file, l.text, { mode: 0o755 });
+      } catch (err) {
+        await fail("open", `The session couldn't be readied for Orca: ${(err as Error).message}. The worktree is ${dir}.`);
+        return done();
+      }
+      // Typed into the terminal's shell: cmd.exe on Windows, asked for, and the login shell on a Mac.
+      const command = o.platform === "win32" ? `"${l.file.replace(/"/g, "")}"` : shQuote(l.file);
+      const opened = await orca(["terminal", "create", "--worktree", `path:${dir}`, "--title", name, "--command", command, ...(o.platform === "win32" ? ["--shell", "cmd.exe"] : []), "--focus"]);
+      if (!opened.ok) {
+        await fail("open", `Orca couldn't open Claude Code in ${dir}: ${opened.error}`);
+        return done();
+      }
+      o.log(`handoff ${handoff.id}: opened Claude Code session ${id} in Orca, in ${dir}`);
+      return done(`claude-code:${id}`);
     }
     try {
       await (o.open ?? openLaunch)(l, env);
@@ -731,9 +777,22 @@ async function repoAt(run: RunGit, base: string, repo: HandoffRepo, folder: stri
 
 // The worktree for the handoff: one already made on its branch, moved to the new tip when nothing
 // in it would be lost, else a new sibling of the clone.
-async function worktreeFor(run: RunGit, clone: string, remote: string, branch: string, id: string, exempt: string[], timeoutMs: number): Promise<string | { error: string }> {
+// `existing`, a worktree already on the handoff's branch wherever it is (Orca's, say), is the one
+// moved, when given.
+async function worktreeFor(run: RunGit, clone: string, remote: string, branch: string, id: string, exempt: string[], timeoutMs: number, existing: string | null = null): Promise<string | { error: string }> {
   const tip = `refs/remotes/${remote}/${branch}`;
   const hooksOff = await noHooks();
+  const move = async (dir: string) => {
+    // Untracked files (a setup script's own, say) are kept by the reset, so only tracked changes count.
+    const dirty = (await run(["status", "--porcelain", "--untracked-files=no"], { cwd: dir, timeoutMs })).stdout.trim() !== "";
+    const extra = await ahead(run, dir, tip, exempt, "HEAD", timeoutMs);
+    if (dirty || extra !== 0) {
+      return { error: `${dir}, this handoff's worktree from before, has work that isn't in the handoff as handed over now (${dirty ? "uncommitted changes" : `${extra ?? "some"} commit(s)`}), so it was left as it is. Commit and push it, or move it aside, then take the handoff again.` };
+    }
+    const moved = await run([...hooksOff, "reset", "-q", "--keep", tip], { cwd: dir, timeoutMs, env: NO_LFS });
+    return moved.code === 0 ? dir : { error: `${dir} couldn't be moved to the handoff as handed over now:\n${moved.stderr}` };
+  };
+  if (existing) return move(existing);
   const base = path.join(path.dirname(clone), `${path.basename(clone)}-handoff-${id}`);
   for (let n = 1; n < 10; n++) {
     const dir = n === 1 ? base : `${base}-${n}`;
@@ -741,14 +800,7 @@ async function worktreeFor(run: RunGit, clone: string, remote: string, branch: s
     if (exists) {
       const head = await run(["rev-parse", "--abbrev-ref", "HEAD"], { cwd: dir, timeoutMs });
       if (head.code !== 0 || head.stdout.trim() !== branch) continue;
-      // Untracked files (a setup script's own, say) are kept by the reset, so only tracked changes count.
-      const dirty = (await run(["status", "--porcelain", "--untracked-files=no"], { cwd: dir, timeoutMs })).stdout.trim() !== "";
-      const extra = await ahead(run, dir, tip, exempt, "HEAD", timeoutMs);
-      if (dirty || extra !== 0) {
-        return { error: `${dir}, this handoff's worktree from before, has work that isn't in the handoff as handed over now (${dirty ? "uncommitted changes" : `${extra ?? "some"} commit(s)`}), so it was left as it is. Commit and push it, or move it aside, then take the handoff again.` };
-      }
-      const moved = await run([...hooksOff, "reset", "-q", "--keep", tip], { cwd: dir, timeoutMs, env: NO_LFS });
-      return moved.code === 0 ? dir : { error: `${dir} couldn't be moved to the handoff as handed over now:\n${moved.stderr}` };
+      return move(dir);
     }
     // A local branch of the handoff's name with commits the remote's doesn't have is never reset.
     if ((await run(["rev-parse", "--verify", "-q", `refs/heads/${branch}`], { cwd: clone, timeoutMs })).code === 0) {
@@ -759,4 +811,54 @@ async function worktreeFor(run: RunGit, clone: string, remote: string, branch: s
     return r.code === 0 ? dir : { error: `git worktree add ${dir} failed${r.timedOut ? " (it took too long)" : ""}:\n${r.stderr}` };
   }
   return { error: `${base} and the next eight names beside it are taken by other folders` };
+}
+
+// The worktree, other than the main checkout, that has `branch` checked out, or null.
+async function worktreeOn(run: RunGit, clone: string, branch: string, timeoutMs: number): Promise<string | null> {
+  const listed = await run(["worktree", "list", "--porcelain"], { cwd: clone, timeoutMs });
+  if (listed.code !== 0) return null;
+  const blocks = listed.stdout.split(/\r?\n\r?\n/).slice(1).map((b) => b.split(/\r?\n/));
+  const at = blocks.find((lines) => lines.includes(`branch refs/heads/${branch}`))?.find((line) => line.startsWith("worktree "));
+  return at ? path.resolve(at.slice("worktree ".length)) : null;
+}
+
+// `dir` known to Orca as a project, added when it isn't: the problem, else null.
+async function inOrca(orca: RunOrca, dir: string): Promise<string | null> {
+  const shown = await orca(["repo", "show", "--repo", `path:${dir}`]);
+  if (shown.ok) return null;
+  if (shown.code !== "repo_not_found") return `Orca couldn't be asked about ${dir}: ${shown.error}`;
+  const added = await orca(["repo", "add", "--path", dir]);
+  return added.ok ? null : `Orca couldn't add ${dir}: ${added.error}`;
+}
+
+/**
+ * The worktree for a take into Orca: made by Orca, on the handoff's branch from the remote's, when
+ * this machine has no worktree on it, no local branch of its name and no core.hooksPath in the
+ * clone; else the take's own (worktreeFor), which Orca finds by its path. Either way the clone is a
+ * repo in Orca, added when it isn't.
+ */
+async function orcaWorktree(orca: RunOrca, run: RunGit, clone: { dir: string; remote: string }, branch: string, id: string, exempt: string[], timeoutMs: number): Promise<string | { error: string }> {
+  const git = (args: string[], cwd = clone.dir) => run(args, { cwd, timeoutMs });
+  const unknown = await inOrca(orca, clone.dir);
+  if (unknown) return { error: unknown };
+  const existing = await worktreeOn(run, clone.dir, branch, timeoutMs);
+  const local = (await git(["rev-parse", "--verify", "-q", `refs/heads/${branch}`])).code === 0;
+  const hooks = (await git(["config", "--get", "core.hooksPath"])).code === 0;
+  if (!existing && !local && !hooks) {
+    const created = await orca(["worktree", "create", "--repo", `path:${clone.dir}`, "--name", `handoff-${id}`, "--branch", branch, "--base-branch", `${clone.remote}/${branch}`, "--no-parent", "--setup", "skip", "--comment", `Isoplan handoff ${id}`]);
+    if (!created.ok) return { error: `Orca couldn't make the handoff's worktree: ${created.error}` };
+    const made = (created.result.worktree as { path?: unknown } | undefined)?.path;
+    if (typeof made !== "string") return { error: "Orca made a worktree but didn't say where." };
+    const dir = path.resolve(made);
+    const head = (await git(["rev-parse", "--abbrev-ref", "HEAD"], dir)).stdout.trim();
+    if (head !== branch) return { error: `Orca made ${dir} on ${head || "no branch"}, not ${branch}, so nothing was opened there.` };
+    const tip = await resolved(run, clone.dir, `refs/remotes/${clone.remote}/${branch}`, timeoutMs);
+    if (!tip || (await resolved(run, dir, "HEAD", timeoutMs)) !== tip) return { error: `Orca made ${dir}, but not at the handoff as handed over now, so nothing was opened there.` };
+    const tracked = await git(["branch", `--set-upstream-to=${clone.remote}/${branch}`, branch], dir);
+    return tracked.code === 0 ? dir : { error: `${branch} in ${dir} couldn't be set to track ${clone.remote}/${branch}:\n${tracked.stderr}` };
+  }
+  const dir = await worktreeFor(run, clone.dir, clone.remote, branch, id, exempt, timeoutMs, existing);
+  if (typeof dir !== "string") return dir;
+  const seen = await orca(["worktree", "show", "--worktree", `path:${dir}`]);
+  return seen.ok ? dir : { error: `Orca doesn't see ${dir} as a worktree of ${clone.dir}: ${seen.error}` };
 }

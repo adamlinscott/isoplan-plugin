@@ -5904,13 +5904,17 @@ const HelloMessageSchema = object({
 	project: ProjectSchema,
 	token: Token
 });
-/** The first message on a runner's link: the one link per machine that answers requests for its rooms. */
+/**
+* The first message on a runner's link: the one link per machine that answers requests for its rooms.
+* `orca`: Orca's CLI is on this machine, so a handoff can be taken into Orca (mode `orca`).
+*/
 const RunnerHelloMessageSchema = object({
 	type: literal("runner"),
 	v: Version,
 	account: Account,
 	machine: Machine,
-	token: Token
+	token: Token,
+	orca: boolean().optional()
 });
 /** All of the session's facts. Sent on connect and on repair. */
 const FullMessageSchema = object({
@@ -6168,7 +6172,11 @@ const HandoffMessageSchema = object({
 	type: literal("handoff"),
 	v: Version,
 	handoff: HandoffSchema,
-	mode: _enum(["terminal", "headless"]).optional(),
+	mode: _enum([
+		"terminal",
+		"headless",
+		"orca"
+	]).optional(),
 	session: string().uuid().optional()
 });
 /** A hand-over-check passed: `to` is the receiver the server found for the name given. */
