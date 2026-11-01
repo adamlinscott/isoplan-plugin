@@ -6433,6 +6433,11 @@ async function claudeBinary(claudeDir, env, platform, home) {
 //#endregion
 //#region src/wake/lock.ts
 const lockPath = (claudeDir, sessionId) => path.join(claudeDir, "isoplan", "live", `${sessionId}.json`);
+/**
+* The offices that didn't want a session, each until when (#105): the wake hook moves them here from
+* a hold-off it ends, for the data layer it starts, which reads the file once and removes it.
+*/
+const notWantedPath = (claudeDir, sessionId) => path.join(claudeDir, "isoplan", "live", `${sessionId}.not-wanted`);
 const HOLD_OFF_MS = 36e5;
 async function readText(file) {
 	try {
@@ -9218,10 +9223,14 @@ function pairingEntry(all, server, account) {
 	const first = all.accounts[account];
 	return all.offices?.[server]?.[account] ?? (first?.server === server ? first : void 0);
 }
-/** `all` with the account's entry for `server` set, where pairingEntry reads it; a new one under `accounts` while that holds no other server's. */
-function withPairingEntry(all, server, account, entry) {
-	const first = all.accounts[account];
-	if (!all.offices?.[server]?.[account] && (!first || first.server === server)) return {
+/**
+* `all` with the account's entry for `server` set: under `accounts` only for the server a version
+* before #105 reports to (`legacy`, config.json's `server`), and only while `offices` holds none for
+* it, so pairingEntry reads it back; any other server's always under `offices`, so a version before
+* #105, which writes `accounts` for its own server, never wipes it.
+*/
+function withPairingEntry(all, server, account, entry, legacy) {
+	if (legacy && !all.offices?.[server]?.[account]) return {
 		...all,
 		accounts: {
 			...all.accounts,
@@ -9317,13 +9326,13 @@ const HTML = {
 	"content-type": "text/html; charset=utf-8",
 	connection: "close"
 };
-function createPairing({ file, lock, writeLock, server, account, machine, emit, allowPlainWs = false, post = postJson, now = Date.now, pid = process.pid, isAlive = alive, retryMs = 200 }) {
+function createPairing({ file, lock, writeLock, server, account, machine, emit, allowPlainWs = false, legacy = false, post = postJson, now = Date.now, pid = process.pid, isAlive = alive, retryMs = 200 }) {
 	let asked = false;
 	let shown = null;
 	let unreadable = false;
 	let callback = null;
 	const entryOf = (all) => pairingEntry(all, server, account.id) ?? { server };
-	const withEntry = (all, entry) => withPairingEntry(all, server, account.id, entry);
+	const withEntry = (all, entry) => withPairingEntry(all, server, account.id, entry, legacy);
 	const mine = async () => entryOf(await readPairing(file));
 	const update = (decide) => locked(file, writeLock, pid, isAlive, (all) => {
 		const { entry, result } = decide(entryOf(all));
@@ -9761,6 +9770,7 @@ function createSessionGate({ approved, open }) {
 			};
 		},
 		link() {
+			if (!home) return null;
 			if (!link) {
 				link = open(home, mayConnect);
 				linked = home.id;
@@ -10145,12 +10155,12 @@ function createLink({ url, hello, emit, minIntervalMs = 1e3, retryBaseMs = 1e3, 
 			if (isOpen && !sent) sendFull();
 			else if (!pacing) flush();
 		},
-		send(message) {
+		send(message, at = Date.now()) {
 			if (isOpen && socket.readyState === WebSocket.OPEN) send(message);
 			else {
 				outbox.push({
 					message,
-					at: Date.now()
+					at
 				});
 				if (outbox.length > OUTBOX_MAX) outbox.shift();
 			}
@@ -10532,7 +10542,7 @@ async function main(argv) {
 			return 0;
 		}
 	}
-	const notWantedBefore = detached ? (await readLock(lock))?.extra.notWanted ?? {} : {};
+	const notWantedBefore = detached ? await takeNotWanted(claudeDir, sessionId) : {};
 	try {
 		if (!await takeLock(lock, process.pid, alive, !detached, Date.now(), { extra: lockExtra })) {
 			process.stderr.write(`another data layer already reports session ${sessionId}\n`);
@@ -10746,6 +10756,7 @@ async function main(argv) {
 			known: held,
 			dormant: null,
 			homing: null,
+			result: null,
 			connected: false,
 			unwanted: held,
 			unwantedUntil: held ? until : null,
@@ -10777,7 +10788,8 @@ async function main(argv) {
 			account: machineAccount,
 			machine,
 			emit: run.emit,
-			allowPlainWs: config.allowPlainWs
+			allowPlainWs: config.allowPlainWs,
+			legacy: !!office.legacy
 		});
 		run.approved = createApproved({
 			server,
@@ -10798,32 +10810,47 @@ async function main(argv) {
 	}));
 	const links = () => runs.flatMap((run) => run.gate.current() ?? []);
 	const isUnwanted = () => runs.some((r) => r.unwanted) && runs.every((r) => r.unwanted || r.dormant === "not-approved");
-	const check = (run, projects, workspace) => run.homing ??= run.gate.home(projects).then((gated) => {
+	const check = (run, projects, workspace) => run.homing ??= run.gate.home(projects).then((gated) => void (run.result = {
+		dormancy: gated.dormancy,
+		projects,
+		workspace
+	})).catch((err) => emit({
+		type: "log",
+		text: `couldn't check which repos ${run.office.server} takes: ${String(err?.message ?? err)}`
+	})).finally(() => run.homing = null);
+	const apply = (run) => {
+		if (!run.result) return;
+		const { dormancy, projects, workspace } = run.result;
+		run.result = null;
 		const { server, label } = run.office;
-		if (gated.dormancy !== run.dormant || !run.known) {
+		if (dormancy !== run.dormant || !run.known) {
 			run.emit({
 				type: "status",
 				server,
 				label,
-				state: gated.dormancy ?? "waiting",
-				...workspace && gated.dormancy && { workspace: true }
+				state: dormancy ?? "waiting",
+				...workspace && dormancy && { workspace: true }
 			});
 			const what = workspace ? "none of the repos in this folder is" : `${projects[0]?.id ?? cwd} isn't`;
-			if (gated.dormancy === "not-approved") emit({
+			if (dormancy === "not-approved") emit({
 				type: "log",
 				text: `${what} one the office at ${server} takes, so nothing of this session is sent to it`
 			});
-			if (gated.dormancy === "no-list") emit({
+			if (dormancy === "no-list") emit({
 				type: "log",
 				text: `can't tell which repos ${server} takes (no list, or one older than ${config.approvedMaxAgeMinutes} minutes), so nothing of this session is sent to it`
 			});
 		}
-		run.dormant = gated.dormancy;
+		run.dormant = dormancy;
 		run.known = true;
-	}).catch((err) => emit({
-		type: "log",
-		text: `couldn't check which repos ${run.office.server} takes: ${String(err?.message ?? err)}`
-	})).finally(() => run.homing = null);
+	};
+	const isHeldOff = (run, now) => {
+		if (run.unwantedUntil !== null && run.unwantedUntil <= now) {
+			run.unwanted = false;
+			run.unwantedUntil = null;
+		}
+		return run.unwantedUntil !== null;
+	};
 	const insecureSaid = /* @__PURE__ */ new Map();
 	const sayInsecure = async (projects) => {
 		for (const { server, label } of offices.filter((o) => o.plainRefused)) {
@@ -10900,11 +10927,12 @@ async function main(argv) {
 		}
 		await sayInsecure(candidates.projects);
 		const { projects: homes, workspace } = candidates;
-		const checks = runs.filter((r) => !(r.unwanted && r.unwantedUntil)).map((r) => check(r, homes, workspace));
+		const checks = runs.filter((r) => !isHeldOff(r, now)).map((r) => check(r, homes, workspace));
 		let slow;
 		await Promise.race([Promise.allSettled(checks), new Promise((r) => slow = setTimeout(r, config.streamSeconds * 1e3))]);
 		clearTimeout(slow);
-		const taking = runs.filter((r) => r.known && !r.dormant && !(r.unwanted && r.unwantedUntil));
+		for (const run of runs) apply(run);
+		const taking = runs.filter((r) => r.known && !r.dormant && !isHeldOff(r, now));
 		pending = runs.some((r) => !r.known);
 		dormant = taking.length ? null : pending ? "no-list" : runs.find((r) => r.dormant && r.dormant !== "not-approved")?.dormant ?? "not-approved";
 		if (!taking.length) {
@@ -11008,7 +11036,14 @@ async function main(argv) {
 		});
 		waiting = detached ? /* @__PURE__ */ new Set() : await waitsOf(waitsDir, facts);
 		shown = [facts, patterns];
-		for (const run of taking) run.gate.link().update(run.sent = outgoing(run, facts, patterns));
+		for (const run of taking) try {
+			run.gate.link()?.update(run.sent = outgoing(run, facts, patterns));
+		} catch (err) {
+			emit({
+				type: "log",
+				text: `couldn't send this session's facts to ${run.office.server}: ${String(err?.message ?? err)}`
+			});
+		}
 		const why = detached ? detachedStop({
 			now,
 			lastActive: facts.session.lastActive,
@@ -11039,6 +11074,13 @@ async function main(argv) {
 	else await releaseLock(lock, process.pid).catch(() => {});
 	await logging;
 	return 0;
+}
+/** The offices that didn't want this session, each until when, as the wake hook left them as it started this data layer (wake.ts); read once, then gone. */
+async function takeNotWanted(claudeDir, sessionId) {
+	const file = notWantedPath(claudeDir, sessionId);
+	const said = await fs.readFile(file, "utf8").then((text) => JSON.parse(text), () => null);
+	await fs.rm(file, { force: true }).catch(() => {});
+	return said && typeof said === "object" ? said : {};
 }
 /** A pair line as the log says it. */
 const pairNote = (line) => `to report to ${line.server}, pair this machine: click ${line.url} on this computer and approve it in the office (it works until ${line.expires})`;

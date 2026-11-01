@@ -1,5 +1,5 @@
 import { expect, test } from "vitest";
-import { answerOffices, OUTBOX_MAX, type AnswerOfficesOptions } from "./offices.js";
+import { answerOffices, OUTBOX_MAX, OUTBOX_MAX_AGE_MS, type AnswerOfficesOptions } from "./offices.js";
 import { createForkSlots } from "./runner.js";
 
 const HOLD_OFF_MS = 3600000;
@@ -63,6 +63,20 @@ test("runner offices: an ended pairing closes that link until the machine is pai
   expect(s.latest("internal").sent).toEqual(["reply-1"]);
   // The old link got nothing after it closed.
   expect(s.opened[0]!.sent).toEqual([]);
+  s.leave();
+  await s.loop.ended;
+});
+
+test("runner offices: a reply that waited for its office's link longer than OUTBOX_MAX_AGE_MS is dropped, not sent", async () => {
+  const s = setUp();
+  s.latest("internal").said.unpaired();
+  await settle();
+  s.loop.sender(0)("stale");
+  s.tick(OUTBOX_MAX_AGE_MS);
+  s.state.paired.add("internal");
+  await settle();
+  expect(s.latest("internal").sent).toEqual([]);
+  expect(s.logs).toContain("dropped 1 of the runner's replies for internal: they waited for its link longer than 60 minutes");
   s.leave();
   await s.loop.ended;
 });

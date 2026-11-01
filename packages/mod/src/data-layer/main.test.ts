@@ -186,7 +186,8 @@ test("one office not wanting the session while no other takes its repo holds it 
   // The wake hook starts it again once dev takes the repo, leaving the not-wanted office in the lock.
   dev.state.repos = ["github.com/team/app"];
   dev.state.version++;
-  fs.writeFileSync(lock, JSON.stringify({ notWanted: held.notWanted }));
+  fs.rmSync(lock);
+  fs.writeFileSync(path.join(claudeDir, "isoplan", "live", "s1.not-wanted"), JSON.stringify(held.notWanted));
   const asked = internal.state.connections.length;
   const repo = path.join(path.dirname(claudeDir), "app");
   const child = spawn(process.execPath, [path.join(modDir, "dist", "data-layer.js"), "--session", "s1", "--cwd", repo, "--detached"], { cwd: repo, env: { ...process.env, CLAUDE_CONFIG_DIR: claudeDir }, stdio: "ignore", windowsHide: true });

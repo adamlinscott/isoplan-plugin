@@ -6499,10 +6499,14 @@ function pairingEntry(all, server, account) {
 	const first = all.accounts[account];
 	return all.offices?.[server]?.[account] ?? (first?.server === server ? first : void 0);
 }
-/** `all` with the account's entry for `server` set, where pairingEntry reads it; a new one under `accounts` while that holds no other server's. */
-function withPairingEntry(all, server, account, entry) {
-	const first = all.accounts[account];
-	if (!all.offices?.[server]?.[account] && (!first || first.server === server)) return {
+/**
+* `all` with the account's entry for `server` set: under `accounts` only for the server a version
+* before #105 reports to (`legacy`, config.json's `server`), and only while `offices` holds none for
+* it, so pairingEntry reads it back; any other server's always under `offices`, so a version before
+* #105, which writes `accounts` for its own server, never wipes it.
+*/
+function withPairingEntry(all, server, account, entry, legacy) {
+	if (legacy && !all.offices?.[server]?.[account]) return {
 		...all,
 		accounts: {
 			...all.accounts,
@@ -6598,13 +6602,13 @@ const HTML = {
 	"content-type": "text/html; charset=utf-8",
 	connection: "close"
 };
-function createPairing({ file, lock, writeLock, server, account, machine, emit, allowPlainWs = false, post = postJson, now = Date.now, pid = process.pid, isAlive = alive, retryMs = 200 }) {
+function createPairing({ file, lock, writeLock, server, account, machine, emit, allowPlainWs = false, legacy = false, post = postJson, now = Date.now, pid = process.pid, isAlive = alive, retryMs = 200 }) {
 	let asked = false;
 	let shown = null;
 	let unreadable = false;
 	let callback = null;
 	const entryOf = (all) => pairingEntry(all, server, account.id) ?? { server };
-	const withEntry = (all, entry) => withPairingEntry(all, server, account.id, entry);
+	const withEntry = (all, entry) => withPairingEntry(all, server, account.id, entry, legacy);
 	const mine = async () => entryOf(await readPairing(file));
 	const update = (decide) => locked(file, writeLock, pid, isAlive, (all) => {
 		const { entry, result } = decide(entryOf(all));
@@ -7403,7 +7407,7 @@ const same = (a, b) => a !== void 0 && JSON.stringify(a) === JSON.stringify(b);
 //#region src/data-layer/link.ts
 const STABLE_MS$1 = 3e4;
 const OUTBOX_MAX$1 = 100;
-const OUTBOX_MAX_AGE_MS = 36e5;
+const OUTBOX_MAX_AGE_MS$1 = 36e5;
 function createLink({ url, hello, emit, minIntervalMs = 1e3, retryBaseMs = 1e3, retryCapMs = 3e4, notWantedRetryMs = 36e5, takenRetryMs = 36e5, onNotWanted, onPairingEnded, onMessage, filter = (facts) => facts, answered, pairing, pairPollMs = 5e3, admit, random = Math.random }) {
 	const outbox = [];
 	let latest = null;
@@ -7481,7 +7485,7 @@ function createLink({ url, hello, emit, minIntervalMs = 1e3, retryBaseMs = 1e3, 
 				...hello,
 				token
 			} : hello);
-			for (const { message, at } of outbox.splice(0)) if (Date.now() - at < OUTBOX_MAX_AGE_MS) send(message);
+			for (const { message, at } of outbox.splice(0)) if (Date.now() - at < OUTBOX_MAX_AGE_MS$1) send(message);
 			sendFull();
 			emit({
 				type: "status",
@@ -7658,12 +7662,12 @@ function createLink({ url, hello, emit, minIntervalMs = 1e3, retryBaseMs = 1e3, 
 			if (isOpen && !sent) sendFull();
 			else if (!pacing) flush();
 		},
-		send(message) {
+		send(message, at = Date.now()) {
 			if (isOpen && socket.readyState === WebSocket.OPEN) send(message);
 			else {
 				outbox.push({
 					message,
-					at: Date.now()
+					at
 				});
 				if (outbox.length > OUTBOX_MAX$1) outbox.shift();
 			}
@@ -11049,6 +11053,8 @@ async function recordTakenOffice(claudeDir, session, server) {
 	await fs.mkdir(path.dirname(file), { recursive: true });
 	await fs.writeFile(file, JSON.stringify({ server }) + "\n");
 }
+/** A reply kept longer than this is dropped: the server will have asked again by then. */
+const OUTBOX_MAX_AGE_MS = 36e5;
 function answerOffices(o) {
 	const now = o.now ?? Date.now;
 	let wake = () => {};
@@ -11066,7 +11072,10 @@ function answerOffices(o) {
 			notWanted: () => (s.notWanted = true, wake()),
 			unpaired: () => (s.unpaired = true, wake())
 		});
-		for (const message of s.outbox.splice(0)) s.link.send(message);
+		const kept = s.outbox.splice(0);
+		const fresh = kept.filter((m) => now() - m.at < OUTBOX_MAX_AGE_MS);
+		if (fresh.length < kept.length) o.log(`dropped ${kept.length - fresh.length} of the runner's replies for ${o.name(o.offices[i])}: they waited for its link longer than ${OUTBOX_MAX_AGE_MS / 6e4} minutes`);
+		for (const { message, at } of fresh) s.link.send(message, at);
 	};
 	let orphaned = false;
 	o.gone.then(() => (orphaned = true, wake()));
@@ -11096,7 +11105,10 @@ function answerOffices(o) {
 		sender: (i) => (message) => {
 			const s = states[i];
 			if (s.link) return s.link.send(message);
-			s.outbox.push(message);
+			s.outbox.push({
+				message,
+				at: now()
+			});
 			if (s.outbox.length > 100) {
 				s.outbox.shift();
 				o.log(`dropped the oldest of the runner's replies for ${o.name(o.offices[i])}: more than 100 waited for its link`);
@@ -11597,7 +11609,8 @@ async function worker() {
 			account,
 			machine: os.hostname(),
 			emit: emitFor(server),
-			allowPlainWs: first.allowPlainWs
+			allowPlainWs: first.allowPlainWs,
+			legacy: !!office.legacy
 		});
 		const approved = createApproved({
 			server,

@@ -1,15 +1,14 @@
 // Which office a take code is taken from, with several office servers in config.json (#105). A take
-// code doesn't name its office, but the floor's take prompt may (`--office`): that office is asked
-// first, then the others in config.json's order. Only an office that may be asked is: one whose
-// fresh list takes at least one repo, or, with no fresh list to tell by, one this machine is paired
-// with; a code is never sent to any other. The first office that knows the code decides, even when
-// this machine's copy of its list doesn't take the code's repo: then the take is refused there,
-// rather than tried in the next office.
+// code doesn't name its office, but the floor's take prompt may (`--office`): then that office alone
+// is asked, and a take it can't give (it can't be reached, this machine isn't paired with it, it
+// doesn't know the code) stops there, naming it. Without `--office` each office is asked in
+// config.json's order, with this machine's token where it is paired, and the first that knows the
+// code decides, even when this machine's copy of its list doesn't take the code's repo: then the
+// take is refused rather than tried in the next office. A take code is single-use and bound to the
+// person taking it, so an office that doesn't know it learns nothing it can use.
 
 export interface RoomIo<O> {
-  /** True when the office may be asked for the code, else why not. */
-  askable(office: O): Promise<true | string>;
-  /** The project of the room the code takes into, or what the office said when it doesn't know it. */
+  /** The project of the room the code takes into, or what the office said when it gave none. */
   ask(office: O, code: string): Promise<{ project: string } | { unknown: string }>;
   /** Whether this machine's fresh copy of the office's list takes `project`. */
   takes(office: O, project: string): Promise<boolean>;
@@ -17,20 +16,19 @@ export interface RoomIo<O> {
 }
 
 export async function findRoom<O>(offices: readonly O[], hint: O | null, code: string, io: RoomIo<O>): Promise<{ office: O; project: string } | { refused: string }> {
-  const order = hint ? [hint, ...offices.filter((o) => o !== hint)] : [...offices];
+  const decide = async (office: O, project: string) =>
+    (await io.takes(office, project))
+      ? { office, project }
+      : { refused: `The handoff's repo, ${project}, isn't on this machine's copy of ${offices.length > 1 ? `the ${io.label(office)} office's` : "the office's"} list, so nothing is sent. A Claude Code session with the Isoplan plugin reads it again within a few minutes; take it then.` };
+  if (hint) {
+    const answer = await io.ask(hint, code);
+    return "unknown" in answer ? { refused: offices.length > 1 ? `The ${io.label(hint)} office couldn't give that take code: ${answer.unknown}` : answer.unknown } : decide(hint, answer.project);
+  }
   const said: string[] = [];
-  for (const office of order) {
-    const askable = await io.askable(office);
-    const answer = askable === true ? await io.ask(office, code) : { unknown: askable };
-    if ("unknown" in answer) {
-      said.push(offices.length > 1 ? `${io.label(office)}: ${answer.unknown}` : answer.unknown);
-      continue;
-    }
-    if (!(await io.takes(office, answer.project)))
-      return {
-        refused: `The handoff's repo, ${answer.project}, isn't on this machine's copy of ${offices.length > 1 ? `the ${io.label(office)} office's` : "the office's"} list, so nothing is sent. A Claude Code session with the Isoplan plugin reads it again within a few minutes; take it then.`,
-      };
-    return { office, project: answer.project };
+  for (const office of offices) {
+    const answer = await io.ask(office, code);
+    if ("project" in answer) return decide(office, answer.project);
+    said.push(offices.length > 1 ? `${io.label(office)}: ${answer.unknown}` : answer.unknown);
   }
   return { refused: offices.length > 1 ? `No office here knows that take code.\n${said.join("\n")}` : said[0]! };
 }

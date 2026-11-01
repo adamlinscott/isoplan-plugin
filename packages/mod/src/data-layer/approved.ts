@@ -234,8 +234,8 @@ export interface SessionGate {
    * changed, and when the list has changed since the server said not-wanted, so it opens afresh.
    */
   home(candidates: readonly Project[]): Promise<{ home: Project | null; dormancy: Dormancy | null }>;
-  /** The link for the home `home` gave, opened now if there is none. */
-  link(): Link;
+  /** The link for the home `home` gave, opened now if there is none; null while there is no home (a check that finished since said none). */
+  link(): Link | null;
   /** The link, while there is one. */
   current(): Link | null;
   /** Closes the link: the session has nothing to report. */
@@ -278,8 +278,9 @@ export function createSessionGate({ approved, open }: { approved: Approved; open
       return { home, dormancy: null };
     },
     link() {
+      if (!home) return null;
       if (!link) {
-        link = open(home!, mayConnect);
+        link = open(home, mayConnect);
         linked = home!.id;
       }
       return link;

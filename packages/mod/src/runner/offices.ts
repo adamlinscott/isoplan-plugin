@@ -7,13 +7,18 @@
 // at once, though, when its supervisor has gone, since its forks end with it.
 //
 // What a runner sends while its office's link is closed is kept, at most OUTBOX_MAX, and sent once
-// the link is open again; what is left when the worker ends is dropped, and the log says how much.
+// the link is open again, unless it is older than OUTBOX_MAX_AGE_MS by then, counted from when the
+// runner first sent it, which the link goes on counting from; what is left when the worker ends is
+// dropped, and the log says how much.
 
 /** At most this many of an office's replies are kept while its link is closed; past that the oldest is dropped. */
 export const OUTBOX_MAX = 100;
+/** A reply kept longer than this is dropped: the server will have asked again by then. */
+export const OUTBOX_MAX_AGE_MS = 3600000;
 
 export interface OfficeLink<M> {
-  send(message: M): void;
+  /** `at`: when the runner first sent it. */
+  send(message: M, at?: number): void;
   close(): void;
 }
 
@@ -49,7 +54,7 @@ export interface AnsweringOffices<M> {
 export function answerOffices<O, M>(o: AnswerOfficesOptions<O, M>): AnsweringOffices<M> {
   const now = o.now ?? Date.now;
   let wake: () => void = () => {};
-  const states = o.offices.map(() => ({ link: null as OfficeLink<M> | null, notWanted: false, unpaired: false, closedAt: 0, outbox: [] as M[] }));
+  const states = o.offices.map(() => ({ link: null as OfficeLink<M> | null, notWanted: false, unpaired: false, closedAt: 0, outbox: [] as { message: M; at: number }[] }));
   const start = (i: number) => {
     const s = states[i]!;
     s.notWanted = s.unpaired = false;
@@ -57,7 +62,10 @@ export function answerOffices<O, M>(o: AnswerOfficesOptions<O, M>): AnsweringOff
       notWanted: () => ((s.notWanted = true), wake()),
       unpaired: () => ((s.unpaired = true), wake()),
     });
-    for (const message of s.outbox.splice(0)) s.link.send(message);
+    const kept = s.outbox.splice(0);
+    const fresh = kept.filter((m) => now() - m.at < OUTBOX_MAX_AGE_MS);
+    if (fresh.length < kept.length) o.log(`dropped ${kept.length - fresh.length} of the runner's replies for ${o.name(o.offices[i]!)}: they waited for its link longer than ${OUTBOX_MAX_AGE_MS / 60000} minutes`);
+    for (const { message, at } of fresh) s.link.send(message, at);
   };
   let orphaned = false;
   void o.gone.then(() => ((orphaned = true), wake()));
@@ -95,7 +103,7 @@ export function answerOffices<O, M>(o: AnswerOfficesOptions<O, M>): AnsweringOff
     sender: (i) => (message) => {
       const s = states[i]!;
       if (s.link) return s.link.send(message);
-      s.outbox.push(message);
+      s.outbox.push({ message, at: now() });
       if (s.outbox.length > OUTBOX_MAX) {
         s.outbox.shift();
         o.log(`dropped the oldest of the runner's replies for ${o.name(o.offices[i]!)}: more than ${OUTBOX_MAX} waited for its link`);

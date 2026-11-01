@@ -6338,20 +6338,19 @@ async function readJson(io, p, optional = false) {
 //#endregion
 //#region src/handoff/offices.ts
 async function findRoom(offices, hint, code, io) {
-	const order = hint ? [hint, ...offices.filter((o) => o !== hint)] : [...offices];
+	const decide = async (office, project) => await io.takes(office, project) ? {
+		office,
+		project
+	} : { refused: `The handoff's repo, ${project}, isn't on this machine's copy of ${offices.length > 1 ? `the ${io.label(office)} office's` : "the office's"} list, so nothing is sent. A Claude Code session with the Isoplan plugin reads it again within a few minutes; take it then.` };
+	if (hint) {
+		const answer = await io.ask(hint, code);
+		return "unknown" in answer ? { refused: offices.length > 1 ? `The ${io.label(hint)} office couldn't give that take code: ${answer.unknown}` : answer.unknown } : decide(hint, answer.project);
+	}
 	const said = [];
-	for (const office of order) {
-		const askable = await io.askable(office);
-		const answer = askable === true ? await io.ask(office, code) : { unknown: askable };
-		if ("unknown" in answer) {
-			said.push(offices.length > 1 ? `${io.label(office)}: ${answer.unknown}` : answer.unknown);
-			continue;
-		}
-		if (!await io.takes(office, answer.project)) return { refused: `The handoff's repo, ${answer.project}, isn't on this machine's copy of ${offices.length > 1 ? `the ${io.label(office)} office's` : "the office's"} list, so nothing is sent. A Claude Code session with the Isoplan plugin reads it again within a few minutes; take it then.` };
-		return {
-			office,
-			project: answer.project
-		};
+	for (const office of offices) {
+		const answer = await io.ask(office, code);
+		if ("project" in answer) return decide(office, answer.project);
+		said.push(offices.length > 1 ? `${io.label(office)}: ${answer.unknown}` : answer.unknown);
 	}
 	return { refused: offices.length > 1 ? `No office here knows that take code.\n${said.join("\n")}` : said[0] };
 }
@@ -8310,17 +8309,6 @@ async function roomOf(server, code, cwd) {
 	if (answer.status !== 200 || typeof body.project !== "string") return { unknown: `The office server says: ${typeof body.error === "string" ? body.error : `it answered ${answer.status}`}` };
 	return { project: body.project };
 }
-/** Whether a take code may be sent to the office (handoff/offices.ts): its fresh list takes a repo, or, with none, this machine is paired with it. */
-async function askable(server) {
-	const config = await loadOwnConfig();
-	const repos = await cachedRepos(approvedPath(claudeDir, server), server, config.approvedMaxAgeMinutes * 6e4);
-	if (repos) return repos.size ? true : "its office takes no repo, so the take code wasn't sent to it.";
-	const account = await accountOf({
-		readText: (p) => fs.readFile(p, "utf8").catch(() => null),
-		run: io.run
-	}, claudeJson, os.homedir());
-	return pairingEntry(await readPairing(pairingPath(claudeDir)), server, account.id)?.credential ? true : `the take code wasn't sent: ${NEEDS_PAIRING}`;
-}
 async function takeCommand(argv) {
 	const code = (argv[0] ?? "").trim();
 	const { offices, picked } = await officesNamed(argv.slice(1));
@@ -8330,7 +8318,6 @@ async function takeCommand(argv) {
 	const patterns = await loadPatterns(path.join(modDir, "secret-patterns.json"), path.join(isoplanDir, "secret-patterns.json"), () => {});
 	const config = await loadOwnConfig();
 	const room = await findRoom(offices, picked, code, {
-		askable: (o) => askable(o.server),
 		ask: (o, c) => roomOf(o.server, c, cwd),
 		takes: async (o, project) => !!(await cachedRepos(approvedPath(claudeDir, o.server), o.server, config.approvedMaxAgeMinutes * 6e4))?.has(project.toLowerCase()),
 		label: (o) => o.label

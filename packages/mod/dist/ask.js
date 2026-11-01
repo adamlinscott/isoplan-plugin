@@ -6519,10 +6519,14 @@ function pairingEntry(all, server, account) {
 	const first = all.accounts[account];
 	return all.offices?.[server]?.[account] ?? (first?.server === server ? first : void 0);
 }
-/** `all` with the account's entry for `server` set, where pairingEntry reads it; a new one under `accounts` while that holds no other server's. */
-function withPairingEntry(all, server, account, entry) {
-	const first = all.accounts[account];
-	if (!all.offices?.[server]?.[account] && (!first || first.server === server)) return {
+/**
+* `all` with the account's entry for `server` set: under `accounts` only for the server a version
+* before #105 reports to (`legacy`, config.json's `server`), and only while `offices` holds none for
+* it, so pairingEntry reads it back; any other server's always under `offices`, so a version before
+* #105, which writes `accounts` for its own server, never wipes it.
+*/
+function withPairingEntry(all, server, account, entry, legacy) {
+	if (legacy && !all.offices?.[server]?.[account]) return {
 		...all,
 		accounts: {
 			...all.accounts,
@@ -6618,13 +6622,13 @@ const HTML = {
 	"content-type": "text/html; charset=utf-8",
 	connection: "close"
 };
-function createPairing({ file, lock, writeLock, server, account, machine, emit, allowPlainWs = false, post = postJson, now = Date.now, pid = process.pid, isAlive = alive, retryMs = 200 }) {
+function createPairing({ file, lock, writeLock, server, account, machine, emit, allowPlainWs = false, legacy = false, post = postJson, now = Date.now, pid = process.pid, isAlive = alive, retryMs = 200 }) {
 	let asked = false;
 	let shown = null;
 	let unreadable = false;
 	let callback = null;
 	const entryOf = (all) => pairingEntry(all, server, account.id) ?? { server };
-	const withEntry = (all, entry) => withPairingEntry(all, server, account.id, entry);
+	const withEntry = (all, entry) => withPairingEntry(all, server, account.id, entry, legacy);
 	const mine = async () => entryOf(await readPairing(file));
 	const update = (decide) => locked(file, writeLock, pid, isAlive, (all) => {
 		const { entry, result } = decide(entryOf(all));
@@ -7439,6 +7443,7 @@ async function machinePairing(office, allowPlainWs) {
 		machine: os.hostname(),
 		emit: () => {},
 		allowPlainWs,
+		legacy: !!office.legacy,
 		post: (url, body) => new URL(url).pathname.endsWith("/pair") ? Promise.reject(/* @__PURE__ */ new Error("pairing is left to the session's data layer")) : postJson(url, body)
 	});
 	return {

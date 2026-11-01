@@ -98,8 +98,8 @@ export type ServerAsk = RequestMessage | ReleaseMessage | HandoffMessage | DropM
 export interface Link {
   /** The session's facts now; what differs from what the server has goes out when the pace allows. */
   update(facts: Facts): void;
-  /** A reply, refusal or taken. One sent while the link is down goes out after the next hello. */
-  send(message: Outgoing): void;
+  /** A reply, refusal or taken, first sent at `at` (now, unless it waited elsewhere first). One sent while the link is down goes out after the next hello, unless it is older than OUTBOX_MAX_AGE_MS by then. */
+  send(message: Outgoing, at?: number): void;
   /**
    * The projects the office holds, from this connection's welcome; null before one, and from a
    * server too old to send one, which would read another repo's files as the session's own (#74).
@@ -350,10 +350,10 @@ export function createLink({
       if (isOpen && !sent) sendFull();
       else if (!pacing) flush();
     },
-    send(message) {
+    send(message, at = Date.now()) {
       if (isOpen && socket!.readyState === WebSocket.OPEN) send(message);
       else {
-        outbox.push({ message, at: Date.now() });
+        outbox.push({ message, at });
         if (outbox.length > OUTBOX_MAX) outbox.shift();
       }
     },

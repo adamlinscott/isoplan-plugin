@@ -7,9 +7,9 @@
 //
 // With several office servers in config.json (#105), a hand-over goes to the one office whose list
 // takes the session's repo; when more than one does, prepare and hand-over name them and stop until
-// `--office` picks one (its label, its address or its host). A take asks the office `--office` names
-// first, then the others in config.json's order, but only those it may (offices.ts), and takes it
-// from the first that knows the code; the session then asks the room in that office.
+// `--office` picks one (its label, its address or its host). A take asks only the office `--office`
+// names; without it, each office in config.json's order, and takes it from the first that knows the
+// code (offices.ts); the session then asks the room in that office.
 //
 // The session is $CLAUDE_CODE_SESSION_ID and its folder $CLAUDE_PROJECT_DIR (else this process's
 // folder, which a cd in the agent's shell may have moved), both of which Claude Code sets for the
@@ -312,15 +312,6 @@ async function roomOf(server: string, code: string, cwd: string): Promise<{ proj
   return { project: body.project };
 }
 
-/** Whether a take code may be sent to the office (handoff/offices.ts): its fresh list takes a repo, or, with none, this machine is paired with it. */
-async function askable(server: string): Promise<true | string> {
-  const config = await loadOwnConfig();
-  const repos = await cachedRepos(approvedPath(claudeDir, server), server, config.approvedMaxAgeMinutes * 60000);
-  if (repos) return repos.size ? true : "its office takes no repo, so the take code wasn't sent to it.";
-  const account = await accountOf({ readText: (p) => fs.readFile(p, "utf8").catch(() => null), run: io.run }, claudeJson, os.homedir());
-  return pairingEntry(await readPairing(pairingPath(claudeDir)), server, account.id)?.credential ? true : `the take code wasn't sent: ${NEEDS_PAIRING}`;
-}
-
 async function takeCommand(argv: string[]): Promise<string> {
   const code = (argv[0] ?? "").trim();
   const { offices, picked } = await officesNamed(argv.slice(1));
@@ -331,7 +322,6 @@ async function takeCommand(argv: string[]): Promise<string> {
   const patterns = await loadPatterns(path.join(modDir, "secret-patterns.json"), path.join(isoplanDir, "secret-patterns.json"), () => {});
   const config = await loadOwnConfig();
   const room = await findRoom(offices, picked, code, {
-    askable: (o) => askable(o.server),
     ask: (o, c) => roomOf(o.server, c, cwd),
     takes: async (o, project) => !!(await cachedRepos(approvedPath(claudeDir, o.server), o.server, config.approvedMaxAgeMinutes * 60000))?.has(project.toLowerCase()),
     label: (o) => o.label,

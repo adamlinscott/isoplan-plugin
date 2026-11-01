@@ -188,6 +188,7 @@ async function worker(): Promise<number> {
       machine: os.hostname(),
       emit: emitFor(server),
       allowPlainWs: first.allowPlainWs,
+      legacy: !!office.legacy,
     });
     // The repos the office takes (src/data-layer/approved.ts): the runner answers only for sessions in them.
     const approved = createApproved({ server, file: approvedPath(claudeDir, server), pairing, refreshMs: first.approvedRefreshMinutes * 60000, maxAgeMs: first.approvedMaxAgeMinutes * 60000, log });

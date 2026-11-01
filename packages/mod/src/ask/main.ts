@@ -78,6 +78,7 @@ async function machinePairing(office: Office, allowPlainWs: boolean) {
     machine: os.hostname(),
     emit: () => {},
     allowPlainWs,
+    legacy: !!office.legacy,
     // Pairing is the data layer's to start, where the person sees its link; this script never asks for one.
     post: (url, body) => (new URL(url).pathname.endsWith("/pair") ? Promise.reject(new Error("pairing is left to the session's data layer")) : postJson(url, body)),
   });
