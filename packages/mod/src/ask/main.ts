@@ -1,9 +1,11 @@
 // The ask_room tool's script, which the hooks module runs for the session's agent (#49):
 //
-//   node dist/ask.js --session <id> --cwd <folder> [--key <id>]     the question on stdin; prints what the agent is told
-//   node dist/ask.js --session <id> --cwd <folder> --ack <question>  the agent was shown that question's end
+//   node dist/ask.js --session <id> --cwd <folder> [--server <address>] [--key <id>]     the question on stdin; prints what the agent is told
+//   node dist/ask.js --session <id> --cwd <folder> [--server <address>] --ack <question>  the agent was shown that question's end
 //
-// `--key` is the tool call's id, so asking again under it is the same question (ask.ts).
+// `--key` is the tool call's id, so asking again under it is the same question (ask.ts). `--server`
+// is the office server that gave the session its rights (#105), one of config.json's; without it, the
+// first office whose list takes the session's repo.
 // It speaks to the office server as that session, on a short link of its own (handoff/connection.ts),
 // and asks the room that session's person was handed (ask.ts). The server decides whether they may.
 //
@@ -19,12 +21,12 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { MAX_QUESTION_LENGTH, PROTOCOL_VERSION, type HelloMessage, type Project } from "@isoplan/protocol";
-import { loadConfig, loadSettings } from "../data-layer/config.js";
+import { loadConfig, loadSettings, officesOf } from "../data-layer/config.js";
 import { approvedPath } from "../data-layer/approved.js";
 import { commandHome, machineHomeIo } from "../data-layer/home.js";
 import { accountOf, claudePaths } from "../data-layer/identity.js";
 import { nodeIo } from "../data-layer/io.js";
-import { createPairing, pairingLockPath, pairingPath, pairingWriteLockPath, postJson, readPairing } from "../data-layer/pairing.js";
+import { createPairing, pairingEntry, pairingLockPath, pairingPath, pairingWriteLockPath, postJson, readPairing } from "../data-layer/pairing.js";
 import { openSideLink } from "../handoff/connection.js";
 import { askRoom, MAX_WAIT_MS, TokenExpired, type AskSettings } from "./ask.js";
 
@@ -64,7 +66,7 @@ async function machinePairing(server: string, allowPlainWs: boolean) {
   const file = pairingPath(claudeDir);
   const pairing = createPairing({
     file,
-    lock: pairingLockPath(claudeDir),
+    lock: pairingLockPath(claudeDir, server),
     writeLock: pairingWriteLockPath(claudeDir),
     server,
     account,
@@ -77,8 +79,7 @@ async function machinePairing(server: string, allowPlainWs: boolean) {
   return {
     // A token only from a credential this machine already holds; none otherwise.
     async token(): Promise<string | undefined> {
-      const entry = (await readPairing(file)).accounts[account.id];
-      if (entry?.server !== server || !entry.credential) return undefined;
+      if (!pairingEntry(await readPairing(file), server, account.id)?.credential) return undefined;
       return (await pairing.token().catch(() => undefined)) ?? undefined;
     },
     expired: (sent: string | undefined) => pairing.refused("token-expired", sent).catch(() => {}),
@@ -97,23 +98,33 @@ async function main(argv: string[]): Promise<string> {
   const cwd = flag(argv, "--cwd");
   const ack = flag(argv, "--ack");
   const key = flag(argv, "--key") ?? undefined;
+  const asked = flag(argv, "--server");
   if (!session || !cwd) return "usage: ask.js --session <id> --cwd <folder> [--key <id>], with the question on stdin; or --ack <question>";
   const question = ack ? "" : (await readStdin()).trim();
   if (!ack && !question) return "Give the question to ask the room.";
   if (question.length > MAX_QUESTION_LENGTH) return `That question is too long to ask the room: keep it under ${MAX_QUESTION_LENGTH} characters.`;
   const settings = await loadSettings<AskSettings>(io, path.join(modDir, "runner.json"), path.join(isoplanDir, "runner.json"));
   const config = await loadConfig(io, path.join(modDir, "config.json"), path.join(isoplanDir, "config.json"));
-  if (config.plainRefused) return `The room can't be asked: config.json's server, ${config.plainRefused}, is plain ws:// to another machine. Carry on without the answer.`;
-  // Nothing of a repo the office doesn't take is sent, its id included (#91): the session's data layer keeps the list.
-  const found = await commandHome(cwd, machineHomeIo(config.workspaceRepos), { file: approvedPath(claudeDir), server: config.server, maxAgeMs: config.approvedMaxAgeMinutes * 60000 });
+  const offices = officesOf(config).filter((o) => !asked || o.server === asked);
+  if (!offices.length) return `The room can't be asked: ${asked} isn't one of the office servers in config.json. Carry on without the answer.`;
+  // Nothing of a repo the office doesn't take is sent, its id included (#91): the session's data layer keeps each office's list.
+  let found: Awaited<ReturnType<typeof commandHome>> = { refused: "" };
+  let server = "";
+  for (const office of offices) {
+    found = office.plainRefused
+      ? { refused: `config.json's server ${office.server} is plain ws:// to another machine.` }
+      : await commandHome(cwd, machineHomeIo(config.workspaceRepos), { file: approvedPath(claudeDir, office.server), server: office.server, maxAgeMs: config.approvedMaxAgeMinutes * 60000 });
+    server = office.server;
+    if ("home" in found) break;
+  }
   if ("refused" in found) return `The room can't be asked: ${found.refused} Carry on without the answer.`;
-  const pairing = await machinePairing(config.server, config.allowPlainWs);
+  const pairing = await machinePairing(server, config.allowPlainWs);
   // One bound for the whole wait, a retry after an expired token included.
   const deadline = Date.now() + MAX_WAIT_MS;
   try {
     for (let tries = 0; ; tries++) {
       const token = await pairing.token();
-      const link = await openSideLink(config.server, await hello(session, cwd, token, found.home), CONNECT_MS);
+      const link = await openSideLink(server, await hello(session, cwd, token, found.home), CONNECT_MS);
       try {
         if (ack) {
           link.send({ type: "asked-ack", v: PROTOCOL_VERSION, question: ack });

@@ -26,8 +26,11 @@
 // config.json says `"allowPlainWs": true`.
 //
 // Everything is kept in <claude dir>/isoplan/pairing.json, readable by its owner only (on Windows
-// it takes the folder's permissions): the machine's id, and one entry per Claude account, each for
-// one server. Every change to it is read, decided and written under <claude dir>/isoplan/pairing.write.lock,
+// it takes the folder's permissions): the machine's id, and one entry per Claude account and office
+// server (#105). The first server an account pairs with keeps its entry under `accounts`, where a
+// version before #105 looks; any other server's is under `offices`, by its address. Each server's
+// pairing.lock is its own, in <claude dir>/isoplan/offices/<id>/, so pairing with one office never
+// waits on another. Every change to it is read, decided and written under <claude dir>/isoplan/pairing.write.lock,
 // so one process never undoes what another has just written. A server that signs nobody in never
 // refuses, so nothing is paired. With no browser on the machine (a headless box) there is no way to
 // pair yet.
@@ -38,6 +41,7 @@ import http from "node:http";
 import type { AddressInfo } from "node:net";
 import path from "node:path";
 import type { DataLayerLine } from "../lines.js";
+import { officeDir } from "./approved-file.js";
 import { alive, refreshLock, releaseLock, takeLock } from "../wake/lock.js";
 
 /** Renewed this long before it runs out. */
@@ -63,14 +67,28 @@ export interface PairingEntry {
   waiting?: { url: string; expires: number };
 }
 
-/** What pairing.json holds: the machine's own id, and each Claude account's entry, by its id. */
+/** What pairing.json holds: the machine's own id, and each Claude account's entry, by its id; for a further server, by its address and then the account's id. */
 export interface PairingFile {
   machine?: string;
   accounts: Record<string, PairingEntry>;
+  offices?: Record<string, Record<string, PairingEntry>>;
 }
 
 export const pairingPath = (claudeDir: string) => path.join(claudeDir, "isoplan", "pairing.json");
-export const pairingLockPath = (claudeDir: string) => path.join(claudeDir, "isoplan", "pairing.lock");
+export const pairingLockPath = (claudeDir: string, server: string) => path.join(officeDir(claudeDir, server), "pairing.lock");
+
+/** The account's entry for `server`, or undefined. */
+export function pairingEntry(all: PairingFile, server: string, account: string): PairingEntry | undefined {
+  const first = all.accounts[account];
+  return first?.server === server ? first : all.offices?.[server]?.[account];
+}
+
+/** `all` with the account's entry for `server` set: where it is now, else under `accounts` while that holds no other server's. */
+function withPairingEntry(all: PairingFile, server: string, account: string, entry: PairingEntry): PairingFile {
+  const first = all.accounts[account];
+  if (!all.offices?.[server]?.[account] && (!first || first.server === server)) return { ...all, accounts: { ...all.accounts, [account]: entry } };
+  return { ...all, offices: { ...all.offices, [server]: { ...all.offices?.[server], [account]: entry } } };
+}
 export const pairingWriteLockPath = (claudeDir: string) => path.join(claudeDir, "isoplan", "pairing.write.lock");
 
 /** A POST of JSON and its answer: what the pairing calls need of `fetch`. */
@@ -210,12 +228,8 @@ export function createPairing({
   let unreadable = false; // said once: the server couldn't read the token sent
   let callback: { server: http.Server; timers: ReturnType<typeof setTimeout>[] } | null = null; // the one this process answers
 
-  const empty = (): PairingEntry => ({ server });
-  const entryOf = (all: PairingFile) => {
-    const kept = all.accounts[account.id];
-    return kept && kept.server === server ? kept : empty();
-  };
-  const withEntry = (all: PairingFile, entry: PairingEntry): PairingFile => ({ ...all, accounts: { ...all.accounts, [account.id]: entry } });
+  const entryOf = (all: PairingFile): PairingEntry => pairingEntry(all, server, account.id) ?? { server };
+  const withEntry = (all: PairingFile, entry: PairingEntry): PairingFile => withPairingEntry(all, server, account.id, entry);
   const mine = async () => entryOf(await readPairing(file));
   const update = <T>(decide: (entry: PairingEntry) => { entry: PairingEntry | null; result: T }) =>
     locked(file, writeLock, pid, isAlive, (all) => {

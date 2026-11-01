@@ -65,6 +65,31 @@ async function loadConfig(io, defaultsPath, userPath) {
 	}
 	return config;
 }
+/**
+* The offices to report to: each usable entry of `servers` (a wss:// address, or ws://, which goes
+* only to this machine unless allowPlainWs, else it is kept to say why it isn't used), once per
+* address; with none, `server` alone. An entry without a label is labelled by its host.
+*/
+function officesOf(config) {
+	const offices = [];
+	for (const entry of config.servers) {
+		const { label, server } = entry ?? {};
+		if (typeof server !== "string" || !URL.canParse(server) || !["ws:", "wss:"].includes(new URL(server).protocol) || offices.some((o) => o.server === server)) continue;
+		const refused = !config.allowPlainWs && !isWebSocketUrl(server);
+		offices.push({
+			label: typeof label === "string" && label.trim() || new URL(server).host,
+			server,
+			...refused && { plainRefused: true }
+		});
+	}
+	if (offices.length) return offices;
+	const server = config.plainRefused ?? config.server;
+	return [{
+		label: new URL(server).host,
+		server,
+		...config.plainRefused && { plainRefused: true }
+	}];
+}
 /** The same per-key override for any settings file of the mod's, such as the runner's runner.json. */
 async function loadSettings(io, defaultsPath, userPath) {
 	const defaults = await readJson$1(io, defaultsPath);
@@ -6890,6 +6915,7 @@ const WRITTEN = [
 	"waits",
 	"answers",
 	"handoffs",
+	"offices",
 	"approved.json",
 	"update.json",
 	"update.lock"
@@ -6900,6 +6926,7 @@ const SESSION_TRACES = [
 	"released",
 	"waits",
 	"answers",
+	"offices",
 	"approved.json",
 	"update.json",
 	"update.lock"
@@ -7197,7 +7224,7 @@ try {
 			dataLayer: path.join(here, "data-layer.js"),
 			spawn: start
 		});
-		console.log(`Reported ${started} session(s) from the last ${config.lightsOffHours} hours to ${config.server}; ${found.length - started} were already reported or their folder is gone.`);
+		console.log(`Reported ${started} session(s) from the last ${config.lightsOffHours} hours to ${officesOf(config).map((o) => o.server).join(", ")}; ${found.length - started} were already reported or their folder is gone.`);
 	}
 } catch (err) {
 	process.stderr.write(`isoplan install: ${err.message}\n`);

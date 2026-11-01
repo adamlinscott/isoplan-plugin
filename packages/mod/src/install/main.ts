@@ -16,7 +16,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { claudePaths } from "../data-layer/claude-paths.js";
-import { loadConfig } from "../data-layer/config.js";
+import { loadConfig, officesOf } from "../data-layer/config.js";
 import { nodeIo } from "../data-layer/io.js";
 import { claudeBinaryPath, findClaude } from "../runner/claude-binary.js";
 import { recordEnv, runnerEnvPath } from "../runner/environment.js";
@@ -63,7 +63,7 @@ try {
     const found = await recentSessions(io, path.join(claudeDir, "projects"), Date.now() - config.lightsOffHours * 3600000);
     const dataLayer = path.join(here, "data-layer.js");
     const started = await backfill(found, { claudeDir, dataLayer, spawn: start });
-    console.log(`Reported ${started} session(s) from the last ${config.lightsOffHours} hours to ${config.server}; ${found.length - started} were already reported or their folder is gone.`);
+    console.log(`Reported ${started} session(s) from the last ${config.lightsOffHours} hours to ${officesOf(config).map((o) => o.server).join(", ")}; ${found.length - started} were already reported or their folder is gone.`);
   }
 } catch (err) {
   process.stderr.write(`isoplan install: ${(err as Error).message}\n`);

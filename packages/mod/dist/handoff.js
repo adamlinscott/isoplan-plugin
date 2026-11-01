@@ -2,7 +2,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { execFile, spawn, spawnSync } from "node:child_process";
 import { realpath, statSync } from "node:fs";
 import { promisify } from "node:util";
@@ -6263,6 +6263,31 @@ async function loadConfig(io, defaultsPath, userPath) {
 	}
 	return config;
 }
+/**
+* The offices to report to: each usable entry of `servers` (a wss:// address, or ws://, which goes
+* only to this machine unless allowPlainWs, else it is kept to say why it isn't used), once per
+* address; with none, `server` alone. An entry without a label is labelled by its host.
+*/
+function officesOf(config) {
+	const offices = [];
+	for (const entry of config.servers) {
+		const { label, server } = entry ?? {};
+		if (typeof server !== "string" || !URL.canParse(server) || !["ws:", "wss:"].includes(new URL(server).protocol) || offices.some((o) => o.server === server)) continue;
+		const refused = !config.allowPlainWs && !isWebSocketUrl(server);
+		offices.push({
+			label: typeof label === "string" && label.trim() || new URL(server).host,
+			server,
+			...refused && { plainRefused: true }
+		});
+	}
+	if (offices.length) return offices;
+	const server = config.plainRefused ?? config.server;
+	return [{
+		label: new URL(server).host,
+		server,
+		...config.plainRefused && { plainRefused: true }
+	}];
+}
 /** The same per-key override for any settings file of the mod's, such as the runner's runner.json. */
 async function loadSettings(io, defaultsPath, userPath) {
 	const defaults = await readJson(io, defaultsPath);
@@ -6306,7 +6331,9 @@ async function readJson(io, p, optional = false) {
 }
 //#endregion
 //#region src/data-layer/approved-file.ts
-const approvedPath = (claudeDir) => path.join(claudeDir, "isoplan", "approved.json");
+/** The folder of what is kept for one office server alone: its list, and its pairing's lock. Named by a hash of its address. */
+const officeDir = (claudeDir, server) => path.join(claudeDir, "isoplan", "offices", createHash("sha256").update(server).digest("hex").slice(0, 12));
+const approvedPath = (claudeDir, server) => path.join(officeDir(claudeDir, server), "approved.json");
 const isFile = (v) => !!v && typeof v.server === "string" && typeof v.version === "string" && typeof v.fetched === "number" && typeof v.checked === "number" && Array.isArray(v.repos) && v.repos.every((r) => typeof r === "string");
 /** approved.json, for `server` when given; null when there is none, or it is another server's. */
 async function readApproved(file, server) {
@@ -6324,6 +6351,11 @@ function freshRepos(copy, maxAgeMs, now) {
 //#endregion
 //#region src/data-layer/pairing.ts
 const pairingPath = (claudeDir) => path.join(claudeDir, "isoplan", "pairing.json");
+/** The account's entry for `server`, or undefined. */
+function pairingEntry(all, server, account) {
+	const first = all.accounts[account];
+	return first?.server === server ? first : all.offices?.[server]?.[account];
+}
 const postJson = async (url, body) => {
 	const response = await fetch(url, {
 		method: "POST",
@@ -7989,54 +8021,77 @@ async function hello(cwd, project) {
 		project
 	};
 }
-/** What a session in `cwd` reports as, by this machine's fresh copy of the office's list; stops the command when there is none. */
-async function homeOf(cwd) {
-	const config = await loadConfig(io, path.join(modDir, "config.json"), path.join(isoplanDir, "config.json"));
-	const found = await commandHome(cwd, machineHomeIo(config.workspaceRepos), {
-		file: approvedPath(claudeDir),
-		server: config.server,
-		maxAgeMs: config.approvedMaxAgeMinutes * 6e4
-	});
-	return "home" in found ? found.home : stop(found.refused);
+const loadOwnConfig = () => loadConfig(io, path.join(modDir, "config.json"), path.join(isoplanDir, "config.json"));
+/** The offices config.json names that may be used, or only the one `--office` picks (by label or address); stops when it picks none. */
+async function officesNamed(argv) {
+	const offices = officesOf(await loadOwnConfig());
+	const picked = flag(argv, "--office");
+	const usable = offices.filter((o) => !o.plainRefused);
+	if (picked === null) return usable.length ? usable : stop(`${offices.map((o) => o.server).join(", ")} ${offices.length > 1 ? "are" : "is"} plain ws:// to another machine, so nothing is sent: use wss://, or set "allowPlainWs": true in config.json.`);
+	const office = offices.find((o) => o.label.toLowerCase() === picked.trim().toLowerCase() || o.server === picked.trim());
+	if (!office) stop(`"${picked}" isn't one of the offices in config.json: ${offices.map((o) => o.label).join(", ")}.`);
+	if (office.plainRefused) stop(`${office.server} is plain ws:// to another machine, so nothing is sent to it: use wss://, or set "allowPlainWs": true in config.json.`);
+	return [office];
+}
+/**
+* The office a hand-over from `cwd` goes to, and what the session reports as there, by this
+* machine's fresh copy of each office's list; stops the command when no office takes it, or when
+* more than one does and `--office` doesn't say which.
+*/
+async function officeHere(cwd, argv) {
+	const config = await loadOwnConfig();
+	const found = [];
+	let refused = "";
+	for (const office of await officesNamed(argv)) {
+		const here = await commandHome(cwd, machineHomeIo(config.workspaceRepos), {
+			file: approvedPath(claudeDir, office.server),
+			server: office.server,
+			maxAgeMs: config.approvedMaxAgeMinutes * 6e4
+		});
+		if ("home" in here) found.push({
+			office,
+			home: here.home
+		});
+		else refused ||= here.refused;
+	}
+	if (found.length > 1) stop(`More than one office takes this repo: ${found.map((f) => f.office.label).join(", ")}. Ask which one to hand over in, then run this again with --office "<label>".`);
+	return found[0] ?? stop(refused);
 }
 /** Which repos under `cwd` a handoff may take: the office's alone, by this machine's fresh copy of its list. */
-async function takesHere() {
-	const config = await loadConfig(io, path.join(modDir, "config.json"), path.join(isoplanDir, "config.json"));
-	return takesFrom(machineHomeIo(config.workspaceRepos), await cachedRepos(approvedPath(claudeDir), config.server, config.approvedMaxAgeMinutes * 6e4));
+async function takesHere(server) {
+	const config = await loadOwnConfig();
+	return takesFrom(machineHomeIo(config.workspaceRepos), await cachedRepos(approvedPath(claudeDir, server), server, config.approvedMaxAgeMinutes * 6e4));
 }
 const TOKEN_LEFT_MS = 3e5;
 /**
-* The office server and this machine's pairing with it (#23), as a command uses it: only read. The
+* This machine's pairing with `server` (#23), as a command uses it: only read. The
 * kept token goes in the hello while it is current; otherwise the credential is swapped for one for
 * this command alone (POST <server>/token), which isn't written back. Nothing here takes the
 * pairing's locks, writes pairing.json or starts a pairing: the session's data layer does those,
 * with its link in the status line. When a token can't be had, the command says the machine needs
 * pairing.
 */
-async function office() {
-	const config = await loadConfig(io, path.join(modDir, "config.json"), path.join(isoplanDir, "config.json"));
+async function pairingWith(server) {
+	const config = await loadOwnConfig();
 	const file = pairingPath(claudeDir);
 	const account = await accountOf({
 		readText: (p) => fs.readFile(p, "utf8").catch(() => null),
 		run: io.run
 	}, claudeJson, os.homedir());
-	return {
-		server: config.server,
-		pairing: { async token(renew) {
-			const entry = (await readPairing(file)).accounts[account.id];
-			if (!entry?.credential || entry.server !== config.server) return void 0;
-			if (!config.allowPlainWs && isPlainRemote(config.server)) throw new PairingRefused(`${config.server} is plain ws:// to another machine, so this machine's pairing isn't sent over it: use wss://, or set "allowPlainWs": true in config.json.`);
-			if (!renew && entry.token && (entry.tokenExpires ?? 0) - TOKEN_LEFT_MS > Date.now()) return entry.token;
-			const answer = await postJson(httpUrl(config.server, "/token"), { credential: entry.credential }).catch(() => null);
-			if (answer?.status === 200 && typeof answer.body.token === "string") return answer.body.token;
-			throw new PairingRefused(NEEDS_PAIRING);
-		} }
-	};
+	return { async token(renew) {
+		const entry = pairingEntry(await readPairing(file), server, account.id);
+		if (!entry?.credential) return void 0;
+		if (!config.allowPlainWs && isPlainRemote(server)) throw new PairingRefused(`${server} is plain ws:// to another machine, so this machine's pairing isn't sent over it: use wss://, or set "allowPlainWs": true in config.json.`);
+		if (!renew && entry.token && (entry.tokenExpires ?? 0) - TOKEN_LEFT_MS > Date.now()) return entry.token;
+		const answer = await postJson(httpUrl(server, "/token"), { credential: entry.credential }).catch(() => null);
+		if (answer?.status === 200 && typeof answer.body.token === "string") return answer.body.token;
+		throw new PairingRefused(NEEDS_PAIRING);
+	} };
 }
-async function exchange(cwd, first, wanted, before = "", project) {
-	const { server, pairing } = await office();
+async function exchange(server, cwd, first, wanted, before, project) {
+	const pairing = await pairingWith(server);
 	try {
-		return await openPairedLink(server, await hello(cwd, project ?? await homeOf(cwd)), pairing, first, wanted, ANSWER_MS);
+		return await openPairedLink(server, await hello(cwd, project), pairing, first, wanted, ANSWER_MS);
 	} catch (err) {
 		if (err instanceof PairingRefused) stop(`${before}${err.message}`);
 		throw err;
@@ -8054,8 +8109,8 @@ async function prepareCommand(argv) {
 	const to = nameOf(argv);
 	const s = await settings();
 	await tidyOut();
-	await homeOf(sessionDir());
-	const prepared = await prepare(run, sessionDir(), s.gitTimeoutSeconds * 1e3, s.repoSearchDepth, void 0, await takesHere()).catch((err) => stop(err instanceof HandoffGitError ? `Can't hand over from here: ${gitFailed(err)}.` : String(err)));
+	const { office } = await officeHere(sessionDir(), argv);
+	const prepared = await prepare(run, sessionDir(), s.gitTimeoutSeconds * 1e3, s.repoSearchDepth, void 0, await takesHere(office.server)).catch((err) => stop(err instanceof HandoffGitError ? `Can't hand over from here: ${gitFailed(err)}.` : String(err)));
 	const id = newHandoffId();
 	const folder = outDir(id);
 	await fs.mkdir(folder, { recursive: true });
@@ -8066,9 +8121,11 @@ async function prepareCommand(argv) {
 	const repos = prepared.repos.filter((r) => r.path !== ".").length ? [`Repos, by path in this folder: ${prepared.repos.map((r) => `${r.path} (${repoBranch(id, r)}${r.from ? `, from ${r.from}` : ""})`).join(", ")}`] : [];
 	const left = prepared.left.length ? [`Left out: ${prepared.left.map((l) => `${l.path} (${l.why})`).join("; ")}`] : [];
 	if (prepared.notInOffice.length) left.push(`Left out, not in the office (named here only, never sent): ${prepared.notInOffice.join(", ")}`);
+	const offices = (await officesNamed([])).length > 1 ? [`Office: ${office.label} (pass --office "${office.label}" to hand-over)`] : [];
 	return [
 		`Handoff id: ${id}`,
 		`Brief file: ${path.join(folder, "brief.md")}`,
+		...offices,
 		`Branch: ${handoffBranch(id)}${prepared.from ? `, made from ${prepared.from}` : ""}`,
 		...repos,
 		...left,
@@ -8099,7 +8156,8 @@ async function handOverCommand(argv) {
 	const cwd = sessionDir();
 	const s = await settings();
 	const timeoutMs = s.gitTimeoutSeconds * 1e3;
-	const prepared = await prepare(run, cwd, timeoutMs, s.repoSearchDepth, void 0, await takesHere()).catch((err) => stop(err instanceof HandoffGitError ? `Can't hand over from here: ${gitFailed(err)}.` : String(err)));
+	const { office, home } = await officeHere(cwd, argv);
+	const prepared = await prepare(run, cwd, timeoutMs, s.repoSearchDepth, void 0, await takesHere(office.server)).catch((err) => stop(err instanceof HandoffGitError ? `Can't hand over from here: ${gitFailed(err)}.` : String(err)));
 	const { from, files, repos, left } = prepared;
 	const unknown = Object.keys(pushAnyway).filter((repo) => !repos.some((r) => r.path === repo));
 	if (unknown.length) stop(`--push-anyway names ${unknown.map((r) => r === "." ? "this folder's own repo" : r).join(", ")}, which this doesn't hand over (it hands over ${repos.map((r) => r.path).join(", ")}). Nothing was pushed.`);
@@ -8114,12 +8172,12 @@ async function handOverCommand(argv) {
 	const patterns = await loadPatterns(path.join(modDir, "secret-patterns.json"), path.join(isoplanDir, "secret-patterns.json"), () => {});
 	const matched = scan(brief, patterns);
 	if (matched) stop(`The brief wasn't sent: it matches the secret pattern "${matched}". Take that out of ${file} and run hand-over again.`);
-	const { link, answer: ready } = await exchange(cwd, {
+	const { link, answer: ready } = await exchange(office.server, cwd, {
 		type: "hand-over-check",
 		v: 1,
 		to,
 		handoff: id
-	}, (m) => m.type === "hand-over-ready" && m.handoff === id, "Nothing was pushed. ");
+	}, (m) => m.type === "hand-over-ready" && m.handoff === id, "Nothing was pushed. ", home);
 	try {
 		if (ready.type === "error") stop(`Nothing was pushed. ${said(ready)}`);
 		const pushed = await pushHandoff(run, cwd, id, timeoutMs, {
@@ -8161,11 +8219,12 @@ async function handOverCommand(argv) {
 /**
 * The project of the room `code` takes into (POST <server>/handoff-room), which the take says hello
 * from: whatever folder the session is in, its own id isn't sent, and the session joins that room
-* (#91). The room's repo must be on this machine's fresh copy of the office's list.
+* (#91). The room's repo must be on this machine's fresh copy of the office's list. Throws Stop with
+* what the office said when it doesn't know the code.
 */
-async function roomOf(code, cwd) {
-	const { server, pairing } = await office();
-	const config = await loadConfig(io, path.join(modDir, "config.json"), path.join(isoplanDir, "config.json"));
+async function roomOf(server, code, cwd) {
+	const pairing = await pairingWith(server);
+	const config = await loadOwnConfig();
 	const token = await pairing.token(false).catch((err) => stop(err instanceof PairingRefused ? err.message : String(err)));
 	const account = await accountOf({
 		readText: (p) => fs.readFile(p, "utf8").catch(() => null),
@@ -8187,23 +8246,39 @@ async function roomOf(code, cwd) {
 	if (answer.status === 401) stop(NEEDS_PAIRING);
 	if (answer.status !== 200 || typeof body.project !== "string") stop(`The office server says: ${typeof body.error === "string" ? body.error : `it answered ${answer.status}`}`);
 	const project = body.project;
-	if (!(await cachedRepos(approvedPath(claudeDir), server, config.approvedMaxAgeMinutes * 6e4))?.has(project.toLowerCase())) stop(`The handoff's repo, ${project}, isn't on this machine's copy of the office's list, so nothing is sent. A Claude Code session with the Isoplan plugin reads it again within a few minutes; take it then.`);
+	if (!(await cachedRepos(approvedPath(claudeDir, server), server, config.approvedMaxAgeMinutes * 6e4))?.has(project.toLowerCase())) stop(`The handoff's repo, ${project}, isn't on this machine's copy of the office's list, so nothing is sent. A Claude Code session with the Isoplan plugin reads it again within a few minutes; take it then.`);
 	return {
 		id: project,
 		name: project.split("/").pop() || project
 	};
 }
+/** The office whose room `code` takes into, asked in config.json's order, and that room's project; with none, what each said. */
+async function findRoom(code, cwd, offices) {
+	const said = [];
+	for (const { label, server } of offices) try {
+		return {
+			server,
+			project: await roomOf(server, code, cwd)
+		};
+	} catch (err) {
+		if (!(err instanceof Stop)) throw err;
+		said.push(offices.length > 1 ? `${label}: ${err.message}` : err.message);
+	}
+	return stop(offices.length > 1 ? `No office here knows that take code.\n${said.join("\n")}` : said[0]);
+}
 async function takeCommand(argv) {
 	const code = (argv[0] ?? "").trim();
+	const offices = await officesNamed(argv.slice(1));
 	if (!CODE.test(code)) stop("That isn't a take code: it is the eight letters and digits the floor shows, like ABCD-EFGH.");
 	const cwd = sessionDir();
 	const timeoutMs = (await settings()).gitTimeoutSeconds * 1e3;
 	const patterns = await loadPatterns(path.join(modDir, "secret-patterns.json"), path.join(isoplanDir, "secret-patterns.json"), () => {});
-	const { link, answer } = await exchange(cwd, {
+	const room = await findRoom(code, cwd, offices);
+	const { link, answer } = await exchange(room.server, cwd, {
 		type: "take",
 		v: 1,
 		code
-	}, (m) => m.type === "handoff", "", await roomOf(code, cwd));
+	}, (m) => m.type === "handoff", "", room.project);
 	try {
 		if (answer.type === "error") stop(said(answer));
 		const { handoff } = answer;

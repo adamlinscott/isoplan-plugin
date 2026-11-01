@@ -6294,6 +6294,31 @@ async function loadConfig(io, defaultsPath, userPath) {
 	}
 	return config;
 }
+/**
+* The offices to report to: each usable entry of `servers` (a wss:// address, or ws://, which goes
+* only to this machine unless allowPlainWs, else it is kept to say why it isn't used), once per
+* address; with none, `server` alone. An entry without a label is labelled by its host.
+*/
+function officesOf(config) {
+	const offices = [];
+	for (const entry of config.servers) {
+		const { label, server } = entry ?? {};
+		if (typeof server !== "string" || !URL.canParse(server) || !["ws:", "wss:"].includes(new URL(server).protocol) || offices.some((o) => o.server === server)) continue;
+		const refused = !config.allowPlainWs && !isWebSocketUrl(server);
+		offices.push({
+			label: typeof label === "string" && label.trim() || new URL(server).host,
+			server,
+			...refused && { plainRefused: true }
+		});
+	}
+	if (offices.length) return offices;
+	const server = config.plainRefused ?? config.server;
+	return [{
+		label: new URL(server).host,
+		server,
+		...config.plainRefused && { plainRefused: true }
+	}];
+}
 /** The same per-key override for any settings file of the mod's, such as the runner's runner.json. */
 async function loadSettings(io, defaultsPath, userPath) {
 	const defaults = await readJson(io, defaultsPath);
@@ -6337,7 +6362,9 @@ async function readJson(io, p, optional = false) {
 }
 //#endregion
 //#region src/data-layer/approved-file.ts
-const approvedPath = (claudeDir) => path.join(claudeDir, "isoplan", "approved.json");
+/** The folder of what is kept for one office server alone: its list, and its pairing's lock. Named by a hash of its address. */
+const officeDir = (claudeDir, server) => path.join(claudeDir, "isoplan", "offices", createHash("sha256").update(server).digest("hex").slice(0, 12));
+const approvedPath = (claudeDir, server) => path.join(officeDir(claudeDir, server), "approved.json");
 const isFile = (v) => !!v && typeof v.server === "string" && typeof v.version === "string" && typeof v.fetched === "number" && typeof v.checked === "number" && Array.isArray(v.repos) && v.repos.every((r) => typeof r === "string");
 /** approved.json, for `server` when given; null when there is none, or it is another server's. */
 async function readApproved(file, server) {
@@ -6484,7 +6511,33 @@ const WRITE_WAIT_MS = 1e4;
 /** How often the callback tries to write the credential it got before saying it couldn't. */
 const WRITE_TRIES = 4;
 const pairingPath = (claudeDir) => path.join(claudeDir, "isoplan", "pairing.json");
-const pairingLockPath = (claudeDir) => path.join(claudeDir, "isoplan", "pairing.lock");
+const pairingLockPath = (claudeDir, server) => path.join(officeDir(claudeDir, server), "pairing.lock");
+/** The account's entry for `server`, or undefined. */
+function pairingEntry(all, server, account) {
+	const first = all.accounts[account];
+	return first?.server === server ? first : all.offices?.[server]?.[account];
+}
+/** `all` with the account's entry for `server` set: where it is now, else under `accounts` while that holds no other server's. */
+function withPairingEntry(all, server, account, entry) {
+	const first = all.accounts[account];
+	if (!all.offices?.[server]?.[account] && (!first || first.server === server)) return {
+		...all,
+		accounts: {
+			...all.accounts,
+			[account]: entry
+		}
+	};
+	return {
+		...all,
+		offices: {
+			...all.offices,
+			[server]: {
+				...all.offices?.[server],
+				[account]: entry
+			}
+		}
+	};
+}
 const pairingWriteLockPath = (claudeDir) => path.join(claudeDir, "isoplan", "pairing.write.lock");
 const postJson = async (url, body) => {
 	const response = await fetch(url, {
@@ -6568,18 +6621,8 @@ function createPairing({ file, lock, writeLock, server, account, machine, emit, 
 	let shown = null;
 	let unreadable = false;
 	let callback = null;
-	const empty = () => ({ server });
-	const entryOf = (all) => {
-		const kept = all.accounts[account.id];
-		return kept && kept.server === server ? kept : empty();
-	};
-	const withEntry = (all, entry) => ({
-		...all,
-		accounts: {
-			...all.accounts,
-			[account.id]: entry
-		}
-	});
+	const entryOf = (all) => pairingEntry(all, server, account.id) ?? { server };
+	const withEntry = (all, entry) => withPairingEntry(all, server, account.id, entry);
 	const mine = async () => entryOf(await readPairing(file));
 	const update = (decide) => locked(file, writeLock, pid, isAlive, (all) => {
 		const { entry, result } = decide(entryOf(all));
@@ -7361,7 +7404,7 @@ async function machinePairing(server, allowPlainWs) {
 	const file = pairingPath(claudeDir);
 	const pairing = createPairing({
 		file,
-		lock: pairingLockPath(claudeDir),
+		lock: pairingLockPath(claudeDir, server),
 		writeLock: pairingWriteLockPath(claudeDir),
 		server,
 		account,
@@ -7372,8 +7415,7 @@ async function machinePairing(server, allowPlainWs) {
 	});
 	return {
 		async token() {
-			const entry = (await readPairing(file)).accounts[account.id];
-			if (entry?.server !== server || !entry.credential) return void 0;
+			if (!pairingEntry(await readPairing(file), server, account.id)?.credential) return void 0;
 			return await pairing.token().catch(() => void 0) ?? void 0;
 		},
 		expired: (sent) => pairing.refused("token-expired", sent).catch(() => {}),
@@ -7390,25 +7432,33 @@ async function main(argv) {
 	const cwd = flag(argv, "--cwd");
 	const ack = flag(argv, "--ack");
 	const key = flag(argv, "--key") ?? void 0;
+	const asked = flag(argv, "--server");
 	if (!session || !cwd) return "usage: ask.js --session <id> --cwd <folder> [--key <id>], with the question on stdin; or --ack <question>";
 	const question = ack ? "" : (await readStdin()).trim();
 	if (!ack && !question) return "Give the question to ask the room.";
 	if (question.length > 4e3) return `That question is too long to ask the room: keep it under ${MAX_QUESTION_LENGTH} characters.`;
 	const settings = await loadSettings(io, path.join(modDir, "runner.json"), path.join(isoplanDir, "runner.json"));
 	const config = await loadConfig(io, path.join(modDir, "config.json"), path.join(isoplanDir, "config.json"));
-	if (config.plainRefused) return `The room can't be asked: config.json's server, ${config.plainRefused}, is plain ws:// to another machine. Carry on without the answer.`;
-	const found = await commandHome(cwd, machineHomeIo(config.workspaceRepos), {
-		file: approvedPath(claudeDir),
-		server: config.server,
-		maxAgeMs: config.approvedMaxAgeMinutes * 6e4
-	});
+	const offices = officesOf(config).filter((o) => !asked || o.server === asked);
+	if (!offices.length) return `The room can't be asked: ${asked} isn't one of the office servers in config.json. Carry on without the answer.`;
+	let found = { refused: "" };
+	let server = "";
+	for (const office of offices) {
+		found = office.plainRefused ? { refused: `config.json's server ${office.server} is plain ws:// to another machine.` } : await commandHome(cwd, machineHomeIo(config.workspaceRepos), {
+			file: approvedPath(claudeDir, office.server),
+			server: office.server,
+			maxAgeMs: config.approvedMaxAgeMinutes * 6e4
+		});
+		server = office.server;
+		if ("home" in found) break;
+	}
 	if ("refused" in found) return `The room can't be asked: ${found.refused} Carry on without the answer.`;
-	const pairing = await machinePairing(config.server, config.allowPlainWs);
+	const pairing = await machinePairing(server, config.allowPlainWs);
 	const deadline = Date.now() + MAX_WAIT_MS;
 	try {
 		for (let tries = 0;; tries++) {
 			const token = await pairing.token();
-			const link = await openSideLink(config.server, await hello(session, cwd, token, found.home), CONNECT_MS);
+			const link = await openSideLink(server, await hello(session, cwd, token, found.home), CONNECT_MS);
 			try {
 				if (ack) {
 					link.send({

@@ -17,6 +17,8 @@ export interface StatusLine {
   type: "status";
   server: string;
   state: "waiting" | "connecting" | "connected" | "disconnected" | "not-wanted" | "not-approved" | "no-list" | "pairing" | "taken" | "insecure";
+  /** The office's short name from config.json (#105), for the status line. */
+  label?: string;
   /** With `not-approved`: the session's folder is a workspace, none of whose repos the office takes. */
   workspace?: true;
   /** With `disconnected`: when the next try is. */
@@ -44,6 +46,8 @@ export interface TitleAskLine {
 export interface PairLine {
   type: "pair";
   server: string;
+  /** The office's short name, as on its status line. */
+  label?: string;
   url: string;
   expires: string;
 }
@@ -115,6 +119,10 @@ export interface TitleReply {
 /**
  * Office server messages are passed on as the server sent them (repair is the data layer's own); an
  * `asked` is the end of a question the session's agent asked the room, arriving after it stopped
- * waiting, and `ask-rights` whether the session may ask its room (#49).
+ * waiting, and `ask-rights` whether the session may ask its room (#49), each with the office server
+ * it came from (#105), which the room is asked through.
  */
-export type DataLayerLine = StatusLine | TitleAskLine | PairLine | WaitsLine | OwnerAnswerLine | UpdatedLine | SupersededLine | LogLine | ConflictMessage | ErrorMessage | AskedMessage | AskRightsMessage;
+export type DataLayerLine = StatusLine | TitleAskLine | PairLine | WaitsLine | OwnerAnswerLine | UpdatedLine | SupersededLine | LogLine | ConflictMessage | ErrorMessage | FromOffice<AskedMessage> | FromOffice<AskRightsMessage>;
+
+/** A server's message, with the data-layer address of the office server that sent it; none from a data layer before #105. */
+export type FromOffice<M> = M & { server?: string };

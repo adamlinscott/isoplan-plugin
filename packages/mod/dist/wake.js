@@ -245,7 +245,11 @@ function alive(pid) {
 }
 //#endregion
 //#region src/data-layer/approved-file.ts
-const approvedPath = (claudeDir) => path.join(claudeDir, "isoplan", "approved.json");
+/** Every office's approved.json on this machine, and the one a version before #105 kept. */
+async function approvedFiles(claudeDir) {
+	const root = path.join(claudeDir, "isoplan", "offices");
+	return [...(await fs.readdir(root).catch(() => [])).map((name) => path.join(root, name, "approved.json")), path.join(claudeDir, "isoplan", "approved.json")];
+}
 const isFile = (v) => !!v && typeof v.server === "string" && typeof v.version === "string" && typeof v.fetched === "number" && typeof v.checked === "number" && Array.isArray(v.repos) && v.repos.every((r) => typeof r === "string");
 /** approved.json, for `server` when given; null when there is none, or it is another server's. */
 async function readApproved(file, server) {
@@ -478,13 +482,16 @@ async function wake(input, { claudeDir, spawn, isAlive = alive, project, plugins
 	], cwd);
 	return true;
 }
-/** Whether `lock` is a hold-off for repos the office didn't take, one of which a fresh copy of its list now has. */
+/** Whether `lock` is a hold-off for repos no office took, one of which a fresh copy of any office's list now has. */
 async function nowApproved(claudeDir, lock) {
 	const held = await readLock(lock);
 	const projects = held?.extra.projects;
 	if (held?.pid !== null || held.extra.reason !== "not-approved" || !Array.isArray(projects)) return false;
-	const repos = freshRepos(await readApproved(approvedPath(claudeDir)), 9e5, Date.now());
-	return !!repos && projects.some((p) => typeof p === "string" && repos.has(p));
+	for (const file of await approvedFiles(claudeDir)) {
+		const repos = freshRepos(await readApproved(file), 9e5, Date.now());
+		if (repos && projects.some((p) => typeof p === "string" && repos.has(p))) return true;
+	}
+	return false;
 }
 //#endregion
 //#region src/runner/environment.ts
@@ -629,6 +636,7 @@ const WRITTEN = [
 	"waits",
 	"answers",
 	"handoffs",
+	"offices",
 	"approved.json",
 	"update.json",
 	"update.lock"
@@ -639,6 +647,7 @@ const SESSION_TRACES = [
 	"released",
 	"waits",
 	"answers",
+	"offices",
 	"approved.json",
 	"update.json",
 	"update.lock"

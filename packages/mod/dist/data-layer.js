@@ -6263,6 +6263,31 @@ async function loadConfig(io, defaultsPath, userPath) {
 	}
 	return config;
 }
+/**
+* The offices to report to: each usable entry of `servers` (a wss:// address, or ws://, which goes
+* only to this machine unless allowPlainWs, else it is kept to say why it isn't used), once per
+* address; with none, `server` alone. An entry without a label is labelled by its host.
+*/
+function officesOf(config) {
+	const offices = [];
+	for (const entry of config.servers) {
+		const { label, server } = entry ?? {};
+		if (typeof server !== "string" || !URL.canParse(server) || !["ws:", "wss:"].includes(new URL(server).protocol) || offices.some((o) => o.server === server)) continue;
+		const refused = !config.allowPlainWs && !isWebSocketUrl(server);
+		offices.push({
+			label: typeof label === "string" && label.trim() || new URL(server).host,
+			server,
+			...refused && { plainRefused: true }
+		});
+	}
+	if (offices.length) return offices;
+	const server = config.plainRefused ?? config.server;
+	return [{
+		label: new URL(server).host,
+		server,
+		...config.plainRefused && { plainRefused: true }
+	}];
+}
 /** The same per-key override for any settings file of the mod's, such as the runner's runner.json. */
 async function loadSettings(io, defaultsPath, userPath) {
 	const defaults = await readJson$1(io, defaultsPath);
@@ -6544,7 +6569,9 @@ function alive(pid) {
 }
 //#endregion
 //#region src/data-layer/approved-file.ts
-const approvedPath = (claudeDir) => path.join(claudeDir, "isoplan", "approved.json");
+/** The folder of what is kept for one office server alone: its list, and its pairing's lock. Named by a hash of its address. */
+const officeDir = (claudeDir, server) => path.join(claudeDir, "isoplan", "offices", createHash("sha256").update(server).digest("hex").slice(0, 12));
+const approvedPath = (claudeDir, server) => path.join(officeDir(claudeDir, server), "approved.json");
 const isFile = (v) => !!v && typeof v.server === "string" && typeof v.version === "string" && typeof v.fetched === "number" && typeof v.checked === "number" && Array.isArray(v.repos) && v.repos.every((r) => typeof r === "string");
 /** approved.json, for `server` when given; null when there is none, or it is another server's. */
 async function readApproved(file, server) {
@@ -9183,7 +9210,33 @@ const WRITE_WAIT_MS = 1e4;
 /** How often the callback tries to write the credential it got before saying it couldn't. */
 const WRITE_TRIES = 4;
 const pairingPath = (claudeDir) => path.join(claudeDir, "isoplan", "pairing.json");
-const pairingLockPath = (claudeDir) => path.join(claudeDir, "isoplan", "pairing.lock");
+const pairingLockPath = (claudeDir, server) => path.join(officeDir(claudeDir, server), "pairing.lock");
+/** The account's entry for `server`, or undefined. */
+function pairingEntry(all, server, account) {
+	const first = all.accounts[account];
+	return first?.server === server ? first : all.offices?.[server]?.[account];
+}
+/** `all` with the account's entry for `server` set: where it is now, else under `accounts` while that holds no other server's. */
+function withPairingEntry(all, server, account, entry) {
+	const first = all.accounts[account];
+	if (!all.offices?.[server]?.[account] && (!first || first.server === server)) return {
+		...all,
+		accounts: {
+			...all.accounts,
+			[account]: entry
+		}
+	};
+	return {
+		...all,
+		offices: {
+			...all.offices,
+			[server]: {
+				...all.offices?.[server],
+				[account]: entry
+			}
+		}
+	};
+}
 const pairingWriteLockPath = (claudeDir) => path.join(claudeDir, "isoplan", "pairing.write.lock");
 const postJson = async (url, body) => {
 	const response = await fetch(url, {
@@ -9267,18 +9320,8 @@ function createPairing({ file, lock, writeLock, server, account, machine, emit, 
 	let shown = null;
 	let unreadable = false;
 	let callback = null;
-	const empty = () => ({ server });
-	const entryOf = (all) => {
-		const kept = all.accounts[account.id];
-		return kept && kept.server === server ? kept : empty();
-	};
-	const withEntry = (all, entry) => ({
-		...all,
-		accounts: {
-			...all.accounts,
-			[account.id]: entry
-		}
-	});
+	const entryOf = (all) => pairingEntry(all, server, account.id) ?? { server };
+	const withEntry = (all, entry) => withPairingEntry(all, server, account.id, entry);
 	const mine = async () => entryOf(await readPairing(file));
 	const update = (decide) => locked(file, writeLock, pid, isAlive, (all) => {
 		const { entry, result } = decide(entryOf(all));
@@ -10404,10 +10447,7 @@ async function main(argv) {
 	const logFile = path.join(claudeDir, "isoplan", "logs", `${sessionId}.log`);
 	let logging = Promise.resolve();
 	let downSince = Date.now();
-	let dropped = () => {};
 	const emit = (line) => {
-		if (line.type === "status") downSince = line.state === "connected" ? null : downSince ?? Date.now();
-		if (line.type === "status" && line.state === "disconnected") dropped();
 		if (isOut) process.stdout.write(JSON.stringify(line) + "\n");
 		else if (detached && (line.type === "log" || line.type === "error" || line.type === "pair")) {
 			const said = line.type === "log" ? line.text : line.type === "pair" ? pairNote(line) : `the office server says: ${line.message} (${line.code})`;
@@ -10578,24 +10618,28 @@ async function main(argv) {
 		type: "log",
 		text: `couldn't report the other sessions: ${String(err?.message ?? err)}`
 	}));
-	const server = config.server;
-	if (config.plainRefused) {
+	const offices = officesOf(config);
+	for (const { label, server } of offices.filter((o) => o.plainRefused)) {
 		emit({
 			type: "status",
-			server: config.plainRefused,
+			server,
+			label,
 			state: "insecure"
 		});
 		emit({
 			type: "log",
-			text: `not reporting: ${config.plainRefused} is plain ws:// to another machine; use wss://, or set "allowPlainWs": true in config.json`
+			text: `not reporting to ${server}: it is plain ws:// to another machine; use wss://, or set "allowPlainWs": true in config.json`
 		});
+	}
+	if (offices.every((o) => o.plainRefused)) {
 		if (!detached) await closed;
 		await logging;
 		return 0;
 	}
-	emit({
+	for (const { label, server } of offices.filter((o) => !o.plainRefused)) emit({
 		type: "status",
 		server,
+		label,
 		state: "waiting"
 	});
 	if (!detached) {
@@ -10612,38 +10656,14 @@ async function main(argv) {
 		readText: (p) => fs.readFile(p, "utf8").catch(() => null),
 		run: io.run
 	}, claudeJson, os.homedir());
-	const pairing = createPairing({
-		file: pairingPath(claudeDir),
-		lock: pairingLockPath(claudeDir),
-		writeLock: pairingWriteLockPath(claudeDir),
-		server,
-		account: machineAccount,
-		machine,
-		emit,
-		allowPlainWs: config.allowPlainWs
-	});
-	const approved = createApproved({
-		server,
-		file: approvedPath(claudeDir),
-		pairing,
-		refreshMs: config.approvedRefreshMinutes * 6e4,
-		maxAgeMs: config.approvedMaxAgeMinutes * 6e4,
-		log: (text) => emit({
-			type: "log",
-			text
-		})
-	});
-	dropped = () => void approved.refresh(true);
 	let candidates = null;
 	let candidatesAt = -Infinity;
 	let dormant = null;
 	let notApproved = null;
 	let factsSession = "";
-	let link = null;
 	let reported = "";
 	let title = null;
 	let asked = null;
-	let isUnwanted = false;
 	let isPlaceless = false;
 	let passes = 0;
 	const hold = await openReportHold(path.join(claudeDir, "isoplan", "released", `${sessionId}.json`), (text) => emit({
@@ -10668,70 +10688,120 @@ async function main(argv) {
 		readText: (p) => fs.readFile(p, "utf8").catch(() => null),
 		run: io.run
 	}, claudeJson, cwd);
-	const gate = createSessionGate({
-		approved,
-		open: (home, mayConnect) => createLink({
-			url: server,
-			emit,
-			pairing,
-			admit: mayConnect,
-			onNotWanted: () => {
-				isUnwanted = detached;
-				gate.notWanted();
-			},
-			filter: (f, projects) => forOffice(candidates?.workspace ? inRepos(f) : f, projects, checkouts),
-			answered: (id) => answered(id),
-			onMessage: (message) => {
-				if (message.type === "request" && message.kind === "owner-answer") {
-					const file = path.join(answersDir, `${randomUUID()}.json`);
-					fs.mkdir(answersDir, { recursive: true }).then(async () => {
-						const relayed = await relayOwnerAnswer(message, {
-							detached,
-							facts: () => sent,
-							file,
-							emit,
-							take: takeFile
-						});
-						link?.send(relayed.message);
-						if (!relayed.gaveUp) return;
-						const late = await lateTake(message.question, file, takeFile);
-						if (late === null) return;
-						emit({
-							type: "log",
-							text: `the hooks module said late that it ${late ? "took" : "didn't take"} the owner's answer to ${message.question}`
-						});
-						if (late) link?.send({
-							type: "reply",
-							v: 1,
-							id: message.id,
-							kind: "owner-answer",
-							late: true
-						});
-					}).finally(() => fs.rm(file, { force: true }).catch(() => {})).catch((err) => emit({
+	const openLink = (run, home, mayConnect) => createLink({
+		url: run.office.server,
+		emit: run.emit,
+		pairing: run.pairing,
+		admit: mayConnect,
+		onNotWanted: () => {
+			run.unwanted = detached;
+			run.gate.notWanted();
+		},
+		filter: (f, projects) => forOffice(candidates?.workspace ? inRepos(f) : f, projects, checkouts),
+		answered: (id) => answered(id),
+		onMessage: (message) => {
+			if (message.type === "request" && message.kind === "owner-answer") {
+				const file = path.join(answersDir, `${randomUUID()}.json`);
+				fs.mkdir(answersDir, { recursive: true }).then(async () => {
+					const relayed = await relayOwnerAnswer(message, {
+						detached,
+						facts: () => sent,
+						file,
+						emit,
+						take: takeFile
+					});
+					run.gate.current()?.send(relayed.message);
+					if (!relayed.gaveUp) return;
+					const late = await lateTake(message.question, file, takeFile);
+					if (late === null) return;
+					emit({
 						type: "log",
-						text: `couldn't pass the owner's answer on: ${String(err?.message ?? err)}`
-					}));
-					return;
-				}
-				if (message.type !== "release") return emit({
+						text: `the hooks module said late that it ${late ? "took" : "didn't take"} the owner's answer to ${message.question}`
+					});
+					if (late) run.gate.current()?.send({
+						type: "reply",
+						v: 1,
+						id: message.id,
+						kind: "owner-answer",
+						late: true
+					});
+				}).finally(() => fs.rm(file, { force: true }).catch(() => {})).catch((err) => emit({
 					type: "log",
-					text: `the office server sent a ${message.type} message, which this data layer doesn't handle yet`
-				});
-				hold.release(message.id).then((released) => {
-					if (released && shown) link?.update(sent = outgoing(...shown));
-				});
-			},
-			hello: {
-				type: "hello",
-				v: 1,
-				source: "claude-code",
-				account,
-				machine: { name: machine },
-				session: factsSession,
-				project: home
+					text: `couldn't pass the owner's answer on: ${String(err?.message ?? err)}`
+				}));
+				return;
 			}
-		})
+			if (message.type !== "release") return emit({
+				type: "log",
+				text: `the office server sent a ${message.type} message, which this data layer doesn't handle yet`
+			});
+			hold.release(message.id).then((released) => {
+				if (!released || !shown) return;
+				sent = outgoing(...shown);
+				for (const link of links()) link.update(sent);
+			});
+		},
+		hello: {
+			type: "hello",
+			v: 1,
+			source: "claude-code",
+			account,
+			machine: { name: machine },
+			session: factsSession,
+			project: home
+		}
 	});
+	const runs = offices.filter((o) => !o.plainRefused).map((office) => {
+		const { server, label } = office;
+		const run = {
+			office,
+			dormant: null,
+			connected: false,
+			unwanted: false
+		};
+		run.emit = (line) => {
+			if (line.type === "status") {
+				run.connected = line.state === "connected";
+				downSince = runs.some((r) => r.connected) ? null : downSince ?? Date.now();
+				if (line.state === "disconnected") run.approved.refresh(true);
+			}
+			emit(line.type === "status" || line.type === "pair" ? {
+				...line,
+				label
+			} : line.type === "asked" || line.type === "ask-rights" ? {
+				...line,
+				server
+			} : line);
+		};
+		run.pairing = createPairing({
+			file: pairingPath(claudeDir),
+			lock: pairingLockPath(claudeDir, server),
+			writeLock: pairingWriteLockPath(claudeDir),
+			server,
+			account: machineAccount,
+			machine,
+			emit: run.emit,
+			allowPlainWs: config.allowPlainWs
+		});
+		run.approved = createApproved({
+			server,
+			file: approvedPath(claudeDir, server),
+			pairing: run.pairing,
+			refreshMs: config.approvedRefreshMinutes * 6e4,
+			maxAgeMs: config.approvedMaxAgeMinutes * 6e4,
+			log: (text) => emit({
+				type: "log",
+				text
+			})
+		});
+		run.gate = createSessionGate({
+			approved: run.approved,
+			open: (home, mayConnect) => openLink(run, home, mayConnect)
+		});
+		return run;
+	});
+	const links = () => runs.flatMap((run) => run.gate.current() ?? []);
+	const isUnwanted = () => runs.some((r) => r.unwanted) && runs.every((r) => r.unwanted || r.dormant === "not-approved");
 	do {
 		const now = Date.now();
 		const isFirstPass = passes++ === 0;
@@ -10784,28 +10854,33 @@ async function main(argv) {
 			});
 			candidatesAt = now;
 		}
-		const gated = await gate.home(candidates.projects);
-		link = gate.current();
-		if (gated.dormancy !== dormant) {
-			if (gated.dormancy) emit({
-				type: "status",
-				server,
-				state: gated.dormancy,
-				...candidates.workspace && { workspace: true }
-			});
-			const what = candidates.workspace ? "none of the repos in this folder is" : `${candidates.projects[0]?.id ?? cwd} isn't`;
-			if (gated.dormancy === "not-approved") emit({
-				type: "log",
-				text: `${what} one the office at ${server} takes, so nothing of this session is sent`
-			});
-			if (gated.dormancy === "no-list") emit({
-				type: "log",
-				text: `can't tell which repos ${server} takes (no list, or one older than ${config.approvedMaxAgeMinutes} minutes), so nothing of this session is sent`
-			});
+		for (const run of runs) {
+			const { server, label } = run.office;
+			const gated = await run.gate.home(candidates.projects);
+			if (gated.dormancy !== run.dormant) {
+				if (gated.dormancy) run.emit({
+					type: "status",
+					server,
+					label,
+					state: gated.dormancy,
+					...candidates.workspace && { workspace: true }
+				});
+				const what = candidates.workspace ? "none of the repos in this folder is" : `${candidates.projects[0]?.id ?? cwd} isn't`;
+				if (gated.dormancy === "not-approved") emit({
+					type: "log",
+					text: `${what} one the office at ${server} takes, so nothing of this session is sent to it`
+				});
+				if (gated.dormancy === "no-list") emit({
+					type: "log",
+					text: `can't tell which repos ${server} takes (no list, or one older than ${config.approvedMaxAgeMinutes} minutes), so nothing of this session is sent to it`
+				});
+			}
+			run.dormant = gated.dormancy;
 		}
-		dormant = gated.dormancy;
-		if (!gated.home) {
-			if (detached && gated.dormancy === "not-approved") {
+		const taking = runs.filter((r) => !r.dormant);
+		dormant = taking.length ? null : runs.find((r) => r.dormant !== "not-approved")?.dormant ?? "not-approved";
+		if (!taking.length) {
+			if (detached && dormant === "not-approved") {
 				notApproved = candidates.projects.map((p) => p.id.toLowerCase());
 				break;
 			}
@@ -10850,19 +10925,19 @@ async function main(argv) {
 				isPlaceless = isFirstPass && !await resolve(cwd);
 				break;
 			}
-			if (link) {
-				gate.drop();
-				link = null;
-				emit({
+			for (const run of taking) {
+				if (!run.gate.current()) continue;
+				run.gate.drop();
+				run.emit({
 					type: "status",
-					server,
+					server: run.office.server,
+					label: run.office.label,
 					state: "waiting"
 				});
 			}
 			continue;
 		}
 		factsSession = read.facts.session.id;
-		link = gate.link();
 		const reply = await takeReply(titleFile);
 		if (reply) {
 			const text = reply.key === asked ? cleanTitle(reply.text) : null;
@@ -10905,7 +10980,8 @@ async function main(argv) {
 		});
 		waiting = detached ? /* @__PURE__ */ new Set() : await waitsOf(waitsDir, facts);
 		shown = [facts, patterns];
-		link.update(sent = outgoing(facts, patterns));
+		sent = outgoing(facts, patterns);
+		for (const run of taking) run.gate.link().update(sent);
 		const why = detached ? detachedStop({
 			now,
 			lastActive: facts.session.lastActive,
@@ -10919,9 +10995,10 @@ async function main(argv) {
 			});
 			break;
 		}
-	} while (await wait(dormant ? DORMANT_MS : config.streamSeconds * 1e3) && !isUnwanted && (!detached || await lockHolder(lock) === process.pid) && !await isOff());
-	link?.close();
-	if (isUnwanted || isPlaceless) await holdOff(lock, process.pid, Date.now() + HOLD_OFF_MS).catch(() => {});
+	} while (await wait(dormant ? DORMANT_MS : config.streamSeconds * 1e3) && !isUnwanted() && (!detached || await lockHolder(lock) === process.pid) && !await isOff());
+	for (const link of links()) link.close();
+	if (isUnwanted() && runs.some((r) => r.dormant === "not-approved")) notApproved = (candidates?.projects ?? []).map((p) => p.id.toLowerCase());
+	if (isUnwanted() && !notApproved || isPlaceless) await holdOff(lock, process.pid, Date.now() + HOLD_OFF_MS).catch(() => {});
 	else if (notApproved) await holdOff(lock, process.pid, Date.now() + HOLD_OFF_MS, {
 		reason: "not-approved",
 		projects: notApproved

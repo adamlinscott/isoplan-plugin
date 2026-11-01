@@ -3,7 +3,7 @@
 
 import fs from "node:fs/promises";
 import path from "node:path";
-import { approvedPath, DEFAULT_MAX_AGE_MINUTES, freshRepos, readApproved } from "../data-layer/approved-file.js";
+import { approvedFiles, DEFAULT_MAX_AGE_MINUTES, freshRepos, readApproved } from "../data-layer/approved-file.js";
 import { newestDataLayer } from "../install/state.js";
 import { alive, isHeld, lockPath, readLock } from "./lock.js";
 
@@ -51,11 +51,14 @@ export async function wake(input: string, { claudeDir, spawn, isAlive = alive, p
   return true;
 }
 
-/** Whether `lock` is a hold-off for repos the office didn't take, one of which a fresh copy of its list now has. */
+/** Whether `lock` is a hold-off for repos no office took, one of which a fresh copy of any office's list now has. */
 async function nowApproved(claudeDir: string, lock: string): Promise<boolean> {
   const held = await readLock(lock);
   const projects = held?.extra.projects;
   if (held?.pid !== null || held.extra.reason !== "not-approved" || !Array.isArray(projects)) return false;
-  const repos = freshRepos(await readApproved(approvedPath(claudeDir)), DEFAULT_MAX_AGE_MINUTES * 60000, Date.now());
-  return !!repos && projects.some((p) => typeof p === "string" && repos.has(p));
+  for (const file of await approvedFiles(claudeDir)) {
+    const repos = freshRepos(await readApproved(file), DEFAULT_MAX_AGE_MINUTES * 60000, Date.now());
+    if (repos && projects.some((p) => typeof p === "string" && repos.has(p))) return true;
+  }
+  return false;
 }

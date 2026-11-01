@@ -1,6 +1,7 @@
 // Isoplan's hooks module: Claude Code loads it through hooks/hooks.json. It draws nothing. It
 // starts the data layer (dist/data-layer.js) for the session and keeps it running, shows the link
-// in one status line, with "Isoplan updated: type /reload-plugins" beside it once the data layer says
+// to each office in one status line, by the office's label (`Isoplan: internal ✓ · dev ✓`, #105),
+// leaving out an office that doesn't take the repo, with "Isoplan updated: type /reload-plugins" beside it once the data layer says
 // a newer version of the plugin is on disk (src/update), writes the room titles the data layer asks for on the owner's own login,
 // and adds the office server's conflict notes to the agent's next tool result. When the office
 // server wants the machine paired, a "Pair this machine" link is in the status line while it waits,
@@ -8,7 +9,7 @@
 //
 // It also gives the session's agent the ask_room tool (#49), once the office server says this
 // session may ask its room (an `ask-rights` line): the session took a handoff, and its owner hasn't
-// turned asking off. A tool can't be taken away again, so once the rights go (turned off, the
+// turned asking off. It asks through the office whose line granted it. A tool can't be taken away again, so once the rights go (turned off, the
 // handoff dismissed, another session id) it answers that asking is off, without running anything. The tool asks the room's lead a question through the office server
 // (dist/ask.js), with no one typing anything; the script waits only as long as runner.json says,
 // then tells the agent to carry on. The end of a question that comes after that arrives as an
@@ -39,7 +40,7 @@
 
 import type { AskedMessage, ConflictMessage } from "@isoplan/protocol";
 import { endText, MAX_WAIT_MS } from "../ask/text.js";
-import type { AnswerTaken, DataLayerLine, OwnerAnswerLine, PairLine, StatusLine, TitleAskLine, WaitMark } from "../lines.js";
+import type { AnswerTaken, DataLayerLine, FromOffice, OwnerAnswerLine, PairLine, StatusLine, TitleAskLine, WaitMark } from "../lines.js";
 import type { Host, On, ToolCallInput, ToolCallResult } from "./host.js";
 
 const RETRY_CAP_MS = 30000;
@@ -70,17 +71,22 @@ let started = false;
 // Notes waiting for their agent's next tool result, by agent id.
 const notes = new Map<string, string[]>();
 // Late replies from the room waiting for a tool result, by question id, each for the agent that
-// asked (null for the lead); those shown; and which agent made each ask, by its key (the call's id).
-const replies = new Map<string, { agent: string | null; text: string }>();
+// asked (null for the lead) and the office it came through; those shown; and which agent made each
+// ask, by its key (the call's id).
+const replies = new Map<string, { agent: string | null; text: string; server?: string }>();
 const shown = new Set<string>();
 const askedBy = new Map<string, string | null>();
 let toolName: string | null = null; // the ask_room tool's full name, as registering it answered
 let toolAdded = false; // registered for this session
-let mayAsk = false; // the office server last said this session may ask
+// Whether each office server last said this session may ask, by its address ("" from a line that names none).
+const mayAsk = new Map<string, boolean>();
 let asking = false; // one title call at a time
 let lastError: string | null = null;
-let pairing: PairLine | null = null; // the link waiting to be clicked, last shown
-let pairSaid = false; // a link was put in the transcript since the session started
+const pairings = new Map<string, PairLine>(); // each office's link waiting to be clicked, last shown
+const pairSaid = new Set<string>(); // the offices whose link was put in the transcript since the session started
+// Each office's part of the status line, by its address, in the order the data layer first named them;
+// undefined for one that shows nothing.
+const offices = new Map<string, string | undefined>();
 // The questions waiting for an answer from the floor too, by their call's id: each ends its call.
 const floorWaits = new Map<string, (answers: Record<string, string>) => void>();
 let waitsDir: string | null = null; // where the waits are marked, as the data layer said
@@ -92,7 +98,7 @@ let marking: Promise<unknown> = Promise.resolve(); // the marks, written in orde
 export function register(on: On): void {
   on("session.start", async ($, e, next) => {
     const result = await next(e);
-    pairSaid = false;
+    pairSaid.clear();
     if (!started) {
       started = true;
       void run($).catch((err) => $.ui.log("isoplan: the data layer loop failed: " + message(err), { to: "debug" }));
@@ -120,10 +126,10 @@ export function register(on: On): void {
       const waiting = notes.get(agent) ?? [];
       notes.delete(agent);
       const late = await lateFor($, e.agentId ?? null);
-      for (const [question] of late) {
+      for (const [question, reply] of late) {
         replies.delete(question);
         shown.add(question);
-        ack($, question);
+        ack($, question, reply.server);
       }
       if (!waiting.length && !late.length) return r;
       return { ...r, context: [...(r.context ?? []), ...waiting, ...late.map(([, reply]) => reply.text)] };
@@ -196,8 +202,11 @@ async function run($: Host): Promise<void> {
       replies.clear();
       askedBy.clear();
       // The new session has rights only once the server says so.
-      toolAdded = mayAsk = false;
+      toolAdded = false;
+      mayAsk.clear();
     }
+    // A data layer that starts names its offices again.
+    offices.clear();
     running = session;
     lead = `claude-code:${session}:lead`;
     let switched = false;
@@ -278,7 +287,8 @@ function handle($: Host, text: string): void {
   }
   switch (line.type) {
     case "status":
-      show($, statusText(line));
+      offices.set(line.server, officeText(line));
+      show($, statusText());
       break;
     case "updated":
       updated = true;
@@ -294,11 +304,12 @@ function handle($: Host, text: string): void {
       $.ui.log("isoplan: " + line.text, { to: "debug" });
       break;
     case "pair":
-      // In the transcript once per session start; the status line keeps the newest while it waits.
-      if (!pairSaid) $.ui.log(`Isoplan: to report to ${line.server}, pair this machine: click ${line.url} on this computer and approve it in the office.`);
-      pairSaid = true;
-      pairing = line;
-      show($, pairText(line));
+      // In the transcript once per office per session start; the status line keeps the newest while it waits.
+      if (!pairSaid.has(line.server)) $.ui.log(`Isoplan: to report to ${line.server}, pair this machine: click ${line.url} on this computer and approve it in the office.`);
+      pairSaid.add(line.server);
+      pairings.set(line.server, line);
+      offices.set(line.server, pairText(line));
+      show($, statusText());
       break;
     case "conflict":
       addNote(line);
@@ -307,7 +318,7 @@ function handle($: Host, text: string): void {
       addReply($, line);
       break;
     case "ask-rights":
-      mayAsk = line.granted;
+      mayAsk.set(line.server ?? "", line.granted);
       if (line.granted) addTool($);
       break;
     case "owner-answer":
@@ -339,15 +350,23 @@ function show($: Host, text: string | undefined): void {
 
 const UPDATED_TEXT = "Isoplan updated: type /reload-plugins";
 
-function statusText(line: StatusLine): string | undefined {
+// The status line: each office's part that shows anything, or nothing at all.
+function statusText(): string | undefined {
+  const parts = [...offices.values()].filter(Boolean);
+  return parts.length ? `Isoplan: ${parts.join(" · ")}` : undefined;
+}
+
+// One office's part of the status line, by its label.
+function officeText(line: StatusLine): string | undefined {
+  const label = line.label ?? line.server;
   switch (line.state) {
     case "waiting":
-      return `Isoplan: ${line.server}, not connected yet (nothing to report)`;
+      return `${label} not connected yet (nothing to report)`;
     case "connecting":
-      return `Isoplan: connecting to ${line.server}…`;
+      return `${label} connecting…`;
     case "connected":
       lastError = null;
-      return `Isoplan: connected to ${line.server}`;
+      return `${label} ✓`;
     // Outside the office Isoplan shows nothing: nothing of the session is sent, and the developer's
     // own work isn't interrupted. The data layer's log still says why.
     case "not-wanted":
@@ -355,17 +374,19 @@ function statusText(line: StatusLine): string | undefined {
     case "no-list":
       return undefined;
     case "taken":
-      return "Isoplan: this session belongs to someone else on the office, so it isn't reported";
+      return `${label}: this session belongs to someone else on the office, so it isn't reported`;
     case "insecure":
-      return `Isoplan: not reporting: ${line.server} is plain ws:// to another machine; use wss://, or set "allowPlainWs": true in config.json`;
-    case "pairing":
-      return pairing ? pairText(pairing) : `Isoplan: waiting for this machine to be paired with ${line.server}`;
+      return `${label}: not reporting: ${line.server} is plain ws:// to another machine; use wss://, or set "allowPlainWs": true in config.json`;
+    case "pairing": {
+      const pairing = pairings.get(line.server);
+      return pairing ? pairText(pairing) : `${label} waiting for this machine to be paired`;
+    }
     case "disconnected":
-      return `Isoplan: can't reach ${line.server}; retrying in ${Math.max(1, Math.round((line.retryInMs ?? 0) / 1000))}s`;
+      return `${label} can't be reached; retrying in ${Math.max(1, Math.round((line.retryInMs ?? 0) / 1000))}s`;
   }
 }
 
-const pairText = (line: PairLine) => `Isoplan: Pair this machine: ${line.url}`;
+const pairText = (line: PairLine) => `${line.label ?? line.server}: Pair this machine: ${line.url}`;
 
 function addNote(line: ConflictMessage): void {
   const waiting = notes.get(line.agent) ?? [];
@@ -375,15 +396,15 @@ function addNote(line: ConflictMessage): void {
 
 // The end of a question the agent asked, sent after it carried on: kept for the lead's next tool
 // result, or, already shown, acked again. The server sends only ends down this link.
-function addReply($: Host, line: AskedMessage): void {
+function addReply($: Host, line: FromOffice<AskedMessage>): void {
   if (line.state !== "answered" && line.state !== "dropped") return;
-  if (shown.has(line.question)) return ack($, line.question);
-  replies.set(line.question, { agent: (line.key && askedBy.get(line.key)) ?? null, text: endText(line, true) });
+  if (shown.has(line.question)) return ack($, line.question, line.server);
+  replies.set(line.question, { agent: (line.key && askedBy.get(line.key)) ?? null, text: endText(line, true), server: line.server });
 }
 
 // The late replies a tool result of `agent` (null for the lead) shows: its own, and for the lead
 // also those of agents that have stopped since they asked.
-async function lateFor($: Host, agent: string | null): Promise<[string, { agent: string | null; text: string }][]> {
+async function lateFor($: Host, agent: string | null): Promise<[string, { agent: string | null; text: string; server?: string }][]> {
   const all = [...replies];
   if (agent !== null) return all.filter(([, r]) => r.agent === agent);
   const others = all.filter(([, r]) => r.agent !== null);
@@ -392,14 +413,16 @@ async function lateFor($: Host, agent: string | null): Promise<[string, { agent:
 }
 
 // Tells the server the lead was shown the question's end, so it isn't sent again.
-function ack($: Host, question: string): void {
+function ack($: Host, question: string, server: string | undefined): void {
   void (async () => {
     const cwd = await $.session.cwd();
-    await $.process.run(["node", askScript($), "--session", await $.session.id(), "--cwd", cwd, "--ack", question], { cwd, timeoutMs: 60000 });
+    await $.process.run(["node", askScript($), "--session", await $.session.id(), "--cwd", cwd, ...serverArgs(server), "--ack", question], { cwd, timeoutMs: 60000 });
   })().catch((err) => $.ui.log("isoplan: couldn't ack the room's reply: " + message(err), { to: "debug" }));
 }
 
 const askScript = ($: Host) => $.plugin.root.replace(/\\/g, "/") + "/dist/ask.js";
+// The office the script talks to; without one, the first that takes the session's repo.
+const serverArgs = (server: string | undefined) => (server ? ["--server", server] : []);
 
 // The ask_room tool, added once the office server says this session may ask its room; it is in the
 // prompt's tool list from then on, as the agent of a session that took a handoff should reach for it.
@@ -424,14 +447,15 @@ function addTool($: Host): void {
 // The ask_room tool: the script asks as this session, under the tool call's id so a retry is the
 // same question, and prints what the agent is told.
 async function askRoom($: Host, e: ToolCallInput): Promise<ToolCallResult> {
-  if (!mayAsk) return { result: "Asking this room is off now: its owner turned it off, the handoff was dismissed, or this session took no handoff. Carry on without asking." };
+  const granted = [...mayAsk].find(([, may]) => may);
+  if (!granted) return { result: "Asking this room is off now: its owner turned it off, the handoff was dismissed, or this session took no handoff. Carry on without asking." };
   const question = typeof e.question === "string" ? e.question.trim() : "";
   if (!question) return { result: "Give the question to ask the room as `question`." };
   askedBy.set(e.tool_use_id, e.agentId ?? null);
   try {
     const session = await $.session.id();
     const cwd = await $.session.cwd();
-    const r = await $.process.run(["node", askScript($), "--session", session, "--cwd", cwd, "--key", e.tool_use_id], { cwd, stdin: question, timeoutMs: ASK_TIMEOUT_MS });
+    const r = await $.process.run(["node", askScript($), "--session", session, "--cwd", cwd, ...serverArgs(granted[0]), "--key", e.tool_use_id], { cwd, stdin: question, timeoutMs: ASK_TIMEOUT_MS });
     if (r.stdout.trim()) return { result: r.stdout.trim() };
     $.ui.log("isoplan: ask_room: " + (r.stderr.trim() || `node exited with code ${r.exitCode}`), { to: "debug" });
     return { result: "The room couldn't be asked here. Carry on without the answer." };

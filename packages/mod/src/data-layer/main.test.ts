@@ -114,6 +114,42 @@ test("an approved session connects; once its copy of the list is past its maximu
   await until(() => o.state.connections.length === 2 && o.state.connections[1]!.messages.some((m) => m.type === "hello"));
 });
 
+test("a session reports to every office whose list takes its repo, each on its own link: one taking it out leaves the other's link up (#105)", async () => {
+  const internal = await office();
+  const dev = await office();
+  internal.state.repos = ["github.com/team/app"];
+  const hello = (o: typeof internal, i: number) => o.state.connections[i]?.messages.some((m) => m.type === "hello") ?? false;
+  const { claudeDir } = start("ws://127.0.0.1:9/data-layer", {
+    servers: [
+      { label: "internal", server: internal.url },
+      { label: "dev", server: dev.url },
+    ],
+    approvedRefreshMinutes: 0.01,
+  });
+  await until(() => hello(internal, 0));
+  // The office that doesn't take the repo gets nothing, not even a hello.
+  await wait(1500);
+  expect(dev.state.connections).toEqual([]);
+
+  // Once it takes it too, the session goes to both.
+  dev.state.repos = ["github.com/team/app"];
+  dev.state.version++;
+  await until(() => hello(dev, 0));
+  expect(internal.state.connections).toHaveLength(1);
+  expect(internal.state.connections[0]!.closed).toBe(false);
+
+  // The first takes it out: its link closes, and the other's stays up.
+  internal.state.repos = [];
+  internal.state.version++;
+  await until(() => internal.state.connections[0]!.closed);
+  await wait(1500);
+  expect(dev.state.connections).toHaveLength(1);
+  expect(dev.state.connections[0]!.closed).toBe(false);
+  // Each office's copy of its list is its own.
+  const lists = fs.readdirSync(path.join(claudeDir, "isoplan", "offices")).map((id) => JSON.parse(fs.readFileSync(path.join(claudeDir, "isoplan", "offices", id, "approved.json"), "utf8")).server);
+  expect(lists.sort()).toEqual([internal.url, dev.url].sort());
+});
+
 /** Two versions of the plugin in a throwaway plugin cache, Claude Code's record naming the newer, and a way to start either for session s1. */
 function versions(server = "ws://127.0.0.1:9/data-layer") {
   const root = tempRoot();

@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { expect, test } from "vitest";
+import { approvedPath } from "../data-layer/approved-file.js";
 import { tempRoot } from "../data-layer/fixture.js";
 import { HOLD_OFF_MS, holdOff, lockPath, takeLock } from "./lock.js";
 import { wake, wakeRecordPath } from "./wake.js";
@@ -78,6 +79,21 @@ test("wake: a data layer held off because the office took none of its repos star
   list(["github.com/team/app"]);
   expect(await s.run(() => false)).toBe(true);
   expect(s.spawned).toHaveLength(1);
+});
+
+test("wake: with several offices, any office's list that takes one of the repos starts it again (#105)", async () => {
+  const s = setup();
+  await takeLock(s.lock, OTHER);
+  await holdOff(s.lock, OTHER, Date.now() + HOLD_OFF_MS, { reason: "not-approved", projects: ["github.com/team/app"] });
+  const list = (server: string, repos: string[]) => {
+    const file = approvedPath(s.claudeDir, server);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, JSON.stringify({ server, version: "v1", repos, fetched: Date.now(), checked: Date.now() }));
+  };
+  list("wss://isoplan-internal.example/data-layer", ["github.com/team/other"]);
+  expect(await s.run(() => false)).toBe(false);
+  list("ws://127.0.0.1:4747/data-layer", ["github.com/team/app"]);
+  expect(await s.run(() => false)).toBe(true);
 });
 
 test("wake: starts the newest data layer Claude Code has installed, not an older one wake.json still records", async () => {

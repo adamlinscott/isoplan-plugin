@@ -1,6 +1,9 @@
 // The data layer's settings: the mod's config.json, overridden per key by the person's own
 // ~/.claude/isoplan/config.json. A user value that is missing, null or the wrong shape leaves that
 // key at the mod's default.
+//
+// The plugin reports to every office server in `servers` (#105), each `{ "label", "server" }`, the
+// label naming it in the status line; without a usable one, to `server` alone, labelled by its host.
 
 import type { MaybePromise, Stat } from "./git.js";
 
@@ -11,6 +14,8 @@ export interface Config {
   allowPlainWs: boolean;
   /** A `server` set to plain ws:// to another machine without allowPlainWs: not used, and said why. */
   plainRefused?: string;
+  /** The office servers to report to, each `{ label, server }`, in place of `server` (officesOf). */
+  servers: unknown[];
   activeMinutes: number;
   idleMinutes: number;
   lightsOffHours: number;
@@ -48,6 +53,34 @@ export async function loadConfig(io: ConfigIo, defaultsPath: string, userPath: s
     else config.plainRefused = asked;
   }
   return config;
+}
+
+/** One office server the plugin reports to. */
+export interface Office {
+  /** Its short name in the status line. */
+  label: string;
+  /** Its data-layer address. */
+  server: string;
+  /** Plain ws:// to another machine without allowPlainWs: not used, and said why. */
+  plainRefused?: true;
+}
+
+/**
+ * The offices to report to: each usable entry of `servers` (a wss:// address, or ws://, which goes
+ * only to this machine unless allowPlainWs, else it is kept to say why it isn't used), once per
+ * address; with none, `server` alone. An entry without a label is labelled by its host.
+ */
+export function officesOf(config: Config): Office[] {
+  const offices: Office[] = [];
+  for (const entry of config.servers) {
+    const { label, server } = (entry ?? {}) as { label?: unknown; server?: unknown };
+    if (typeof server !== "string" || !URL.canParse(server) || !["ws:", "wss:"].includes(new URL(server).protocol) || offices.some((o) => o.server === server)) continue;
+    const refused = !config.allowPlainWs && !isWebSocketUrl(server);
+    offices.push({ label: (typeof label === "string" && label.trim()) || new URL(server).host, server, ...(refused && { plainRefused: true as const }) });
+  }
+  if (offices.length) return offices;
+  const server = config.plainRefused ?? config.server;
+  return [{ label: new URL(server).host, server, ...(config.plainRefused && { plainRefused: true as const }) }];
 }
 
 /** The same per-key override for any settings file of the mod's, such as the runner's runner.json. */

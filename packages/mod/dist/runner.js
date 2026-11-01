@@ -6264,6 +6264,31 @@ async function loadConfig(io, defaultsPath, userPath) {
 	}
 	return config;
 }
+/**
+* The offices to report to: each usable entry of `servers` (a wss:// address, or ws://, which goes
+* only to this machine unless allowPlainWs, else it is kept to say why it isn't used), once per
+* address; with none, `server` alone. An entry without a label is labelled by its host.
+*/
+function officesOf(config) {
+	const offices = [];
+	for (const entry of config.servers) {
+		const { label, server } = entry ?? {};
+		if (typeof server !== "string" || !URL.canParse(server) || !["ws:", "wss:"].includes(new URL(server).protocol) || offices.some((o) => o.server === server)) continue;
+		const refused = !config.allowPlainWs && !isWebSocketUrl(server);
+		offices.push({
+			label: typeof label === "string" && label.trim() || new URL(server).host,
+			server,
+			...refused && { plainRefused: true }
+		});
+	}
+	if (offices.length) return offices;
+	const server = config.plainRefused ?? config.server;
+	return [{
+		label: new URL(server).host,
+		server,
+		...config.plainRefused && { plainRefused: true }
+	}];
+}
 /** The same per-key override for any settings file of the mod's, such as the runner's runner.json. */
 async function loadSettings(io, defaultsPath, userPath) {
 	const defaults = await readJson(io, defaultsPath);
@@ -6307,7 +6332,9 @@ async function readJson(io, p, optional = false) {
 }
 //#endregion
 //#region src/data-layer/approved-file.ts
-const approvedPath = (claudeDir) => path.join(claudeDir, "isoplan", "approved.json");
+/** The folder of what is kept for one office server alone: its list, and its pairing's lock. Named by a hash of its address. */
+const officeDir = (claudeDir, server) => path.join(claudeDir, "isoplan", "offices", createHash("sha256").update(server).digest("hex").slice(0, 12));
+const approvedPath = (claudeDir, server) => path.join(officeDir(claudeDir, server), "approved.json");
 const isFile$1 = (v) => !!v && typeof v.server === "string" && typeof v.version === "string" && typeof v.fetched === "number" && typeof v.checked === "number" && Array.isArray(v.repos) && v.repos.every((r) => typeof r === "string");
 /** approved.json, for `server` when given; null when there is none, or it is another server's. */
 async function readApproved(file, server) {
@@ -6464,7 +6491,33 @@ const WRITE_WAIT_MS = 1e4;
 /** How often the callback tries to write the credential it got before saying it couldn't. */
 const WRITE_TRIES = 4;
 const pairingPath = (claudeDir) => path.join(claudeDir, "isoplan", "pairing.json");
-const pairingLockPath = (claudeDir) => path.join(claudeDir, "isoplan", "pairing.lock");
+const pairingLockPath = (claudeDir, server) => path.join(officeDir(claudeDir, server), "pairing.lock");
+/** The account's entry for `server`, or undefined. */
+function pairingEntry(all, server, account) {
+	const first = all.accounts[account];
+	return first?.server === server ? first : all.offices?.[server]?.[account];
+}
+/** `all` with the account's entry for `server` set: where it is now, else under `accounts` while that holds no other server's. */
+function withPairingEntry(all, server, account, entry) {
+	const first = all.accounts[account];
+	if (!all.offices?.[server]?.[account] && (!first || first.server === server)) return {
+		...all,
+		accounts: {
+			...all.accounts,
+			[account]: entry
+		}
+	};
+	return {
+		...all,
+		offices: {
+			...all.offices,
+			[server]: {
+				...all.offices?.[server],
+				[account]: entry
+			}
+		}
+	};
+}
 const pairingWriteLockPath = (claudeDir) => path.join(claudeDir, "isoplan", "pairing.write.lock");
 const postJson = async (url, body) => {
 	const response = await fetch(url, {
@@ -6548,18 +6601,8 @@ function createPairing({ file, lock, writeLock, server, account, machine, emit, 
 	let shown = null;
 	let unreadable = false;
 	let callback = null;
-	const empty = () => ({ server });
-	const entryOf = (all) => {
-		const kept = all.accounts[account.id];
-		return kept && kept.server === server ? kept : empty();
-	};
-	const withEntry = (all, entry) => ({
-		...all,
-		accounts: {
-			...all.accounts,
-			[account.id]: entry
-		}
-	});
+	const entryOf = (all) => pairingEntry(all, server, account.id) ?? { server };
+	const withEntry = (all, entry) => withPairingEntry(all, server, account.id, entry);
 	const mine = async () => entryOf(await readPairing(file));
 	const update = (decide) => locked(file, writeLock, pid, isAlive, (all) => {
 		const { entry, result } = decide(entryOf(all));
@@ -11432,10 +11475,9 @@ async function worker() {
 	const config = () => loadConfig(io, path.join(appDir, "config.json"), path.join(isoplanDir, "config.json"));
 	const settings = () => loadSettings(io, path.join(appDir, "runner.json"), path.join(isoplanDir, "runner.json"));
 	const first = await config();
-	if (first.plainRefused) {
-		log(`the runner isn't starting: ${first.plainRefused} is plain ws:// to another machine; use wss://, or set "allowPlainWs": true in config.json`);
-		return 0;
-	}
+	const offices = officesOf(first);
+	for (const { server } of offices.filter((o) => o.plainRefused)) log(`the runner doesn't answer through ${server}: it is plain ws:// to another machine; use wss://, or set "allowPlainWs": true in config.json`);
+	if (offices.every((o) => o.plainRefused)) return 0;
 	await settings();
 	const answerer = createClaudeAnswerer({
 		claudeDir,
@@ -11456,131 +11498,155 @@ async function worker() {
 		readText: (p) => fs.readFile(p, "utf8").catch(() => null),
 		run: io.run
 	}, claudeJson, os.homedir());
-	const emit = (line) => {
+	const emitFor = (server) => (line) => {
 		if (line.type === "log") log(line.text);
-		else if (line.type === "error") log(`the office server says: ${line.message} (${line.code})`);
+		else if (line.type === "error") log(`the office server at ${server} says: ${line.message} (${line.code})`);
 		else if (line.type === "pair") log(`to answer for this machine's rooms through ${line.server}, pair it: click ${line.url} on this computer and approve it in the office (it works until ${line.expires})`);
 	};
-	const pairing = createPairing({
-		file: pairingPath(claudeDir),
-		lock: pairingLockPath(claudeDir),
-		writeLock: pairingWriteLockPath(claudeDir),
-		server: first.server,
-		account,
-		machine: os.hostname(),
-		emit,
-		allowPlainWs: first.allowPlainWs
-	});
-	const approved = createApproved({
-		server: first.server,
-		file: approvedPath(claudeDir),
-		pairing,
-		refreshMs: first.approvedRefreshMinutes * 6e4,
-		maxAgeMs: first.approvedMaxAgeMinutes * 6e4,
-		log
-	});
 	const homeIo = machineHomeIo(first.workspaceRepos);
-	const takes = async () => {
-		await approved.refresh();
-		return takesFrom(homeIo, approved.repos());
-	};
-	let send = () => {};
+	const ledger = await openLedger(path.join(isoplanDir, "runner", "ledger.json"));
 	const preparedFor = /* @__PURE__ */ new Map();
-	const runner = createRunner({
-		answerer,
-		ledger: await openLedger(path.join(isoplanDir, "runner", "ledger.json")),
-		settings,
-		prompts: () => loadPrompts(path.join(appDir, "prompts")),
-		scan: scanText,
-		send: (message) => send(message),
-		log,
-		isDir: (p) => fs.stat(p).then((s) => s.isDirectory(), () => false),
-		isReported: async (session, lead) => {
-			const id = forkableId(session);
-			const lock = id ? await readLock(lockPath(claudeDir, id)) : null;
-			if (!id || lock && lock.pid === null && lock.until !== null && lock.until > Date.now()) return false;
-			if (Date.now() - lead.lastActive > askableMs(await config().catch(() => first))) return false;
-			await approved.refresh();
-			return await approvedHome(lead.cwd, homeIo, approved.repos()) !== null;
-		},
-		prepareBrief: async (lead, handoff) => {
-			const ready = await prepare(git, lead.cwd, await gitMs(), (await settings()).repoSearchDepth, void 0, await takes()).catch((err) => Promise.reject(told(err)));
-			if (ready.notInOffice.length) log(`handoff ${handoff}: left out, not in the office: ${ready.notInOffice.join(", ")}`);
-			preparedFor.set(handoff, ready);
-			if (preparedFor.size > MAX_PREPARED) preparedFor.delete(preparedFor.keys().next().value);
-			const { from, files, repos, left } = ready;
-			return {
-				files,
-				note: handoffNote({
-					branch: handoffBranch(handoff),
-					from,
-					files,
-					at: /* @__PURE__ */ new Date(),
-					repos,
-					left
-				})
-			};
-		},
-		push: async (_session, lead, handoff, pushAnyway) => {
-			const pushed = await pushHandoff(git, lead.cwd, handoff, await gitMs(), {
-				scan: scanText,
-				depth: (await settings()).repoSearchDepth,
-				prepared: preparedFor.get(handoff),
-				takes: await takes(),
-				...pushAnyway ? { pushAnyway } : {}
-			}).catch((err) => Promise.reject(told(err)));
-			return "held" in pushed ? pushed : pushed.repos;
-		},
-		take: (message) => takeHandoff(message, {
-			run: git,
-			io,
-			claudeDir,
-			machine: os.hostname(),
-			platform: process.platform,
-			env: process.env,
-			settings,
-			claude: () => claudeBinary(claudeDir, process.env, process.platform, os.homedir()),
-			claudeJson,
-			scan: scanText,
-			log
-		})
-	});
-	let notWanted = false;
-	let unpaired = false;
 	let wake = () => {};
-	const link = createLink({
-		url: first.server,
-		emit,
-		pairing,
-		onMessage: (message) => runner.take(message),
-		onNotWanted: () => {
-			notWanted = true;
-			wake();
-		},
-		onPairingEnded: () => {
-			unpaired = true;
-			wake();
-		},
-		hello: {
-			type: "runner",
-			v: 1,
+	const answerFor = ({ server }) => {
+		const emit = emitFor(server);
+		const pairing = createPairing({
+			file: pairingPath(claudeDir),
+			lock: pairingLockPath(claudeDir, server),
+			writeLock: pairingWriteLockPath(claudeDir),
+			server,
 			account,
-			machine: { name: os.hostname() }
-		}
-	});
-	send = (message) => link.send(message);
-	log(`the runner's worker ${process.pid} is answering for this machine through ${first.server}`);
+			machine: os.hostname(),
+			emit,
+			allowPlainWs: first.allowPlainWs
+		});
+		const approved = createApproved({
+			server,
+			file: approvedPath(claudeDir, server),
+			pairing,
+			refreshMs: first.approvedRefreshMinutes * 6e4,
+			maxAgeMs: first.approvedMaxAgeMinutes * 6e4,
+			log
+		});
+		const takes = async () => {
+			await approved.refresh();
+			return takesFrom(homeIo, approved.repos());
+		};
+		let send = () => {};
+		const runner = createRunner({
+			answerer,
+			ledger,
+			settings,
+			prompts: () => loadPrompts(path.join(appDir, "prompts")),
+			scan: scanText,
+			send: (message) => send(message),
+			log,
+			isDir: (p) => fs.stat(p).then((s) => s.isDirectory(), () => false),
+			isReported: async (session, lead) => {
+				const id = forkableId(session);
+				const lock = id ? await readLock(lockPath(claudeDir, id)) : null;
+				if (!id || lock && lock.pid === null && lock.until !== null && lock.until > Date.now()) return false;
+				if (Date.now() - lead.lastActive > askableMs(await config().catch(() => first))) return false;
+				await approved.refresh();
+				return await approvedHome(lead.cwd, homeIo, approved.repos()) !== null;
+			},
+			prepareBrief: async (lead, handoff) => {
+				const ready = await prepare(git, lead.cwd, await gitMs(), (await settings()).repoSearchDepth, void 0, await takes()).catch((err) => Promise.reject(told(err)));
+				if (ready.notInOffice.length) log(`handoff ${handoff}: left out, not in the office: ${ready.notInOffice.join(", ")}`);
+				preparedFor.set(handoff, ready);
+				if (preparedFor.size > MAX_PREPARED) preparedFor.delete(preparedFor.keys().next().value);
+				const { from, files, repos, left } = ready;
+				return {
+					files,
+					note: handoffNote({
+						branch: handoffBranch(handoff),
+						from,
+						files,
+						at: /* @__PURE__ */ new Date(),
+						repos,
+						left
+					})
+				};
+			},
+			push: async (_session, lead, handoff, pushAnyway) => {
+				const pushed = await pushHandoff(git, lead.cwd, handoff, await gitMs(), {
+					scan: scanText,
+					depth: (await settings()).repoSearchDepth,
+					prepared: preparedFor.get(handoff),
+					takes: await takes(),
+					...pushAnyway ? { pushAnyway } : {}
+				}).catch((err) => Promise.reject(told(err)));
+				return "held" in pushed ? pushed : pushed.repos;
+			},
+			take: (message) => takeHandoff(message, {
+				run: git,
+				io,
+				claudeDir,
+				machine: os.hostname(),
+				platform: process.platform,
+				env: process.env,
+				settings,
+				claude: () => claudeBinary(claudeDir, process.env, process.platform, os.homedir()),
+				claudeJson,
+				scan: scanText,
+				log
+			})
+		});
+		const state = {
+			runner,
+			link: null,
+			notWanted: false,
+			unpaired: false
+		};
+		state.link = createLink({
+			url: server,
+			emit,
+			pairing,
+			onMessage: (message) => runner.take(message),
+			onNotWanted: () => {
+				state.notWanted = true;
+				wake();
+			},
+			onPairingEnded: () => {
+				state.unpaired = true;
+				wake();
+			},
+			hello: {
+				type: "runner",
+				v: 1,
+				account,
+				machine: { name: os.hostname() }
+			}
+		});
+		send = (message) => state.link?.send(message);
+		log(`the runner's worker ${process.pid} is answering for this machine through ${server}`);
+		return state;
+	};
+	const answering = /* @__PURE__ */ new Map();
+	for (const office of offices.filter((o) => !o.plainRefused)) answering.set(office, answerFor(office));
+	const mayReopen = async (office, state) => state.notWanted ? Date.now() - state.closedAt >= HOLD_OFF_MS : !!pairingEntry(await readPairing(pairingPath(claudeDir)), office.server, account.id)?.credential;
 	let orphaned = false;
 	const gone = new Promise((resolve) => process.stdin.on("end", resolve).on("error", resolve).resume()).then(() => orphaned = true);
+	let stopped = "done";
 	for (;;) {
 		await Promise.race([new Promise((r) => (wake = r, setTimeout(r, CHECK_MS))), gone]);
-		if (orphaned || notWanted || unpaired) break;
-		if (!runner.idle()) continue;
+		if (orphaned) break;
+		for (const [office, state] of answering) if (state.link && (state.notWanted || state.unpaired)) {
+			log(`the runner stopped answering through ${office.server}: ${state.notWanted ? `it doesn't want this machine's runner; asking again in ${HOLD_OFF_MS / 6e4} minutes` : "it says this machine's pairing has ended; answering again once it is paired"}`);
+			state.link.close();
+			state.link = null;
+			state.closedAt = Date.now();
+		} else if (!state.link && await mayReopen(office, state)) answering.set(office, answerFor(office));
+		const open = [...answering.values()].filter((s) => s.link);
+		if (!open.length) {
+			stopped = [...answering.values()].some((s) => s.notWanted) ? "not-wanted" : "unpaired";
+			break;
+		}
+		if (!open.every((s) => s.runner.idle())) continue;
 		const window = askableMs(await config().catch(() => first));
 		if (!await anyRoomSince(io, path.join(claudeDir, "projects"), Date.now() - window)) break;
 	}
-	link.close();
-	return notWanted ? 3 : unpaired ? 4 : 0;
+	for (const state of answering.values()) state.link?.close();
+	return stopped === "not-wanted" ? 3 : stopped === "unpaired" ? 4 : 0;
 }
 process.exitCode = await (process.argv.includes("--worker") ? worker() : supervisor());
 await logging;

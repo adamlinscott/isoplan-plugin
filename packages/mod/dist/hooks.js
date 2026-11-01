@@ -33,11 +33,12 @@ const shown = /* @__PURE__ */ new Set();
 const askedBy = /* @__PURE__ */ new Map();
 let toolName = null;
 let toolAdded = false;
-let mayAsk = false;
+const mayAsk = /* @__PURE__ */ new Map();
 let asking = false;
 let lastError = null;
-let pairing = null;
-let pairSaid = false;
+const pairings = /* @__PURE__ */ new Map();
+const pairSaid = /* @__PURE__ */ new Set();
+const offices = /* @__PURE__ */ new Map();
 const floorWaits = /* @__PURE__ */ new Map();
 let waitsDir = null;
 let shownStatus;
@@ -47,7 +48,7 @@ let marking = Promise.resolve();
 function register(on) {
 	on("session.start", async ($, e, next) => {
 		const result = await next(e);
-		pairSaid = false;
+		pairSaid.clear();
 		if (!started) {
 			started = true;
 			run($).catch((err) => $.ui.log("isoplan: the data layer loop failed: " + message(err), { to: "debug" }));
@@ -69,10 +70,10 @@ function register(on) {
 			const waiting = notes.get(agent) ?? [];
 			notes.delete(agent);
 			const late = await lateFor($, e.agentId ?? null);
-			for (const [question] of late) {
+			for (const [question, reply] of late) {
 				replies.delete(question);
 				shown.add(question);
-				ack($, question);
+				ack($, question, reply.server);
 			}
 			if (!waiting.length && !late.length) return r;
 			return {
@@ -144,8 +145,10 @@ async function run($) {
 			notes.clear();
 			replies.clear();
 			askedBy.clear();
-			toolAdded = mayAsk = false;
+			toolAdded = false;
+			mayAsk.clear();
 		}
+		offices.clear();
 		running = session;
 		lead = `claude-code:${session}:lead`;
 		let switched = false;
@@ -231,7 +234,8 @@ function handle($, text) {
 	}
 	switch (line.type) {
 		case "status":
-			show($, statusText(line));
+			offices.set(line.server, officeText(line));
+			show($, statusText());
 			break;
 		case "updated":
 			updated = true;
@@ -247,10 +251,11 @@ function handle($, text) {
 			$.ui.log("isoplan: " + line.text, { to: "debug" });
 			break;
 		case "pair":
-			if (!pairSaid) $.ui.log(`Isoplan: to report to ${line.server}, pair this machine: click ${line.url} on this computer and approve it in the office.`);
-			pairSaid = true;
-			pairing = line;
-			show($, pairText(line));
+			if (!pairSaid.has(line.server)) $.ui.log(`Isoplan: to report to ${line.server}, pair this machine: click ${line.url} on this computer and approve it in the office.`);
+			pairSaid.add(line.server);
+			pairings.set(line.server, line);
+			offices.set(line.server, pairText(line));
+			show($, statusText());
 			break;
 		case "conflict":
 			addNote(line);
@@ -259,7 +264,7 @@ function handle($, text) {
 			addReply($, line);
 			break;
 		case "ask-rights":
-			mayAsk = line.granted;
+			mayAsk.set(line.server ?? "", line.granted);
 			if (line.granted) addTool($);
 			break;
 		case "owner-answer":
@@ -283,23 +288,31 @@ function show($, text) {
 	$.ui.status(updated ? [text, UPDATED_TEXT].filter(Boolean).join(" · ") : text);
 }
 const UPDATED_TEXT = "Isoplan updated: type /reload-plugins";
-function statusText(line) {
+function statusText() {
+	const parts = [...offices.values()].filter(Boolean);
+	return parts.length ? `Isoplan: ${parts.join(" · ")}` : void 0;
+}
+function officeText(line) {
+	const label = line.label ?? line.server;
 	switch (line.state) {
-		case "waiting": return `Isoplan: ${line.server}, not connected yet (nothing to report)`;
-		case "connecting": return `Isoplan: connecting to ${line.server}…`;
+		case "waiting": return `${label} not connected yet (nothing to report)`;
+		case "connecting": return `${label} connecting…`;
 		case "connected":
 			lastError = null;
-			return `Isoplan: connected to ${line.server}`;
+			return `${label} ✓`;
 		case "not-wanted":
 		case "not-approved":
 		case "no-list": return;
-		case "taken": return "Isoplan: this session belongs to someone else on the office, so it isn't reported";
-		case "insecure": return `Isoplan: not reporting: ${line.server} is plain ws:// to another machine; use wss://, or set "allowPlainWs": true in config.json`;
-		case "pairing": return pairing ? pairText(pairing) : `Isoplan: waiting for this machine to be paired with ${line.server}`;
-		case "disconnected": return `Isoplan: can't reach ${line.server}; retrying in ${Math.max(1, Math.round((line.retryInMs ?? 0) / 1e3))}s`;
+		case "taken": return `${label}: this session belongs to someone else on the office, so it isn't reported`;
+		case "insecure": return `${label}: not reporting: ${line.server} is plain ws:// to another machine; use wss://, or set "allowPlainWs": true in config.json`;
+		case "pairing": {
+			const pairing = pairings.get(line.server);
+			return pairing ? pairText(pairing) : `${label} waiting for this machine to be paired`;
+		}
+		case "disconnected": return `${label} can't be reached; retrying in ${Math.max(1, Math.round((line.retryInMs ?? 0) / 1e3))}s`;
 	}
 }
-const pairText = (line) => `Isoplan: Pair this machine: ${line.url}`;
+const pairText = (line) => `${line.label ?? line.server}: Pair this machine: ${line.url}`;
 function addNote(line) {
 	const waiting = notes.get(line.agent) ?? [];
 	waiting.push(line.text.length > NOTE_MAX ? line.text.slice(0, 999) + "…" : line.text);
@@ -307,10 +320,11 @@ function addNote(line) {
 }
 function addReply($, line) {
 	if (line.state !== "answered" && line.state !== "dropped") return;
-	if (shown.has(line.question)) return ack($, line.question);
+	if (shown.has(line.question)) return ack($, line.question, line.server);
 	replies.set(line.question, {
 		agent: (line.key && askedBy.get(line.key)) ?? null,
-		text: endText(line, true)
+		text: endText(line, true),
+		server: line.server
 	});
 }
 async function lateFor($, agent) {
@@ -319,7 +333,7 @@ async function lateFor($, agent) {
 	const running = all.filter(([, r]) => r.agent !== null).length ? new Set((await $.agent.list().catch(() => [])).filter((a) => RUNNING.has(a.status)).map((a) => a.id)) : /* @__PURE__ */ new Set();
 	return all.filter(([, r]) => r.agent === null || !running.has(r.agent));
 }
-function ack($, question) {
+function ack($, question, server) {
 	(async () => {
 		const cwd = await $.session.cwd();
 		await $.process.run([
@@ -329,6 +343,7 @@ function ack($, question) {
 			await $.session.id(),
 			"--cwd",
 			cwd,
+			...serverArgs(server),
 			"--ack",
 			question
 		], {
@@ -338,6 +353,7 @@ function ack($, question) {
 	})().catch((err) => $.ui.log("isoplan: couldn't ack the room's reply: " + message(err), { to: "debug" }));
 }
 const askScript = ($) => $.plugin.root.replace(/\\/g, "/") + "/dist/ask.js";
+const serverArgs = (server) => server ? ["--server", server] : [];
 function addTool($) {
 	if (toolAdded) return;
 	toolAdded = true;
@@ -359,7 +375,8 @@ function addTool($) {
 	});
 }
 async function askRoom($, e) {
-	if (!mayAsk) return { result: "Asking this room is off now: its owner turned it off, the handoff was dismissed, or this session took no handoff. Carry on without asking." };
+	const granted = [...mayAsk].find(([, may]) => may);
+	if (!granted) return { result: "Asking this room is off now: its owner turned it off, the handoff was dismissed, or this session took no handoff. Carry on without asking." };
 	const question = typeof e.question === "string" ? e.question.trim() : "";
 	if (!question) return { result: "Give the question to ask the room as `question`." };
 	askedBy.set(e.tool_use_id, e.agentId ?? null);
@@ -373,6 +390,7 @@ async function askRoom($, e) {
 			session,
 			"--cwd",
 			cwd,
+			...serverArgs(granted[0]),
 			"--key",
 			e.tool_use_id
 		], {
