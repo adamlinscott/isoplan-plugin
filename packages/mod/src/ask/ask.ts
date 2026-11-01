@@ -43,7 +43,7 @@ export const UNCONFIRMED =
   "The office server didn't confirm the question in time. It may have been logged all the same, and if so its answer reaches you later as a note on one of your next tool results. Carry on without it, and don't ask it again.";
 
 /** What the agent is told: the answer, or why there is none and that it should carry on. */
-export async function askRoom(link: SideLink, question: string, s: AskSettings, { key, deadline = Date.now() + MAX_WAIT_MS, now = Date.now }: { key?: string; deadline?: number; now?: () => number } = {}): Promise<string> {
+export async function askRoom(link: SideLink, question: string, s: AskSettings, { key, deadline = Date.now() + MAX_WAIT_MS, now = Date.now, me }: { key?: string; deadline?: number; now?: () => number; me?: string } = {}): Promise<string> {
   const left = () => deadline - now();
   link.send({ type: "ask-room", v: PROTOCOL_VERSION, question, ...(key ? { key } : {}) });
   const first = left() > 0 ? await link.next(isAsked(null), Math.min(ANSWER_MS, left())).catch(() => null) : null;
@@ -76,7 +76,7 @@ export async function askRoom(link: SideLink, question: string, s: AskSettings, 
     // The link went, or the last check ran out of time: what the server knows stands, and the end
     // still arrives as a note.
   }
-  return over(latest) ? endText(latest, false) : waitText(latest);
+  return over(latest) ? endText(latest, false, me) : waitText(latest);
 }
 
 const over = (m: AskedMessage) => m.state === "answered" || m.state === "dropped";

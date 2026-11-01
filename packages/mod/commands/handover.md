@@ -1,12 +1,12 @@
 ---
-description: Hand this session's work over to someone in the Isoplan office, with a brief you write
-argument-hint: <their name>
+description: Hand this session's work over to someone in the Isoplan office, or to a new session of yours, with a brief you write
+argument-hint: <their name, or me for a new session of yours>
 allowed-tools: Bash(node "${CLAUDE_PLUGIN_ROOT}/dist/handoff.js" prepare:*), Bash(node "${CLAUDE_PLUGIN_ROOT}/dist/handoff.js" hand-over:*), Write
 ---
 
 Hand this session's work over, through Isoplan, to the person named here: $ARGUMENTS
 
-1. A name is at most 80 characters of letters, digits, spaces and `. _ @ -`, starting with a letter or digit. If what is given above isn't, say so and stop without running anything.
+1. A name is at most 80 characters of letters, digits, spaces and `. _ @ -`, starting with a letter or digit. If what is given above isn't, say so and stop without running anything. `me` hands it to a new session of my own, which opens with the brief and can ask this session questions: use `me` as the name in the steps below.
 2. Run this, with the name in place of `<name>`:
    `node "${CLAUDE_PLUGIN_ROOT}/dist/handoff.js" prepare --to "<name>"`
    If it says it can't hand over from here, tell me why and stop. If it says more than one office takes this repo, ask me which of the offices it names to hand over in, then run it again with `--office "<label>"` added, using the label I picked.

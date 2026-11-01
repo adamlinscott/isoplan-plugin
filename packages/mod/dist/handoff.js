@@ -8168,9 +8168,11 @@ const CODE = /^[A-HJ-NP-Z2-9]{4}-?[A-HJ-NP-Z2-9]{4}$/i;
 const NAME = /^[\p{L}\p{N}][\p{L}\p{N} ._@-]{0,79}$/u;
 const nameOf = (argv) => {
 	const to = (flag(argv, "--to") ?? "").trim();
-	if (!NAME.test(to)) stop(`"${to}" isn't a name to hand over to: use their name or account id, in letters, digits, spaces and . _ @ - only.`);
+	if (!NAME.test(to)) stop(`"${to}" isn't a name to hand over to: use their name or account id, in letters, digits, spaces and . _ @ - only, or "me" for a new session of yours.`);
 	return to;
 };
+/** Whether the name is "me": a new session of the person's own. */
+const toSelf = (to) => /^(me|myself)$/i.test(to);
 async function prepareCommand(argv) {
 	const to = nameOf(argv);
 	const s = await settings();
@@ -8181,7 +8183,7 @@ async function prepareCommand(argv) {
 	const folder = outDir(id);
 	await fs.mkdir(folder, { recursive: true });
 	const brief = fill((await loadPrompts(path.join(modDir, "prompts"))).brief, {
-		to,
+		to: toSelf(to) ? "a new Claude Code session of this same person's" : to,
 		untracked: untrackedLine(prepared.files)
 	});
 	const repos = prepared.repos.filter((r) => r.path !== ".").length ? [`Repos, by path in this folder: ${prepared.repos.map((r) => `${r.path} (${repoBranch(id, r)}${r.from ? `, from ${r.from}` : ""})`).join(", ")}`] : [];
@@ -8277,7 +8279,9 @@ async function handOverCommand(argv) {
 			recursive: true,
 			force: true
 		}).catch(() => {});
-		return `Handed over to ${name}, on ${branch}${sent.some((r) => r.path !== ".") ? ` in ${sent.map((r) => r.branch === branch ? r.path : `${r.path} (as ${r.branch})`).join(", ")}` : ""}. They will see a Take handoff button in the room on the floor.`;
+		const inRepos = sent.some((r) => r.path !== ".") ? ` in ${sent.map((r) => r.branch === branch ? r.path : `${r.path} (as ${r.branch})`).join(", ")}` : "";
+		if (toSelf(to)) return `Handed over to a new session of yours, on ${branch}${inRepos}. Open it from its room on the floor with Take handoff, or copy its prompt there into a session you have.`;
+		return `Handed over to ${name}, on ${branch}${inRepos}. They will see a Take handoff button in the room on the floor.`;
 	} finally {
 		await link.close();
 	}
