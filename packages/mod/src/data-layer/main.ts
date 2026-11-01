@@ -36,6 +36,16 @@
 // process (the hook's parent may be a short-lived shell), so a closed session shows as quiet until
 // its data layer exits, then unreachable.
 //
+// It reports to every office server config.json names (#105): each has its own pairing, its own
+// copy of the office's list, its own link, opened only while that office takes the session's repo,
+// and its own hold on reports, which a release on that office's floor lets out to it alone. Each
+// office's list is checked at once with the others', and a pass waits for a slow one at most
+// `streamSeconds`, so one office's failure, pairing link, list or slowness never touches another's.
+// The facts are read once a pass and go to each of those links; what the hooks module is sent names
+// the office, and an office shows in the status line only once it is known to take the repo (or
+// waits to be paired). A detached data layer one office doesn't want, while no office takes the
+// repo, holds off naming that office, so the wake hook doesn't start it again for that office's list.
+//
 // One data layer reports a session: each takes <claude dir>/isoplan/live/<session>.json (src/wake/
 // lock.ts), naming its own script, whether it is detached, when its window's hooks module started
 // (`--since`) and that window's Claude Code process, and refreshes it each pass. A detached one
@@ -62,24 +72,48 @@ import { startRunner } from "../runner/start.js";
 import { recentSessions } from "../sweep/find.js";
 import { checkForUpdate, commandEnv, gitChoices, START_GAP_MS, updatesOffBy } from "../update/update.js";
 import { backfill } from "../wake/backfill.js";
-import { alive, HOLD_OFF_MS, holdOff, lockHolder, lockPath, readLock, refreshLock, releaseLock, takeLock } from "../wake/lock.js";
-import { approvedPath, createApproved, createSessionGate, type Dormancy } from "./approved.js";
+import { alive, HOLD_OFF_MS, holdOff, lockHolder, lockPath, notWantedPath, readLock, refreshLock, releaseLock, takeLock } from "../wake/lock.js";
+import { approvedPath, cachedRepos, createApproved, createSessionGate, type Approved, type Dormancy, type SessionGate } from "./approved.js";
 import { forOffice } from "./attribution.js";
 import { candidatesOf, inRepos } from "./home.js";
 import { createClaudeCode } from "./claude-code.js";
-import { loadConfig, type Config } from "./config.js";
+import { loadConfig, officesOf, type Config, type Office } from "./config.js";
 import { detachedStop } from "./detached.js";
 import { createGit, pathKey, type Where } from "./git.js";
 import { accountOf, claudePaths, projectOf } from "./identity.js";
 import { nodeIo } from "./io.js";
 import { createLink, type Link } from "./link.js";
 import { lateTake, prepareQuestions, relayOwnerAnswer } from "./owner-answers.js";
-import { createPairing, pairingLockPath, pairingPath, pairingWriteLockPath } from "./pairing.js";
-import { openReportHold } from "./reports.js";
+import { createPairing, pairingLockPath, pairingPath, pairingWriteLockPath, type Pairing } from "./pairing.js";
+import { openReportHold, releasedPath, type ReportHold } from "./reports.js";
 import { cleanTitle, nextTitle, TITLE_SYSTEM, type TitleCache } from "./titles.js";
 
 // A detached data layer's log starts over once it is this big.
 const LOG_CAP_BYTES = 64 * 1024;
+/** One office server this data layer reports to, and what it keeps for it alone. */
+interface OfficeRun {
+  office: Office;
+  pairing: Pairing;
+  approved: Approved;
+  gate: SessionGate;
+  /** The reports held for this office, until its floor releases them. */
+  hold: ReportHold;
+  /** The facts last given to its link. */
+  sent: Facts | null;
+  /** The hooks module's lines from this office's link and pairing, named for it. */
+  emit: (line: DataLayerLine) => void;
+  /** Whether its list has said yet whether it takes the session's home, and why nothing is sent to it while it doesn't. */
+  known: boolean;
+  dormant: Dormancy | null;
+  /** Its list's check under way, and what one that finished said, kept until the next pass's gating takes it. */
+  homing: Promise<void> | null;
+  result: { dormancy: Dormancy | null; projects: readonly Project[]; workspace: boolean } | null;
+  connected: boolean;
+  /** Detached, and the server said this project isn't wanted; until when that holds, once the data layer stops. */
+  unwanted: boolean;
+  unwantedUntil: number | null;
+}
+
 // How long a session the office doesn't take waits between passes.
 const DORMANT_MS = 30000;
 // A session lock its holder hasn't refreshed for this long (three of its slowest passes) counts for
@@ -133,12 +167,8 @@ async function main(argv: string[]): Promise<number> {
   void closed.then(() => (isOut = false));
   const logFile = path.join(claudeDir, "isoplan", "logs", `${sessionId}.log`);
   let logging = Promise.resolve();
-  let downSince: number | null = Date.now(); // since when the link hasn't been connected; null while it is
-  // A link that drops has the list of repos the office takes read again, in case that is why.
-  let dropped = () => {};
+  let downSince: number | null = Date.now(); // since when no office's link has been connected; null while one is
   const emit = (line: DataLayerLine) => {
-    if (line.type === "status") downSince = line.state === "connected" ? null : (downSince ?? Date.now());
-    if (line.type === "status" && line.state === "disconnected") dropped();
     if (isOut) process.stdout.write(JSON.stringify(line) + "\n");
     else if (detached && (line.type === "log" || line.type === "error" || line.type === "pair")) {
       const said = line.type === "log" ? line.text : line.type === "pair" ? pairNote(line) : `the office server says: ${line.message} (${line.code})`;
@@ -200,6 +230,9 @@ async function main(argv: string[]): Promise<number> {
     }
   }
 
+  // A detached data layer started again after one office didn't want the session: that office stays
+  // left alone until its hold-off ends (wake.ts).
+  const notWantedBefore: Record<string, unknown> = detached ? await takeNotWanted(claudeDir, sessionId) : {};
   try {
     if (!(await takeLock(lock, process.pid, alive, !detached, Date.now(), { extra: lockExtra }))) {
       process.stderr.write(`another data layer already reports session ${sessionId}\n`);
@@ -261,109 +294,76 @@ async function main(argv: string[]): Promise<number> {
       emit({ type: "log", text: `reported ${started} other session(s) from the last ${config.lightsOffHours} hours` });
     })
     .catch((err: unknown) => emit({ type: "log", text: `couldn't report the other sessions: ${String((err as Error)?.message ?? err)}` }));
-  // The address is read once: a link that moved servers mid-session would leave a room behind.
-  const server = config.server;
+  // The offices are read once: a link that moved servers mid-session would leave a room behind.
   // Plain ws:// to another machine would send facts and the machine's credential unencrypted.
-  if (config.plainRefused) {
-    emit({ type: "status", server: config.plainRefused, state: "insecure" });
-    emit({ type: "log", text: `not reporting: ${config.plainRefused} is plain ws:// to another machine; use wss://, or set "allowPlainWs": true in config.json` });
-    if (!detached) await closed;
-    await logging;
-    return 0;
-  }
-  emit({ type: "status", server, state: "waiting" });
+  const offices = officesOf(config);
+  for (const { server } of offices.filter((o) => o.plainRefused)) emit({ type: "log", text: `not reporting to ${server}: it is plain ws:// to another machine; use wss://, or set "allowPlainWs": true in config.json` });
   if (!detached) {
     for (const dir of [answersDir, waitsDir]) await fs.rm(dir, { recursive: true, force: true }).catch(() => {});
     if (await fs.mkdir(waitsDir, { recursive: true }).then(() => true, () => false)) emit({ type: "waits", dir: waitsDir });
   }
 
-  // The pairing is the machine's, whichever folder the session is in. The list of repos the office
+  // The pairing is the machine's, whichever folder the session is in. The list of repos each office
   // takes is read with it, which pairs a machine not paired yet (approved.ts).
   const machineAccount = await accountOf({ readText: (p) => fs.readFile(p, "utf8").catch(() => null), run: io.run }, claudeJson, os.homedir());
-  const pairing = createPairing({
-    file: pairingPath(claudeDir),
-    lock: pairingLockPath(claudeDir),
-    writeLock: pairingWriteLockPath(claudeDir),
-    server,
-    account: machineAccount,
-    machine,
-    emit,
-    allowPlainWs: config.allowPlainWs,
-  });
-  const approved = createApproved({
-    server,
-    file: approvedPath(claudeDir),
-    pairing,
-    refreshMs: config.approvedRefreshMinutes * 60000,
-    maxAgeMs: config.approvedMaxAgeMinutes * 60000,
-    log: (text) => emit({ type: "log", text }),
-  });
-  dropped = () => void approved.refresh(true);
   // The projects the session may report as (home.ts), looked up again as git's answers are.
   let candidates: { projects: Project[]; workspace: boolean } | null = null;
   let candidatesAt = -Infinity;
   let dormant: Dormancy | null = null; // why nothing is sent, while it isn't
-  let notApproved: string[] | null = null; // detached, and the office takes none of these: it holds off
+  let notApproved: string[] | null = null; // detached, and no office takes any of these: it holds off
   let factsSession = ""; // the session's id as its facts give it, for the hello
-  let link: Link | null = null;
   let reported = ""; // the last problem logged, so a lasting one is logged once
   let title: TitleCache | null = null;
   let asked: string | null = null; // the key of the title call in flight
-  let isUnwanted = false; // detached, and the server said this project isn't wanted
   let isPlaceless = false; // detached, and git couldn't place the session's folder
   let passes = 0;
-  const hold = await openReportHold(path.join(claudeDir, "isoplan", "released", `${sessionId}.json`), (text) => emit({ type: "log", text }));
-  let shown: Parameters<typeof hold.apply> | null = null; // the last facts and patterns the hold was applied to
+  let shown: Parameters<ReportHold["apply"]> | null = null; // the last facts and patterns the holds were applied to
   let waiting: ReadonlySet<string> = new Set(); // the open questions the hooks module marks it waits on
-  let sent: Facts | null = null; // the facts last given to the link
   const said = new Set<string>(); // the pattern files' problems, logged once each, since they are read every pass
   const patternLog = (text: string) => {
     if (!said.has(text)) emit({ type: "log", text });
     said.add(text);
   };
-  // What goes to the link: the reports the scan holds held, and the questions checked and marked.
-  const outgoing = (facts: Facts, patterns: Pattern[] | null) => prepareQuestions(hold.apply(facts, patterns), patterns, waiting, patternLog);
+  // What goes to an office's link: the reports its hold keeps held, and the questions checked and marked.
+  const outgoing = (run: OfficeRun, facts: Facts, patterns: Pattern[] | null) => prepareQuestions(run.hold.apply(facts, patterns), patterns, waiting, patternLog);
   // The project of each subagent working in a worktree of another repo, from the latest read.
   let checkouts: Record<string, string> = {};
   // Whether a question got an answer, from the latest read, so one that closed says how.
   let answered = (_id: string) => false;
 
   const account = await accountOf({ readText: (p) => fs.readFile(p, "utf8").catch(() => null), run: io.run }, claudeJson, cwd);
-  // The session's link, opened by the gate only while the office takes its home (approved.ts), which
-  // it asks again before every reconnect, so a hello never goes on a list that changed or aged out.
-  const gate = createSessionGate({
-    approved,
-    open: (home, mayConnect) =>
+  const openLink = (run: OfficeRun, home: Project, mayConnect: () => Promise<boolean>): Link =>
     createLink({
-      url: server,
-      emit,
-      pairing,
+      url: run.office.server,
+      emit: run.emit,
+      pairing: run.pairing,
       admit: mayConnect,
       // The list may have changed: it is read again, and the link opens afresh once it has.
       onNotWanted: () => {
-        isUnwanted = detached;
-        gate.notWanted();
+        run.unwanted = detached;
+        run.gate.notWanted();
       },
       // Another repo's files, commands and checkouts go only to a server that welcomed them, and
       // only for its office's repos; the link applies this at every send, on every connection.
       filter: (f, projects) => forOffice(candidates?.workspace ? inRepos(f) : f, projects, checkouts),
       answered: (id) => answered(id),
-      // The owner released a withheld report: it goes to the link now, not on the next pass.
-      // The owner answered a question from the floor: it goes to the hooks module.
+      // The owner released a withheld report on this office's floor: it goes to this office alone, now, not on the next pass.
+      // The owner answered a question from the floor: it goes to the hooks module, and the reply to
+      // the office it came from.
       onMessage: (message) => {
         if (message.type === "request" && message.kind === "owner-answer") {
           const file = path.join(answersDir, `${randomUUID()}.json`);
           void fs
             .mkdir(answersDir, { recursive: true })
             .then(async () => {
-              const relayed = await relayOwnerAnswer(message, { detached, facts: () => sent, file, emit, take: takeFile });
-              link?.send(relayed.message);
+              const relayed = await relayOwnerAnswer(message, { detached, facts: () => run.sent, file, emit, take: takeFile });
+              run.gate.current()?.send(relayed.message);
               if (!relayed.gaveUp) return;
               // The hooks module's word may still come: a take that does follows as a late reply.
               const late = await lateTake(message.question, file, takeFile);
               if (late === null) return;
               emit({ type: "log", text: `the hooks module said late that it ${late ? "took" : "didn't take"} the owner's answer to ${message.question}` });
-              if (late) link?.send({ type: "reply", v: PROTOCOL_VERSION, id: message.id, kind: "owner-answer", late: true });
+              if (late) run.gate.current()?.send({ type: "reply", v: PROTOCOL_VERSION, id: message.id, kind: "owner-answer", late: true });
             })
             // A word that came later still, or not at all, is left over: it goes.
             .finally(() => fs.rm(file, { force: true }).catch(() => {}))
@@ -371,8 +371,8 @@ async function main(argv: string[]): Promise<number> {
           return;
         }
         if (message.type !== "release") return emit({ type: "log", text: `the office server sent a ${message.type} message, which this data layer doesn't handle yet` });
-        void hold.release(message.id).then((released) => {
-          if (released && shown) link?.update((sent = outgoing(...shown)));
+        void run.hold.release(message.id).then((released) => {
+          if (released && shown) run.gate.current()?.update((run.sent = outgoing(run, ...shown)));
         });
       },
       hello: {
@@ -384,8 +384,97 @@ async function main(argv: string[]): Promise<number> {
         session: factsSession,
         project: home,
       },
-    }),
-  });
+    });
+  // Each office's link, opened by its gate only while that office takes the session's home
+  // (approved.ts), which it asks again before every reconnect, so a hello never goes on a list that
+  // changed or aged out.
+  const runs: OfficeRun[] = await Promise.all(offices
+    .filter((o) => !o.plainRefused)
+    .map(async (office) => {
+      const { server, label } = office;
+      const until = notWantedBefore[server];
+      const held = typeof until === "number" && until > Date.now();
+      const run = { office, known: held, dormant: null, homing: null, result: null, connected: false, unwanted: held, unwantedUntil: held ? until : null, sent: null } as OfficeRun;
+      run.hold = await openReportHold(releasedPath(claudeDir, office, sessionId), (text) => emit({ type: "log", text: `${text} (for ${server})` }));
+      run.emit = (line) => {
+        if (line.type === "status") {
+          run.connected = line.state === "connected";
+          downSince = runs.some((r) => r.connected) ? null : (downSince ?? Date.now());
+          // A link that drops has the list of repos the office takes read again, in case that is why.
+          if (line.state === "disconnected") void run.approved.refresh(true);
+        }
+        emit(line.type === "status" || line.type === "pair" ? { ...line, label } : line.type === "asked" || line.type === "ask-rights" ? { ...line, server } : line);
+      };
+      run.pairing = createPairing({
+        file: pairingPath(claudeDir),
+        lock: pairingLockPath(claudeDir, office),
+        writeLock: pairingWriteLockPath(claudeDir),
+        server,
+        account: machineAccount,
+        machine,
+        emit: run.emit,
+        allowPlainWs: config.allowPlainWs,
+        legacy: !!office.legacy,
+      });
+      run.approved = createApproved({
+        server,
+        file: approvedPath(claudeDir, server),
+        pairing: run.pairing,
+        refreshMs: config.approvedRefreshMinutes * 60000,
+        maxAgeMs: config.approvedMaxAgeMinutes * 60000,
+        log: (text) => emit({ type: "log", text }),
+      });
+      run.gate = createSessionGate({ approved: run.approved, open: (home, mayConnect) => openLink(run, home, mayConnect) });
+      return run;
+    }));
+  const links = () => runs.flatMap((run) => run.gate.current() ?? []);
+  // Detached, and every office either doesn't want this project or doesn't take its repo, one at least not wanting it.
+  const isUnwanted = () => runs.some((r) => r.unwanted) && runs.every((r) => r.unwanted || r.dormant === "not-approved");
+  // Whether an office's list now takes the session's home, checked at once with the others'; a check
+  // still under way is left running, not started again. What it says is kept, and taken only at a
+  // pass's gating (apply), so a check that ends late never changes an office in the middle of a pass.
+  const check = (run: OfficeRun, projects: readonly Project[], workspace: boolean) =>
+    (run.homing ??= run.gate
+      .home(projects)
+      .then((gated) => void (run.result = { dormancy: gated.dormancy, projects, workspace }))
+      .catch((err: unknown) => emit({ type: "log", text: `couldn't check which repos ${run.office.server} takes: ${String((err as Error)?.message ?? err)}` }))
+      .finally(() => (run.homing = null)));
+  const apply = (run: OfficeRun) => {
+    if (!run.result) return;
+    const { dormancy, projects, workspace } = run.result;
+    run.result = null;
+    const { server, label } = run.office;
+    if (dormancy !== run.dormant || !run.known) {
+      // An office shows only once it takes the repo, or waits to be paired; outside it, nothing.
+      run.emit({ type: "status", server, label, state: dormancy ?? "waiting", ...(workspace && dormancy && { workspace: true as const }) });
+      const what = workspace ? "none of the repos in this folder is" : `${projects[0]?.id ?? cwd} isn't`;
+      if (dormancy === "not-approved") emit({ type: "log", text: `${what} one the office at ${server} takes, so nothing of this session is sent to it` });
+      if (dormancy === "no-list") emit({ type: "log", text: `can't tell which repos ${server} takes (no list, or one older than ${config.approvedMaxAgeMinutes} minutes), so nothing of this session is sent to it` });
+    }
+    run.dormant = dormancy;
+    run.known = true;
+  };
+  // Left alone while its hold-off from an earlier run lasts; once it has ended, asked again.
+  const isHeldOff = (run: OfficeRun, now: number) => {
+    if (run.unwantedUntil !== null && run.unwantedUntil <= now) {
+      run.unwanted = false;
+      run.unwantedUntil = null;
+    }
+    return run.unwantedUntil !== null;
+  };
+  // A plain ws:// office to another machine is named in the status line only when its last list
+  // takes the session's home, or there is none to tell by.
+  const insecureSaid = new Map<string, string>();
+  const sayInsecure = async (projects: readonly Project[]) => {
+    for (const { server, label } of offices.filter((o) => o.plainRefused)) {
+      const repos = await cachedRepos(approvedPath(claudeDir, server), server, config.approvedMaxAgeMinutes * 60000);
+      const state = !repos ? "unchecked" : projects.some((p) => repos.has(p.id.toLowerCase())) ? "insecure" : "not-approved";
+      if (insecureSaid.get(server) === state) continue;
+      insecureSaid.set(server, state);
+      emit(state === "not-approved" ? { type: "status", server, label, state } : { type: "status", server, label, state: "insecure", ...(state === "unchecked" && { unchecked: true as const }) });
+    }
+  };
+  let pending = false; // an office's list hasn't answered yet
 
   do {
     const now = Date.now();
@@ -428,19 +517,21 @@ async function main(argv: string[]): Promise<number> {
       candidates = await candidatesOf(cwd, { ...io2, home: os.homedir(), workspaceRepos: config.workspaceRepos });
       candidatesAt = now;
     }
-    const gated = await gate.home(candidates.projects);
-    link = gate.current();
-    if (gated.dormancy !== dormant) {
-      if (gated.dormancy) emit({ type: "status", server, state: gated.dormancy, ...(candidates.workspace && { workspace: true as const }) });
-      const what = candidates.workspace ? "none of the repos in this folder is" : `${candidates.projects[0]?.id ?? cwd} isn't`;
-      if (gated.dormancy === "not-approved") emit({ type: "log", text: `${what} one the office at ${server} takes, so nothing of this session is sent` });
-      if (gated.dormancy === "no-list") emit({ type: "log", text: `can't tell which repos ${server} takes (no list, or one older than ${config.approvedMaxAgeMinutes} minutes), so nothing of this session is sent` });
-    }
-    dormant = gated.dormancy;
-    if (!gated.home) {
-      // A detached one holds off, as for not-wanted, until the wake hook finds the list takes one of
+    await sayInsecure(candidates.projects);
+    const { projects: homes, workspace } = candidates;
+    const checks = runs.filter((r) => !isHeldOff(r, now)).map((r) => check(r, homes, workspace));
+    let slow: ReturnType<typeof setTimeout> | undefined;
+    await Promise.race([Promise.allSettled(checks), new Promise((r) => (slow = setTimeout(r, config.streamSeconds * 1000)))]);
+    clearTimeout(slow);
+    for (const run of runs) apply(run);
+    // The offices that take the session's home now; with none, why nothing is sent.
+    const taking = runs.filter((r) => r.known && !r.dormant && !isHeldOff(r, now));
+    pending = runs.some((r) => !r.known);
+    dormant = taking.length ? null : pending ? "no-list" : (runs.find((r) => r.dormant && r.dormant !== "not-approved")?.dormant ?? "not-approved");
+    if (!taking.length) {
+      // A detached one holds off, as for not-wanted, until the wake hook finds a list takes one of
       // these repos, or the hold ends; one with no list stops once that has lasted LINK_DOWN_MS.
-      if (detached && gated.dormancy === "not-approved") {
+      if (detached && dormant === "not-approved") {
         notApproved = candidates.projects.map((p) => p.id.toLowerCase());
         break;
       }
@@ -469,15 +560,14 @@ async function main(argv: string[]): Promise<number> {
         isPlaceless = isFirstPass && !(await resolve(cwd));
         break;
       }
-      if (link) {
-        gate.drop();
-        link = null;
-        emit({ type: "status", server, state: "waiting" });
+      for (const run of taking) {
+        if (!run.gate.current()) continue;
+        run.gate.drop();
+        run.emit({ type: "status", server: run.office.server, label: run.office.label, state: "waiting" });
       }
       continue;
     }
     factsSession = read.facts.session.id;
-    link = gate.link();
 
     // A written title replaces the branch stand-in; the hooks module writes the reply to a file.
     const reply = await takeReply(titleFile);
@@ -502,21 +592,42 @@ async function main(argv: string[]): Promise<number> {
     });
     waiting = detached ? new Set() : await waitsOf(waitsDir, facts);
     shown = [facts, patterns];
-    link.update((sent = outgoing(facts, patterns)));
+    // One office's failure never ends the loop for the others.
+    for (const run of taking) {
+      try {
+        run.gate.link()?.update((run.sent = outgoing(run, facts, patterns)));
+      } catch (err) {
+        emit({ type: "log", text: `couldn't send this session's facts to ${run.office.server}: ${String((err as Error)?.message ?? err)}` });
+      }
+    }
     const why = detached ? detachedStop({ now, lastActive: facts.session.lastActive, idleMinutes: config.idleMinutes, downSince }) : null;
     if (why) {
       emit({ type: "log", text: `stopping: ${why}` });
       break;
     }
     // A dormant session waits longer between passes: there is nothing to send, only the list to check.
-  } while ((await wait(dormant ? DORMANT_MS : config.streamSeconds * 1000)) && !isUnwanted && (!detached || (await lockHolder(lock)) === process.pid) && !(await isOff()));
+  } while ((await wait(dormant && !pending ? DORMANT_MS : config.streamSeconds * 1000)) && !isUnwanted() && (!detached || (await lockHolder(lock)) === process.pid) && !(await isOff()));
 
-  link?.close();
-  if (isUnwanted || isPlaceless) await holdOff(lock, process.pid, Date.now() + HOLD_OFF_MS).catch(() => {});
-  else if (notApproved) await holdOff(lock, process.pid, Date.now() + HOLD_OFF_MS, { reason: "not-approved", projects: notApproved }).catch(() => {});
+  for (const link of links()) link.close();
+  // The offices that didn't want the session, each until its hold-off ends; the wake hook reads no
+  // list of theirs, and lists only of the offices configured now (wake.ts).
+  const notWanted = Object.fromEntries(runs.filter((r) => r.unwanted).map((r) => [r.office.server, r.unwantedUntil ?? Date.now() + HOLD_OFF_MS]));
+  const named = { offices: offices.map((o) => o.server), notWanted };
+  // An office that doesn't take the repo may yet: then the hold-off ends once one of its lists does.
+  if (isUnwanted() && runs.some((r) => r.dormant === "not-approved")) notApproved = (candidates?.projects ?? []).map((p) => p.id.toLowerCase());
+  if ((isUnwanted() && !notApproved) || isPlaceless) await holdOff(lock, process.pid, Date.now() + HOLD_OFF_MS, named).catch(() => {});
+  else if (notApproved) await holdOff(lock, process.pid, Date.now() + HOLD_OFF_MS, { reason: "not-approved", projects: notApproved, ...named }).catch(() => {});
   else await releaseLock(lock, process.pid).catch(() => {});
   await logging;
   return 0;
+}
+
+/** The offices that didn't want this session, each until when, as the wake hook left them as it started this data layer (wake.ts); read once, then gone. */
+async function takeNotWanted(claudeDir: string, sessionId: string): Promise<Record<string, unknown>> {
+  const file = notWantedPath(claudeDir, sessionId);
+  const said = await fs.readFile(file, "utf8").then((text) => JSON.parse(text) as unknown, () => null);
+  await fs.rm(file, { force: true }).catch(() => {});
+  return said && typeof said === "object" ? (said as Record<string, unknown>) : {};
 }
 
 /** A pair line as the log says it. */

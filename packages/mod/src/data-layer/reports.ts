@@ -10,13 +10,20 @@
 //
 // A release is kept as the sha256 of the agent and the released text in <claude dir>/isoplan/
 // released/<session>.json, so the report stays released when the data layer starts again. The
-// hashes never leave the machine.
+// hashes never leave the machine. Each office server keeps its own (#105): a release on one
+// office's floor lets the report out to that office alone, so another office's are in
+// <claude dir>/isoplan/offices/<id>/released/<session>.json (releasedPath).
 
 import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 import type { Facts } from "@isoplan/protocol";
+import { officeDir } from "./approved-file.js";
 import { scan, type Pattern } from "../runner/scan.js";
+
+/** Where the reports released on one office's floor are kept for `session`; the server a version before #105 reports to keeps the old place. */
+export const releasedPath = (claudeDir: string, office: { server: string; legacy?: boolean }, session: string) =>
+  path.join(office.legacy ? path.join(claudeDir, "isoplan") : officeDir(claudeDir, office.server), "released", `${session}.json`);
 
 /** What a withheld report says in place of its text. */
 export const WITHHELD_TEXT = "Held for its owner to check: the secret check found what may be a secret in this report.";

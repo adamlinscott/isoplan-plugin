@@ -26,11 +26,16 @@
 // config.json says `"allowPlainWs": true`.
 //
 // Everything is kept in <claude dir>/isoplan/pairing.json, readable by its owner only (on Windows
-// it takes the folder's permissions): the machine's id, and one entry per Claude account, each for
-// one server. Every change to it is read, decided and written under <claude dir>/isoplan/pairing.write.lock,
-// so one process never undoes what another has just written. A server that signs nobody in never
-// refuses, so nothing is paired. With no browser on the machine (a headless box) there is no way to
-// pair yet.
+// it takes the folder's permissions): the machine's id, and one entry per Claude account and office
+// server (#105). The entry of the server config.json's `server` names, which a version before #105
+// reports to, is under `accounts`, where that version looks; every other server's is under
+// `offices`, by its address, which is read first. Each server's pairing.lock is its own, in
+// <claude dir>/isoplan/offices/<id>/, so pairing with one office never waits on another; the server
+// config.json's `server` names keeps <claude dir>/isoplan/pairing.lock, which a version before #105
+// takes for it. Every change to the file is read, decided and written under
+// <claude dir>/isoplan/pairing.write.lock, so one process never undoes what another has just
+// written. A server that signs nobody in never refuses, so nothing is paired. With no browser on the
+// machine (a headless box) there is no way to pair yet.
 
 import { randomBytes, createHash } from "node:crypto";
 import fs from "node:fs/promises";
@@ -38,6 +43,7 @@ import http from "node:http";
 import type { AddressInfo } from "node:net";
 import path from "node:path";
 import type { DataLayerLine } from "../lines.js";
+import { officeDir } from "./approved-file.js";
 import { alive, refreshLock, releaseLock, takeLock } from "../wake/lock.js";
 
 /** Renewed this long before it runs out. */
@@ -63,14 +69,34 @@ export interface PairingEntry {
   waiting?: { url: string; expires: number };
 }
 
-/** What pairing.json holds: the machine's own id, and each Claude account's entry, by its id. */
+/** What pairing.json holds: the machine's own id, and each Claude account's entry, by its id; for a further server, by its address and then the account's id. */
 export interface PairingFile {
   machine?: string;
   accounts: Record<string, PairingEntry>;
+  offices?: Record<string, Record<string, PairingEntry>>;
 }
 
 export const pairingPath = (claudeDir: string) => path.join(claudeDir, "isoplan", "pairing.json");
-export const pairingLockPath = (claudeDir: string) => path.join(claudeDir, "isoplan", "pairing.lock");
+/** The office's pairing lock; for the server a version before #105 reports to, the one it uses, so the two never answer one pairing at once. */
+export const pairingLockPath = (claudeDir: string, office: { server: string; legacy?: boolean }) =>
+  office.legacy ? path.join(claudeDir, "isoplan", "pairing.lock") : path.join(officeDir(claudeDir, office.server), "pairing.lock");
+
+/** The account's entry for `server`, or undefined: the one under `offices`, else the one under `accounts` when it is that server's. */
+export function pairingEntry(all: PairingFile, server: string, account: string): PairingEntry | undefined {
+  const first = all.accounts[account];
+  return all.offices?.[server]?.[account] ?? (first?.server === server ? first : undefined);
+}
+
+/**
+ * `all` with the account's entry for `server` set: under `accounts` only for the server a version
+ * before #105 reports to (`legacy`, config.json's `server`), and only while `offices` holds none for
+ * it, so pairingEntry reads it back; any other server's always under `offices`, so a version before
+ * #105, which writes `accounts` for its own server, never wipes it.
+ */
+function withPairingEntry(all: PairingFile, server: string, account: string, entry: PairingEntry, legacy: boolean): PairingFile {
+  if (legacy && !all.offices?.[server]?.[account]) return { ...all, accounts: { ...all.accounts, [account]: entry } };
+  return { ...all, offices: { ...all.offices, [server]: { ...all.offices?.[server], [account]: entry } } };
+}
 export const pairingWriteLockPath = (claudeDir: string) => path.join(claudeDir, "isoplan", "pairing.write.lock");
 
 /** A POST of JSON and its answer: what the pairing calls need of `fetch`. */
@@ -88,6 +114,8 @@ export interface PairingOptions {
   account: { id: string; name: string };
   machine: string;
   emit: (line: DataLayerLine) => void;
+  /** The server a version before #105 reports to, config.json's `server`: its entry stays under `accounts`. */
+  legacy?: boolean;
   /** config.json's `allowPlainWs`: send credentials over ws:// to another machine. */
   allowPlainWs?: boolean;
   post?: Post;
@@ -199,6 +227,7 @@ export function createPairing({
   machine,
   emit,
   allowPlainWs = false,
+  legacy = false,
   post = postJson,
   now = Date.now,
   pid = process.pid,
@@ -210,12 +239,8 @@ export function createPairing({
   let unreadable = false; // said once: the server couldn't read the token sent
   let callback: { server: http.Server; timers: ReturnType<typeof setTimeout>[] } | null = null; // the one this process answers
 
-  const empty = (): PairingEntry => ({ server });
-  const entryOf = (all: PairingFile) => {
-    const kept = all.accounts[account.id];
-    return kept && kept.server === server ? kept : empty();
-  };
-  const withEntry = (all: PairingFile, entry: PairingEntry): PairingFile => ({ ...all, accounts: { ...all.accounts, [account.id]: entry } });
+  const entryOf = (all: PairingFile): PairingEntry => pairingEntry(all, server, account.id) ?? { server };
+  const withEntry = (all: PairingFile, entry: PairingEntry): PairingFile => withPairingEntry(all, server, account.id, entry, legacy);
   const mine = async () => entryOf(await readPairing(file));
   const update = <T>(decide: (entry: PairingEntry) => { entry: PairingEntry | null; result: T }) =>
     locked(file, writeLock, pid, isAlive, (all) => {

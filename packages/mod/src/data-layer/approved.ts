@@ -8,8 +8,8 @@
 // project id, flat (of repos with no remote, only this machine's). With sign-in on it needs this
 // machine's access token, so a machine not paired yet pairs here, from that refusal, as the link
 // would from a hello's; pairing sends only the machine's name, its id and the Claude account's
-// label, never a repo. It is kept in <claude dir>/isoplan/approved.json for the server it came from,
-// which every process of the machine shares (approved-file.ts): a copy confirmed within `refreshMs`
+// label, never a repo. It is kept in <claude dir>/isoplan/offices/<id>/approved.json, one per server
+// (#105), which every process of the machine shares (approved-file.ts): a copy confirmed within `refreshMs`
 // is used as it is, an older one is asked for again with its version, which the server answers with
 // a 304 while it is current, and one not confirmed within `maxAgeMs` approves nothing, so a list the
 // machine can't check fails closed. Two processes writing it keep the newer version, whichever
@@ -23,7 +23,7 @@ import { freshRepos, readApproved, type ApprovedFile } from "./approved-file.js"
 import type { Link } from "./link.js";
 import { httpUrl, type Pairing, type Refusal } from "./pairing.js";
 
-export { approvedPath, DEFAULT_MAX_AGE_MINUTES } from "./approved-file.js";
+export { approvedPath, DEFAULT_MAX_AGE_MINUTES, officeDir } from "./approved-file.js";
 
 /** What GET <server>/repos answers. */
 export interface RepoList {
@@ -234,8 +234,8 @@ export interface SessionGate {
    * changed, and when the list has changed since the server said not-wanted, so it opens afresh.
    */
   home(candidates: readonly Project[]): Promise<{ home: Project | null; dormancy: Dormancy | null }>;
-  /** The link for the home `home` gave, opened now if there is none. */
-  link(): Link;
+  /** The link for the home `home` gave, opened now if there is none; null while there is no home (a check that finished since said none). */
+  link(): Link | null;
   /** The link, while there is one. */
   current(): Link | null;
   /** Closes the link: the session has nothing to report. */
@@ -278,8 +278,9 @@ export function createSessionGate({ approved, open }: { approved: Approved; open
       return { home, dormancy: null };
     },
     link() {
+      if (!home) return null;
       if (!link) {
-        link = open(home!, mayConnect);
+        link = open(home, mayConnect);
         linked = home!.id;
       }
       return link;

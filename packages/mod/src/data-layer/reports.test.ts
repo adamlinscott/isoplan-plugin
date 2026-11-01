@@ -4,7 +4,7 @@ import type { Facts } from "@isoplan/protocol";
 import { expect, test } from "vitest";
 import { loadPatterns } from "../runner/scan.js";
 import { at, modDir, tempRoot } from "./fixture.js";
-import { openReportHold, WITHHELD_TEXT } from "./reports.js";
+import { openReportHold, releasedPath, WITHHELD_TEXT } from "./reports.js";
 
 const patterns = await loadPatterns(path.join(modDir, "secret-patterns.json"), path.join(modDir, "missing.json"), () => {});
 const KEY = "aws_access_key_id = AKIAIOSFODNN7EXAMPLE";
@@ -81,4 +81,25 @@ test("reports: with no patterns to read, every report is held", async () => {
   const sent = hold.apply(factsWith([{ agent: "claude-code:a2", at: at(5), text: "Coverage is 81%." }]), null);
   expect(sent.reports[0]).toMatchObject({ text: WITHHELD_TEXT, withheld: { id: expect.any(String) } });
   expect(logs[0]).toContain("the secret patterns couldn't be read");
+});
+
+test("reports: a release on one office's floor lets the report out to that office alone, and each office keeps its own after a restart (#105)", async () => {
+  const claudeDir = tempRoot();
+  const internal = { server: "wss://isoplan-internal.example/data-layer" };
+  const dev = { server: "ws://127.0.0.1:4747/data-layer", legacy: true };
+  // The office a version before #105 reports to keeps the old place; any other has its own.
+  expect(releasedPath(claudeDir, dev, "s1")).toBe(path.join(claudeDir, "isoplan", "released", "s1.json"));
+  expect(releasedPath(claudeDir, internal, "s1")).toBe(path.join(claudeDir, "isoplan", "offices", path.basename(path.dirname(path.dirname(releasedPath(claudeDir, internal, "s1")))), "released", "s1.json"));
+  expect(path.basename(path.dirname(path.dirname(releasedPath(claudeDir, internal, "s1"))))).toMatch(/^[0-9a-f]{12}$/);
+  const facts = factsWith([{ agent: "claude-code:a1", at: at(5), text: `Set it up: ${KEY}` }]);
+  const a = await open(releasedPath(claudeDir, internal, "s1"));
+  const b = await open(releasedPath(claudeDir, dev, "s1"));
+  const held = a.hold.apply(facts, patterns).reports[0]!.withheld!.id;
+  expect(b.hold.apply(facts, patterns).reports[0]!.text).toBe(WITHHELD_TEXT);
+  expect(await a.hold.release(held)).toBe(true);
+  expect(a.hold.apply(facts, patterns).reports[0]!.text).toBe(facts.reports[0]!.text);
+  expect(b.hold.apply(facts, patterns).reports[0]!.text).toBe(WITHHELD_TEXT);
+  const again = { a: await open(releasedPath(claudeDir, internal, "s1")), b: await open(releasedPath(claudeDir, dev, "s1")) };
+  expect(again.a.hold.apply(facts, patterns).reports[0]!.text).toBe(facts.reports[0]!.text);
+  expect(again.b.hold.apply(facts, patterns).reports[0]!.text).toBe(WITHHELD_TEXT);
 });

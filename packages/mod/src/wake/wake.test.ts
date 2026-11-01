@@ -1,8 +1,9 @@
 import fs from "node:fs";
 import path from "node:path";
 import { expect, test } from "vitest";
-import { tempRoot } from "../data-layer/fixture.js";
-import { HOLD_OFF_MS, holdOff, lockPath, takeLock } from "./lock.js";
+import { approvedPath } from "../data-layer/approved-file.js";
+import { modDir, tempRoot } from "../data-layer/fixture.js";
+import { HOLD_OFF_MS, holdOff, lockPath, notWantedPath, takeLock } from "./lock.js";
 import { wake, wakeRecordPath } from "./wake.js";
 
 const OTHER = 4242; // a pid that isn't this process
@@ -78,6 +79,61 @@ test("wake: a data layer held off because the office took none of its repos star
   list(["github.com/team/app"]);
   expect(await s.run(() => false)).toBe(true);
   expect(s.spawned).toHaveLength(1);
+});
+
+test("wake: with several offices, any office's list that takes one of the repos starts it again (#105)", async () => {
+  const s = setup();
+  await takeLock(s.lock, OTHER);
+  await holdOff(s.lock, OTHER, Date.now() + HOLD_OFF_MS, { reason: "not-approved", projects: ["github.com/team/app"] });
+  const list = (server: string, repos: string[]) => {
+    const file = approvedPath(s.claudeDir, server);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, JSON.stringify({ server, version: "v1", repos, fetched: Date.now(), checked: Date.now() }));
+  };
+  list("wss://isoplan-internal.example/data-layer", ["github.com/team/other"]);
+  expect(await s.run(() => false)).toBe(false);
+  list("ws://127.0.0.1:4747/data-layer", ["github.com/team/app"]);
+  expect(await s.run(() => false)).toBe(true);
+});
+
+test("wake: the list of an office that didn't want the session, or of one no longer configured, never starts it again; another's does, and the office that didn't is kept beside the lock (#105)", async () => {
+  const s = setup();
+  const internal = "wss://isoplan-internal.example/data-layer";
+  const dev = "ws://127.0.0.1:4747/data-layer";
+  const gone = "wss://old.example/data-layer";
+  const until = Date.now() + HOLD_OFF_MS;
+  await takeLock(s.lock, OTHER);
+  await holdOff(s.lock, OTHER, until, { reason: "not-approved", projects: ["github.com/team/app"], offices: [internal, dev], notWanted: { [internal]: until } });
+  const list = (server: string, repos: string[]) => {
+    const file = approvedPath(s.claudeDir, server);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, JSON.stringify({ server, version: "v1", repos, fetched: Date.now(), checked: Date.now() }));
+  };
+  // The office that didn't want it takes the repo, as it did all along; a folder of one taken out of config.json does too.
+  list(internal, ["github.com/team/app"]);
+  list(gone, ["github.com/team/app"]);
+  expect(await s.run(() => false)).toBe(false);
+  // The other office takes it now: the session starts again, told to leave the first alone.
+  list(dev, ["github.com/team/app"]);
+  expect(await s.run(() => false)).toBe(true);
+  expect(fs.existsSync(s.lock)).toBe(false);
+  expect(JSON.parse(fs.readFileSync(notWantedPath(s.claudeDir, "s-1"), "utf8"))).toEqual({ [internal]: until });
+});
+
+test("wake: an office added to config.json since the hold-off can start the session again (#105)", async () => {
+  const s = setup();
+  const added = "wss://added.example/data-layer";
+  await takeLock(s.lock, OTHER);
+  await holdOff(s.lock, OTHER, Date.now() + HOLD_OFF_MS, { reason: "not-approved", projects: ["github.com/team/app"], offices: ["ws://127.0.0.1:4747/data-layer"], notWanted: {} });
+  const file = approvedPath(s.claudeDir, added);
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, JSON.stringify({ server: added, version: "v1", repos: ["github.com/team/app"], fetched: Date.now(), checked: Date.now() }));
+  // Not configured: its folder is left over, and counts for nothing.
+  fs.copyFileSync(path.join(modDir, "config.json"), path.join(path.dirname(path.dirname(s.dataLayer)), "config.json"));
+  expect(await s.run(() => false)).toBe(false);
+  fs.writeFileSync(path.join(s.claudeDir, "isoplan", "config.json"), JSON.stringify({ servers: [{ label: "added", server: added }] }));
+  expect(await s.run(() => false)).toBe(true);
+  expect(fs.existsSync(notWantedPath(s.claudeDir, "s-1"))).toBe(false);
 });
 
 test("wake: starts the newest data layer Claude Code has installed, not an older one wake.json still records", async () => {

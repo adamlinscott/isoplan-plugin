@@ -64,8 +64,9 @@ function setUp(server = office()) {
   const file = path.join(dir, "isoplan", "pairing.json");
   const lock = path.join(dir, "isoplan", "pairing.lock");
   const writeLock = path.join(dir, "isoplan", "pairing.write.lock");
+  // SERVER stands for the server config.json's `server` names, whose entry is under `accounts`.
   const make = (account = ADA, url = SERVER, pid = process.pid, at = file) => {
-    const p = createPairing({ file: at, lock, writeLock, server: url, account, machine: "sevengill", emit: (line) => lines.push(line), post: server.post, now: () => clock, pid, isAlive: () => true, retryMs: 1 });
+    const p = createPairing({ file: at, lock, writeLock, server: url, account, machine: "sevengill", emit: (line) => lines.push(line), post: server.post, now: () => clock, pid, isAlive: () => true, retryMs: 1, legacy: url === SERVER });
     pairings.push(p);
     return p;
   };
@@ -270,4 +271,73 @@ test("a credential or token is never sent over plain ws:// to another machine wi
   pairings.push(allowed);
   await allowed.refused("not-paired", undefined);
   expect(await allowed.token()).toBeNull();
+});
+
+test("each office server has its own pairing: config.json's server stays where an older version looks, another server's goes beside it, and one ending leaves the other (#105)", async () => {
+  const { pairing, file, dir, approve } = setUp();
+  const dev = office();
+  const DEV = "ws://127.0.0.1:4747/data-layer";
+  const other = createPairing({ file, lock: path.join(dir, "isoplan", "offices", "dev", "pairing.lock"), writeLock: path.join(dir, "isoplan", "pairing.write.lock"), server: DEV, account: ADA, machine: "sevengill", emit: () => {}, post: dev.post, now: () => clock, isAlive: () => true, retryMs: 1 });
+  pairings.push(other);
+  // Both wait to be paired at once: neither's lock holds the other up.
+  await pairing.refused("not-paired", undefined);
+  await other.refused("not-paired", undefined);
+  expect(await pairing.token()).toBeNull();
+  expect(await other.token()).toBeNull();
+  expect(dev.state.asks).toHaveLength(1);
+  await approve();
+  await dev.approve();
+  expect(await pairing.token()).toBe(token(1));
+  expect(await other.token()).toBe(token(1));
+  const kept = await readPairing(file);
+  expect(kept.accounts[ADA.id]?.server).toBe(SERVER);
+  expect(kept.offices?.[DEV]?.[ADA.id]?.credential).toBe(CREDENTIAL);
+
+  await pairing.refused("pairing-ended", token(1));
+  const after = await readPairing(file);
+  expect(after.accounts[ADA.id]?.credential).toBeUndefined();
+  expect(after.offices?.[DEV]?.[ADA.id]?.credential).toBe(CREDENTIAL);
+  expect(await other.token()).toBe(token(1));
+});
+
+test("with an entry for one server in both places (an older version wrote under accounts), the one under offices is read and renewed there, and the other left alone (#105)", async () => {
+  const { file, make } = setUp();
+  const DEV = "ws://127.0.0.1:4747/data-layer";
+  await writePairing(file, {
+    accounts: { [ADA.id]: { server: DEV, credential: "old" + "-cred", token: token(8), tokenExpires: clock + 60 * 60000 } },
+    offices: { [DEV]: { [ADA.id]: { server: DEV, credential: CREDENTIAL, token: token(9), tokenExpires: clock + 60 * 60000 } } },
+  });
+  const dev = make(ADA, DEV);
+  expect(await dev.token()).toBe(token(9));
+  await dev.refused("token-expired", token(9));
+  const kept = await readPairing(file);
+  expect(kept.offices?.[DEV]?.[ADA.id]?.tokenExpires).toBe(0);
+  expect(kept.accounts[ADA.id]?.tokenExpires).toBe(clock + 60 * 60000);
+});
+
+test("with servers X and Y and config.json's server L left at its default, both go under offices, so an older version writing L under accounts wipes neither (#105)", async () => {
+  const { file, dir } = setUp();
+  const L = "ws://127.0.0.1:4747/data-layer";
+  const make = (url: string, o: ReturnType<typeof office>) => {
+    const p = createPairing({ file, lock: path.join(dir, "isoplan", "offices", url.length.toString(), "pairing.lock"), writeLock: path.join(dir, "isoplan", "pairing.write.lock"), server: url, account: ADA, machine: "sevengill", emit: () => {}, post: o.post, now: () => clock, isAlive: () => true, retryMs: 1 });
+    pairings.push(p);
+    return p;
+  };
+  const X = "wss://x.example/data-layer";
+  const Y = "wss://y.example.org/data-layer";
+  for (const [url, o] of [[X, office()], [Y, office()]] as const) {
+    const p = make(url, o);
+    await p.refused("not-paired", undefined);
+    await p.token();
+    await o.approve();
+    expect(await p.token()).toBe(token(1));
+  }
+  const kept = await readPairing(file);
+  expect(kept.accounts).toEqual({});
+  expect(Object.keys(kept.offices ?? {}).sort()).toEqual([X, Y]);
+  // The older version pairs with L, writing accounts whole: X and Y are still there.
+  await writePairing(file, { ...kept, accounts: { [ADA.id]: { server: L, credential: "l" + "-cred" } } });
+  const after = await readPairing(file);
+  expect(after.offices?.[X]?.[ADA.id]?.credential).toBe(CREDENTIAL);
+  expect(after.offices?.[Y]?.[ADA.id]?.credential).toBe(CREDENTIAL);
 });

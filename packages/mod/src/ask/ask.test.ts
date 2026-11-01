@@ -1,7 +1,7 @@
 import { PROTOCOL_VERSION, type AskedMessage, type DataLayerMessage, type OfficeServerMessage } from "@isoplan/protocol";
 import { expect, test } from "vitest";
 import type { SideLink } from "../handoff/connection.js";
-import { askRoom, MAX_WAIT_MS, REFUSED, TokenExpired, UNCONFIRMED } from "./ask.js";
+import { askOffices, askRoom, MAX_WAIT_MS, REFUSED, TokenExpired, UNCONFIRMED } from "./ask.js";
 
 const SETTINGS = { askPolls: 3, askPollSeconds: 0.02 };
 const asked = (state: AskedMessage["state"], more: Partial<AskedMessage> = {}): AskedMessage => ({ type: "asked", v: PROTOCOL_VERSION, question: "q-1", text: "Which branch?", state, ...more });
@@ -110,4 +110,15 @@ test("ask: the whole wait, each check included, fits in MAX_WAIT_MS whatever run
   // An hour of polls a minute apart is cut to what fits: four rounds of a minute's wait and a 20 s check, then what is left.
   expect(s.sent.filter((m) => m.type === "ask-check").length).toBeLessThan(6);
   expect(Math.max(...waits)).toBeLessThanOrEqual(60000);
+});
+
+test("ask: with rights from several offices, it asks in the one the session took its handoff through, else in config order; with none named, in every office (#105)", () => {
+  const offices = [{ server: "wss://a.example/data-layer" }, { server: "wss://b.example/data-layer" }, { server: "ws://127.0.0.1:4747/data-layer" }];
+  const [a, b, c] = offices;
+  expect(askOffices(offices, [c!.server, b!.server], null)).toEqual([b, c]);
+  expect(askOffices(offices, [b!.server, c!.server], c!.server)).toEqual([c, b]);
+  // A taken office that gave no rights isn't asked.
+  expect(askOffices(offices, [b!.server], a!.server)).toEqual([b]);
+  expect(askOffices(offices, [], b!.server)).toEqual([b, a, c]);
+  expect(askOffices(offices, ["wss://elsewhere.example/data-layer"], null)).toEqual([]);
 });

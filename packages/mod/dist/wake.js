@@ -14,6 +14,32 @@ async function loadConfig(io, defaultsPath, userPath) {
 	}
 	return config;
 }
+/**
+* The offices to report to: each entry of `servers` with a ws:// or wss:// address (ws:// goes only
+* to this machine unless allowPlainWs; to another it is kept, to say why it isn't used), once per
+* address; with none, `server` alone. An entry without a label is labelled by its host, and a label
+* already taken gets -2, -3 and so on, so each names one office.
+*/
+function officesOf(config) {
+	const offices = [];
+	const add = (server, label, refused) => {
+		let unique = label;
+		for (let n = 2; offices.some((o) => o.label.toLowerCase() === unique.toLowerCase()); n++) unique = `${label}-${n}`;
+		offices.push({
+			label: unique,
+			server,
+			...refused && { plainRefused: true },
+			...server === config.server && { legacy: true }
+		});
+	};
+	for (const entry of config.servers) {
+		const { label, server } = entry ?? {};
+		if (typeof server !== "string" || !URL.canParse(server) || !["ws:", "wss:"].includes(new URL(server).protocol) || offices.some((o) => o.server === server)) continue;
+		add(server, typeof label === "string" && label.trim() || new URL(server).host, !config.allowPlainWs && !isWebSocketUrl(server));
+	}
+	if (!offices.length) add(config.plainRefused ?? config.server, new URL(config.plainRefused ?? config.server).host, !!config.plainRefused);
+	return offices;
+}
 /** The same per-key override for any settings file of the mod's, such as the runner's runner.json. */
 async function loadSettings(io, defaultsPath, userPath) {
 	const defaults = await readJson$1(io, defaultsPath);
@@ -124,6 +150,11 @@ const claudeBinaryPath = (claudeDir) => path.join(claudeDir, "isoplan", "claude-
 //#endregion
 //#region src/wake/lock.ts
 const lockPath = (claudeDir, sessionId) => path.join(claudeDir, "isoplan", "live", `${sessionId}.json`);
+/**
+* The offices that didn't want a session, each until when (#105): the wake hook moves them here from
+* a hold-off it ends, for the data layer it starts, which reads the file once and removes it.
+*/
+const notWantedPath = (claudeDir, sessionId) => path.join(claudeDir, "isoplan", "live", `${sessionId}.not-wanted`);
 async function readText(file) {
 	try {
 		const [text, st] = await Promise.all([fs.readFile(file, "utf8"), fs.stat(file)]);
@@ -245,7 +276,11 @@ function alive(pid) {
 }
 //#endregion
 //#region src/data-layer/approved-file.ts
-const approvedPath = (claudeDir) => path.join(claudeDir, "isoplan", "approved.json");
+/** Every office's approved.json on this machine, and the one a version before #105 kept. */
+async function approvedFiles(claudeDir) {
+	const root = path.join(claudeDir, "isoplan", "offices");
+	return [...(await fs.readdir(root).catch(() => [])).map((name) => path.join(root, name, "approved.json")), path.join(claudeDir, "isoplan", "approved.json")];
+}
 const isFile = (v) => !!v && typeof v.server === "string" && typeof v.version === "string" && typeof v.fetched === "number" && typeof v.checked === "number" && Array.isArray(v.repos) && v.repos.every((r) => typeof r === "string");
 /** approved.json, for `server` when given; null when there is none, or it is another server's. */
 async function readApproved(file, server) {
@@ -459,12 +494,14 @@ async function wake(input, { claudeDir, spawn, isAlive = alive, project, plugins
 	const { session_id: sessionId, cwd } = JSON.parse(input);
 	if (typeof sessionId !== "string" || !/^[\w-]+$/.test(sessionId) || typeof cwd !== "string" || !cwd) return false;
 	const lock = lockPath(claudeDir, sessionId);
-	if (await isHeld(lock, Date.now(), isAlive)) {
-		if (!await nowApproved(claudeDir, lock)) return false;
-		await fs.rm(lock, { force: true });
-	}
 	const { dataLayer: recorded } = JSON.parse(await fs.readFile(wakeRecordPath(claudeDir), "utf8"));
 	if (typeof recorded !== "string") return false;
+	if (await isHeld(lock, Date.now(), isAlive)) {
+		const notWanted = await nowApproved(claudeDir, lock, await configuredServers(claudeDir, recorded));
+		if (!notWanted) return false;
+		await fs.rm(lock, { force: true });
+		if (Object.keys(notWanted).length) await fs.writeFile(notWantedPath(claudeDir, sessionId), JSON.stringify(notWanted));
+	}
 	const dataLayer = plugins ? await newestDataLayer(plugins, recorded, project).catch(() => recorded) : recorded;
 	if (!await fs.stat(dataLayer).then((s) => s.isFile(), () => false)) return false;
 	spawn([
@@ -478,13 +515,38 @@ async function wake(input, { claudeDir, spawn, isAlive = alive, project, plugins
 	], cwd);
 	return true;
 }
-/** Whether `lock` is a hold-off for repos the office didn't take, one of which a fresh copy of its list now has. */
-async function nowApproved(claudeDir, lock) {
+/** The office servers config.json names now, by the defaults beside the recorded data layer; none when it can't be read. */
+async function configuredServers(claudeDir, dataLayer) {
+	const config = await loadConfig({
+		stat: (p) => fs.stat(p).then((s) => ({
+			isDir: s.isDirectory(),
+			mtimeMs: s.mtimeMs,
+			size: s.size
+		}), () => null),
+		read: (p) => fs.readFile(p, "utf8")
+	}, path.join(path.dirname(path.dirname(dataLayer)), "config.json"), path.join(claudeDir, "isoplan", "config.json")).catch(() => null);
+	return config ? officesOf(config).map((o) => o.server) : [];
+}
+/**
+* Whether `lock` is a hold-off for repos no office took, one of which a fresh copy of an office's
+* list now has: then the offices that didn't want the session, each until when, else null. Only the
+* lists of the offices the data layer reported to, or that config.json names now (`configured`),
+* count (a folder left by a server taken out of config.json doesn't), and never one of an office
+* that didn't want the session.
+*/
+async function nowApproved(claudeDir, lock, configured) {
 	const held = await readLock(lock);
-	const projects = held?.extra.projects;
-	if (held?.pid !== null || held.extra.reason !== "not-approved" || !Array.isArray(projects)) return false;
-	const repos = freshRepos(await readApproved(approvedPath(claudeDir)), 9e5, Date.now());
-	return !!repos && projects.some((p) => typeof p === "string" && repos.has(p));
+	const { projects, offices, notWanted: said } = held?.extra ?? {};
+	if (held?.pid !== null || held.extra.reason !== "not-approved" || !Array.isArray(projects)) return null;
+	const now = Date.now();
+	const notWanted = Object.fromEntries(Object.entries(said && typeof said === "object" ? said : {}).filter(([, until]) => typeof until === "number" && until > now));
+	for (const file of await approvedFiles(claudeDir)) {
+		const copy = await readApproved(file);
+		if (!copy || Array.isArray(offices) && !offices.includes(copy.server) && !configured.includes(copy.server) || copy.server in notWanted) continue;
+		const repos = freshRepos(copy, 9e5, now);
+		if (repos && projects.some((p) => typeof p === "string" && repos.has(p))) return notWanted;
+	}
+	return null;
 }
 //#endregion
 //#region src/runner/environment.ts
@@ -629,6 +691,7 @@ const WRITTEN = [
 	"waits",
 	"answers",
 	"handoffs",
+	"offices",
 	"approved.json",
 	"update.json",
 	"update.lock"
@@ -639,6 +702,7 @@ const SESSION_TRACES = [
 	"released",
 	"waits",
 	"answers",
+	"offices",
 	"approved.json",
 	"update.json",
 	"update.lock"

@@ -302,3 +302,24 @@ test("after not-wanted the link sits out its hour, but opens afresh once the lis
   expect(gate.current()).toBeNull();
   expect(gate.link()).not.toBe(first);
 });
+
+test("a check that ends late, taking the repo out while a pass still uses the gate, leaves no link to open: link() is null, never a throw (#105)", async () => {
+  const o = office([APP]);
+  const clock = { now: 0 };
+  const { connections, gate } = await gated(o, clock);
+  expect((await gate.home([project(APP)])).home?.id).toBe(APP);
+  expect(gate.link()).not.toBeNull();
+  await until(() => connections[0]?.messages.some((m) => m.type === "hello") ?? false);
+
+  // The next check is slow; meanwhile the pass goes on with the home it had.
+  let answer = () => {};
+  o.state.slow = new Promise<void>((r) => (answer = r));
+  o.change([]);
+  clock.now += 5 * MINUTE;
+  const late = gate.home([project(APP)]);
+  expect(gate.link()).not.toBeNull();
+  answer();
+  expect(await late).toEqual({ home: null, dormancy: "not-approved" });
+  expect(gate.link()).toBeNull();
+  await until(() => connections[0]!.closed);
+});

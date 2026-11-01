@@ -95,13 +95,36 @@ const stopped = (h: ReturnType<typeof host>) => vi.waitFor(() => expect(h.status
 const call = (h: ReturnType<typeof host>, e: Partial<ToolCallInput>, result: ToolCallResult = { result: "ok" }) =>
   hooks["tool.call"]!(h.$, { tool: "Read", tool_use_id: "t", ...e }, async () => result) as Promise<ToolCallResult>;
 
-const connected: DataLayerLine = { type: "status", server: "ws://127.0.0.1:4747/data-layer", state: "connected" };
+const connected: DataLayerLine = { type: "status", server: "ws://127.0.0.1:4747/data-layer", label: "dev", state: "connected" };
 
 test("hooks: starts the data layer for its session and shows the link's state, then that it stopped", async () => {
   const h = await start([connected]);
   await stopped(h);
   expect(h.spawned).toEqual([["node", "C:/plugins/isoplan/dist/data-layer.js", "--session", "s1", "--cwd", "C:/w/repo", "--since", "0"]]);
-  expect(h.status).toEqual(["Isoplan: connected to ws://127.0.0.1:4747/data-layer", "Isoplan: the data layer stopped (node exited with code 0); restarting in 1s"]);
+  expect(h.status).toEqual(["Isoplan: dev ✓", "Isoplan: the data layer stopped (node exited with code 0); restarting in 1s"]);
+});
+
+test("hooks: the status line names each office by its label, leaving out one that doesn't take the repo", async () => {
+  const internal = "wss://isoplan-internal.example/data-layer";
+  const h = await start([
+    { type: "status", server: internal, label: "internal", state: "waiting" },
+    { type: "status", server: "ws://127.0.0.1:4747/data-layer", label: "dev", state: "waiting" },
+    { type: "status", server: internal, label: "internal", state: "connected" },
+    connected,
+    { type: "status", server: internal, label: "internal", state: "disconnected", retryInMs: 3000 },
+    { type: "status", server: internal, label: "internal", state: "not-approved" },
+    { type: "status", server: "ws://127.0.0.1:4747/data-layer", label: "dev", state: "not-approved" },
+  ]);
+  await stopped(h);
+  expect(h.status.slice(0, -1)).toEqual([
+    "Isoplan: internal not connected yet (nothing to report)",
+    "Isoplan: internal not connected yet (nothing to report) · dev not connected yet (nothing to report)",
+    "Isoplan: internal ✓ · dev not connected yet (nothing to report)",
+    "Isoplan: internal ✓ · dev ✓",
+    "Isoplan: internal can't be reached; retrying in 3s · dev ✓",
+    "Isoplan: dev ✓",
+    undefined,
+  ]);
 });
 
 test("hooks: in a repo the office doesn't take, Isoplan shows nothing: no status line and nothing in the transcript", async () => {
@@ -118,12 +141,12 @@ test("hooks: in a repo the office doesn't take, Isoplan shows nothing: no status
 });
 
 test("hooks: once a newer version is on disk, the status line says to reload, beside the link's state", async () => {
-  const h = await start([connected, { type: "updated" }, { type: "status", server: "ws://127.0.0.1:4747/data-layer", state: "disconnected", retryInMs: 2000 }]);
+  const h = await start([connected, { type: "updated" }, { type: "status", server: "ws://127.0.0.1:4747/data-layer", label: "dev", state: "disconnected", retryInMs: 2000 }]);
   await stopped(h);
   expect(h.status).toEqual([
-    "Isoplan: connected to ws://127.0.0.1:4747/data-layer",
-    "Isoplan: connected to ws://127.0.0.1:4747/data-layer · Isoplan updated: type /reload-plugins",
-    "Isoplan: can't reach ws://127.0.0.1:4747/data-layer; retrying in 2s · Isoplan updated: type /reload-plugins",
+    "Isoplan: dev ✓",
+    "Isoplan: dev ✓ · Isoplan updated: type /reload-plugins",
+    "Isoplan: dev can't be reached; retrying in 2s · Isoplan updated: type /reload-plugins",
     "Isoplan: the data layer stopped (node exited with code 0); restarting in 1s · Isoplan updated: type /reload-plugins",
   ]);
   // Before any other status, the note stands alone.
@@ -253,21 +276,26 @@ test("hooks: a title ask is answered by the model and written where the line say
   await vi.waitFor(() => expect(h.written).toEqual([[file, JSON.stringify({ key: "k1", text: "Fixing the wizard" })]]));
 });
 
-test("hooks: a pairing link is in the status line while it waits, and in the transcript once per session start", async () => {
-  const pair: DataLayerLine = { type: "pair", server: "wss://office.team.example/data-layer", url: "https://office.team.example/#pair=r1", expires: "2026-10-20T09:10:00.000Z" };
+test("hooks: a pairing link is in the status line while it waits, and in the transcript once per office per session start", async () => {
+  const pair: DataLayerLine = { type: "pair", server: "wss://office.team.example/data-layer", label: "team", url: "https://office.team.example/#pair=r1", expires: "2026-10-20T09:10:00.000Z" };
   const later: DataLayerLine = { ...pair, url: "https://office.team.example/#pair=r2" };
-  const pairing: DataLayerLine = { type: "status", server: "wss://office.team.example/data-layer", state: "pairing" };
-  const h = await start([pair, pairing, later, pairing, connected]);
+  const pairing: DataLayerLine = { type: "status", server: "wss://office.team.example/data-layer", label: "team", state: "pairing" };
+  const dev: DataLayerLine = { type: "pair", server: "ws://127.0.0.1:4747/data-layer", label: "dev", url: "http://127.0.0.1:4747/#pair=d1", expires: "2026-10-20T09:10:00.000Z" };
+  const h = await start([pair, pairing, later, pairing, dev, connected]);
   await stopped(h);
-  expect(h.status.slice(0, 4)).toEqual([
-    "Isoplan: Pair this machine: https://office.team.example/#pair=r1",
-    "Isoplan: Pair this machine: https://office.team.example/#pair=r1",
-    "Isoplan: Pair this machine: https://office.team.example/#pair=r2",
-    "Isoplan: Pair this machine: https://office.team.example/#pair=r2",
+  expect(h.status.slice(0, 6)).toEqual([
+    "Isoplan: team: Pair this machine: https://office.team.example/#pair=r1",
+    "Isoplan: team: Pair this machine: https://office.team.example/#pair=r1",
+    "Isoplan: team: Pair this machine: https://office.team.example/#pair=r2",
+    "Isoplan: team: Pair this machine: https://office.team.example/#pair=r2",
+    "Isoplan: team: Pair this machine: https://office.team.example/#pair=r2 · dev: Pair this machine: http://127.0.0.1:4747/#pair=d1",
+    "Isoplan: team: Pair this machine: https://office.team.example/#pair=r2 · dev ✓",
   ]);
-  expect(h.status[4]).toBe("Isoplan: connected to ws://127.0.0.1:4747/data-layer");
-  // A new link ten minutes on goes to the status line, not the transcript again.
-  expect(h.logged).toEqual(["Isoplan: to report to wss://office.team.example/data-layer, pair this machine: click https://office.team.example/#pair=r1 on this computer and approve it in the office."]);
+  // A new link ten minutes on goes to the status line, not the transcript again; another office's goes there too.
+  expect(h.logged).toEqual([
+    "Isoplan: to report to wss://office.team.example/data-layer, pair this machine: click https://office.team.example/#pair=r1 on this computer and approve it in the office.",
+    "Isoplan: to report to ws://127.0.0.1:4747/data-layer, pair this machine: click http://127.0.0.1:4747/#pair=d1 on this computer and approve it in the office.",
+  ]);
 });
 
 const ASK = "mcp__plugin_isoplan__ask_room";
@@ -291,6 +319,46 @@ test("hooks: the ask_room tool is added only once the server says the session ma
   expect(r).toEqual({ result: "The room answered your question (q-1), from its lead's own session:\n\nBecause." });
   expect(h.ran).toEqual([{ argv: ["node", "C:/plugins/isoplan/dist/ask.js", "--session", "s1", "--cwd", "C:/w/repo", "--key", "toolu_01"], stdin: "Why skip archived rows?" }]);
   expect(await hooks["tool.call"]!(h.$, { tool: ASK, tool_use_id: "t" }, next)).toEqual({ result: "Give the question to ask the room as `question`." });
+});
+
+test("hooks: with several offices, the room is asked, and a late reply acked, through the office that gave the rights", async () => {
+  const internal = "wss://isoplan-internal.example/data-layer";
+  const late: DataLayerLine = { type: "asked", v: PROTOCOL_VERSION, question: "q-2", text: "Which branch?", state: "answered", answer: "main.", owner: "Adam", server: internal };
+  const h = await start([connected, { ...rightsLine(false), server: "ws://127.0.0.1:4747/data-layer" } as DataLayerLine, { ...rightsLine(true), server: internal } as DataLayerLine, late], { stays: true });
+  await vi.waitFor(() => expect(h.tools).toEqual(["ask_room"]));
+  await new Promise((r) => setTimeout(r, 10));
+  await hooks["tool.call"]!(h.$, { tool: ASK, tool_use_id: "toolu_02", question: "Why?" }, vi.fn());
+  expect(h.ran[0]).toEqual({ argv: ["node", "C:/plugins/isoplan/dist/ask.js", "--session", "s1", "--cwd", "C:/w/repo", "--server", internal, "--key", "toolu_02"], stdin: "Why?" });
+  await call(h, {});
+  await vi.waitFor(() => expect(h.ran[1]).toEqual({ argv: ["node", "C:/plugins/isoplan/dist/ask.js", "--session", "s1", "--cwd", "C:/w/repo", "--server", internal, "--ack", "q-2"], stdin: undefined }));
+});
+
+test("hooks: with rights from two offices, the ask script is given both, to pick the session's own office", async () => {
+  const internal = "wss://isoplan-internal.example/data-layer";
+  const dev = "ws://127.0.0.1:4747/data-layer";
+  const h = await start([connected, { ...rightsLine(true), server: internal } as DataLayerLine, { ...rightsLine(true), server: dev } as DataLayerLine], { stays: true });
+  await vi.waitFor(() => expect(h.tools).toEqual(["ask_room"]));
+  await new Promise((r) => setTimeout(r, 10));
+  await hooks["tool.call"]!(h.$, { tool: ASK, tool_use_id: "toolu_03", question: "Why?" }, vi.fn());
+  expect(h.ran[0]!.argv).toEqual(["node", "C:/plugins/isoplan/dist/ask.js", "--session", "s1", "--cwd", "C:/w/repo", "--server", internal, "--server", dev, "--key", "toolu_03"]);
+});
+
+test("hooks: an office's pairing link goes once it stops pairing, and a plain ws:// office says when whether it takes the repo can't be checked", async () => {
+  const team = "wss://office.team.example/data-layer";
+  const plain = "ws://10.0.0.5:4747/data-layer";
+  const h = await start([
+    { type: "pair", server: team, label: "team", url: "https://office.team.example/#pair=r1", expires: "2026-10-20T09:10:00.000Z" },
+    { type: "status", server: team, label: "team", state: "connected" },
+    { type: "status", server: team, label: "team", state: "pairing" },
+    { type: "status", server: plain, label: "plain", state: "insecure", unchecked: true },
+  ]);
+  await stopped(h);
+  expect(h.status.slice(0, 4)).toEqual([
+    "Isoplan: team: Pair this machine: https://office.team.example/#pair=r1",
+    "Isoplan: team ✓",
+    "Isoplan: team waiting for this machine to be paired",
+    `Isoplan: team waiting for this machine to be paired · plain: not reporting: ${plain} is plain ws:// to another machine (whether its office takes this repo can't be checked); use wss://, or set "allowPlainWs": true in config.json`,
+  ]);
 });
 
 test("hooks: once the rights go, the tool answers that asking is off and runs nothing; a new session id starts without rights", async () => {

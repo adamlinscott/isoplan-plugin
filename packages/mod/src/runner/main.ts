@@ -15,14 +15,17 @@
 // takes <claude dir>/isoplan/runner/lock.json, so a second one exits at once, writes the code it
 // runs into it and keeps it fresh, and runs the worker, starting it again after a crash
 // (lifecycle.ts). After MAX_FAST_FAILURES quick crashes in a row it gives up and lets the lock go.
-// The worker holds one link to the office server, opened with a runner hello carrying the machine's
-// pairing token when the server signs people in, under the machine's Claude account
-// (src/data-layer/pairing.ts; a link to approve goes
-// to the log, and the data layers show the same one in Claude Code), and stays up while
-// any session on the machine is inside its lights-off window. A server that doesn't want this
-// machine's runner ends it, and it holds off starting again for HOLD_OFF_MS. It answers only for
-// sessions in a repo the office takes, from the same list the data layers read (src/data-layer/approved.ts). The worker exits when
-// its supervisor has gone too, since its stdin closes then, and ends its forks as it goes.
+// The worker holds one link to each office server in config.json (#105), opened with a runner hello
+// carrying the machine's pairing token with that server when it signs people in, under the machine's
+// Claude account (src/data-layer/pairing.ts; a link to approve goes to the log, and the data layers
+// show the same one in Claude Code), and stays up while any session on the machine is inside its
+// lights-off window. Each office's link answers for that office alone: only for sessions in a repo
+// it takes, from the same list the data layers read (src/data-layer/approved.ts). The forks, their
+// cap (`maxForks`, one for the machine), the ledger and its caps are shared by every office. When a
+// server doesn't want this machine's runner, or says its pairing has ended, only that office's link
+// closes, and opens again later (offices.ts); a runner none wants holds off starting again for
+// HOLD_OFF_MS. The worker exits when its supervisor has gone too, since its stdin closes then, and
+// ends its forks as it goes.
 //
 // Its settings are runner.json, overridden per key by ~/.claude/isoplan/runner.json; the secret
 // patterns are secret-patterns.json plus ~/.claude/isoplan/secret-patterns.json. Its ledger of
@@ -35,13 +38,13 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { PROTOCOL_VERSION } from "@isoplan/protocol";
-import { loadConfig, loadSettings } from "../data-layer/config.js";
+import { loadConfig, loadSettings, officesOf, type Office } from "../data-layer/config.js";
 import { approvedPath, createApproved } from "../data-layer/approved.js";
 import { approvedHome, machineHomeIo, takesFrom } from "../data-layer/home.js";
 import { accountOf, claudePaths } from "../data-layer/identity.js";
 import { nodeIo } from "../data-layer/io.js";
 import { createLink } from "../data-layer/link.js";
-import { createPairing, pairingLockPath, pairingPath, pairingWriteLockPath } from "../data-layer/pairing.js";
+import { createPairing, pairingEntry, pairingLockPath, pairingPath, pairingWriteLockPath, readPairing } from "../data-layer/pairing.js";
 import { HOLD_OFF_MS, alive, holdOff, lockPath, readLock, refreshLock, releaseLock, takeLock } from "../wake/lock.js";
 import { openLedger } from "./caps.js";
 import { createClaudeAnswerer, forkableId } from "./claude.js";
@@ -50,7 +53,9 @@ import { anyRoomSince, askableMs, NOT_WANTED_CODE, supervise, UNPAIRED_CODE } fr
 import { loadPrompts } from "./prompts.js";
 import { createRunGit, gitFailed, handoffBranch, handoffNote, HandoffGitError, prepare, pushHandoff, type Prepared } from "../handoff/git.js";
 import { takeHandoff, type TakeSettings } from "../handoff/take.js";
-import { createRunner, PushFailed, type RunnerSettings } from "./runner.js";
+import { recordTakenOffice } from "../handoff/taken-office.js";
+import { answerOffices } from "./offices.js";
+import { createForkSlots, createRunner, PushFailed, type RunnerSettings } from "./runner.js";
 import { loadPatterns, scan } from "./scan.js";
 import { runnerEnvPath } from "./environment.js";
 import { applyClaudeDir, LOCK_REFRESH_MS, RUNNER_FRESH_MS, runnerCode, runnerLockPath } from "./start.js";
@@ -134,10 +139,9 @@ async function worker(): Promise<number> {
   const settings = () => loadSettings<RunnerSettings & TakeSettings & { claudeModel: string; repoSearchDepth: number }>(io, path.join(appDir, "runner.json"), path.join(isoplanDir, "runner.json"));
   const first = await config();
   // Plain ws:// to another machine would send the machine's credential unencrypted.
-  if (first.plainRefused) {
-    log(`the runner isn't starting: ${first.plainRefused} is plain ws:// to another machine; use wss://, or set "allowPlainWs": true in config.json`);
-    return 0;
-  }
+  const offices = officesOf(first);
+  for (const { server } of offices.filter((o) => o.plainRefused)) log(`the runner doesn't answer through ${server}: it is plain ws:// to another machine; use wss://, or set "allowPlainWs": true in config.json`);
+  if (offices.every((o) => o.plainRefused)) return 0;
   await settings(); // a broken runner.json of the plugin's is a crash to see at once
 
   const answerer = createClaudeAnswerer({
@@ -158,124 +162,137 @@ async function worker(): Promise<number> {
   };
   const scanText = async (text: string) => scan(text, await loadPatterns(path.join(appDir, "secret-patterns.json"), path.join(isoplanDir, "secret-patterns.json"), log));
   const account = await accountOf({ readText: (p) => fs.readFile(p, "utf8").catch(() => null), run: io.run }, claudeJson, os.homedir());
-  const emit: Parameters<typeof createLink>[0]["emit"] = (line) => {
+  const emitFor = (server: string): Parameters<typeof createLink>[0]["emit"] => (line) => {
     if (line.type === "log") log(line.text);
-    else if (line.type === "error") log(`the office server says: ${line.message} (${line.code})`);
+    else if (line.type === "error") log(`the office server at ${server} says: ${line.message} (${line.code})`);
     else if (line.type === "pair") log(`to answer for this machine's rooms through ${line.server}, pair it: click ${line.url} on this computer and approve it in the office (it works until ${line.expires})`);
   };
-  const pairing = createPairing({
-    file: pairingPath(claudeDir),
-    lock: pairingLockPath(claudeDir),
-    writeLock: pairingWriteLockPath(claudeDir),
-    server: first.server,
-    account,
-    machine: os.hostname(),
-    emit,
-    allowPlainWs: first.allowPlainWs,
-  });
-  // The repos the office takes (src/data-layer/approved.ts): the runner answers only for sessions in them.
-  const approved = createApproved({ server: first.server, file: approvedPath(claudeDir), pairing, refreshMs: first.approvedRefreshMinutes * 60000, maxAgeMs: first.approvedMaxAgeMinutes * 60000, log });
   const homeIo = machineHomeIo(first.workspaceRepos);
-  // The repos a handoff from the lead's folder may hand over: the office's alone (#91).
-  const takes = async () => {
-    await approved.refresh();
-    return takesFrom(homeIo, approved.repos());
-  };
-  let send: Parameters<typeof createRunner>[0]["send"] = () => {};
+  const ledger = await openLedger(path.join(isoplanDir, "runner", "ledger.json"));
   // What each brief's prepare found, by handoff, for its push and any push anyway after it.
   const preparedFor = new Map<string, Prepared>();
-  const runner = createRunner({
-    answerer,
-    ledger: await openLedger(path.join(isoplanDir, "runner", "ledger.json")),
-    settings,
-    prompts: () => loadPrompts(path.join(appDir, "prompts")),
-    scan: scanText,
-    send: (message) => send(message),
-    log,
-    isDir: (p) => fs.stat(p).then((s) => s.isDirectory(), () => false),
-    // Only the rooms the data layer would report: inside the askable window, and not held off,
-    // which a detached data layer leaves when the server doesn't want the session's project (or git
-    // can't place its folder). That hold-off in isoplan/live/<id>.json is the only record of it.
-    // And only in a repo the office takes (#91), as the data layer would report it.
-    isReported: async (session, lead) => {
-      const id = forkableId(session);
-      const lock = id ? await readLock(lockPath(claudeDir, id)) : null;
-      if (!id || (lock && lock.pid === null && lock.until !== null && lock.until > Date.now())) return false;
-      if (Date.now() - lead.lastActive > askableMs(await config().catch(() => first))) return false;
-      await approved.refresh();
-      return (await approvedHome(lead.cwd, homeIo, approved.repos())) !== null;
-    },
-    // The handoff (#48): the brief names the untracked files, then the branch is pushed, both from
-    // the lead's folder, in the background, with no prompts and under gitTimeoutSeconds.
-    prepareBrief: async (lead, handoff) => {
-      const ready = await prepare(git, lead.cwd, await gitMs(), (await settings()).repoSearchDepth, undefined, await takes()).catch((err) => Promise.reject(told(err)));
-      // The repos the office doesn't take are named only here, never in the brief.
-      if (ready.notInOffice.length) log(`handoff ${handoff}: left out, not in the office: ${ready.notInOffice.join(", ")}`);
-      // The push hands over the repos the brief's note names (#56).
-      preparedFor.set(handoff, ready);
-      if (preparedFor.size > MAX_PREPARED) preparedFor.delete(preparedFor.keys().next().value!);
-      const { from, files, repos, left } = ready;
-      return { files, note: handoffNote({ branch: handoffBranch(handoff), from, files, at: new Date(), repos, left }) };
-    },
-    push: async (_session, lead, handoff, pushAnyway) => {
-      const pushed = await pushHandoff(git, lead.cwd, handoff, await gitMs(), { scan: scanText, depth: (await settings()).repoSearchDepth, prepared: preparedFor.get(handoff), takes: await takes(), ...(pushAnyway ? { pushAnyway } : {}) }).catch((err) => Promise.reject(told(err)));
-      return "held" in pushed ? pushed : pushed.repos;
-    },
-    take: (message) =>
-      takeHandoff(message, {
-        run: git,
-        io,
-        claudeDir,
-        machine: os.hostname(),
-        platform: process.platform,
-        env: process.env,
-        settings,
-        claude: () => claudeBinary(claudeDir, process.env, process.platform, os.homedir()),
-        claudeJson,
-        scan: scanText,
-        log,
-      }),
-  });
+  // One fork cap for the machine, whichever office asks.
+  const forks = createForkSlots();
+  const answering = offices.filter((o) => !o.plainRefused);
+  let send = (_index: number): Parameters<typeof createRunner>[0]["send"] => () => {};
 
-  let notWanted = false;
-  let unpaired = false;
-  let wake: () => void = () => {};
-  const link = createLink({
-    url: first.server,
-    emit,
-    pairing,
-    onMessage: (message) => runner.take(message),
-    onNotWanted: () => {
-      notWanted = true;
-      wake();
-    },
-    // A revoked or lapsed pairing ends the runner: its data layers pair the machine again.
-    onPairingEnded: () => {
-      unpaired = true;
-      wake();
-    },
-    hello: {
-      type: "runner",
-      v: PROTOCOL_VERSION,
+  // The runner answering what one office asks, for that office alone; it outlives its office's link.
+  const runnerFor = (office: Office, index: number) => {
+    const { server } = office;
+    const pairing = createPairing({
+      file: pairingPath(claudeDir),
+      lock: pairingLockPath(claudeDir, office),
+      writeLock: pairingWriteLockPath(claudeDir),
+      server,
       account,
-      machine: { name: os.hostname() },
-    },
-  });
-  send = (message) => link.send(message);
-  log(`the runner's worker ${process.pid} is answering for this machine through ${first.server}`);
+      machine: os.hostname(),
+      emit: emitFor(server),
+      allowPlainWs: first.allowPlainWs,
+      legacy: !!office.legacy,
+    });
+    // The repos the office takes (src/data-layer/approved.ts): the runner answers only for sessions in them.
+    const approved = createApproved({ server, file: approvedPath(claudeDir, server), pairing, refreshMs: first.approvedRefreshMinutes * 60000, maxAgeMs: first.approvedMaxAgeMinutes * 60000, log });
+    // The repos a handoff from the lead's folder may hand over: the office's alone (#91).
+    const takes = async () => {
+      await approved.refresh();
+      return takesFrom(homeIo, approved.repos());
+    };
+    const runner = createRunner({
+      answerer,
+      ledger,
+      forks,
+      settings,
+      prompts: () => loadPrompts(path.join(appDir, "prompts")),
+      scan: scanText,
+      send: (message) => send(index)(message),
+      log,
+      isDir: (p) => fs.stat(p).then((s) => s.isDirectory(), () => false),
+      // Only the rooms the data layer would report: inside the askable window, and not held off,
+      // which a detached data layer leaves when the server doesn't want the session's project (or git
+      // can't place its folder). That hold-off in isoplan/live/<id>.json is the only record of it.
+      // And only in a repo the office takes (#91), as the data layer would report it.
+      isReported: async (session, lead) => {
+        const id = forkableId(session);
+        const lock = id ? await readLock(lockPath(claudeDir, id)) : null;
+        if (!id || (lock && lock.pid === null && lock.until !== null && lock.until > Date.now())) return false;
+        if (Date.now() - lead.lastActive > askableMs(await config().catch(() => first))) return false;
+        await approved.refresh();
+        return (await approvedHome(lead.cwd, homeIo, approved.repos())) !== null;
+      },
+      // The handoff (#48): the brief names the untracked files, then the branch is pushed, both from
+      // the lead's folder, in the background, with no prompts and under gitTimeoutSeconds.
+      prepareBrief: async (lead, handoff) => {
+        const ready = await prepare(git, lead.cwd, await gitMs(), (await settings()).repoSearchDepth, undefined, await takes()).catch((err) => Promise.reject(told(err)));
+        // The repos the office doesn't take are named only here, never in the brief.
+        if (ready.notInOffice.length) log(`handoff ${handoff}: left out, not in the office: ${ready.notInOffice.join(", ")}`);
+        // The push hands over the repos the brief's note names (#56).
+        preparedFor.set(handoff, ready);
+        if (preparedFor.size > MAX_PREPARED) preparedFor.delete(preparedFor.keys().next().value!);
+        const { from, files, repos, left } = ready;
+        return { files, note: handoffNote({ branch: handoffBranch(handoff), from, files, at: new Date(), repos, left }) };
+      },
+      push: async (_session, lead, handoff, pushAnyway) => {
+        const pushed = await pushHandoff(git, lead.cwd, handoff, await gitMs(), { scan: scanText, depth: (await settings()).repoSearchDepth, prepared: preparedFor.get(handoff), takes: await takes(), ...(pushAnyway ? { pushAnyway } : {}) }).catch((err) => Promise.reject(told(err)));
+        return "held" in pushed ? pushed : pushed.repos;
+      },
+      // The session it opens asks the room in this office (handoff/taken-office.ts).
+      take: async (message) => {
+        const taken = await takeHandoff(message, {
+          run: git,
+          io,
+          claudeDir,
+          machine: os.hostname(),
+          platform: process.platform,
+          env: process.env,
+          settings,
+          claude: () => claudeBinary(claudeDir, process.env, process.platform, os.homedir()),
+          claudeJson,
+          scan: scanText,
+          log,
+        });
+        if (taken.session) await recordTakenOffice(claudeDir, taken.session, server).catch(() => {});
+        return taken;
+      },
+    });
+    return { pairing, runner };
+  };
+  const answerers = answering.map(runnerFor);
 
   // The supervisor holds stdin open; it closes when the supervisor has gone.
-  let orphaned = false;
-  const gone = new Promise<void>((resolve) => process.stdin.on("end", resolve).on("error", resolve).resume()).then(() => (orphaned = true));
-  for (;;) {
-    await Promise.race([new Promise<void>((r) => ((wake = r), setTimeout(r, CHECK_MS))), gone]);
-    if (orphaned || notWanted || unpaired) break;
-    if (!runner.idle()) continue;
-    const window = askableMs(await config().catch(() => first));
-    if (!(await anyRoomSince(io, path.join(claudeDir, "projects"), Date.now() - window))) break;
-  }
-  link.close();
-  return notWanted ? NOT_WANTED_CODE : unpaired ? UNPAIRED_CODE : 0;
+  const gone = new Promise<void>((resolve) => process.stdin.on("end", resolve).on("error", resolve).resume());
+  const links = answerOffices({
+    offices: answering,
+    name: (office) => office.server,
+    open: (office, said) => {
+      const { pairing, runner } = answerers[answering.indexOf(office)]!;
+      log(`the runner's worker ${process.pid} is answering for this machine through ${office.server}`);
+      return createLink({
+        url: office.server,
+        emit: emitFor(office.server),
+        pairing,
+        onMessage: (message) => runner.take(message),
+        onNotWanted: said.notWanted,
+        // A revoked or lapsed pairing closes this link: its data layers pair the machine again.
+        onPairingEnded: said.unpaired,
+        hello: {
+          type: "runner",
+          v: PROTOCOL_VERSION,
+          account,
+          machine: { name: os.hostname() },
+        },
+      });
+    },
+    paired: async (office) => !!pairingEntry(await readPairing(pairingPath(claudeDir)), office.server, account.id)?.credential,
+    idle: () => answerers.every((a) => a.runner.idle()),
+    lit: async () => anyRoomSince(io, path.join(claudeDir, "projects"), Date.now() - askableMs(await config().catch(() => first))),
+    gone,
+    log,
+    checkMs: CHECK_MS,
+    holdOffMs: HOLD_OFF_MS,
+  });
+  send = links.sender;
+  const ended = await links.ended;
+  return ended === "not-wanted" ? NOT_WANTED_CODE : ended === "unpaired" ? UNPAIRED_CODE : 0;
 }
 
 process.exitCode = await (process.argv.includes("--worker") ? worker() : supervisor());

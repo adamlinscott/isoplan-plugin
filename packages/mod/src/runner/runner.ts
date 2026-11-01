@@ -7,7 +7,8 @@
 //    note saying so. The server names the session, so this is what keeps it to this machine's rooms.
 // 3. Caps (caps.ts): over one, it is refused `over-cap` with the cap's name. One that passes
 //    reserves its estimate at once, so a request in another room counts it.
-// 4. The fork answers, at most `maxForks` at once across rooms; the rest wait their turn, and a
+// 4. The fork answers, at most `maxForks` at once across rooms, and across every office's runner on
+//    the machine when they share their ForkSlots (#105); the rest wait their turn, and a
 //    request's timeout runs from when its fork starts. The reservation is settled to what the fork
 //    used, or taken back when no fork could be started.
 // 5. The secret scan (scan.ts): a match is refused `withheld` and the reply is held; the owner's
@@ -79,7 +80,32 @@ export interface RunnerOptions {
   prepareBrief?: (lead: Lead, handoff: string) => Promise<{ files: string[] | null; note: string }>;
   /** Takes a handoff on this machine (#48); without it, handoffs are logged as not handled. */
   take?: (message: HandoffMessage) => Promise<TakenMessage>;
+  /** The fork slots, shared by every office's runner on the machine; without it, this runner's own. */
+  forks?: ForkSlots;
   now?: () => number;
+}
+
+/** The machine's fork slots: `take(max)` waits for one of `max`, and the function it returns gives it back. */
+export interface ForkSlots {
+  take(max: number): Promise<() => void>;
+  /** Forks running now. */
+  running(): number;
+}
+
+export function createForkSlots(): ForkSlots {
+  let forking = 0; // forks running now
+  const waiting: (() => void)[] = []; // requests waiting for a fork, in order
+  return {
+    async take(max) {
+      while (forking >= max) await new Promise<void>((resolve) => waiting.push(resolve));
+      forking++;
+      return () => {
+        forking--;
+        waiting.shift()?.();
+      };
+    },
+    running: () => forking,
+  };
 }
 
 export interface Runner {
@@ -107,7 +133,7 @@ const FAILED: Record<FailureKind, string> = {
 // Ids of replies dropped from the held set, remembered so a release for one says so.
 const REMEMBER_DROPPED = 200;
 
-export function createRunner({ answerer, ledger, settings, prompts, scan, send, log, isDir, isReported, push, prepareBrief, take, now = Date.now }: RunnerOptions): Runner {
+export function createRunner({ answerer, ledger, settings, prompts, scan, send, log, isDir, isReported, push, prepareBrief, take, forks = createForkSlots(), now = Date.now }: RunnerOptions): Runner {
   const rooms = new Map<string, Promise<void>>(); // each room's last queued request
   const running = new Set<string>(); // ids queued or running
   const finished = new Map<string, Outgoing>(); // id → what was last sent for it
@@ -117,18 +143,6 @@ export function createRunner({ answerer, ledger, settings, prompts, scan, send, 
   const taking = new Set<string>(); // handoffs being taken now
   const takes = new Set<string>(); // the takes run so far, by take id, oldest first
   const dropping = new Set<string>(); // requests dropped while they ran
-  let forking = 0; // forks running now
-  const waiting: (() => void)[] = []; // requests waiting for a fork, in order
-
-  // Waits for one of `max` fork slots; the returned function gives it back.
-  async function forkSlot(max: number): Promise<() => void> {
-    while (forking >= max) await new Promise<void>((resolve) => waiting.push(resolve));
-    forking++;
-    return () => {
-      forking--;
-      waiting.shift()?.();
-    };
-  }
 
   const unavailable = (id: string, detail: string): RefusalMessage => ({ type: "refusal", v: PROTOCOL_VERSION, id, reason: "unavailable", detail });
   const overCapRefusal = (id: string, cap: Cap): RefusalMessage => ({ type: "refusal", v: PROTOCOL_VERSION, id, reason: "over-cap", cap });
@@ -192,7 +206,7 @@ export function createRunner({ answerer, ledger, settings, prompts, scan, send, 
       const text = isBrief
         ? fill(p.brief, { to: request.to.name || request.to.id, untracked: untrackedLine(brief.files) })
         : fill(p.question, { from: request.from.name || request.from.id, question: request.question });
-      const free = await forkSlot(s.maxForks);
+      const free = await forks.take(s.maxForks);
       if (dropping.has(id)) {
         free();
         await reservation.cancel().catch((err: unknown) => log(`couldn't record ${id} in the ledger: ${(err as Error).message}`));

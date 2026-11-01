@@ -80,3 +80,14 @@ export async function askRoom(link: SideLink, question: string, s: AskSettings, 
 }
 
 const over = (m: AskedMessage) => m.state === "answered" || m.state === "dropped";
+
+/**
+ * The offices to ask in, in turn, until one's list takes the session's repo (#105): those that gave
+ * the session its rights (`granted`, by address), or every one with none named, in config.json's
+ * order, with the one the session took its handoff through (`taken`) first.
+ */
+export function askOffices<O extends { server: string }>(offices: readonly O[], granted: readonly string[], taken: string | null): O[] {
+  const named = granted.length ? offices.filter((o) => granted.includes(o.server)) : [...offices];
+  const first = named.find((o) => o.server === taken);
+  return first ? [first, ...named.filter((o) => o !== first)] : named;
+}

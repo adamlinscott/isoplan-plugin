@@ -12,7 +12,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { DataLayerLine } from "../lines.js";
-import { loadConfig } from "../data-layer/config.js";
+import { loadConfig, officesOf } from "../data-layer/config.js";
 import { createGit } from "../data-layer/git.js";
 import { claudePaths, projectOf } from "../data-layer/identity.js";
 import { nodeIo } from "../data-layer/io.js";
@@ -35,7 +35,7 @@ if (!where) {
 }
 const project = await projectOf(io.run, where, repo, machine);
 const config = await loadConfig(io, path.join(here, "..", "config.json"), path.join(claudeDir, "isoplan", "config.json"));
-console.log(`Sweeping ${project.name} (${project.id}) into ${config.server}`);
+console.log(`Sweeping ${project.name} (${project.id}) into ${officesOf(config).map((o) => o.server).join(", ")}`);
 
 const running = new Map<string, ChildProcess>();
 const seen = new Map<string, string | null>();

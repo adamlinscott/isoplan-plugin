@@ -14,6 +14,12 @@ import path from "node:path";
 
 export const lockPath = (claudeDir: string, sessionId: string) => path.join(claudeDir, "isoplan", "live", `${sessionId}.json`);
 
+/**
+ * The offices that didn't want a session, each until when (#105): the wake hook moves them here from
+ * a hold-off it ends, for the data layer it starts, which reads the file once and removes it.
+ */
+export const notWantedPath = (claudeDir: string, sessionId: string) => path.join(claudeDir, "isoplan", "live", `${sessionId}.not-wanted`);
+
 // How long a hold-off keeps the wake hook from starting another data layer.
 export const HOLD_OFF_MS = 3600000;
 
