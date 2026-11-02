@@ -35,7 +35,8 @@
 // is held for it goes, and one still running neither pushes nor sends. A handoff to take goes to
 // `take`, with how to open its session; each take (the session id the server chose) runs once, however
 // often it is sent, and what it did goes back as `taken`. owner-answer requests go to the live session, not
-// the runner (#50).
+// the runner (#50). A focus request (Focus this session, for a handoff this machine took into Orca)
+// goes to `focus`, and is answered with a focus reply, or refused `unavailable` saying why.
 
 import { PROTOCOL_VERSION, type HandoffMessage, type HandoffRepo, type RefusalMessage, type ReplyMessage, type RequestMessage, type TakenMessage } from "@isoplan/protocol";
 import type { ServerAsk } from "../data-layer/link.js";
@@ -80,6 +81,8 @@ export interface RunnerOptions {
   prepareBrief?: (lead: Lead, handoff: string) => Promise<{ files: string[] | null; note: string }>;
   /** Takes a handoff on this machine (#48); without it, handoffs are logged as not handled. */
   take?: (message: HandoffMessage) => Promise<TakenMessage>;
+  /** Brings a handoff's session to the front in Orca: null when it is, else why not. Without it, focus requests are refused. */
+  focus?: (handoff: string) => Promise<string | null>;
   /** The fork slots, shared by every office's runner on the machine; without it, this runner's own. */
   forks?: ForkSlots;
   now?: () => number;
@@ -133,7 +136,7 @@ const FAILED: Record<FailureKind, string> = {
 // Ids of replies dropped from the held set, remembered so a release for one says so.
 const REMEMBER_DROPPED = 200;
 
-export function createRunner({ answerer, ledger, settings, prompts, scan, send, log, isDir, isReported, push, prepareBrief, take, forks = createForkSlots(), now = Date.now }: RunnerOptions): Runner {
+export function createRunner({ answerer, ledger, settings, prompts, scan, send, log, isDir, isReported, push, prepareBrief, take, focus, forks = createForkSlots(), now = Date.now }: RunnerOptions): Runner {
   const rooms = new Map<string, Promise<void>>(); // each room's last queued request
   const running = new Set<string>(); // ids queued or running
   const finished = new Map<string, Outgoing>(); // id → what was last sent for it
@@ -323,6 +326,16 @@ export function createRunner({ answerer, ledger, settings, prompts, scan, send, 
       }
       if (message.kind === "owner-answer") {
         send(unavailable(message.id, "an owner's answer goes to the live session, not the runner"));
+        return;
+      }
+      if (message.kind === "focus") {
+        const { id, handoff } = message;
+        if (!focus) send(unavailable(id, "this plugin version can't bring a session to the front"));
+        else
+          void focus(handoff).then(
+            (problem) => send(problem ? unavailable(id, problem) : { type: "reply", v: PROTOCOL_VERSION, id, kind: "focus" }),
+            (err: unknown) => (log(`handoff ${handoff}: focusing it failed: ${(err as Error)?.stack ?? String(err)}`), send(unavailable(id, "the runner failed"))),
+          );
         return;
       }
       const request = message;

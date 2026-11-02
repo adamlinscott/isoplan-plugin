@@ -290,6 +290,18 @@ test("runner: a handoff to take goes to take once at a time, and what it did goe
   expect(t.sent).toEqual([{ type: "taken", v: PROTOCOL_VERSION, handoff: "h-1", session: "claude-code:new", failures: [] }]);
 });
 
+test("runner: a focus request goes to focus, and is answered with a focus reply, or refused saying why", async () => {
+  const t = await setup({ focus: async (handoff) => (handoff === "h-1" ? null : "Orca wasn't found on this machine") });
+  t.runner.take({ type: "request", v: PROTOCOL_VERSION, id: "f1", kind: "focus", handoff: "h-1" });
+  t.runner.take({ type: "request", v: PROTOCOL_VERSION, id: "f2", kind: "focus", handoff: "h-2" });
+  await t.sentN(2);
+  expect(t.sent).toEqual([
+    { type: "reply", v: PROTOCOL_VERSION, id: "f1", kind: "focus" },
+    { type: "refusal", v: PROTOCOL_VERSION, id: "f2", reason: "unavailable", detail: "Orca wasn't found on this machine" },
+  ]);
+  expect(t.asks).toEqual([]);
+});
+
 test("runner: without the handoff's push, a brief is refused before the fork runs", async () => {
   const t = await setup();
   t.runner.take(brief("b1"));

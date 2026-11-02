@@ -144,6 +144,8 @@ export const ReplyMessageSchema = z.discriminatedUnion("kind", [
   // it took the answer after this request was refused for taking too long, so this reply follows that
   // refusal, with the same id.
   z.object({ type: z.literal("reply"), v: Version, id: RequestId, kind: z.literal("owner-answer"), closed: z.literal(true).optional(), late: z.literal(true).optional() }),
+  // The handoff's session is in front in Orca now (protocol 0.3.8); one that couldn't be is refused `unavailable`.
+  z.object({ type: z.literal("reply"), v: Version, id: RequestId, kind: z.literal("focus") }),
 ]);
 
 /**
@@ -354,6 +356,15 @@ export const RequestMessageSchema = z.discriminatedUnion("kind", [
     session: z.string().min(1),
     question: z.string().min(1),
     answers: z.record(z.string(), z.string()),
+  }),
+  // The receiver clicked Focus this session on the floor (protocol 0.3.8): the runner of the machine
+  // that took this handoff into Orca brings its session to the front there.
+  z.object({
+    type: z.literal("request"),
+    v: Version,
+    id: RequestId,
+    kind: z.literal("focus"),
+    handoff: HandoffId,
   }),
 ]);
 
