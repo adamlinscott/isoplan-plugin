@@ -133,7 +133,7 @@ test("into Orca: the clone added to Orca, Orca's own worktree on the handoff's b
   expect(orca.calls()).toEqual([
     ["repo", "show", "--repo", `path:${t.receiver.clone}`],
     ["repo", "add", "--path", t.receiver.clone],
-    ["worktree", "create", "--repo", `path:${t.receiver.clone}`, "--name", "handoff-h2o", "--branch", "isoplan/handoff/h2o", "--base-branch", "origin/isoplan/handoff/h2o", "--no-parent", "--setup", "skip", "--comment", "Isoplan handoff h2o"],
+    ["worktree", "create", "--repo", `path:${t.receiver.clone}`, "--name", "handoff-h2o", "--branch", "isoplan/handoff/h2o", "--base-branch", "origin/isoplan/handoff/h2o", "--no-parent", "--setup", "skip", "--comment", "Isoplan handoff h2o", "--activate"],
     ["terminal", "create", "--worktree", `path:${dir}`, "--title", "Isoplan handoff h2o", "--command", `"${launcher}"`, "--shell", "cmd.exe", "--focus"],
   ]);
   expect(fs.readFileSync(launcher, "utf8")).toMatch(new RegExp(`"--session-id" "${SESSION}" "--name" "Isoplan handoff h2o"`));
