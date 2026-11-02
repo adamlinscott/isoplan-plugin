@@ -6865,6 +6865,7 @@ const exec = (file, args, env) => new Promise((resolve) => {
 [
 	"$ErrorActionPreference = 'Stop'",
 	"Add-Type -AssemblyName System.Windows.Forms, System.Drawing",
+	...[`Add-Type -Namespace IsoplanWin -Name User32 -MemberDefinition '[DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int c);'`, "$first = New-Object System.Windows.Forms.Form; [void][IsoplanWin.User32]::ShowWindow($first.Handle, 0); $first.Dispose()"],
 	"[System.Windows.Forms.Application]::EnableVisualStyles()",
 	"$f = New-Object System.Windows.Forms.Form",
 	"$f.Text = $env:ISOPLAN_DIALOG_TITLE",
