@@ -32,16 +32,19 @@ const paths = { claudeDir, settings: path.join(claudeDir, "settings.json"), plug
 // How long uninstall waits for the runner to exit before it removes its files.
 const RUNNER_EXIT_MS = 10000;
 const uninstall = process.argv.includes("--uninstall");
+// Where the operating system keeps the isoplan:// link handler (link-handler.ts), which runs this node.
+const linkHandler = { platform: process.platform, home: os.homedir(), dataHome: process.env.XDG_DATA_HOME, node: process.execPath };
 
 const start = (args: string[], cwd: string, env?: Record<string, string>) => spawn(process.execPath, args, { cwd, env, detached: true, stdio: "ignore", windowsHide: true }).on("error", () => {}).unref();
 
 try {
   const settle = () => settleMs(claudeDir, path.join(here, "..", "config.json"));
   const changes = uninstall
-    ? (await uninstallAll(paths, { optOut: true, settleMs: await settle(), runner: { commandOf: processCommand, waitMs: RUNNER_EXIT_MS } })).changes
+    ? (await uninstallAll(paths, { optOut: true, settleMs: await settle(), runner: { commandOf: processCommand, waitMs: RUNNER_EXIT_MS }, linkHandler })).changes
     : await installWake(paths, path.join(here, "data-layer.js"), path.join(here, "wake.js"), {
         runnerFrom: path.join(here, ".."),
         findClaude: () => findClaude(process.env, process.platform, os.homedir()),
+        linkHandler,
       });
   for (const change of changes) console.log(change);
   if (!changes.length) console.log(uninstall ? "Nothing of Isoplan's was installed; nothing to remove." : "The wake hook is already installed; nothing changed.");
