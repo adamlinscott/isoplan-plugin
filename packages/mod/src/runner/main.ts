@@ -52,6 +52,7 @@ import { claudeBinary } from "./claude-binary.js";
 import { anyRoomSince, askableMs, NOT_WANTED_CODE, supervise, UNPAIRED_CODE } from "./lifecycle.js";
 import { loadPrompts } from "./prompts.js";
 import { createRunGit, gitFailed, handoffBranch, handoffNote, HandoffGitError, prepare, pushHandoff, type Prepared } from "../handoff/git.js";
+import { focusHandoff } from "../handoff/focus.js";
 import { findOrca, orcaRunner } from "../handoff/orca.js";
 import { takeHandoff, type TakeSettings } from "../handoff/take.js";
 import { recordTakenOffice } from "../handoff/taken-office.js";
@@ -171,6 +172,10 @@ async function worker(): Promise<number> {
   // Orca's CLI, as the runner starts: the office offers a take into Orca only where it is.
   const orca = () => findOrca(process.env, process.platform, os.homedir());
   const hasOrca = (await orca()) !== null;
+  const takeOrca = async () => {
+    const bin = await orca();
+    return bin ? orcaRunner(bin, forkEnv(process.env)) : null;
+  };
   const homeIo = machineHomeIo(first.workspaceRepos);
   const ledger = await openLedger(path.join(isoplanDir, "runner", "ledger.json"));
   // What each brief's prepare found, by handoff, for its push and any push anyway after it.
@@ -253,14 +258,13 @@ async function worker(): Promise<number> {
           claudeJson,
           scan: scanText,
           log,
-          orca: async () => {
-            const bin = await orca();
-            return bin ? orcaRunner(bin, forkEnv(process.env)) : null;
-          },
+          orca: takeOrca,
         });
         if (taken.session) await recordTakenOffice(claudeDir, taken.session, server).catch(() => {});
         return taken;
       },
+      // Focus this session: the handoff's session, which a take into Orca opened, to the front in Orca.
+      focus: (handoff) => focusHandoff(handoff, { claudeDir, platform: process.platform, orca: takeOrca, log }),
     });
     return { pairing, runner };
   };

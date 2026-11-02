@@ -118,7 +118,7 @@ function intoOrca(t: Awaited<ReturnType<typeof handedOver>>, setup: Parameters<t
   return { orca, options: { ...t.options, orca: async () => orcaRunner(orca.bin, { ...process.env } as Record<string, string>) } };
 }
 
-test("into Orca: the clone added to Orca, Orca's own worktree on the handoff's branch, setup, then Claude Code in an Orca terminal in front, under the server's session id", async () => {
+test("into Orca: the clone added to Orca, Orca's own worktree on the handoff's branch, setup, then Claude Code in an Orca terminal, under the server's session id, with nothing brought to the front", async () => {
   const t = await handedOver("h2o", { command: "node -e \"require('fs').writeFileSync('setup-ran.txt', 'yes')\"" });
   const { orca, options } = intoOrca(t);
   const taken = await takeHandoff({ handoff: t.handoff, mode: "orca", session: SESSION }, options);
@@ -133,9 +133,11 @@ test("into Orca: the clone added to Orca, Orca's own worktree on the handoff's b
   expect(orca.calls()).toEqual([
     ["repo", "show", "--repo", `path:${t.receiver.clone}`],
     ["repo", "add", "--path", t.receiver.clone],
-    ["worktree", "create", "--repo", `path:${t.receiver.clone}`, "--name", "handoff-h2o", "--branch", "isoplan/handoff/h2o", "--base-branch", "origin/isoplan/handoff/h2o", "--no-parent", "--setup", "skip", "--comment", "Isoplan handoff h2o", "--activate"],
-    ["terminal", "create", "--worktree", `path:${dir}`, "--title", "Isoplan handoff h2o", "--command", `"${launcher}"`, "--shell", "cmd.exe", "--focus"],
+    ["worktree", "create", "--repo", `path:${t.receiver.clone}`, "--name", "handoff-h2o", "--branch", "isoplan/handoff/h2o", "--base-branch", "origin/isoplan/handoff/h2o", "--no-parent", "--setup", "skip", "--comment", "Isoplan handoff h2o"],
+    ["terminal", "create", "--worktree", `path:${dir}`, "--title", "Isoplan handoff h2o", "--command", `"${launcher}"`, "--shell", "cmd.exe"],
   ]);
+  // What Focus this session needs later: the terminal's handle and the worktree.
+  expect(JSON.parse(fs.readFileSync(path.join(t.claudeDir, "isoplan", "handoffs", "h2o", "orca.json"), "utf8"))).toMatchObject({ terminal: "term_1", worktree: dir });
   expect(fs.readFileSync(launcher, "utf8")).toMatch(new RegExp(`"--session-id" "${SESSION}" "--name" "Isoplan handoff h2o"`));
   expect(JSON.parse(fs.readFileSync(t.claudeJson, "utf8")).projects[trustKey(dir, "win32")]).toEqual({ hasTrustDialogAccepted: true });
   // No window of Isoplan's own, and no background session.

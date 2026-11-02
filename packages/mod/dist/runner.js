@@ -5967,6 +5967,12 @@ discriminatedUnion("type", [
 			kind: literal("owner-answer"),
 			closed: literal(true).optional(),
 			late: literal(true).optional()
+		}),
+		object({
+			type: literal("reply"),
+			v: Version,
+			id: RequestId,
+			kind: literal("focus")
 		})
 	]),
 	discriminatedUnion("reason", [
@@ -6113,6 +6119,13 @@ const RequestMessageSchema = discriminatedUnion("kind", [
 		session: string().min(1),
 		question: string().min(1),
 		answers: record(string(), string())
+	}),
+	object({
+		type: literal("request"),
+		v: Version,
+		id: RequestId,
+		kind: literal("focus"),
+		handoff: HandoffId
 	})
 ]);
 /**
@@ -10208,83 +10221,6 @@ async function commitIn(run, repo, id, index, timeoutMs, pushAnyway, scan) {
 	return ready(commit, held, binary.map(inFolder));
 }
 //#endregion
-//#region src/handoff/orca.ts
-const isFile = (p) => fs.stat(p).then((s) => s.isFile(), () => false);
-/**
-* Orca's CLI: PATH first, then where Orca's installer puts it (Windows: %LOCALAPPDATA%\Programs\orca,
-* a Mac: Orca.app in /Applications or ~/Applications). Null when none is found, and always on any
-* other platform.
-*/
-async function findOrca(env, platform, home, exists = isFile) {
-	if (platform !== "win32" && platform !== "darwin") return null;
-	const windows = platform === "win32";
-	const join = windows ? path.win32.join : path.posix.join;
-	const dirs = (Object.entries(env).find(([key]) => key.toUpperCase() === "PATH")?.[1] ?? "").split(windows ? ";" : ":").filter(Boolean);
-	const localAppData = Object.entries(env).find(([key]) => key.toUpperCase() === "LOCALAPPDATA")?.[1] ?? join(home, "AppData", "Local");
-	const candidates = windows ? [...dirs.map((d) => join(d, "orca.exe")), join(localAppData, "Programs", "orca", "resources", "bin", "orca.exe")] : [
-		...dirs.map((d) => join(d, "orca")),
-		"/Applications/Orca.app/Contents/Resources/bin/orca",
-		join(home, "Applications", "Orca.app", "Contents", "Resources", "bin", "orca")
-	];
-	for (const candidate of candidates) if (await exists(candidate)) return candidate;
-	return null;
-}
-/**
-* Runs the CLI at `bin` hidden, with no window of its own, and reads its JSON answer. A .js or .mjs
-* `bin` is run with node (a test's fake Orca).
-*/
-function orcaRunner(bin, env, timeoutMs = 6e4) {
-	const command = /\.m?js$/.test(bin) ? [process.execPath, bin] : [bin];
-	return (args) => new Promise((resolve) => {
-		let stdout = "";
-		let stderr = "";
-		const child = spawn(command[0], [
-			...command.slice(1),
-			...args,
-			"--json"
-		], {
-			env,
-			stdio: [
-				"ignore",
-				"pipe",
-				"pipe"
-			],
-			windowsHide: true
-		});
-		child.stdout.setEncoding("utf8").on("data", (piece) => stdout += piece);
-		child.stderr.setEncoding("utf8").on("data", (piece) => stderr = (stderr + piece).slice(-2e3));
-		const timer = setTimeout(() => killTree(child), timeoutMs);
-		child.on("error", (err) => (clearTimeout(timer), resolve({
-			ok: false,
-			error: err.message,
-			code: null
-		})));
-		child.on("close", (code) => {
-			clearTimeout(timer);
-			try {
-				const answer = JSON.parse(stdout);
-				if (answer.ok === true) return resolve({
-					ok: true,
-					result: answer.result ?? {}
-				});
-				const steps = Array.isArray(answer.error?.data?.nextSteps) ? ` ${answer.error.data.nextSteps.join(" ")}` : "";
-				const said = typeof answer.error?.code === "string" ? answer.error.code : null;
-				return resolve({
-					ok: false,
-					error: `${String(answer.error?.message ?? said ?? "it failed")}${steps}`,
-					code: said
-				});
-			} catch {
-				resolve({
-					ok: false,
-					error: (stderr || stdout).trim() || `orca exited with code ${code}`,
-					code: null
-				});
-			}
-		});
-	});
-}
-//#endregion
 //#region src/handoff/take.ts
 /** The repo's own labelled settings file, at its top. */
 const REPO_CONFIG = "isoplan.json";
@@ -10690,6 +10626,39 @@ async function recordTaken(folder, commit) {
 		commits
 	}, null, 2) + "\n");
 }
+/**
+* Orca's `terminal create` for the handoff's launcher `file` in `dir`, typed into the terminal's
+* shell: cmd.exe on Windows, asked for, and the login shell on a Mac. Only with `focus` does Orca's
+* view switch to it.
+*/
+function orcaTerminal(platform, dir, title, file, focus) {
+	const command = platform === "win32" ? `"${file.replace(/"/g, "")}"` : shQuote(file);
+	return [
+		"terminal",
+		"create",
+		"--worktree",
+		`path:${dir}`,
+		"--title",
+		title,
+		"--command",
+		command,
+		...platform === "win32" ? ["--shell", "cmd.exe"] : [],
+		...focus ? ["--focus"] : []
+	];
+}
+/** The handle Orca gave the terminal `terminal create` opened, or null when it gave none. */
+const terminalHandle = (result) => {
+	const handle = result.terminal?.handle;
+	return typeof handle === "string" && handle ? handle : null;
+};
+/** What a take into Orca leaves in the handoff's folder for Focus this session (focus.ts): its terminal's handle and its worktree. */
+async function recordOrca(folder, terminal, worktree) {
+	await fs.writeFile(path.join(folder, "orca.json"), JSON.stringify({
+		about: "The Orca terminal and worktree this handoff was opened in on this machine, for the floor's Focus this session.",
+		terminal,
+		worktree
+	}, null, 2) + "\n");
+}
 let emptyHooks = null;
 const noHooks = async () => ["-c", `core.hooksPath=${await (emptyHooks ??= fs.mkdtemp(path.join(os.tmpdir(), "isoplan-no-hooks-")))}`];
 /** Takes the handoff on this machine; never throws. */
@@ -10871,23 +10840,12 @@ async function takeHandoff(message, o) {
 				await fail("open", `The session couldn't be readied for Orca: ${err.message}. The worktree is ${dir}.`);
 				return done();
 			}
-			const command = o.platform === "win32" ? `"${l.file.replace(/"/g, "")}"` : shQuote(l.file);
-			const opened = await orca([
-				"terminal",
-				"create",
-				"--worktree",
-				`path:${dir}`,
-				"--title",
-				name,
-				"--command",
-				command,
-				...o.platform === "win32" ? ["--shell", "cmd.exe"] : [],
-				"--focus"
-			]);
+			const opened = await orca(orcaTerminal(o.platform, dir, name, l.file, false));
 			if (!opened.ok) {
 				await fail("open", `Orca couldn't open Claude Code in ${dir}: ${opened.error}`);
 				return done();
 			}
+			await recordOrca(folder, terminalHandle(opened.result), dir).catch((err) => o.log(`handoff ${handoff.id}: couldn't record its Orca terminal: ${err.message}`));
 			o.log(`handoff ${handoff.id}: opened Claude Code session ${id} in Orca, in ${dir}`);
 			return done(`claude-code:${id}`);
 		}
@@ -11244,8 +11202,7 @@ async function orcaWorktree(orca, run, clone, branch, id, exempt, timeoutMs) {
 			"--setup",
 			"skip",
 			"--comment",
-			`Isoplan handoff ${id}`,
-			"--activate"
+			`Isoplan handoff ${id}`
 		]);
 		if (!created.ok) return { error: `Orca couldn't make the handoff's worktree: ${created.error}` };
 		const made = created.result.worktree?.path;
@@ -11275,6 +11232,153 @@ async function orcaWorktree(orca, run, clone, branch, id, exempt, timeoutMs) {
 		`path:${dir}`
 	]);
 	return seen.ok ? dir : { error: `Orca doesn't see ${dir} as a worktree of ${clone.dir}: ${seen.error}` };
+}
+//#endregion
+//#region src/handoff/focus.ts
+async function readOrca(folder) {
+	try {
+		const { terminal, worktree } = JSON.parse(await fs.readFile(path.join(folder, "orca.json"), "utf8"));
+		return typeof worktree === "string" && worktree ? {
+			terminal: typeof terminal === "string" && terminal ? terminal : null,
+			worktree
+		} : null;
+	} catch {
+		return null;
+	}
+}
+/** Brings handoff `id`'s session to the front in Orca: null when it is, else why not, in a few words. Never throws. */
+async function focusHandoff(id, o) {
+	const failed = (what, answer) => {
+		o.log(`handoff ${id}: ${what}: ${answer.error}`);
+		return `${what} (${answer.code ?? "it failed"})`;
+	};
+	try {
+		const orca = await o.orca();
+		if (!orca) return "Orca wasn't found on this machine";
+		const folder = handoffDir(o.claudeDir, id);
+		const kept = await readOrca(folder);
+		if (!kept) return "this machine has no record of opening this handoff in Orca: take it into Orca again";
+		const keep = (terminal) => recordOrca(folder, terminal, kept.worktree).catch((err) => o.log(`handoff ${id}: couldn't record its Orca terminal: ${err.message}`));
+		if (kept.terminal) {
+			const switched = await orca([
+				"terminal",
+				"switch",
+				"--terminal",
+				kept.terminal
+			]);
+			if (switched.ok) return null;
+			o.log(`handoff ${id}: Orca couldn't switch to terminal ${kept.terminal}, so the worktree's terminals are looked for: ${switched.error}`);
+		}
+		const listed = await orca([
+			"terminal",
+			"list",
+			"--worktree",
+			`path:${kept.worktree}`
+		]);
+		if (!listed.ok) return failed("Orca couldn't list the handoff's terminals", listed);
+		const title = `Isoplan handoff ${id}`;
+		const live = (Array.isArray(listed.result.terminals) ? listed.result.terminals : []).filter((t) => typeof t?.handle === "string" && t.orphaned !== true);
+		const found = live.find((t) => t.title === title) ?? live[0];
+		if (found) {
+			const handle = found.handle;
+			const switched = await orca([
+				"terminal",
+				"switch",
+				"--terminal",
+				handle
+			]);
+			if (!switched.ok) return failed("Orca couldn't switch to the handoff's terminal", switched);
+			await keep(handle);
+			return null;
+		}
+		const launcher = path.join(folder, o.platform === "win32" ? "open.cmd" : "open.command");
+		if (!await fs.stat(launcher).then((s) => s.isFile(), () => false)) return "the handoff's launcher on this machine is gone, so no terminal was opened: take it into Orca again";
+		const opened = await orca(orcaTerminal(o.platform, kept.worktree, title, launcher, true));
+		if (!opened.ok) return failed("Orca couldn't open a terminal for the handoff", opened);
+		await keep(terminalHandle(opened.result));
+		o.log(`handoff ${id}: no terminal of it was open in Orca, so its launcher was opened again in ${kept.worktree}`);
+		return null;
+	} catch (err) {
+		o.log(`handoff ${id}: focusing it failed: ${err?.stack ?? String(err)}`);
+		return "the runner failed";
+	}
+}
+//#endregion
+//#region src/handoff/orca.ts
+const isFile = (p) => fs.stat(p).then((s) => s.isFile(), () => false);
+/**
+* Orca's CLI: PATH first, then where Orca's installer puts it (Windows: %LOCALAPPDATA%\Programs\orca,
+* a Mac: Orca.app in /Applications or ~/Applications). Null when none is found, and always on any
+* other platform.
+*/
+async function findOrca(env, platform, home, exists = isFile) {
+	if (platform !== "win32" && platform !== "darwin") return null;
+	const windows = platform === "win32";
+	const join = windows ? path.win32.join : path.posix.join;
+	const dirs = (Object.entries(env).find(([key]) => key.toUpperCase() === "PATH")?.[1] ?? "").split(windows ? ";" : ":").filter(Boolean);
+	const localAppData = Object.entries(env).find(([key]) => key.toUpperCase() === "LOCALAPPDATA")?.[1] ?? join(home, "AppData", "Local");
+	const candidates = windows ? [...dirs.map((d) => join(d, "orca.exe")), join(localAppData, "Programs", "orca", "resources", "bin", "orca.exe")] : [
+		...dirs.map((d) => join(d, "orca")),
+		"/Applications/Orca.app/Contents/Resources/bin/orca",
+		join(home, "Applications", "Orca.app", "Contents", "Resources", "bin", "orca")
+	];
+	for (const candidate of candidates) if (await exists(candidate)) return candidate;
+	return null;
+}
+/**
+* Runs the CLI at `bin` hidden, with no window of its own, and reads its JSON answer. A .js or .mjs
+* `bin` is run with node (a test's fake Orca).
+*/
+function orcaRunner(bin, env, timeoutMs = 6e4) {
+	const command = /\.m?js$/.test(bin) ? [process.execPath, bin] : [bin];
+	return (args) => new Promise((resolve) => {
+		let stdout = "";
+		let stderr = "";
+		const child = spawn(command[0], [
+			...command.slice(1),
+			...args,
+			"--json"
+		], {
+			env,
+			stdio: [
+				"ignore",
+				"pipe",
+				"pipe"
+			],
+			windowsHide: true
+		});
+		child.stdout.setEncoding("utf8").on("data", (piece) => stdout += piece);
+		child.stderr.setEncoding("utf8").on("data", (piece) => stderr = (stderr + piece).slice(-2e3));
+		const timer = setTimeout(() => killTree(child), timeoutMs);
+		child.on("error", (err) => (clearTimeout(timer), resolve({
+			ok: false,
+			error: err.message,
+			code: null
+		})));
+		child.on("close", (code) => {
+			clearTimeout(timer);
+			try {
+				const answer = JSON.parse(stdout);
+				if (answer.ok === true) return resolve({
+					ok: true,
+					result: answer.result ?? {}
+				});
+				const steps = Array.isArray(answer.error?.data?.nextSteps) ? ` ${answer.error.data.nextSteps.join(" ")}` : "";
+				const said = typeof answer.error?.code === "string" ? answer.error.code : null;
+				return resolve({
+					ok: false,
+					error: `${String(answer.error?.message ?? said ?? "it failed")}${steps}`,
+					code: said
+				});
+			} catch {
+				resolve({
+					ok: false,
+					error: (stderr || stdout).trim() || `orca exited with code ${code}`,
+					code: null
+				});
+			}
+		});
+	});
 }
 //#endregion
 //#region src/handoff/taken-office.ts
@@ -11383,7 +11487,7 @@ const FAILED = {
 	"not-set-up": "this machine can't run the fork; its owner can see why in the runner's log"
 };
 const REMEMBER_DROPPED = 200;
-function createRunner({ answerer, ledger, settings, prompts, scan, send, log, isDir, isReported, push, prepareBrief, take, forks = createForkSlots(), now = Date.now }) {
+function createRunner({ answerer, ledger, settings, prompts, scan, send, log, isDir, isReported, push, prepareBrief, take, focus, forks = createForkSlots(), now = Date.now }) {
 	const rooms = /* @__PURE__ */ new Map();
 	const running = /* @__PURE__ */ new Set();
 	const finished = /* @__PURE__ */ new Map();
@@ -11615,6 +11719,17 @@ function createRunner({ answerer, ledger, settings, prompts, scan, send, log, is
 				send(unavailable(message.id, "an owner's answer goes to the live session, not the runner"));
 				return;
 			}
+			if (message.kind === "focus") {
+				const { id, handoff } = message;
+				if (!focus) send(unavailable(id, "this plugin version can't bring a session to the front"));
+				else focus(handoff).then((problem) => send(problem ? unavailable(id, problem) : {
+					type: "reply",
+					v: 1,
+					id,
+					kind: "focus"
+				}), (err) => (log(`handoff ${handoff}: focusing it failed: ${err?.stack ?? String(err)}`), send(unavailable(id, "the runner failed"))));
+				return;
+			}
 			const request = message;
 			const { id, room } = request;
 			if (running.has(id)) return;
@@ -11828,6 +11943,10 @@ async function worker() {
 	};
 	const orca = () => findOrca(process.env, process.platform, os.homedir());
 	const hasOrca = await orca() !== null;
+	const takeOrca = async () => {
+		const bin = await orca();
+		return bin ? orcaRunner(bin, forkEnv(process.env)) : null;
+	};
 	const homeIo = machineHomeIo(first.workspaceRepos);
 	const ledger = await openLedger(path.join(isoplanDir, "runner", "ledger.json"));
 	const preparedFor = /* @__PURE__ */ new Map();
@@ -11920,14 +12039,17 @@ async function worker() {
 						claudeJson,
 						scan: scanText,
 						log,
-						orca: async () => {
-							const bin = await orca();
-							return bin ? orcaRunner(bin, forkEnv(process.env)) : null;
-						}
+						orca: takeOrca
 					});
 					if (taken.session) await recordTakenOffice(claudeDir, taken.session, server).catch(() => {});
 					return taken;
-				}
+				},
+				focus: (handoff) => focusHandoff(handoff, {
+					claudeDir,
+					platform: process.platform,
+					orca: takeOrca,
+					log
+				})
 			})
 		};
 	};

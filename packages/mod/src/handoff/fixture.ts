@@ -78,14 +78,15 @@ export function workspace(root: string, name: string, { parent = true, ignores =
  * A fake Orca CLI at <root>/fake-orca.mjs, run with node: it logs each command's arguments, keeps
  * its projects in a state file, makes a worktree in <root>/orca-workspaces with git as Orca would,
  * and answers as Orca's --json does. `fail` makes a command (such as "terminal create") answer an
- * error. Nothing it does opens a window.
+ * error. Its terminals, `terminals` and those it creates, are kept in the state file too, and
+ * switching to any other handle answers terminal_handle_stale. Nothing it does opens a window.
  */
-export function fakeOrca(root: string, { repos = [] as string[], fail = {} as Record<string, string> } = {}) {
+export function fakeOrca(root: string, { repos = [] as string[], fail = {} as Record<string, string>, terminals = [] as { handle: string; title: string; worktreePath: string }[] } = {}) {
   const bin = path.join(root, "fake-orca.mjs");
   const state = path.join(root, "fake-orca.json");
   const log = path.join(root, "fake-orca.log");
   const workspaces = path.join(root, "orca-workspaces");
-  fs.writeFileSync(state, JSON.stringify({ repos, fail, workspaces, log }));
+  fs.writeFileSync(state, JSON.stringify({ repos, fail, workspaces, log, terminals }));
   fs.writeFileSync(
     bin,
     `import fs from "node:fs";
@@ -116,7 +117,17 @@ if (command === "worktree create") {
   answer({ ok: true, result: { worktree: { path: dir.replace(/\\\\/g, "/"), branch: "refs/heads/" + flag("--branch") } } });
 }
 if (command === "worktree show") answer({ ok: true, result: { worktree: { path: flag("--worktree").slice("path:".length) } } });
-if (command === "terminal create") answer({ ok: true, result: { terminal: { handle: "term_1" } } });
+if (command === "terminal create") {
+  const terminal = { handle: "term_" + (state.terminals.length + 1), title: flag("--title"), worktreePath: flag("--worktree").slice("path:".length) };
+  state.terminals.push(terminal);
+  fs.writeFileSync(file, JSON.stringify(state));
+  answer({ ok: true, result: { terminal: { handle: terminal.handle } } });
+}
+if (command === "terminal list") answer({ ok: true, result: { terminals: state.terminals.filter((t) => key(t.worktreePath) === key(flag("--worktree").slice("path:".length))) } });
+if (command === "terminal switch") {
+  if (!state.terminals.some((t) => t.handle === flag("--terminal"))) answer({ ok: false, error: { code: "terminal_handle_stale", message: "terminal_handle_stale" } }, 1);
+  answer({ ok: true, result: { focus: { handle: flag("--terminal") } } });
+}
 answer({ ok: false, error: { code: "unknown_command", message: "unknown command " + command } }, 1);
 `,
   );

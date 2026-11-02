@@ -6482,6 +6482,12 @@ discriminatedUnion("type", [
 			kind: literal("owner-answer"),
 			closed: literal(true).optional(),
 			late: literal(true).optional()
+		}),
+		object({
+			type: literal("reply"),
+			v: Version,
+			id: RequestId,
+			kind: literal("focus")
 		})
 	]),
 	discriminatedUnion("reason", [
@@ -6628,6 +6634,13 @@ const RequestMessageSchema = discriminatedUnion("kind", [
 		session: string().min(1),
 		question: string().min(1),
 		answers: record(string(), string())
+	}),
+	object({
+		type: literal("request"),
+		v: Version,
+		id: RequestId,
+		kind: literal("focus"),
+		handoff: HandoffId
 	})
 ]);
 /**

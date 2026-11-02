@@ -49,7 +49,10 @@
 //      before, a local branch of the handoff's name, or a clone whose core.hooksPath is set (whose
 //      hooks could be the handoff branch's own, and Orca's checkout doesn't turn them off) gets the
 //      take's own worktree instead, which Orca finds by its path. The worktree is trusted as for
-//      headless, then `orca terminal create` opens a terminal in it, in front, that runs the launcher.
+//      headless, then `orca terminal create` opens a terminal in it that runs the launcher. Neither
+//      the worktree nor the terminal is brought to the front: Orca's view changes only when the
+//      receiver clicks Focus this session on the floor (focus.ts), which is why the terminal's handle
+//      and the worktree are kept in orca.json in the handoff's folder.
 //      Without Orca's CLI nothing is made, and the take says so; nor for a handoff of a plain folder
 //      above several repos, which Orca can't hold.
 //
@@ -432,6 +435,27 @@ async function recordTaken(folder: string, commit: string): Promise<void> {
   await fs.writeFile(path.join(folder, "taken.json"), JSON.stringify({ about: "The commits of this handoff taken on this machine, which a later take may replace.", commits }, null, 2) + "\n");
 }
 
+/**
+ * Orca's `terminal create` for the handoff's launcher `file` in `dir`, typed into the terminal's
+ * shell: cmd.exe on Windows, asked for, and the login shell on a Mac. Only with `focus` does Orca's
+ * view switch to it.
+ */
+export function orcaTerminal(platform: NodeJS.Platform, dir: string, title: string, file: string, focus: boolean): string[] {
+  const command = platform === "win32" ? `"${file.replace(/"/g, "")}"` : shQuote(file);
+  return ["terminal", "create", "--worktree", `path:${dir}`, "--title", title, "--command", command, ...(platform === "win32" ? ["--shell", "cmd.exe"] : []), ...(focus ? ["--focus"] : [])];
+}
+
+/** The handle Orca gave the terminal `terminal create` opened, or null when it gave none. */
+export const terminalHandle = (result: Record<string, unknown>) => {
+  const handle = (result.terminal as { handle?: unknown } | undefined)?.handle;
+  return typeof handle === "string" && handle ? handle : null;
+};
+
+/** What a take into Orca leaves in the handoff's folder for Focus this session (focus.ts): its terminal's handle and its worktree. */
+export async function recordOrca(folder: string, terminal: string | null, worktree: string): Promise<void> {
+  await fs.writeFile(path.join(folder, "orca.json"), JSON.stringify({ about: "The Orca terminal and worktree this handoff was opened in on this machine, for the floor's Focus this session.", terminal, worktree }, null, 2) + "\n");
+}
+
 // An empty folder as core.hooksPath, so no hook of the repo's runs while the handoff's branch is
 // checked out: they would be the sender's, from that branch.
 let emptyHooks: Promise<string> | null = null;
@@ -588,13 +612,12 @@ export async function takeHandoff(message: Pick<HandoffMessage, "handoff" | "mod
         await fail("open", `The session couldn't be readied for Orca: ${(err as Error).message}. The worktree is ${dir}.`);
         return done();
       }
-      // Typed into the terminal's shell: cmd.exe on Windows, asked for, and the login shell on a Mac.
-      const command = o.platform === "win32" ? `"${l.file.replace(/"/g, "")}"` : shQuote(l.file);
-      const opened = await orca(["terminal", "create", "--worktree", `path:${dir}`, "--title", name, "--command", command, ...(o.platform === "win32" ? ["--shell", "cmd.exe"] : []), "--focus"]);
+      const opened = await orca(orcaTerminal(o.platform, dir, name, l.file, false));
       if (!opened.ok) {
         await fail("open", `Orca couldn't open Claude Code in ${dir}: ${opened.error}`);
         return done();
       }
+      await recordOrca(folder, terminalHandle(opened.result), dir).catch((err: Error) => o.log(`handoff ${handoff.id}: couldn't record its Orca terminal: ${err.message}`));
       o.log(`handoff ${handoff.id}: opened Claude Code session ${id} in Orca, in ${dir}`);
       return done(`claude-code:${id}`);
     }
@@ -845,7 +868,7 @@ async function orcaWorktree(orca: RunOrca, run: RunGit, clone: { dir: string; re
   const local = (await git(["rev-parse", "--verify", "-q", `refs/heads/${branch}`])).code === 0;
   const hooks = (await git(["config", "--get", "core.hooksPath"])).code === 0;
   if (!existing && !local && !hooks) {
-    const created = await orca(["worktree", "create", "--repo", `path:${clone.dir}`, "--name", `handoff-${id}`, "--branch", branch, "--base-branch", `${clone.remote}/${branch}`, "--no-parent", "--setup", "skip", "--comment", `Isoplan handoff ${id}`, "--activate"]);
+    const created = await orca(["worktree", "create", "--repo", `path:${clone.dir}`, "--name", `handoff-${id}`, "--branch", branch, "--base-branch", `${clone.remote}/${branch}`, "--no-parent", "--setup", "skip", "--comment", `Isoplan handoff ${id}`]);
     if (!created.ok) return { error: `Orca couldn't make the handoff's worktree: ${created.error}` };
     const made = (created.result.worktree as { path?: unknown } | undefined)?.path;
     if (typeof made !== "string") return { error: "Orca made a worktree but didn't say where." };
