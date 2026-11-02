@@ -303,7 +303,7 @@ function statusText() {
 function officeText(line) {
 	const label = line.label ?? line.server;
 	switch (line.state) {
-		case "waiting": return `${label} not connected yet (nothing to report)`;
+		case "waiting": return `${label} ready`;
 		case "connecting": return `${label} connecting…`;
 		case "connected":
 			lastError = null;
