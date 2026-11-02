@@ -845,7 +845,7 @@ async function orcaWorktree(orca: RunOrca, run: RunGit, clone: { dir: string; re
   const local = (await git(["rev-parse", "--verify", "-q", `refs/heads/${branch}`])).code === 0;
   const hooks = (await git(["config", "--get", "core.hooksPath"])).code === 0;
   if (!existing && !local && !hooks) {
-    const created = await orca(["worktree", "create", "--repo", `path:${clone.dir}`, "--name", `handoff-${id}`, "--branch", branch, "--base-branch", `${clone.remote}/${branch}`, "--no-parent", "--setup", "skip", "--comment", `Isoplan handoff ${id}`]);
+    const created = await orca(["worktree", "create", "--repo", `path:${clone.dir}`, "--name", `handoff-${id}`, "--branch", branch, "--base-branch", `${clone.remote}/${branch}`, "--no-parent", "--setup", "skip", "--comment", `Isoplan handoff ${id}`, "--activate"]);
     if (!created.ok) return { error: `Orca couldn't make the handoff's worktree: ${created.error}` };
     const made = (created.result.worktree as { path?: unknown } | undefined)?.path;
     if (typeof made !== "string") return { error: "Orca made a worktree but didn't say where." };

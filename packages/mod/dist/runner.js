@@ -11244,7 +11244,8 @@ async function orcaWorktree(orca, run, clone, branch, id, exempt, timeoutMs) {
 			"--setup",
 			"skip",
 			"--comment",
-			`Isoplan handoff ${id}`
+			`Isoplan handoff ${id}`,
+			"--activate"
 		]);
 		if (!created.ok) return { error: `Orca couldn't make the handoff's worktree: ${created.error}` };
 		const made = created.result.worktree?.path;
