@@ -24,10 +24,19 @@ export const exec: Exec = (file, args, env) =>
 /** How long the question waits before it cancels itself. */
 export const ASK_SECONDS = 300;
 
+// PowerShell runs hidden (no console window), and Windows applies a hidden start to the first window
+// the process shows: the question itself would be invisible, and cancel itself unseen. A throwaway
+// window hidden first takes that, so the question shows.
+const WIN_FIRST_SHOW = [
+  `Add-Type -Namespace IsoplanWin -Name User32 -MemberDefinition '[DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int c);'`,
+  "$first = New-Object System.Windows.Forms.Form; [void][IsoplanWin.User32]::ShowWindow($first.Handle, 0); $first.Dispose()",
+];
+
 /** The Windows form: exits 0 for Connect, 2 for Cancel, Esc, closing it or the time running out, 1 when it couldn't be shown. */
 export const WIN_FORM = [
   "$ErrorActionPreference = 'Stop'",
   "Add-Type -AssemblyName System.Windows.Forms, System.Drawing",
+  ...WIN_FIRST_SHOW,
   "[System.Windows.Forms.Application]::EnableVisualStyles()",
   "$f = New-Object System.Windows.Forms.Form",
   "$f.Text = $env:ISOPLAN_DIALOG_TITLE",
@@ -46,7 +55,7 @@ export const WIN_FORM = [
   "if ($r -eq [System.Windows.Forms.DialogResult]::OK) { exit 0 } else { exit 2 }",
 ].join("\n");
 const WIN_TELL = (icon: string) =>
-  `$ErrorActionPreference = 'Stop'; Add-Type -AssemblyName System.Windows.Forms; [void][System.Windows.Forms.MessageBox]::Show($env:ISOPLAN_DIALOG_TEXT, $env:ISOPLAN_DIALOG_TITLE, 'OK', '${icon}', 'Button1', 'DefaultDesktopOnly')`;
+  `$ErrorActionPreference = 'Stop'; Add-Type -AssemblyName System.Windows.Forms; ${WIN_FIRST_SHOW.join("; ")}; [void][System.Windows.Forms.MessageBox]::Show($env:ISOPLAN_DIALOG_TEXT, $env:ISOPLAN_DIALOG_TITLE, 'OK', '${icon}', 'Button1', 'DefaultDesktopOnly')`;
 const MAC_ASK = [
   "on run argv",
   "try",

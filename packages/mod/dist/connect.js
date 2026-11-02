@@ -6664,10 +6664,12 @@ const exec = (file, args, env) => new Promise((resolve) => {
 		stdout
 	}));
 });
+const WIN_FIRST_SHOW = [`Add-Type -Namespace IsoplanWin -Name User32 -MemberDefinition '[DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int c);'`, "$first = New-Object System.Windows.Forms.Form; [void][IsoplanWin.User32]::ShowWindow($first.Handle, 0); $first.Dispose()"];
 /** The Windows form: exits 0 for Connect, 2 for Cancel, Esc, closing it or the time running out, 1 when it couldn't be shown. */
 const WIN_FORM = [
 	"$ErrorActionPreference = 'Stop'",
 	"Add-Type -AssemblyName System.Windows.Forms, System.Drawing",
+	...WIN_FIRST_SHOW,
 	"[System.Windows.Forms.Application]::EnableVisualStyles()",
 	"$f = New-Object System.Windows.Forms.Form",
 	"$f.Text = $env:ISOPLAN_DIALOG_TITLE",
@@ -6685,7 +6687,7 @@ const WIN_FORM = [
 	"$r = $f.ShowDialog(); $timer.Stop()",
 	"if ($r -eq [System.Windows.Forms.DialogResult]::OK) { exit 0 } else { exit 2 }"
 ].join("\n");
-const WIN_TELL = (icon) => `$ErrorActionPreference = 'Stop'; Add-Type -AssemblyName System.Windows.Forms; [void][System.Windows.Forms.MessageBox]::Show($env:ISOPLAN_DIALOG_TEXT, $env:ISOPLAN_DIALOG_TITLE, 'OK', '${icon}', 'Button1', 'DefaultDesktopOnly')`;
+const WIN_TELL = (icon) => `$ErrorActionPreference = 'Stop'; Add-Type -AssemblyName System.Windows.Forms; ${WIN_FIRST_SHOW.join("; ")}; [void][System.Windows.Forms.MessageBox]::Show($env:ISOPLAN_DIALOG_TEXT, $env:ISOPLAN_DIALOG_TITLE, 'OK', '${icon}', 'Button1', 'DefaultDesktopOnly')`;
 const MAC_ASK = [
 	"on run argv",
 	"try",
