@@ -28,6 +28,7 @@
 //   node <claude dir>/isoplan/wake.mjs --uninstall
 
 import { spawn } from "node:child_process";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { isUninstalling, processCommand, recordedState, runnerAppDir, settleMs, stopOurRunner, uninstallInBackground } from "../install/install.js";
@@ -69,7 +70,8 @@ const paths = { claudeDir, settings: path.join(claudeDir, "settings.json"), plug
 const start = (args: string[], cwd: string, env?: Record<string, string>) => spawn(process.execPath, args, { cwd, env, detached: true, stdio: "ignore", windowsHide: true }).on("error", () => {}).unref();
 if (process.argv.includes("--uninstall")) {
   const settle = await settleMs(claudeDir, path.join(runnerAppDir(claudeDir), "config.json"));
-  await uninstallInBackground(paths, { settleMs: settle, runner: { commandOf: processCommand, waitMs: RUNNER_EXIT_MS } }).catch(() => {});
+  const linkHandler = { platform: process.platform, home: os.homedir(), dataHome: process.env.XDG_DATA_HOME };
+  await uninstallInBackground(paths, { settleMs: settle, runner: { commandOf: processCommand, waitMs: RUNNER_EXIT_MS }, linkHandler }).catch(() => {});
   process.exit(0);
 }
 const input = await readStdin();

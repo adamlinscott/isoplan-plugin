@@ -6903,6 +6903,188 @@ async function stopRunner(claudeDir, { isAlive = alive, kill = (pid) => process.
 	return true;
 }
 //#endregion
+//#region src/connect/dialog.ts
+const exec = (file, args, env) => new Promise((resolve) => {
+	let stdout = "";
+	const child = spawn(file, args, {
+		windowsHide: true,
+		stdio: [
+			"ignore",
+			"pipe",
+			"ignore"
+		],
+		env: env ? {
+			...process.env,
+			...env
+		} : process.env
+	});
+	child.stdout.on("data", (chunk) => stdout += String(chunk));
+	child.on("error", () => resolve({
+		code: null,
+		stdout
+	}));
+	child.on("close", (code) => resolve({
+		code,
+		stdout
+	}));
+});
+//#endregion
+//#region src/install/link-handler.ts
+const KEY = "HKCU\\Software\\Classes\\isoplan";
+const COMMAND_KEY = `${KEY}\\shell\\open\\command`;
+const LSREGISTER = "/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister";
+const DESKTOP = "isoplan-connect.desktop";
+const macAppPath = (claudeDir) => path.join(claudeDir, "isoplan", "Isoplan Connect.app");
+const macMarker = (app) => path.join(app, "Contents", "Resources", "isoplan-handler.json");
+const desktopPath = (h) => path.join(h.dataHome || path.join(h.home, ".local", "share"), "applications", DESKTOP);
+/** The Windows open command: node and the handler, quoted, and the link. */
+const windowsCommand = (node, script) => `"${node}" "${script}" "%1"`;
+const regValue = (stdout) => /REG_SZ[ \t]+(.*?)\s*$/m.exec(stdout)?.[1] ?? null;
+const appleString = (text) => `"${text.replace(/\\/g, "\\\\").replace(/"/g, "\\\"")}"`;
+/** The macOS app's script: the link to node in the background, quoted by the shell's own rules. */
+const macScript = (node, script) => [
+	"on open location theURL",
+	`\tdo shell script "ISOPLAN_CONNECT_URL=" & quoted form of theURL & " " & quoted form of ${appleString(node)} & " " & quoted form of ${appleString(script)} & " >/dev/null 2>&1 &"`,
+	"end open location",
+	""
+].join("\n");
+const execArg = (value) => `"${value.replace(/(["`$\\])/g, "\\$1")}"`.replace(/\\/g, "\\\\");
+/** The Linux desktop entry. */
+const desktopEntry = (node, script) => [
+	"[Desktop Entry]",
+	"Type=Application",
+	"Name=Isoplan Connect",
+	`Exec=${execArg(node)} ${execArg(script)} %u`,
+	"NoDisplay=true",
+	"Terminal=false",
+	"MimeType=x-scheme-handler/isoplan;",
+	""
+].join("\n");
+/** Registers the handler when it isn't already, as wanted; says what it changed. */
+async function registerLinkHandler(given) {
+	const h = {
+		...given,
+		node: await fs.realpath(given.node).catch(() => given.node)
+	};
+	const run = h.run ?? exec;
+	const must = async (file, args) => {
+		const r = await run(file, args);
+		if (r.code !== 0) throw new Error(`${path.basename(file)} ${args[0] ?? ""} failed${r.code === null ? " to start" : ` (${r.code})`}`);
+	};
+	if (h.platform === "win32") {
+		const want = windowsCommand(h.node, h.script);
+		if (regValue((await run("reg", [
+			"query",
+			COMMAND_KEY,
+			"/ve"
+		])).stdout) === want) return [];
+		await must("reg", [
+			"add",
+			KEY,
+			"/ve",
+			"/d",
+			"URL:Isoplan",
+			"/f"
+		]);
+		await must("reg", [
+			"add",
+			KEY,
+			"/v",
+			"URL Protocol",
+			"/d",
+			"",
+			"/f"
+		]);
+		await must("reg", [
+			"add",
+			COMMAND_KEY,
+			"/ve",
+			"/d",
+			want,
+			"/f"
+		]);
+		return [`registered isoplan:// links to open ${h.script}`];
+	}
+	if (h.platform === "darwin") {
+		const app = macAppPath(h.claudeDir);
+		const marker = JSON.stringify({
+			node: h.node,
+			script: h.script
+		});
+		if (await fs.readFile(macMarker(app), "utf8").catch(() => null) === marker) return [];
+		const source = path.join(h.claudeDir, "isoplan", "connect.applescript");
+		await fs.rm(app, {
+			recursive: true,
+			force: true
+		});
+		await fs.mkdir(path.dirname(source), { recursive: true });
+		await fs.writeFile(source, macScript(h.node, h.script));
+		try {
+			await must("osacompile", [
+				"-o",
+				app,
+				source
+			]);
+		} finally {
+			await fs.rm(source, { force: true });
+		}
+		const plist = path.join(app, "Contents", "Info.plist");
+		await must("plutil", [
+			"-replace",
+			"CFBundleIdentifier",
+			"-string",
+			"dev.isoplan.connect",
+			plist
+		]);
+		await must("plutil", [
+			"-replace",
+			"CFBundleURLTypes",
+			"-json",
+			JSON.stringify([{
+				CFBundleURLName: "Isoplan link",
+				CFBundleURLSchemes: ["isoplan"]
+			}]),
+			plist
+		]);
+		await must("plutil", [
+			"-replace",
+			"LSUIElement",
+			"-bool",
+			"true",
+			plist
+		]);
+		await must("codesign", [
+			"--force",
+			"--deep",
+			"--sign",
+			"-",
+			app
+		]);
+		await fs.writeFile(macMarker(app), marker);
+		await must(LSREGISTER, ["-f", app]);
+		return [`registered isoplan:// links to open ${h.script}, through ${app}`];
+	}
+	if (h.platform === "linux") {
+		const file = desktopPath(h);
+		const want = desktopEntry(h.node, h.script);
+		if (await fs.readFile(file, "utf8").catch(() => null) === want && (await run("xdg-mime", [
+			"query",
+			"default",
+			"x-scheme-handler/isoplan"
+		])).stdout.trim() === DESKTOP) return [];
+		await fs.mkdir(path.dirname(file), { recursive: true });
+		await fs.writeFile(file, want);
+		await must("xdg-mime", [
+			"default",
+			DESKTOP,
+			"x-scheme-handler/isoplan"
+		]);
+		await run("update-desktop-database", [path.dirname(file)]);
+		return [`registered isoplan:// links to open ${h.script}, through ${file}`];
+	}
+	return [];
+}
+//#endregion
 //#region src/install/install.ts
 const WAKE_EVENTS = ["UserPromptSubmit", "Stop"];
 const TIMEOUT_SECONDS = 10;
@@ -6916,8 +7098,11 @@ const RUNNER_FILES = [
 	"prompts/instructions.md",
 	"prompts/question.md",
 	"prompts/brief.md",
+	"dist/connect.js",
 	"dist/runner.js"
 ];
+/** The link handler's copy, which the operating system runs for an isoplan:// link. */
+const connectScriptPath = (claudeDir) => path.join(runnerAppDir(claudeDir), copiedAs("dist/connect.js"));
 /** A file's name in the copy: the bundle is an ES module and no package.json beside the copy says so, so it is .mjs, as wake.mjs is. */
 const copiedAs = (file) => file.replace(/\.js$/, ".mjs");
 /** The uninstall's lock, which also holds off a retry once one has failed. */
@@ -6955,7 +7140,7 @@ const isWakeFor = (claudeDir) => {
 * script failing. An uninstall that failed, or whose process has gone, leaves its lock and log,
 * which go now, since the plugin is wanted after all.
 */
-async function installWake(paths, dataLayer, wakeSource, { auto = false, runnerFrom, findClaude, waitMs = INSTALL_WAIT_MS } = {}) {
+async function installWake(paths, dataLayer, wakeSource, { auto = false, runnerFrom, findClaude, waitMs = INSTALL_WAIT_MS, linkHandler } = {}) {
 	const { claudeDir, settings } = paths;
 	if (auto && await isOptedOut(claudeDir)) return finishOptOut(paths);
 	if (auto && await pluginState(paths, dataLayer) === "uninstalled") return [];
@@ -7024,6 +7209,11 @@ async function installWake(paths, dataLayer, wakeSource, { auto = false, runnerF
 		auto: true
 	}, null, 2) + "\n")) changes.push(`recorded the claude binary at ${claude}`);
 	for (const file of [uninstallLogPath(claudeDir), uninstallLockPath(claudeDir)]) if (await fs.rm(file).then(() => true, () => false)) changes.push(`removed ${file}, left by an uninstall that didn't finish`);
+	if (runnerFrom && linkHandler) changes.push(...await registerLinkHandler({
+		...linkHandler,
+		claudeDir,
+		script: connectScriptPath(claudeDir)
+	}).catch((err) => [`couldn't register isoplan:// links: ${String(err?.message ?? err)}`]));
 	if (done.length) await writeSettings(settings, current);
 	return [...changes, ...done];
 }
@@ -9342,6 +9532,23 @@ async function locked(file, writeLock, pid, isAlive, change) {
 	queues.set(file, next.catch(() => {}));
 	return next;
 }
+/** The machine's own id, made the first time it pairs and kept in pairing.json. */
+function machineIdOf(file, writeLock, pid = process.pid, isAlive = alive) {
+	return locked(file, writeLock, pid, isAlive, (all) => {
+		if (all.machine) return {
+			write: null,
+			result: all.machine
+		};
+		const made = randomBytes(16).toString("base64url");
+		return {
+			write: {
+				...all,
+				machine: made
+			},
+			result: made
+		};
+	});
+}
 const page = (worked, text) => `<!doctype html><meta charset="utf-8"><title>Isoplan: ${worked ? "paired" : "not paired"}</title><p style="font:16px system-ui;margin:3em auto;max-width:30em">${text}</p>`;
 const HTML = {
 	"content-type": "text/html; charset=utf-8",
@@ -9495,20 +9702,7 @@ function createPairing({ file, lock, writeLock, server, account, machine, emit, 
 			timers: [refresh]
 		};
 		try {
-			const machineId = await locked(file, writeLock, pid, isAlive, (all) => {
-				if (all.machine) return {
-					write: null,
-					result: all.machine
-				};
-				const made = randomBytes(16).toString("base64url");
-				return {
-					write: {
-						...all,
-						machine: made
-					},
-					result: made
-				};
-			});
+			const machineId = await machineIdOf(file, writeLock, pid, isAlive);
 			const answer = await post(httpUrl(server, "/pair"), {
 				account,
 				machine: {
@@ -10590,7 +10784,13 @@ async function main(argv) {
 	const installing = detached || outdated ? Promise.resolve([]) : installWake(paths, path.join(here, "data-layer.js"), path.join(here, "wake.js"), {
 		auto: true,
 		runnerFrom: path.join(here, ".."),
-		findClaude: () => findClaude(process.env, process.platform, os.homedir())
+		findClaude: () => findClaude(process.env, process.platform, os.homedir()),
+		linkHandler: {
+			platform: process.platform,
+			home: os.homedir(),
+			dataHome: process.env.XDG_DATA_HOME,
+			node: process.execPath
+		}
 	}).then((changes) => (changes.forEach((text) => emit({
 		type: "log",
 		text

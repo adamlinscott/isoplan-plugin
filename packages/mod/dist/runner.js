@@ -6618,6 +6618,23 @@ async function locked(file, writeLock, pid, isAlive, change) {
 	queues.set(file, next.catch(() => {}));
 	return next;
 }
+/** The machine's own id, made the first time it pairs and kept in pairing.json. */
+function machineIdOf(file, writeLock, pid = process.pid, isAlive = alive) {
+	return locked(file, writeLock, pid, isAlive, (all) => {
+		if (all.machine) return {
+			write: null,
+			result: all.machine
+		};
+		const made = randomBytes(16).toString("base64url");
+		return {
+			write: {
+				...all,
+				machine: made
+			},
+			result: made
+		};
+	});
+}
 const page = (worked, text) => `<!doctype html><meta charset="utf-8"><title>Isoplan: ${worked ? "paired" : "not paired"}</title><p style="font:16px system-ui;margin:3em auto;max-width:30em">${text}</p>`;
 const HTML = {
 	"content-type": "text/html; charset=utf-8",
@@ -6771,20 +6788,7 @@ function createPairing({ file, lock, writeLock, server, account, machine, emit, 
 			timers: [refresh]
 		};
 		try {
-			const machineId = await locked(file, writeLock, pid, isAlive, (all) => {
-				if (all.machine) return {
-					write: null,
-					result: all.machine
-				};
-				const made = randomBytes(16).toString("base64url");
-				return {
-					write: {
-						...all,
-						machine: made
-					},
-					result: made
-				};
-			});
+			const machineId = await machineIdOf(file, writeLock, pid, isAlive);
 			const answer = await post(httpUrl(server, "/pair"), {
 				account,
 				machine: {

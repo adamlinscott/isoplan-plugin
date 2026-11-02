@@ -36,6 +36,9 @@
 // <claude dir>/isoplan/pairing.write.lock, so one process never undoes what another has just
 // written. A server that signs nobody in never refuses, so nothing is paired. With no browser on the
 // machine (a headless box) there is no way to pair yet.
+//
+// The floor's Connect Claude Code pairs without the link (src/connect): its own credential is kept
+// here the same way (keepCredential), under the same machine id (machineIdOf) and locks.
 
 import { randomBytes, createHash } from "node:crypto";
 import fs from "node:fs/promises";
@@ -213,6 +216,30 @@ async function locked<T>(file: string, writeLock: string, pid: number, isAlive: 
   return next;
 }
 
+/** The machine's own id, made the first time it pairs and kept in pairing.json. */
+export function machineIdOf(file: string, writeLock: string, pid = process.pid, isAlive: (pid: number) => boolean = alive): Promise<string> {
+  return locked(file, writeLock, pid, isAlive, (all) => {
+    if (all.machine) return { write: null, result: all.machine };
+    const made = randomBytes(16).toString("base64url");
+    return { write: { ...all, machine: made }, result: made };
+  });
+}
+
+/**
+ * Keeps `credential` as the account's for `server`, got some other way than this file's callback
+ * (src/connect): it replaces the entry's credential, and the token and any link waiting go with the
+ * old one, since the server ended that pairing when it made this one.
+ */
+export function keepCredential(
+  { file, writeLock, server, account, legacy = false, pid = process.pid, isAlive = alive }: Pick<PairingOptions, "file" | "writeLock" | "server" | "legacy" | "pid" | "isAlive"> & { account: string },
+  credential: string,
+): Promise<void> {
+  return locked(file, writeLock, pid, isAlive, (all) => {
+    const { token: _, tokenExpires: __, waiting: ___, ...rest } = pairingEntry(all, server, account) ?? { server };
+    return { write: withPairingEntry(all, server, account, { ...rest, credential }, legacy), result: undefined };
+  });
+}
+
 const page = (worked: boolean, text: string) =>
   `<!doctype html><meta charset="utf-8"><title>Isoplan: ${worked ? "paired" : "not paired"}</title><p style="font:16px system-ui;margin:3em auto;max-width:30em">${text}</p>`;
 // Each answer closes its connection, so once the callback stops listening nothing reaches it.
@@ -350,12 +377,7 @@ export function createPairing({
     refresh.unref();
     callback = { server: listener, timers: [refresh] };
     try {
-      // The machine's own id, made the first time it pairs and kept.
-      const machineId = await locked(file, writeLock, pid, isAlive, (all) => {
-        if (all.machine) return { write: null, result: all.machine };
-        const made = randomBytes(16).toString("base64url");
-        return { write: { ...all, machine: made }, result: made };
-      });
+      const machineId = await machineIdOf(file, writeLock, pid, isAlive);
       const answer = await post(httpUrl(server, "/pair"), { account, machine: { name: machine, id: machineId }, callback: `http://127.0.0.1:${port}/${nonce}`, challenge });
       if (answer.status !== 200 || typeof answer.body.url !== "string") {
         throw new Error(`the office server answered ${answer.status} when asked to pair${answer.body.error ? `: ${String(answer.body.error)}` : ""}`);

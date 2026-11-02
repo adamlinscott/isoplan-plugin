@@ -1,4 +1,5 @@
 import { execFile, spawn, spawnSync } from "node:child_process";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import fs from "node:fs/promises";
@@ -642,10 +643,85 @@ async function stopRunner(claudeDir, { isAlive = alive, kill = (pid) => process.
 	return true;
 }
 //#endregion
+//#region src/connect/dialog.ts
+const exec = (file, args, env) => new Promise((resolve) => {
+	let stdout = "";
+	const child = spawn(file, args, {
+		windowsHide: true,
+		stdio: [
+			"ignore",
+			"pipe",
+			"ignore"
+		],
+		env: env ? {
+			...process.env,
+			...env
+		} : process.env
+	});
+	child.stdout.on("data", (chunk) => stdout += String(chunk));
+	child.on("error", () => resolve({
+		code: null,
+		stdout
+	}));
+	child.on("close", (code) => resolve({
+		code,
+		stdout
+	}));
+});
+//#endregion
+//#region src/install/link-handler.ts
+const KEY = "HKCU\\Software\\Classes\\isoplan";
+const COMMAND_KEY = `${KEY}\\shell\\open\\command`;
+const LSREGISTER = "/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister";
+const DESKTOP = "isoplan-connect.desktop";
+const macAppPath = (claudeDir) => path.join(claudeDir, "isoplan", "Isoplan Connect.app");
+const desktopPath = (h) => path.join(h.dataHome || path.join(h.home, ".local", "share"), "applications", DESKTOP);
+const regValue = (stdout) => /REG_SZ[ \t]+(.*?)\s*$/m.exec(stdout)?.[1] ?? null;
+const norm = (p) => p.replace(/\\/g, "/").toLowerCase();
+const execArg = (value) => `"${value.replace(/(["`$\\])/g, "\\$1")}"`.replace(/\\/g, "\\\\");
+/** Takes the handler out when it is this config folder's; says what it changed. */
+async function unregisterLinkHandler(h) {
+	const run = h.run ?? exec;
+	if (h.platform === "win32") {
+		const value = regValue((await run("reg", [
+			"query",
+			COMMAND_KEY,
+			"/ve"
+		])).stdout);
+		if (!value || !norm(value).includes(norm(h.script))) return [];
+		await run("reg", [
+			"delete",
+			KEY,
+			"/f"
+		]);
+		return ["removed the isoplan:// link handler"];
+	}
+	if (h.platform === "darwin") {
+		const app = macAppPath(h.claudeDir);
+		if (!await fs.stat(app).catch(() => null)) return [];
+		await run(LSREGISTER, ["-u", app]);
+		await fs.rm(app, {
+			recursive: true,
+			force: true
+		});
+		return [`removed the isoplan:// link handler, ${app}`];
+	}
+	if (h.platform === "linux") {
+		const file = desktopPath(h);
+		if (!(await fs.readFile(file, "utf8").catch(() => "")).includes(execArg(h.script))) return [];
+		await fs.rm(file, { force: true });
+		await run("update-desktop-database", [path.dirname(file)]);
+		return [`removed the isoplan:// link handler, ${file}`];
+	}
+	return [];
+}
+//#endregion
 //#region src/install/install.ts
 const wakeScriptPath = (claudeDir) => path.join(claudeDir, "isoplan", "wake.mjs");
 /** Where install copies the runner and the defaults it reads, under the plugin's own layout. */
 const runnerAppDir = (claudeDir) => path.join(claudeDir, "isoplan", "runner", "app");
+/** The link handler's copy, which the operating system runs for an isoplan:// link. */
+const connectScriptPath = (claudeDir) => path.join(runnerAppDir(claudeDir), copiedAs("dist/connect.js"));
 /** A file's name in the copy: the bundle is an ES module and no package.json beside the copy says so, so it is .mjs, as wake.mjs is. */
 const copiedAs = (file) => file.replace(/\.js$/, ".mjs");
 /** The uninstall's lock, which also holds off a retry once one has failed. */
@@ -717,7 +793,7 @@ const SESSION_TRACES = [
 * person writes, is kept, and the folder goes once it is empty. Throws when settings.json can't be
 * merged, with the hooks and wake.mjs still in place and settings.json not written.
 */
-async function uninstall(paths, { optOut = false, settleMs = 0, confirm, runner = {} } = {}) {
+async function uninstall(paths, { optOut = false, settleMs = 0, confirm, runner = {}, linkHandler } = {}) {
 	const changes = [];
 	const dir = path.dirname(wakeScriptPath(paths.claudeDir));
 	const remove = async (file) => {
@@ -739,6 +815,14 @@ async function uninstall(paths, { optOut = false, settleMs = 0, confirm, runner 
 	if (await stopOurRunner(paths.claudeDir, runner)) changes.push("stopped the runner, which answered for this machine's rooms");
 	const autoUpdate = await takeOutAutoUpdate(paths);
 	if (autoUpdate) changes.push(autoUpdate);
+	if (linkHandler) {
+		const unregistered = unregisterLinkHandler({
+			...linkHandler,
+			claudeDir: paths.claudeDir,
+			script: connectScriptPath(paths.claudeDir)
+		});
+		changes.push(...await unregistered.catch((err) => [`couldn't take out the isoplan:// link handler: ${String(err?.message ?? err)}`]));
+	}
 	await remove(path.join(dir, "live"));
 	if (settleMs) await new Promise((r) => setTimeout(r, settleMs));
 	for (const name of WRITTEN) {
@@ -798,7 +882,7 @@ const UNINSTALL_RETRY_MS = 864e5;
 * uninstalled `recheckMs` after the reading that started it, so a record rewritten during an
 * update never counts.
 */
-async function uninstallInBackground(paths, { settleMs = 0, runner = {}, now = Date.now, recheckMs = UNINSTALL_RECHECK_MS } = {}) {
+async function uninstallInBackground(paths, { settleMs = 0, runner = {}, linkHandler, now = Date.now, recheckMs = UNINSTALL_RECHECK_MS } = {}) {
 	const lock = uninstallLockPath(paths.claudeDir);
 	if (!await takeLock(lock, process.pid, alive, false, now())) return;
 	await new Promise((r) => setTimeout(r, recheckMs));
@@ -808,6 +892,7 @@ async function uninstallInBackground(paths, { settleMs = 0, runner = {}, now = D
 		const { changes, isDone } = await uninstall(paths, {
 			settleMs,
 			runner,
+			linkHandler,
 			confirm: async () => await recordedState(paths) === "uninstalled"
 		});
 		if (isDone) return;
@@ -1016,12 +1101,19 @@ const start = (args, cwd, env) => spawn(process.execPath, args, {
 	windowsHide: true
 }).on("error", () => {}).unref();
 if (process.argv.includes("--uninstall")) {
+	const settle = await settleMs(claudeDir, path.join(runnerAppDir(claudeDir), "config.json"));
+	const linkHandler = {
+		platform: process.platform,
+		home: os.homedir(),
+		dataHome: process.env.XDG_DATA_HOME
+	};
 	await uninstallInBackground(paths, {
-		settleMs: await settleMs(claudeDir, path.join(runnerAppDir(claudeDir), "config.json")),
+		settleMs: settle,
 		runner: {
 			commandOf: processCommand,
 			waitMs: RUNNER_EXIT_MS
-		}
+		},
+		linkHandler
 	}).catch(() => {});
 	process.exit(0);
 }
