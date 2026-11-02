@@ -117,9 +117,9 @@ test("hooks: the status line names each office by its label, leaving out one tha
   ]);
   await stopped(h);
   expect(h.status.slice(0, -1)).toEqual([
-    "Isoplan: internal not connected yet (nothing to report)",
-    "Isoplan: internal not connected yet (nothing to report) · dev not connected yet (nothing to report)",
-    "Isoplan: internal ✓ · dev not connected yet (nothing to report)",
+    "Isoplan: internal ready",
+    "Isoplan: internal ready · dev ready",
+    "Isoplan: internal ✓ · dev ready",
     "Isoplan: internal ✓ · dev ✓",
     "Isoplan: internal can't be reached; retrying in 3s · dev ✓",
     "Isoplan: dev ✓",
