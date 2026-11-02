@@ -29,10 +29,15 @@ test("anything else is refused: another scheme, plain http to another machine, a
     link("https://office.team.com", "Team", "A".repeat(42) + "/"),
     link("https://office.team.com", ""),
     link("https://office.team.com", "x".repeat(81)),
-    link("https://office.team.com", "Team‮evil"),
+    link("https://office.team.com", "‮‍"),
     link("https://office.team.com", "Team\nYes"),
   ];
   for (const text of refused) expect(typeof parseLink(text), text).toBe("string");
+});
+
+test("a name's invisible formatting is taken out, not refused: bidi overrides go, and an emoji name still works", () => {
+  expect(parseLink(link("https://office.team.com", "Team‮live‬"))).toMatchObject({ name: "Teamlive" });
+  expect(parseLink(link("https://office.team.com", "\u{1F468}‍\u{1F4BB} Devs"))).toMatchObject({ name: "\u{1F468}\u{1F4BB} Devs" });
 });
 
 const config = (over: Partial<Config> = {}) => ({ server: "ws://127.0.0.1:4747/data-layer", servers: [], allowPlainWs: false, ...over }) as Config;
@@ -47,7 +52,7 @@ test("config.json: the office is added to servers, after what is there, under it
   expect(withOffice({}, config(), { ...team, server: "ws://127.0.0.1:4747/data-layer" })).toBeNull();
 });
 
-test("config.json: with only `server`, that office goes into servers first so it is still reported to; a label already taken gets -2", () => {
+test("config.json: with only a `server` of the person's own, that office goes into servers first so it is still reported to; a label already taken gets -2", () => {
   const user = { server: "wss://old.team.com/data-layer" };
   expect(withOffice(user, config({ server: user.server }), { ...team, name: "old.team.com" })).toEqual({
     server: user.server,
@@ -56,8 +61,9 @@ test("config.json: with only `server`, that office goes into servers first so it
       { label: "old-team-com", server: team.server },
     ],
   });
-  // No config.json: the plugin's default office stays.
-  expect(withOffice({}, config(), team)).toEqual({ servers: [{ label: "127.0.0.1:4747", server: "ws://127.0.0.1:4747/data-layer" }, { label: "team-office", server: team.server }] });
+  // No server of the person's own: the plugin's default office isn't kept, only the one asked for.
+  expect(withOffice({}, config(), team)).toEqual({ servers: [{ label: "team-office", server: team.server }] });
+  expect(withOffice({ streamSeconds: 2 }, config(), team)).toEqual({ streamSeconds: 2, servers: [{ label: "team-office", server: team.server }] });
   const taken = [{ label: "team-office", server: "wss://a.example/data-layer" }];
   expect((withOffice({ servers: taken }, config({ servers: taken }), team)!.servers as unknown[]).at(-1)).toEqual({ label: "team-office-2", server: team.server });
   // A name with nothing to make a label of is labelled by its host.

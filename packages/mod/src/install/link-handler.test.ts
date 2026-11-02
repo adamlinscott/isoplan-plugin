@@ -33,10 +33,33 @@ test("Windows: the isoplan URL protocol goes under HKCU, running node on the han
     ["reg", "add", "HKCU\\Software\\Classes\\isoplan", "/v", "URL Protocol", "/d", "", "/f"],
     ["reg", "add", "HKCU\\Software\\Classes\\isoplan\\shell\\open\\command", "/ve", "/d", `"${NODE}" "${SCRIPT}" "%1"`, "/f"],
   ]);
-  // Already as wanted: only looked at.
-  const again = fakeOs(() => queried(windowsCommand(NODE, SCRIPT)));
-  expect(await registerLinkHandler({ ...h, run: again.run })).toEqual([]);
-  expect(again.calls).toHaveLength(1);
+});
+
+/** A node and a handler that exist, in a temp folder. */
+function realFiles() {
+  const root = tempRoot();
+  const node = path.join(root, "node.exe");
+  const script = path.join(root, "connect.mjs");
+  fs.writeFileSync(node, "");
+  fs.writeFileSync(script, "");
+  return { node, script };
+}
+
+test("Windows: a registration whose node and handler exist is left alone, even naming another node; one naming a path that has gone is redone", async () => {
+  const claudeDir = path.join(tempRoot(), ".claude");
+  const there = realFiles();
+  const h = { platform: "win32" as const, claudeDir, home: "C:\\Users\\ada", node: NODE, script: SCRIPT };
+  const working = fakeOs(() => queried(windowsCommand(there.node, there.script)));
+  expect(await registerLinkHandler({ ...h, run: working.run })).toEqual([]);
+  expect(working.calls).toHaveLength(1);
+  const broken = fakeOs((_, args) => (args[0] === "query" ? queried(windowsCommand(there.node, path.join(path.dirname(there.script), "gone.mjs"))) : { code: 0 }));
+  expect(await registerLinkHandler({ ...h, run: broken.run })).toHaveLength(1);
+  expect(broken.calls).toHaveLength(4);
+  // Another install registering at the same moment leaves it to that one.
+  fs.writeFileSync(path.join(claudeDir, "isoplan", "link-handler.lock"), JSON.stringify({ pid: process.ppid }));
+  const held = fakeOs(() => ({ code: 1 }));
+  expect(await registerLinkHandler({ ...h, run: held.run })).toEqual([]);
+  expect(held.calls).toEqual([]);
 });
 
 test("Windows: uninstall takes the protocol out only when it runs this config folder's handler", async () => {
@@ -62,10 +85,10 @@ test("macOS: an AppleScript app claims the isoplan scheme, is signed again and r
     }
     return { code: 0 };
   });
-  const h = { platform: "darwin" as const, claudeDir, home: "/Users/ada", node: "/opt/homebrew/bin/node", script: "/Users/ada/.claude/isoplan/runner/app/dist/connect.mjs", run: os.run };
+  const h = { platform: "darwin" as const, claudeDir, home: "/Users/ada", ...realFiles(), run: os.run };
   expect(await registerLinkHandler(h)).toHaveLength(1);
-  expect(source).toBe(macScript(h.node, h.script));
-  expect(source).toContain('do shell script "ISOPLAN_CONNECT_URL=" & quoted form of theURL & " " & quoted form of "/opt/homebrew/bin/node"');
+  expect(source).toBe(macScript(fs.realpathSync(h.node), h.script));
+  expect(macScript("/opt/homebrew/bin/node", "/x/connect.mjs")).toContain('do shell script "ISOPLAN_CONNECT_URL=" & quoted form of theURL & " " & quoted form of "/opt/homebrew/bin/node"');
   const plist = path.join(app, "Contents", "Info.plist");
   expect(os.calls.map((c) => c.slice(0, 2))).toEqual([
     ["osacompile", "-o"],
@@ -77,9 +100,9 @@ test("macOS: an AppleScript app claims the isoplan scheme, is signed again and r
   ]);
   expect(os.calls[2]).toEqual(["plutil", "-replace", "CFBundleURLTypes", "-json", '[{"CFBundleURLName":"Isoplan link","CFBundleURLSchemes":["isoplan"]}]', plist]);
   expect(os.calls).toHaveLength(6);
-  // The source it compiled is gone, and a second install leaves the app alone.
+  // The source it compiled is gone, and a second install, even with another node, leaves the working app alone.
   expect(fs.readdirSync(path.join(claudeDir, "isoplan"))).toEqual(["Isoplan Connect.app"]);
-  expect(await registerLinkHandler(h)).toEqual([]);
+  expect(await registerLinkHandler({ ...h, node: realFiles().node })).toEqual([]);
   expect(os.calls).toHaveLength(6);
 
   expect(await unregisterLinkHandler(h)).toHaveLength(1);
@@ -90,11 +113,11 @@ test("macOS: an AppleScript app claims the isoplan scheme, is signed again and r
 test("Linux: a desktop entry for x-scheme-handler/isoplan, made the default with xdg-mime; uninstall removes it", async () => {
   const root = tempRoot();
   const os = fakeOs();
-  const h = { platform: "linux" as const, claudeDir: path.join(root, ".claude"), home: root, node: "/usr/bin/node", script: "/home/ada/.claude/isoplan/runner/app/dist/connect.mjs", run: os.run };
+  const h = { platform: "linux" as const, claudeDir: path.join(root, ".claude"), home: root, ...realFiles(), run: os.run };
   const file = path.join(root, ".local", "share", "applications", "isoplan-connect.desktop");
   expect(await registerLinkHandler(h)).toHaveLength(1);
-  expect(fs.readFileSync(file, "utf8")).toBe(desktopEntry(h.node, h.script));
-  expect(desktopEntry(h.node, h.script)).toContain(`Exec="/usr/bin/node" "${h.script}" %u\nNoDisplay=true\nTerminal=false\nMimeType=x-scheme-handler/isoplan;`);
+  expect(fs.readFileSync(file, "utf8")).toBe(desktopEntry(fs.realpathSync(h.node), h.script));
+  expect(desktopEntry("/usr/bin/node", "/x/connect.mjs")).toContain(`Exec="/usr/bin/node" "/x/connect.mjs" %u\nNoDisplay=true\nTerminal=false\nMimeType=x-scheme-handler/isoplan;`);
   expect(os.calls).toContainEqual(["xdg-mime", "default", "isoplan-connect.desktop", "x-scheme-handler/isoplan"]);
   expect(await unregisterLinkHandler(h)).toHaveLength(1);
   expect(fs.existsSync(file)).toBe(false);

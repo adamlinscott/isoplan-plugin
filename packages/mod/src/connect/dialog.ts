@@ -1,9 +1,11 @@
 // The connect handler's dialogs on this computer: the one window Isoplan opens without being asked
 // from a terminal, and only because the person just pressed Connect Claude Code. A question with
-// Yes and No (No first, so Enter refuses), and a notice with OK. On Windows a WinForms message box
-// from a hidden PowerShell, on top; on a Mac osascript's `display dialog`; on Linux zenity, or
-// kdialog. The text goes in through the environment or argv, never into the script, so nothing in
-// an office's name can run as code.
+// Connect and Cancel, where Cancel is the default and no key but a click on Connect, or Tab to it
+// and Enter, connects; it cancels itself after five minutes. And a notice with OK. On Windows a
+// small WinForms form from a hidden PowerShell, on top (a message box's Yes takes the Y key); on a
+// Mac osascript's `display dialog`; on Linux zenity, with markup off. kdialog would read the text as
+// rich text, so without zenity Linux has no confirmation, and nothing connects. The text goes in
+// through the environment or argv, never into the script, so nothing an office says can run.
 
 import { spawn } from "node:child_process";
 
@@ -19,48 +21,70 @@ export const exec: Exec = (file, args, env) =>
     child.on("close", (code) => resolve({ code, stdout }));
   });
 
-const WIN_BOX = (buttons: string, icon: string, button: string) =>
-  `Add-Type -AssemblyName System.Windows.Forms; $r = [System.Windows.Forms.MessageBox]::Show($env:ISOPLAN_DIALOG_TEXT, $env:ISOPLAN_DIALOG_TITLE, '${buttons}', '${icon}', '${button}', 'DefaultDesktopOnly'); if ($r -eq 'Yes' -or $r -eq 'OK') { exit 0 } else { exit 1 }`;
+/** How long the question waits before it cancels itself. */
+export const ASK_SECONDS = 300;
+
+/** The Windows form: exits 0 for Connect, 2 for Cancel, Esc, closing it or the time running out, 1 when it couldn't be shown. */
+export const WIN_FORM = [
+  "$ErrorActionPreference = 'Stop'",
+  "Add-Type -AssemblyName System.Windows.Forms, System.Drawing",
+  "[System.Windows.Forms.Application]::EnableVisualStyles()",
+  "$f = New-Object System.Windows.Forms.Form",
+  "$f.Text = $env:ISOPLAN_DIALOG_TITLE",
+  "$f.FormBorderStyle = 'FixedDialog'; $f.MaximizeBox = $false; $f.MinimizeBox = $false; $f.StartPosition = 'CenterScreen'; $f.TopMost = $true",
+  "$f.AutoSize = $true; $f.AutoSizeMode = 'GrowAndShrink'; $f.Padding = New-Object System.Windows.Forms.Padding 16",
+  "$layout = New-Object System.Windows.Forms.FlowLayoutPanel; $layout.FlowDirection = 'TopDown'; $layout.AutoSize = $true; $layout.AutoSizeMode = 'GrowAndShrink'",
+  "$label = New-Object System.Windows.Forms.Label; $label.Text = $env:ISOPLAN_DIALOG_TEXT; $label.UseMnemonic = $false; $label.AutoSize = $true; $label.MaximumSize = New-Object System.Drawing.Size 480, 0",
+  "$row = New-Object System.Windows.Forms.FlowLayoutPanel; $row.FlowDirection = 'RightToLeft'; $row.AutoSize = $true; $row.Anchor = 'Right'",
+  "$cancel = New-Object System.Windows.Forms.Button; $cancel.Text = 'Cancel'; $cancel.UseMnemonic = $false; $cancel.AutoSize = $true; $cancel.DialogResult = 'Cancel'",
+  "$connect = New-Object System.Windows.Forms.Button; $connect.Text = 'Connect'; $connect.UseMnemonic = $false; $connect.AutoSize = $true; $connect.DialogResult = 'OK'",
+  "$row.Controls.AddRange(@($cancel, $connect)); $layout.Controls.AddRange(@($label, $row)); $f.Controls.Add($layout)",
+  "$f.AcceptButton = $cancel; $f.CancelButton = $cancel",
+  `$timer = New-Object System.Windows.Forms.Timer; $timer.Interval = ${ASK_SECONDS * 1000}; $timer.Add_Tick({ $f.DialogResult = 'Cancel'; $f.Close() })`,
+  "$f.Add_Shown({ $f.Activate(); $cancel.Focus(); $timer.Start() })",
+  "$r = $f.ShowDialog(); $timer.Stop()",
+  "if ($r -eq [System.Windows.Forms.DialogResult]::OK) { exit 0 } else { exit 2 }",
+].join("\n");
+const WIN_TELL = (icon: string) =>
+  `$ErrorActionPreference = 'Stop'; Add-Type -AssemblyName System.Windows.Forms; [void][System.Windows.Forms.MessageBox]::Show($env:ISOPLAN_DIALOG_TEXT, $env:ISOPLAN_DIALOG_TITLE, 'OK', '${icon}', 'Button1', 'DefaultDesktopOnly')`;
 const MAC_ASK = [
   "on run argv",
-  'display dialog (item 2 of argv) with title (item 1 of argv) buttons {"No", "Yes"} default button "No" cancel button "No" with icon caution giving up after 300',
-  'if button returned of result is "Yes" then return "yes"',
-  'return "no"',
+  "try",
+  `set answer to display dialog (item 2 of argv) with title (item 1 of argv) buttons {"Cancel", "Connect"} default button "Cancel" with icon caution giving up after ${ASK_SECONDS}`,
+  "on error number -128",
+  'return "cancel"',
+  "end try",
+  'if gave up of answer then return "cancel"',
+  'if button returned of answer is "Connect" then return "connect"',
+  'return "cancel"',
   "end run",
 ];
 const MAC_TELL = ["on run argv", 'display dialog (item 2 of argv) with title (item 1 of argv) buttons {"OK"} default button "OK" giving up after 120', "end run"];
 const osascript = (lines: string[], title: string, text: string): [string, string[]] => ["osascript", [...lines.flatMap((l) => ["-e", l]), title, text]];
+const powershell = (script: string, title: string, text: string): Parameters<Exec> => ["powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script], { ISOPLAN_DIALOG_TITLE: title, ISOPLAN_DIALOG_TEXT: text }];
 
-/** Asks Yes or No; true only for Yes. Throws when this computer has no way to ask. */
+/** Asks Connect or Cancel; true only for Connect. Throws when the question couldn't be shown, which is not a Cancel. */
 export async function ask(platform: NodeJS.Platform, title: string, text: string, run: Exec = exec): Promise<boolean> {
   if (platform === "win32") {
-    const r = await run("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", WIN_BOX("YesNo", "Question", "Button2")], { ISOPLAN_DIALOG_TITLE: title, ISOPLAN_DIALOG_TEXT: text });
-    if (r.code === null) throw new Error("couldn't start PowerShell to ask");
-    return r.code === 0;
+    const r = await run(...powershell(WIN_FORM, title, text));
+    if (r.code === 0 || r.code === 2) return r.code === 0;
+    throw new Error(r.code === null ? "PowerShell couldn't be started" : `PowerShell couldn't show it (exit ${r.code})`);
   }
   if (platform === "darwin") {
     const r = await run(...osascript(MAC_ASK, title, text));
-    if (r.code === null) throw new Error("couldn't start osascript to ask");
-    return r.stdout.trim() === "yes";
+    const said = r.stdout.trim();
+    if (r.code === 0 && (said === "connect" || said === "cancel")) return said === "connect";
+    throw new Error(r.code === null ? "osascript couldn't be started" : `osascript couldn't show it (exit ${r.code})`);
   }
-  const zenity = await run("zenity", ["--question", "--no-markup", "--title", title, "--text", text]);
-  if (zenity.code !== null) return zenity.code === 0;
-  const kdialog = await run("kdialog", ["--title", title, "--yesno", text]);
-  if (kdialog.code !== null) return kdialog.code === 0;
-  throw new Error("no zenity or kdialog to ask with");
+  const r = await run("zenity", ["--question", "--no-markup", "--title", title, "--text", text, "--ok-label", "Connect", "--cancel-label", "Cancel", "--default-cancel", "--timeout", String(ASK_SECONDS)]);
+  // 1 is Cancel or closing it, 5 the time running out.
+  if (r.code === 0 || r.code === 1 || r.code === 5) return r.code === 0;
+  throw new Error(r.code === null ? "zenity isn't installed, and it is the only way Isoplan asks on Linux" : `zenity couldn't show it (exit ${r.code})`);
 }
 
 /** Shows a notice with OK; a problem with a warning sign. Nothing when there is no way to show it. */
 export async function tell(platform: NodeJS.Platform, title: string, text: string, problem = false, run: Exec = exec): Promise<void> {
-  if (platform === "win32") {
-    await run("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", WIN_BOX("OK", problem ? "Warning" : "Information", "Button1")], { ISOPLAN_DIALOG_TITLE: title, ISOPLAN_DIALOG_TEXT: text });
-    return;
-  }
-  if (platform === "darwin") {
-    await run(...osascript(MAC_TELL, title, text));
-    return;
-  }
-  if ((await run("zenity", [problem ? "--warning" : "--info", "--no-markup", "--title", title, "--text", text])).code !== null) return;
-  if ((await run("kdialog", ["--title", title, problem ? "--sorry" : "--msgbox", text])).code !== null) return;
-  await run("notify-send", [title, text]);
+  if (platform === "win32") await run(...powershell(WIN_TELL(problem ? "Warning" : "Information"), title, text));
+  else if (platform === "darwin") await run(...osascript(MAC_TELL, title, text));
+  else await run("zenity", [problem ? "--warning" : "--info", "--no-markup", "--title", title, "--text", text, "--timeout", "120"]);
 }

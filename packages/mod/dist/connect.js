@@ -6535,6 +6535,7 @@ const postJson = async (url, body) => {
 		method: "POST",
 		headers: { "content-type": "application/json" },
 		body: JSON.stringify(body),
+		redirect: "error",
 		signal: AbortSignal.timeout(15e3)
 	});
 	const value = await response.json().catch(() => ({}));
@@ -6663,12 +6664,38 @@ const exec = (file, args, env) => new Promise((resolve) => {
 		stdout
 	}));
 });
-const WIN_BOX = (buttons, icon, button) => `Add-Type -AssemblyName System.Windows.Forms; $r = [System.Windows.Forms.MessageBox]::Show($env:ISOPLAN_DIALOG_TEXT, $env:ISOPLAN_DIALOG_TITLE, '${buttons}', '${icon}', '${button}', 'DefaultDesktopOnly'); if ($r -eq 'Yes' -or $r -eq 'OK') { exit 0 } else { exit 1 }`;
+/** The Windows form: exits 0 for Connect, 2 for Cancel, Esc, closing it or the time running out, 1 when it couldn't be shown. */
+const WIN_FORM = [
+	"$ErrorActionPreference = 'Stop'",
+	"Add-Type -AssemblyName System.Windows.Forms, System.Drawing",
+	"[System.Windows.Forms.Application]::EnableVisualStyles()",
+	"$f = New-Object System.Windows.Forms.Form",
+	"$f.Text = $env:ISOPLAN_DIALOG_TITLE",
+	"$f.FormBorderStyle = 'FixedDialog'; $f.MaximizeBox = $false; $f.MinimizeBox = $false; $f.StartPosition = 'CenterScreen'; $f.TopMost = $true",
+	"$f.AutoSize = $true; $f.AutoSizeMode = 'GrowAndShrink'; $f.Padding = New-Object System.Windows.Forms.Padding 16",
+	"$layout = New-Object System.Windows.Forms.FlowLayoutPanel; $layout.FlowDirection = 'TopDown'; $layout.AutoSize = $true; $layout.AutoSizeMode = 'GrowAndShrink'",
+	"$label = New-Object System.Windows.Forms.Label; $label.Text = $env:ISOPLAN_DIALOG_TEXT; $label.UseMnemonic = $false; $label.AutoSize = $true; $label.MaximumSize = New-Object System.Drawing.Size 480, 0",
+	"$row = New-Object System.Windows.Forms.FlowLayoutPanel; $row.FlowDirection = 'RightToLeft'; $row.AutoSize = $true; $row.Anchor = 'Right'",
+	"$cancel = New-Object System.Windows.Forms.Button; $cancel.Text = 'Cancel'; $cancel.UseMnemonic = $false; $cancel.AutoSize = $true; $cancel.DialogResult = 'Cancel'",
+	"$connect = New-Object System.Windows.Forms.Button; $connect.Text = 'Connect'; $connect.UseMnemonic = $false; $connect.AutoSize = $true; $connect.DialogResult = 'OK'",
+	"$row.Controls.AddRange(@($cancel, $connect)); $layout.Controls.AddRange(@($label, $row)); $f.Controls.Add($layout)",
+	"$f.AcceptButton = $cancel; $f.CancelButton = $cancel",
+	`$timer = New-Object System.Windows.Forms.Timer; $timer.Interval = 300000; $timer.Add_Tick({ $f.DialogResult = 'Cancel'; $f.Close() })`,
+	"$f.Add_Shown({ $f.Activate(); $cancel.Focus(); $timer.Start() })",
+	"$r = $f.ShowDialog(); $timer.Stop()",
+	"if ($r -eq [System.Windows.Forms.DialogResult]::OK) { exit 0 } else { exit 2 }"
+].join("\n");
+const WIN_TELL = (icon) => `$ErrorActionPreference = 'Stop'; Add-Type -AssemblyName System.Windows.Forms; [void][System.Windows.Forms.MessageBox]::Show($env:ISOPLAN_DIALOG_TEXT, $env:ISOPLAN_DIALOG_TITLE, 'OK', '${icon}', 'Button1', 'DefaultDesktopOnly')`;
 const MAC_ASK = [
 	"on run argv",
-	"display dialog (item 2 of argv) with title (item 1 of argv) buttons {\"No\", \"Yes\"} default button \"No\" cancel button \"No\" with icon caution giving up after 300",
-	"if button returned of result is \"Yes\" then return \"yes\"",
-	"return \"no\"",
+	"try",
+	`set answer to display dialog (item 2 of argv) with title (item 1 of argv) buttons {"Cancel", "Connect"} default button "Cancel" with icon caution giving up after 300`,
+	"on error number -128",
+	"return \"cancel\"",
+	"end try",
+	"if gave up of answer then return \"cancel\"",
+	"if button returned of answer is \"Connect\" then return \"connect\"",
+	"return \"cancel\"",
 	"end run"
 ];
 const MAC_TELL = [
@@ -6681,77 +6708,64 @@ const osascript = (lines, title, text) => ["osascript", [
 	title,
 	text
 ]];
-/** Asks Yes or No; true only for Yes. Throws when this computer has no way to ask. */
+const powershell = (script, title, text) => [
+	"powershell.exe",
+	[
+		"-NoProfile",
+		"-NonInteractive",
+		"-Command",
+		script
+	],
+	{
+		ISOPLAN_DIALOG_TITLE: title,
+		ISOPLAN_DIALOG_TEXT: text
+	}
+];
+/** Asks Connect or Cancel; true only for Connect. Throws when the question couldn't be shown, which is not a Cancel. */
 async function ask(platform, title, text, run = exec) {
 	if (platform === "win32") {
-		const r = await run("powershell.exe", [
-			"-NoProfile",
-			"-NonInteractive",
-			"-Command",
-			WIN_BOX("YesNo", "Question", "Button2")
-		], {
-			ISOPLAN_DIALOG_TITLE: title,
-			ISOPLAN_DIALOG_TEXT: text
-		});
-		if (r.code === null) throw new Error("couldn't start PowerShell to ask");
-		return r.code === 0;
+		const r = await run(...powershell(WIN_FORM, title, text));
+		if (r.code === 0 || r.code === 2) return r.code === 0;
+		throw new Error(r.code === null ? "PowerShell couldn't be started" : `PowerShell couldn't show it (exit ${r.code})`);
 	}
 	if (platform === "darwin") {
 		const r = await run(...osascript(MAC_ASK, title, text));
-		if (r.code === null) throw new Error("couldn't start osascript to ask");
-		return r.stdout.trim() === "yes";
+		const said = r.stdout.trim();
+		if (r.code === 0 && (said === "connect" || said === "cancel")) return said === "connect";
+		throw new Error(r.code === null ? "osascript couldn't be started" : `osascript couldn't show it (exit ${r.code})`);
 	}
-	const zenity = await run("zenity", [
+	const r = await run("zenity", [
 		"--question",
 		"--no-markup",
 		"--title",
 		title,
 		"--text",
-		text
+		text,
+		"--ok-label",
+		"Connect",
+		"--cancel-label",
+		"Cancel",
+		"--default-cancel",
+		"--timeout",
+		String(300)
 	]);
-	if (zenity.code !== null) return zenity.code === 0;
-	const kdialog = await run("kdialog", [
-		"--title",
-		title,
-		"--yesno",
-		text
-	]);
-	if (kdialog.code !== null) return kdialog.code === 0;
-	throw new Error("no zenity or kdialog to ask with");
+	if (r.code === 0 || r.code === 1 || r.code === 5) return r.code === 0;
+	throw new Error(r.code === null ? "zenity isn't installed, and it is the only way Isoplan asks on Linux" : `zenity couldn't show it (exit ${r.code})`);
 }
 /** Shows a notice with OK; a problem with a warning sign. Nothing when there is no way to show it. */
 async function tell(platform, title, text, problem = false, run = exec) {
-	if (platform === "win32") {
-		await run("powershell.exe", [
-			"-NoProfile",
-			"-NonInteractive",
-			"-Command",
-			WIN_BOX("OK", problem ? "Warning" : "Information", "Button1")
-		], {
-			ISOPLAN_DIALOG_TITLE: title,
-			ISOPLAN_DIALOG_TEXT: text
-		});
-		return;
-	}
-	if (platform === "darwin") {
-		await run(...osascript(MAC_TELL, title, text));
-		return;
-	}
-	if ((await run("zenity", [
+	if (platform === "win32") await run(...powershell(WIN_TELL(problem ? "Warning" : "Information"), title, text));
+	else if (platform === "darwin") await run(...osascript(MAC_TELL, title, text));
+	else await run("zenity", [
 		problem ? "--warning" : "--info",
 		"--no-markup",
 		"--title",
 		title,
 		"--text",
-		text
-	])).code !== null) return;
-	if ((await run("kdialog", [
-		"--title",
-		title,
-		problem ? "--sorry" : "--msgbox",
-		text
-	])).code !== null) return;
-	await run("notify-send", [title, text]);
+		text,
+		"--timeout",
+		"120"
+	]);
 }
 //#endregion
 //#region src/install/install.ts
@@ -6831,6 +6845,16 @@ const LOOPBACK = /* @__PURE__ */ new Set([
 	"[::1]"
 ]);
 const MAX_NAME = 80;
+/**
+* Text from a link or an office, fit for a dialog: format characters (zero-width joiners, bidi
+* overrides and isolates) taken out, trimmed and cut to `max`; null when it holds a control
+* character or nothing is left.
+*/
+function shown(text, max = MAX_NAME) {
+	if (/\p{Cc}/u.test(text)) return null;
+	const plain = text.replace(/\p{Cf}/gu, "").trim();
+	return plain ? plain.slice(0, max) : null;
+}
 /** The link's parts, or why it isn't one Connect takes. */
 function parseLink(text) {
 	if (!URL.canParse(text)) return "this isn't a link Isoplan can read";
@@ -6844,13 +6868,13 @@ function parseLink(text) {
 	].every((k) => keys.includes(k))) return "the link should name an office, a code and a name, once each";
 	const office = url.searchParams.get("office");
 	const code = url.searchParams.get("code");
-	const name = url.searchParams.get("name").trim();
+	const name = shown(url.searchParams.get("name"), Infinity);
 	if (!URL.canParse(office)) return "the link's office isn't an address";
 	const at = new URL(office);
 	if (at.username || at.password || at.pathname !== "/" || at.search || at.hash || ![at.origin, `${at.origin}/`].includes(office)) return "the link's office should be an address with no path";
 	if (at.protocol !== "https:" && !(at.protocol === "http:" && LOOPBACK.has(at.hostname))) return `the office ${at.host} isn't https, so nothing is sent to it (plain http only to this computer)`;
 	if (!/^[\w-]{43}$/.test(code)) return "the link's code isn't one an office makes";
-	if (!name || name.length > MAX_NAME || /[\p{Cc}\p{Cf}]/u.test(name)) return `the office's name should be 1 to ${MAX_NAME} characters of plain text`;
+	if (!name || name.length > MAX_NAME) return `the office's name should be 1 to ${MAX_NAME} characters of plain text`;
 	if (at.hostname === "localhost") at.hostname = "127.0.0.1";
 	return {
 		office: at.origin,
@@ -6865,15 +6889,17 @@ const labelOf = (name) => name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace
 /**
 * The person's config.json (`user`, as read) with `server` added to `servers`, or null when the
 * plugin already reports to it (`config`, the settings it makes). Every entry already there stays as
-* it is. With no usable `servers`, the plugin reported to `server` alone, so that office goes into
-* the list first, under the label it showed with: adding another never stops it. The new entry's
+* it is. With no usable `servers` but a `server` of the person's own, the plugin reported to that
+* alone, so it goes into the list first, under the label it showed with: adding another never stops
+* it. The plugin's default office, on this machine, isn't kept that way: someone who never set
+* one connects to the office they asked for alone. The new entry's
 * label is the office's name (labelOf), or its host, with -2, -3 and so on when that is taken.
 */
 function withOffice(user, config, link) {
 	const offices = officesOf(config);
 	if (offices.some((o) => o.server === link.server)) return null;
 	const servers = Array.isArray(user.servers) ? [...user.servers] : [];
-	if (!offices.filter((o) => config.servers.some((e) => e?.server === o.server)).length) servers.push({
+	if (!offices.filter((o) => config.servers.some((e) => e?.server === o.server)).length && offices[0].server === user.server) servers.push({
 		label: offices[0].label,
 		server: offices[0].server
 	});
@@ -6892,35 +6918,67 @@ function withOffice(user, config, link) {
 //#endregion
 //#region src/connect/connect.ts
 const TITLE = "Connect Claude Code to Isoplan";
+/** How much of an office's own message is shown. */
+const MAX_SAID = 200;
+/** config.write.lock: free once this old, and waited for at most this long. */
+const CONFIG_LOCK_MS = 1e4;
+const connectLockPath = (claudeDir) => path.join(claudeDir, "isoplan", "connect.lock");
+const configLockPath = (claudeDir) => path.join(claudeDir, "isoplan", "config.write.lock");
+/** An office's refusal, as the person sees it: its own words, cut short and labelled as its. */
+const refusal = (answer) => typeof answer.body.error === "string" && answer.body.error ? `the office said: "${shown(answer.body.error, MAX_SAID) ?? ""}"` : `the office answered ${answer.status}`;
 /** Handles one link; true once the machine is connected. */
-async function connect(text, { claudeDir, defaultsPath, account, machine, ask, tell, restart, log, post = postJson }) {
+async function connect(text, o) {
+	const lock = connectLockPath(o.claudeDir);
+	if (!await takeLock(lock, process.pid, alive, false)) {
+		o.log("refused a connect link: another is being handled on this machine");
+		return false;
+	}
+	try {
+		return await connectOne(text, o);
+	} finally {
+		await releaseLock(lock, process.pid).catch(() => {});
+	}
+}
+async function connectOne(text, { claudeDir, defaultsPath, account, machine, ask, tell, restart, log, post = postJson }) {
 	const link = parseLink(text);
-	const fail = async (why, name) => {
+	const fail = async (why, host) => {
 		log(`not connected: ${why}`);
-		await tell(TITLE, `Claude Code wasn't connected${name ? ` to ${name}` : ""}: ${why}. Nothing was changed.`, true);
+		await tell(TITLE, `Claude Code wasn't connected${host ? ` to ${host}` : ""}: ${why}. Nothing was changed.`, true);
 		return false;
 	};
 	if (typeof link === "string") return fail(link);
 	const userPath = path.join(claudeDir, "isoplan", "config.json");
-	let user = {};
+	const unreadable = await readUser(userPath).then(() => null, (why) => why);
+	if (unreadable) return fail(unreadable, link.host);
+	let whose;
 	try {
-		const parsed = JSON.parse(await fs.readFile(userPath, "utf8"));
-		if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return fail(`${userPath} doesn't hold a JSON object; fix it or add the office by hand`, link.name);
-		user = parsed;
+		const answer = await post(httpUrl(link.server, "/connect/peek"), { code: link.code });
+		const body = answer.body;
+		const person = typeof body.person?.name === "string" ? shown(body.person.name) : null;
+		const email = typeof body.person?.email === "string" ? shown(body.person.email, MAX_SAID) : null;
+		if (answer.status !== 200 || !person || !email) return fail(answer.status === 200 ? "the office didn't say whose link this is" : refusal(answer), link.host);
+		whose = {
+			person,
+			email,
+			office: typeof body.office === "string" && shown(body.office) || link.name
+		};
 	} catch (err) {
-		if (err.code !== "ENOENT") return fail(`${userPath} couldn't be read as JSON; fix it or add the office by hand`, link.name);
+		return fail(`the office couldn't be reached (${String(err?.message ?? err)})`, link.host);
 	}
-	const config = await loadConfig(nodeIo(), defaultsPath, userPath);
-	const next = withOffice(user, config, link);
-	if (!await ask(TITLE, `Connect Claude Code on this computer to the Isoplan office "${link.name}" at ${link.host}?\n\nYour Claude Code sessions in the repos that office's admins approve will be sent to it, as yours.
-
-Only say Yes if you just pressed Connect Claude Code in that office.`)) {
-		log(`not connected to ${link.server}: the person said no`);
-		return false;
-	}
+	const who = await account();
 	const file = pairingPath(claudeDir);
 	const writeLock = pairingWriteLockPath(claudeDir);
-	const who = await account();
+	const replaces = !!pairingEntry(await readPairing(file), link.server, who.id)?.credential;
+	let yes;
+	try {
+		yes = await ask(TITLE, dialogText(link.host, whose, replaces));
+	} catch (err) {
+		return fail(`the confirmation couldn't be shown (${String(err?.message ?? err)})`, link.host);
+	}
+	if (!yes) {
+		log(`not connected to ${link.server}: cancelled`);
+		return false;
+	}
 	let credential;
 	try {
 		const answer = await post(httpUrl(link.server, "/connect"), {
@@ -6931,11 +6989,12 @@ Only say Yes if you just pressed Connect Claude Code in that office.`)) {
 				id: await machineIdOf(file, writeLock)
 			}
 		});
-		if (answer.status !== 200 || typeof answer.body.credential !== "string") return fail(answer.body.error ? String(answer.body.error) : `the office answered ${answer.status}`, link.name);
+		if (answer.status !== 200 || typeof answer.body.credential !== "string") return fail(refusal(answer), link.host);
 		credential = answer.body.credential;
 	} catch (err) {
-		return fail(`the office couldn't be reached (${String(err?.message ?? err)})`, link.name);
+		return fail(`the office couldn't be reached (${String(err?.message ?? err)})`, link.host);
 	}
+	const config = await loadConfig(nodeIo(), defaultsPath, userPath);
 	try {
 		await keepCredential({
 			file,
@@ -6944,14 +7003,76 @@ Only say Yes if you just pressed Connect Claude Code in that office.`)) {
 			account: who.id,
 			legacy: link.server === config.server
 		}, credential);
-		if (next) await writeJson(userPath, next);
 	} catch (err) {
-		return fail(`this computer's files couldn't be written (${String(err?.message ?? err)})`, link.name);
+		const why = String(err?.message ?? err);
+		log(`paired by ${link.server}, but its credential couldn't be saved: ${why}`);
+		await tell(TITLE, `${link.host} paired this computer, but its credential couldn't be saved here (${why}), so Claude Code can't report to it. Press Connect Claude Code on the floor again.`, true);
+		return false;
 	}
-	log(`connected to ${link.server}${next ? ", added to config.json" : ""}`);
-	if (next) for (const change of await restart().catch((err) => [`couldn't stop the running data layers: ${String(err?.message ?? err)}`])) log(change);
-	await tell("Isoplan", `Connected to ${link.name}. Claude Code reports to it from your next prompt.`);
+	let added;
+	try {
+		added = await addOffice(claudeDir, defaultsPath, link);
+	} catch (err) {
+		const why = String(err?.message ?? err);
+		const line = JSON.stringify({
+			label: labelOf(link.name) || link.host,
+			server: link.server
+		});
+		log(`paired with ${link.server}, but couldn't add it to config.json: ${why}`);
+		await tell(TITLE, `This computer is paired with ${link.host}, but the office couldn't be added to ${userPath} (${why}). Add this entry to "servers" there, keeping any already there, then start a new session:\n\n${line}`, true);
+		return false;
+	}
+	log(`connected to ${link.server} as ${whose.email}${added ? ", added to config.json" : ""}`);
+	for (const change of await restart().catch((err) => [`couldn't stop the running data layers: ${String(err?.message ?? err)}`])) log(change);
+	await tell("Isoplan", `Connected to ${link.host} as ${whose.person}. Claude Code reports to it from your next prompt.`);
 	return true;
+}
+/** What the person is asked: the host first, then who this machine reports as, then what the office calls itself. */
+function dialogText(host, whose, replaces) {
+	return [
+		`Connect to ${host}?`,
+		"",
+		`This computer's Claude Code sessions, in the repos that office's admins approve, will be reported to ${host} as ${whose.person} (${whose.email}).`,
+		`The office calls itself "${whose.office}".`,
+		...replaces ? ["", `This replaces this computer's current pairing with ${host}.`] : [],
+		"",
+		`Only connect if you just pressed Connect Claude Code there, signed in as ${whose.person}.`
+	].join("\n");
+}
+/** The person's config.json, or {} when there is none; rejects with why when it isn't a JSON object. */
+async function readUser(userPath) {
+	let text;
+	try {
+		text = await fs.readFile(userPath, "utf8");
+	} catch (err) {
+		if (err.code === "ENOENT") return {};
+		throw `${userPath} couldn't be read`;
+	}
+	let parsed;
+	try {
+		parsed = JSON.parse(text);
+	} catch {
+		throw `${userPath} isn't valid JSON; fix it or add the office by hand`;
+	}
+	if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw `${userPath} doesn't hold a JSON object; fix it or add the office by hand`;
+	return parsed;
+}
+/** Adds the office to config.json, read again under config.write.lock; false when the plugin already reports to it. */
+async function addOffice(claudeDir, defaultsPath, link) {
+	const lock = configLockPath(claudeDir);
+	const until = Date.now() + CONFIG_LOCK_MS;
+	while (!await takeLock(lock, process.pid, alive, false, Date.now(), { freshMs: CONFIG_LOCK_MS })) {
+		if (Date.now() > until) throw new Error(`couldn't take ${lock}`);
+		await new Promise((r) => setTimeout(r, 25));
+	}
+	try {
+		const userPath = path.join(claudeDir, "isoplan", "config.json");
+		const next = withOffice(await readUser(userPath).catch((why) => Promise.reject(new Error(why))), await loadConfig(nodeIo(), defaultsPath, userPath), link);
+		if (next) await writeJson(userPath, next);
+		return !!next;
+	} finally {
+		await releaseLock(lock, process.pid).catch(() => {});
+	}
 }
 /** Written whole, through a temp file, so a data layer never reads half of it. */
 async function writeJson(file, value) {

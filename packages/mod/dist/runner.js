@@ -6551,6 +6551,7 @@ const postJson = async (url, body) => {
 		method: "POST",
 		headers: { "content-type": "application/json" },
 		body: JSON.stringify(body),
+		redirect: "error",
 		signal: AbortSignal.timeout(15e3)
 	});
 	const value = await response.json().catch(() => ({}));

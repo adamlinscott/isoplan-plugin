@@ -668,6 +668,26 @@ const exec = (file, args, env) => new Promise((resolve) => {
 		stdout
 	}));
 });
+[
+	"$ErrorActionPreference = 'Stop'",
+	"Add-Type -AssemblyName System.Windows.Forms, System.Drawing",
+	"[System.Windows.Forms.Application]::EnableVisualStyles()",
+	"$f = New-Object System.Windows.Forms.Form",
+	"$f.Text = $env:ISOPLAN_DIALOG_TITLE",
+	"$f.FormBorderStyle = 'FixedDialog'; $f.MaximizeBox = $false; $f.MinimizeBox = $false; $f.StartPosition = 'CenterScreen'; $f.TopMost = $true",
+	"$f.AutoSize = $true; $f.AutoSizeMode = 'GrowAndShrink'; $f.Padding = New-Object System.Windows.Forms.Padding 16",
+	"$layout = New-Object System.Windows.Forms.FlowLayoutPanel; $layout.FlowDirection = 'TopDown'; $layout.AutoSize = $true; $layout.AutoSizeMode = 'GrowAndShrink'",
+	"$label = New-Object System.Windows.Forms.Label; $label.Text = $env:ISOPLAN_DIALOG_TEXT; $label.UseMnemonic = $false; $label.AutoSize = $true; $label.MaximumSize = New-Object System.Drawing.Size 480, 0",
+	"$row = New-Object System.Windows.Forms.FlowLayoutPanel; $row.FlowDirection = 'RightToLeft'; $row.AutoSize = $true; $row.Anchor = 'Right'",
+	"$cancel = New-Object System.Windows.Forms.Button; $cancel.Text = 'Cancel'; $cancel.UseMnemonic = $false; $cancel.AutoSize = $true; $cancel.DialogResult = 'Cancel'",
+	"$connect = New-Object System.Windows.Forms.Button; $connect.Text = 'Connect'; $connect.UseMnemonic = $false; $connect.AutoSize = $true; $connect.DialogResult = 'OK'",
+	"$row.Controls.AddRange(@($cancel, $connect)); $layout.Controls.AddRange(@($label, $row)); $f.Controls.Add($layout)",
+	"$f.AcceptButton = $cancel; $f.CancelButton = $cancel",
+	`$timer = New-Object System.Windows.Forms.Timer; $timer.Interval = 300000; $timer.Add_Tick({ $f.DialogResult = 'Cancel'; $f.Close() })`,
+	"$f.Add_Shown({ $f.Activate(); $cancel.Focus(); $timer.Start() })",
+	"$r = $f.ShowDialog(); $timer.Stop()",
+	"if ($r -eq [System.Windows.Forms.DialogResult]::OK) { exit 0 } else { exit 2 }"
+].join("\n");
 //#endregion
 //#region src/install/link-handler.ts
 const KEY = "HKCU\\Software\\Classes\\isoplan";

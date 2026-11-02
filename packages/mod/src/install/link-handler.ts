@@ -11,13 +11,18 @@
 // - Linux, as far as the desktop allows: isoplan-connect.desktop in ~/.local/share/applications,
 //   for x-scheme-handler/isoplan, made the default with xdg-mime.
 //
-// Each is checked first and left alone when it is already as wanted, since install runs as every
-// session starts; and each is taken out only when it runs this config folder's handler, so another
-// config folder's, or another program's, is never touched. Every command runs hidden, through `run`.
+// Install runs as every session starts, so registering is done under a lock (link-handler.lock) and
+// only when nothing is registered, or what is registered names a node or a handler that no longer
+// exists: a working registration stays as it is, even when this session's node is another one, or it
+// is another config folder's. So with several config folders on one machine, the first to register
+// keeps the scheme until its registration breaks, and only then does the next one's install take
+// it. Each is taken out only when it runs this config folder's handler, so another config folder's,
+// or another program's, is never touched. Every command runs hidden, through `run`.
 
 import fs from "node:fs/promises";
 import path from "node:path";
 import { exec, type Exec } from "../connect/dialog.js";
+import { alive, releaseLock, takeLock } from "../wake/lock.js";
 
 export interface LinkHandler {
   platform: NodeJS.Platform;
@@ -59,14 +64,54 @@ export const macScript = (node: string, script: string) =>
     "",
   ].join("\n");
 
+const exists = (file: string) => fs.stat(file).then(() => true, () => false);
+/** Whether a registration naming this node and this handler still works: both are there. */
+const works = async (paths: { node?: unknown; script?: unknown } | null) =>
+  !!paths && typeof paths.node === "string" && typeof paths.script === "string" && (await exists(paths.node)) && (await exists(paths.script));
+/** The node and handler a Windows open command names, as windowsCommand writes it. */
+const windowsPaths = (command: string | null) => {
+  const m = command ? /^"([^"]+)" "([^"]+)" "%1"$/.exec(command) : null;
+  return m ? { node: m[1], script: m[2] } : null;
+};
+
 // A desktop entry's Exec argument, quoted as the Desktop Entry spec asks, then escaped as its strings are.
 const execArg = (value: string) => `"${value.replace(/(["`$\\])/g, "\\$1")}"`.replace(/\\/g, "\\\\");
 /** The Linux desktop entry. */
 export const desktopEntry = (node: string, script: string) =>
-  ["[Desktop Entry]", "Type=Application", "Name=Isoplan Connect", `Exec=${execArg(node)} ${execArg(script)} %u`, "NoDisplay=true", "Terminal=false", "MimeType=x-scheme-handler/isoplan;", ""].join("\n");
+  [
+    "[Desktop Entry]",
+    "Type=Application",
+    "Name=Isoplan Connect",
+    `Exec=${execArg(node)} ${execArg(script)} %u`,
+    "NoDisplay=true",
+    "Terminal=false",
+    "MimeType=x-scheme-handler/isoplan;",
+    `X-Isoplan-Handler=${JSON.stringify({ node, script })}`,
+    "",
+  ].join("\n");
+const desktopPaths = (entry: string | null) => {
+  const line = entry ? /^X-Isoplan-Handler=(.*)$/m.exec(entry)?.[1] : undefined;
+  try {
+    return line ? (JSON.parse(line) as { node?: unknown; script?: unknown }) : null;
+  } catch {
+    return null;
+  }
+};
 
-/** Registers the handler when it isn't already, as wanted; says what it changed. */
+export const linkHandlerLockPath = (claudeDir: string) => path.join(claudeDir, "isoplan", "link-handler.lock");
+
+/** Registers the handler when none works; says what it changed. Another install registering at the same moment leaves it to that one. */
 export async function registerLinkHandler(given: LinkHandler): Promise<string[]> {
+  const lock = linkHandlerLockPath(given.claudeDir);
+  if (!(await takeLock(lock, process.pid, alive, false, Date.now(), { freshMs: 2 * 60 * 1000 }))) return [];
+  try {
+    return await register(given);
+  } finally {
+    await releaseLock(lock, process.pid).catch(() => {});
+  }
+}
+
+async function register(given: LinkHandler): Promise<string[]> {
   // A version manager's node may be a link in a folder of the shell's own (fnm's multishells), gone with it.
   const h = { ...given, node: await fs.realpath(given.node).catch(() => given.node) };
   const run = h.run ?? exec;
@@ -76,7 +121,7 @@ export async function registerLinkHandler(given: LinkHandler): Promise<string[]>
   };
   if (h.platform === "win32") {
     const want = windowsCommand(h.node, h.script);
-    if (regValue((await run("reg", ["query", COMMAND_KEY, "/ve"])).stdout) === want) return [];
+    if (await works(windowsPaths(regValue((await run("reg", ["query", COMMAND_KEY, "/ve"])).stdout)))) return [];
     await must("reg", ["add", KEY, "/ve", "/d", "URL:Isoplan", "/f"]);
     await must("reg", ["add", KEY, "/v", "URL Protocol", "/d", "", "/f"]);
     await must("reg", ["add", COMMAND_KEY, "/ve", "/d", want, "/f"]);
@@ -85,7 +130,8 @@ export async function registerLinkHandler(given: LinkHandler): Promise<string[]>
   if (h.platform === "darwin") {
     const app = macAppPath(h.claudeDir);
     const marker = JSON.stringify({ node: h.node, script: h.script });
-    if ((await fs.readFile(macMarker(app), "utf8").catch(() => null)) === marker) return [];
+    const registered = await fs.readFile(macMarker(app), "utf8").then((t) => JSON.parse(t) as { node?: unknown; script?: unknown }, () => null);
+    if (await works(registered)) return [];
     const source = path.join(h.claudeDir, "isoplan", "connect.applescript");
     await fs.rm(app, { recursive: true, force: true });
     await fs.mkdir(path.dirname(source), { recursive: true });
@@ -107,7 +153,7 @@ export async function registerLinkHandler(given: LinkHandler): Promise<string[]>
   if (h.platform === "linux") {
     const file = desktopPath(h);
     const want = desktopEntry(h.node, h.script);
-    if ((await fs.readFile(file, "utf8").catch(() => null)) === want && (await run("xdg-mime", ["query", "default", "x-scheme-handler/isoplan"])).stdout.trim() === DESKTOP) return [];
+    if ((await run("xdg-mime", ["query", "default", "x-scheme-handler/isoplan"])).stdout.trim() === DESKTOP && (await works(desktopPaths(await fs.readFile(file, "utf8").catch(() => null))))) return [];
     await fs.mkdir(path.dirname(file), { recursive: true });
     await fs.writeFile(file, want);
     await must("xdg-mime", ["default", DESKTOP, "x-scheme-handler/isoplan"]);

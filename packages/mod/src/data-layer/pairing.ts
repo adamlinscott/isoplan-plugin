@@ -149,7 +149,8 @@ export interface Pairing {
 }
 
 export const postJson: Post = async (url, body) => {
-  const response = await fetch(url, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body), signal: AbortSignal.timeout(15000) });
+  // A redirect is refused, so a credential or a code never follows one to another address.
+  const response = await fetch(url, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body), redirect: "error", signal: AbortSignal.timeout(15000) });
   const value = (await response.json().catch(() => ({}))) as Record<string, unknown>;
   return { status: response.status, body: value && typeof value === "object" ? value : {} };
 };

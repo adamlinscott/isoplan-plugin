@@ -360,6 +360,65 @@ async function isHeld(file, now = Date.now(), isAlive = alive, rule = {}) {
 		isAlive
 	});
 }
+/**
+* Takes the lock for `pid`; false when it is held (`isHeld`). With `force` (the plugin's data
+* layer) it is taken regardless: a detached one holding it sees that and steps aside. `extra` is
+* written into the lock beside the pid.
+*
+* A new lock is created exclusively, so of two takers at once only one gets it. A stale one is
+* moved aside by rename, which only one taker can do to the same file, and the taker checks that
+* what it moved is the lock it judged stale, by its text and its write time, so a lock its holder
+* refreshed meanwhile isn't taken: one that moved another's lock instead puts it back and loses.
+* With `force` a lock that can't be moved (on Windows a scanner may have it open) is tried again
+* after a short wait, then overwritten, so the plugin's data layer always gets it.
+*/
+async function takeLock(file, pid, isAlive = alive, force = false, now = Date.now(), { freshMs, extra = {} } = {}) {
+	await fs.mkdir(path.dirname(file), { recursive: true });
+	const body = JSON.stringify({
+		pid,
+		...extra
+	});
+	for (let tries = 0; tries < 5; tries++) {
+		if (tries && force) await new Promise((r) => setTimeout(r, 20 * tries));
+		try {
+			await fs.writeFile(file, body, { flag: "wx" });
+			return true;
+		} catch (err) {
+			if (err.code !== "EEXIST") throw err;
+		}
+		const seen = await readText(file);
+		if (!seen) continue;
+		const lock = parseLock(seen.text, seen.mtimeMs);
+		if (!force && lock?.pid !== pid && held(lock, now, {
+			isAlive,
+			freshMs
+		})) return false;
+		const aside = `${file}.${pid}-${Math.random().toString(36).slice(2)}`;
+		try {
+			await fs.rename(file, aside);
+		} catch (err) {
+			if ([
+				"ENOENT",
+				"EPERM",
+				"EBUSY",
+				"EACCES"
+			].includes(err.code ?? "")) continue;
+			throw err;
+		}
+		const moved = await fs.readFile(aside, "utf8").catch(() => null);
+		const movedAt = (await fs.stat(aside).catch(() => null))?.mtimeMs;
+		if (moved !== seen.text || movedAt !== seen.mtimeMs) {
+			await fs.link(aside, file).catch(() => {});
+			await fs.rm(aside, { force: true });
+			if (!force) return false;
+			continue;
+		}
+		await fs.rm(aside, { force: true });
+	}
+	if (!force) return false;
+	await fs.writeFile(file, body);
+	return true;
+}
 /** Removes the lock if it still names `pid`. */
 async function releaseLock(file, pid) {
 	if (await lockHolder(file) === pid) await fs.rm(file, { force: true });
@@ -6803,6 +6862,26 @@ const exec = (file, args, env) => new Promise((resolve) => {
 		stdout
 	}));
 });
+[
+	"$ErrorActionPreference = 'Stop'",
+	"Add-Type -AssemblyName System.Windows.Forms, System.Drawing",
+	"[System.Windows.Forms.Application]::EnableVisualStyles()",
+	"$f = New-Object System.Windows.Forms.Form",
+	"$f.Text = $env:ISOPLAN_DIALOG_TITLE",
+	"$f.FormBorderStyle = 'FixedDialog'; $f.MaximizeBox = $false; $f.MinimizeBox = $false; $f.StartPosition = 'CenterScreen'; $f.TopMost = $true",
+	"$f.AutoSize = $true; $f.AutoSizeMode = 'GrowAndShrink'; $f.Padding = New-Object System.Windows.Forms.Padding 16",
+	"$layout = New-Object System.Windows.Forms.FlowLayoutPanel; $layout.FlowDirection = 'TopDown'; $layout.AutoSize = $true; $layout.AutoSizeMode = 'GrowAndShrink'",
+	"$label = New-Object System.Windows.Forms.Label; $label.Text = $env:ISOPLAN_DIALOG_TEXT; $label.UseMnemonic = $false; $label.AutoSize = $true; $label.MaximumSize = New-Object System.Drawing.Size 480, 0",
+	"$row = New-Object System.Windows.Forms.FlowLayoutPanel; $row.FlowDirection = 'RightToLeft'; $row.AutoSize = $true; $row.Anchor = 'Right'",
+	"$cancel = New-Object System.Windows.Forms.Button; $cancel.Text = 'Cancel'; $cancel.UseMnemonic = $false; $cancel.AutoSize = $true; $cancel.DialogResult = 'Cancel'",
+	"$connect = New-Object System.Windows.Forms.Button; $connect.Text = 'Connect'; $connect.UseMnemonic = $false; $connect.AutoSize = $true; $connect.DialogResult = 'OK'",
+	"$row.Controls.AddRange(@($cancel, $connect)); $layout.Controls.AddRange(@($label, $row)); $f.Controls.Add($layout)",
+	"$f.AcceptButton = $cancel; $f.CancelButton = $cancel",
+	`$timer = New-Object System.Windows.Forms.Timer; $timer.Interval = 300000; $timer.Add_Tick({ $f.DialogResult = 'Cancel'; $f.Close() })`,
+	"$f.Add_Shown({ $f.Activate(); $cancel.Focus(); $timer.Start() })",
+	"$r = $f.ShowDialog(); $timer.Stop()",
+	"if ($r -eq [System.Windows.Forms.DialogResult]::OK) { exit 0 } else { exit 2 }"
+].join("\n");
 //#endregion
 //#region src/install/link-handler.ts
 const KEY = "HKCU\\Software\\Classes\\isoplan";
@@ -6824,6 +6903,17 @@ const macScript = (node, script) => [
 	"end open location",
 	""
 ].join("\n");
+const exists$1 = (file) => fs.stat(file).then(() => true, () => false);
+/** Whether a registration naming this node and this handler still works: both are there. */
+const works = async (paths) => !!paths && typeof paths.node === "string" && typeof paths.script === "string" && await exists$1(paths.node) && await exists$1(paths.script);
+/** The node and handler a Windows open command names, as windowsCommand writes it. */
+const windowsPaths = (command) => {
+	const m = command ? /^"([^"]+)" "([^"]+)" "%1"$/.exec(command) : null;
+	return m ? {
+		node: m[1],
+		script: m[2]
+	} : null;
+};
 const execArg = (value) => `"${value.replace(/(["`$\\])/g, "\\$1")}"`.replace(/\\/g, "\\\\");
 /** The Linux desktop entry. */
 const desktopEntry = (node, script) => [
@@ -6834,10 +6924,32 @@ const desktopEntry = (node, script) => [
 	"NoDisplay=true",
 	"Terminal=false",
 	"MimeType=x-scheme-handler/isoplan;",
+	`X-Isoplan-Handler=${JSON.stringify({
+		node,
+		script
+	})}`,
 	""
 ].join("\n");
-/** Registers the handler when it isn't already, as wanted; says what it changed. */
+const desktopPaths = (entry) => {
+	const line = entry ? /^X-Isoplan-Handler=(.*)$/m.exec(entry)?.[1] : void 0;
+	try {
+		return line ? JSON.parse(line) : null;
+	} catch {
+		return null;
+	}
+};
+const linkHandlerLockPath = (claudeDir) => path.join(claudeDir, "isoplan", "link-handler.lock");
+/** Registers the handler when none works; says what it changed. Another install registering at the same moment leaves it to that one. */
 async function registerLinkHandler(given) {
+	const lock = linkHandlerLockPath(given.claudeDir);
+	if (!await takeLock(lock, process.pid, alive, false, Date.now(), { freshMs: 12e4 })) return [];
+	try {
+		return await register(given);
+	} finally {
+		await releaseLock(lock, process.pid).catch(() => {});
+	}
+}
+async function register(given) {
 	const h = {
 		...given,
 		node: await fs.realpath(given.node).catch(() => given.node)
@@ -6849,11 +6961,11 @@ async function registerLinkHandler(given) {
 	};
 	if (h.platform === "win32") {
 		const want = windowsCommand(h.node, h.script);
-		if (regValue((await run("reg", [
+		if (await works(windowsPaths(regValue((await run("reg", [
 			"query",
 			COMMAND_KEY,
 			"/ve"
-		])).stdout) === want) return [];
+		])).stdout)))) return [];
 		await must("reg", [
 			"add",
 			KEY,
@@ -6887,7 +6999,8 @@ async function registerLinkHandler(given) {
 			node: h.node,
 			script: h.script
 		});
-		if (await fs.readFile(macMarker(app), "utf8").catch(() => null) === marker) return [];
+		const registered = await fs.readFile(macMarker(app), "utf8").then((t) => JSON.parse(t), () => null);
+		if (await works(registered)) return [];
 		const source = path.join(h.claudeDir, "isoplan", "connect.applescript");
 		await fs.rm(app, {
 			recursive: true,
@@ -6943,11 +7056,11 @@ async function registerLinkHandler(given) {
 	if (h.platform === "linux") {
 		const file = desktopPath(h);
 		const want = desktopEntry(h.node, h.script);
-		if (await fs.readFile(file, "utf8").catch(() => null) === want && (await run("xdg-mime", [
+		if ((await run("xdg-mime", [
 			"query",
 			"default",
 			"x-scheme-handler/isoplan"
-		])).stdout.trim() === DESKTOP) return [];
+		])).stdout.trim() === DESKTOP && await works(desktopPaths(await fs.readFile(file, "utf8").catch(() => null)))) return [];
 		await fs.mkdir(path.dirname(file), { recursive: true });
 		await fs.writeFile(file, want);
 		await must("xdg-mime", [
