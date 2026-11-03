@@ -7116,21 +7116,23 @@ async function stopReporting(claudeDir, { isAlive = alive, commandOf = processCo
 const ENV = "ISOPLAN_CONNECT_URL";
 const here = path.dirname(fileURLToPath(import.meta.url));
 const link = process.env[ENV] ?? process.argv[2];
-if (process.platform === "win32" && !process.env[ENV] && link) spawn(process.execPath, [fileURLToPath(import.meta.url)], {
-	detached: true,
-	windowsHide: true,
-	stdio: "ignore",
-	env: {
-		...process.env,
-		[ENV]: link
-	}
-}).unref();
-else if (!link) {
+const { dir: claudeDir, json: claudeJson } = claudePaths(process.env, os.homedir());
+const logFile = path.join(claudeDir, "isoplan", "logs", "connect.log");
+if (!process.env[ENV] && link) {
+	spawn(process.execPath, [fileURLToPath(import.meta.url)], {
+		detached: true,
+		windowsHide: true,
+		stdio: "ignore",
+		env: {
+			...process.env,
+			[ENV]: link
+		}
+	}).unref();
+	process.stdout.write(`A window is opening on this computer to connect Claude Code to Isoplan: answer it there. Run this only once. What happens is written to ${logFile}.\n`);
+} else if (!link) {
 	process.stderr.write("usage: node connect.js <isoplan://connect?...>\n");
 	process.exitCode = 2;
 } else {
-	const { dir: claudeDir, json: claudeJson } = claudePaths(process.env, os.homedir());
-	const logFile = path.join(claudeDir, "isoplan", "logs", "connect.log");
 	const log = (text) => {
 		fs.mkdir(path.dirname(logFile), { recursive: true }).then(() => fs.appendFile(logFile, `${(/* @__PURE__ */ new Date()).toISOString()} ${text}\n`)).catch(() => {});
 	};
