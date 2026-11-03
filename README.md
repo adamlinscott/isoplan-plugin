@@ -17,6 +17,8 @@ Then connect it to your office: start a Claude Code session once, so the plugin 
 
 The plugin handles those `isoplan://connect` links itself. Installing it (as each session starts, and the install script) copies the handler to `~/.claude/isoplan/runner/app/dist/connect.mjs` and registers it for you alone, with no admin rights: on Windows under `HKCU\Software\Classes\isoplan`; on a Mac as a small app, `~/.claude/isoplan/Isoplan Connect.app`, registered with LaunchServices; on Linux as `~/.local/share/applications/isoplan-connect.desktop`, made the default for `x-scheme-handler/isoplan` with `xdg-mime` (and its dialog needs `zenity`). It is registered only when nothing is, or what is names a node or a handler that has gone, so with several config folders on one machine the first keeps the link until its registration breaks. The handler accepts only an office at `https://`, or `http://` on this computer, handles one link at a time, and changes nothing unless you press Connect; what it did, or why not, is also in `~/.claude/isoplan/logs/connect.log`.
 
+In a session, `/isoplan:connect` says which offices this computer is connected to: those in `servers` it holds a credential for, never the credential. `/isoplan:connect <isoplan://connect link>` connects with a link from the floor instead of the browser, and says in the conversation how it went: it runs `dist/connect.js --wait <link>`, which starts the handler as above, then reads `connect.log` for up to 110 seconds. The floor's set-up message runs the same, since the command only loads in a new session.
+
 Or do it by hand: set `server` in `~/.claude/isoplan/config.json`, for example `{ "server": "wss://your-office.example/data-layer" }`, then pair with the link the status line shows. Any key in that file overrides the plugin's defaults in `packages/mod/config.json`.
 
 To report to several office servers at once, list them under `servers` instead, each with a short label for the status line:
@@ -152,7 +154,7 @@ An agent often works in more than one repo: editing files with Edit or Write, or
 
 | Path | What |
 |---|---|
-| `packages/mod/commands/` | The plugin's commands, `/isoplan:handover` and `/isoplan:take`, which run `dist/handoff.js`. |
+| `packages/mod/commands/` | The plugin's commands: `/isoplan:handover` and `/isoplan:take`, which run `dist/handoff.js`, and `/isoplan:connect`, which runs `dist/connect.js`. |
 | `packages/mod/` | The Claude Code plugin. Its bundle in `dist/` is committed, so the plugin runs from a checkout with no install step; rebuild it with every change to `src/`. |
 | `packages/protocol/` | The wire protocol, published to npm as [`@isoplan/protocol`](https://www.npmjs.com/package/@isoplan/protocol). |
 | `.claude-plugin/marketplace.json` | The marketplace listing. |

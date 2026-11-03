@@ -6,6 +6,84 @@ import { fileURLToPath } from "node:url";
 import { statSync } from "node:fs";
 import { randomBytes } from "node:crypto";
 import { promisify } from "node:util";
+//#region src/data-layer/config.ts
+async function loadConfig(io, defaultsPath, userPath) {
+	const config = await loadSettings(io, defaultsPath, userPath);
+	const asked = (await readJson(io, userPath, true)).server;
+	if (typeof asked === "string" && URL.canParse(asked) && new URL(asked).protocol === "ws:" && !LOOPBACK$1.has(new URL(asked).hostname)) {
+		if (config.allowPlainWs) config.server = asked;
+		else config.plainRefused = asked;
+	}
+	return config;
+}
+/**
+* The offices to report to: each entry of `servers` with a ws:// or wss:// address (ws:// goes only
+* to this machine unless allowPlainWs; to another it is kept, to say why it isn't used), once per
+* address; with none, `server` alone. An entry without a label is labelled by its host, and a label
+* already taken gets -2, -3 and so on, so each names one office.
+*/
+function officesOf(config) {
+	const offices = [];
+	const add = (server, label, refused) => {
+		let unique = label;
+		for (let n = 2; offices.some((o) => o.label.toLowerCase() === unique.toLowerCase()); n++) unique = `${label}-${n}`;
+		offices.push({
+			label: unique,
+			server,
+			...refused && { plainRefused: true },
+			...server === config.server && { legacy: true }
+		});
+	};
+	for (const entry of config.servers) {
+		const { label, server } = entry ?? {};
+		if (typeof server !== "string" || !URL.canParse(server) || !["ws:", "wss:"].includes(new URL(server).protocol) || offices.some((o) => o.server === server)) continue;
+		add(server, typeof label === "string" && label.trim() || new URL(server).host, !config.allowPlainWs && !isWebSocketUrl(server));
+	}
+	if (!offices.length) add(config.plainRefused ?? config.server, new URL(config.plainRefused ?? config.server).host, !!config.plainRefused);
+	return offices;
+}
+/** The same per-key override for any settings file of the mod's, such as the runner's runner.json. */
+async function loadSettings(io, defaultsPath, userPath) {
+	const defaults = await readJson(io, defaultsPath);
+	const user = await readJson(io, userPath, true);
+	const config = {};
+	for (const [key, fallback] of Object.entries(defaults)) config[key] = fits(key, user[key], fallback) ? user[key] : fallback;
+	return config;
+}
+const BYTE_KEYS = /* @__PURE__ */ new Set(["tailBytes"]);
+const FLOORS = /* @__PURE__ */ new Map([["streamSeconds", .25]]);
+const ZERO_OFF = /* @__PURE__ */ new Set(["lightsOffHours", "updateCheckHours"]);
+function fits(key, value, fallback) {
+	if (key === "server") return typeof value === "string" && isWebSocketUrl(value);
+	if (typeof fallback === "number") {
+		if (BYTE_KEYS.has(key)) return Number.isSafeInteger(value) && value > 0;
+		if (ZERO_OFF.has(key) && value === 0) return true;
+		return typeof value === "number" && Number.isFinite(value) && value > 0 && value >= (FLOORS.get(key) ?? 0);
+	}
+	if (Array.isArray(fallback)) return Array.isArray(value);
+	return value != null && typeof value === typeof fallback;
+}
+const LOOPBACK$1 = /* @__PURE__ */ new Set([
+	"127.0.0.1",
+	"[::1]",
+	"localhost"
+]);
+function isWebSocketUrl(value) {
+	if (!URL.canParse(value)) return false;
+	const url = new URL(value);
+	return url.protocol === "wss:" || url.protocol === "ws:" && LOOPBACK$1.has(url.hostname);
+}
+async function readJson(io, p, optional = false) {
+	if (optional && !await io.stat(p)) return {};
+	try {
+		const value = JSON.parse(await io.read(p));
+		return value && typeof value === "object" && !Array.isArray(value) ? value : {};
+	} catch (err) {
+		if (optional) return {};
+		throw err;
+	}
+}
+//#endregion
 //#region ../../node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/core/util.js
 function getEnumValues(entries) {
 	const numericValues = Object.values(entries).filter((v) => typeof v === "number");
@@ -820,12 +898,12 @@ const _safeParse = (_Err) => (schema, value, _ctx) => {
 		issues: []
 	}, ctx);
 	if (result instanceof Promise) throw new $ZodAsyncError();
-	return result.issues.length ? failure(_Err, result.issues, ctx) : {
+	return result.issues.length ? failure$1(_Err, result.issues, ctx) : {
 		success: true,
 		data: result.value
 	};
 };
-function failure(Err, issues, ctx) {
+function failure$1(Err, issues, ctx) {
 	let error;
 	return {
 		success: false,
@@ -854,7 +932,7 @@ const _safeParseAsync = (_Err) => async (schema, value, _ctx) => {
 		issues: []
 	}, ctx);
 	if (result instanceof Promise) result = await result;
-	return result.issues.length ? failure(_Err, result.issues, ctx) : {
+	return result.issues.length ? failure$1(_Err, result.issues, ctx) : {
 		success: true,
 		data: result.value
 	};
@@ -6310,84 +6388,6 @@ function runCommand([cmd, ...args], { cwd }) {
 	});
 }
 //#endregion
-//#region src/data-layer/config.ts
-async function loadConfig(io, defaultsPath, userPath) {
-	const config = await loadSettings(io, defaultsPath, userPath);
-	const asked = (await readJson(io, userPath, true)).server;
-	if (typeof asked === "string" && URL.canParse(asked) && new URL(asked).protocol === "ws:" && !LOOPBACK$1.has(new URL(asked).hostname)) {
-		if (config.allowPlainWs) config.server = asked;
-		else config.plainRefused = asked;
-	}
-	return config;
-}
-/**
-* The offices to report to: each entry of `servers` with a ws:// or wss:// address (ws:// goes only
-* to this machine unless allowPlainWs; to another it is kept, to say why it isn't used), once per
-* address; with none, `server` alone. An entry without a label is labelled by its host, and a label
-* already taken gets -2, -3 and so on, so each names one office.
-*/
-function officesOf(config) {
-	const offices = [];
-	const add = (server, label, refused) => {
-		let unique = label;
-		for (let n = 2; offices.some((o) => o.label.toLowerCase() === unique.toLowerCase()); n++) unique = `${label}-${n}`;
-		offices.push({
-			label: unique,
-			server,
-			...refused && { plainRefused: true },
-			...server === config.server && { legacy: true }
-		});
-	};
-	for (const entry of config.servers) {
-		const { label, server } = entry ?? {};
-		if (typeof server !== "string" || !URL.canParse(server) || !["ws:", "wss:"].includes(new URL(server).protocol) || offices.some((o) => o.server === server)) continue;
-		add(server, typeof label === "string" && label.trim() || new URL(server).host, !config.allowPlainWs && !isWebSocketUrl(server));
-	}
-	if (!offices.length) add(config.plainRefused ?? config.server, new URL(config.plainRefused ?? config.server).host, !!config.plainRefused);
-	return offices;
-}
-/** The same per-key override for any settings file of the mod's, such as the runner's runner.json. */
-async function loadSettings(io, defaultsPath, userPath) {
-	const defaults = await readJson(io, defaultsPath);
-	const user = await readJson(io, userPath, true);
-	const config = {};
-	for (const [key, fallback] of Object.entries(defaults)) config[key] = fits(key, user[key], fallback) ? user[key] : fallback;
-	return config;
-}
-const BYTE_KEYS = /* @__PURE__ */ new Set(["tailBytes"]);
-const FLOORS = /* @__PURE__ */ new Map([["streamSeconds", .25]]);
-const ZERO_OFF = /* @__PURE__ */ new Set(["lightsOffHours", "updateCheckHours"]);
-function fits(key, value, fallback) {
-	if (key === "server") return typeof value === "string" && isWebSocketUrl(value);
-	if (typeof fallback === "number") {
-		if (BYTE_KEYS.has(key)) return Number.isSafeInteger(value) && value > 0;
-		if (ZERO_OFF.has(key) && value === 0) return true;
-		return typeof value === "number" && Number.isFinite(value) && value > 0 && value >= (FLOORS.get(key) ?? 0);
-	}
-	if (Array.isArray(fallback)) return Array.isArray(value);
-	return value != null && typeof value === typeof fallback;
-}
-const LOOPBACK$1 = /* @__PURE__ */ new Set([
-	"127.0.0.1",
-	"[::1]",
-	"localhost"
-]);
-function isWebSocketUrl(value) {
-	if (!URL.canParse(value)) return false;
-	const url = new URL(value);
-	return url.protocol === "wss:" || url.protocol === "ws:" && LOOPBACK$1.has(url.hostname);
-}
-async function readJson(io, p, optional = false) {
-	if (optional && !await io.stat(p)) return {};
-	try {
-		const value = JSON.parse(await io.read(p));
-		return value && typeof value === "object" && !Array.isArray(value) ? value : {};
-	} catch (err) {
-		if (optional) return {};
-		throw err;
-	}
-}
-//#endregion
 //#region src/wake/lock.ts
 async function readText(file) {
 	try {
@@ -7112,25 +7112,141 @@ async function stopReporting(claudeDir, { isAlive = alive, commandOf = processCo
 	return stopped;
 }
 //#endregion
+//#region src/connect/status.ts
+/** How long `--wait` reads connect.log for an answer: under Claude Code's two-minute default for a command. */
+const WAIT_MS = 11e4;
+/**
+* How connecting to `server` ended, from connect.log's lines stamped at or after `since` (an ISO
+* time, as the log writes them), or null while none says. connect.lock lets one link through at a
+* time, so a line from then on is this link's, or says another was being handled.
+*/
+function resultOf(log, since, server) {
+	for (const line of log.split("\n")) {
+		const at = line.indexOf(" ");
+		if (at < 0 || line.slice(0, at) < since) continue;
+		const text = line.slice(at + 1).trimEnd();
+		const connected = /^connected to (\S+) as (.+?)(, added to config\.json)?$/.exec(text);
+		if (connected?.[1] === server) return {
+			kind: "connected",
+			email: connected[2]
+		};
+		if (text === `not connected to ${server}: cancelled`) return { kind: "cancelled" };
+		if (text.startsWith(`paired by ${server},`) || text.startsWith(`paired with ${server},`)) return { kind: "unfinished" };
+		if (text.startsWith("refused a connect link:")) return { kind: "busy" };
+		if (text.startsWith("couldn't connect:")) return {
+			kind: "failed",
+			why: "something went wrong on this computer"
+		};
+		if (text.startsWith("not connected: ")) return failure(text.slice(15));
+	}
+	return null;
+}
+/** Reads connect.log (`read`) each second until resultOf has an answer, for up to `waitMs`; null when none came. */
+async function waitForResult(read, since, server, { waitMs = WAIT_MS, everyMs = 1e3, now = Date.now } = {}) {
+	for (const until = now() + waitMs; now() < until;) {
+		await new Promise((r) => setTimeout(r, everyMs));
+		const result = resultOf(await read(), since, server);
+		if (result) return result;
+	}
+	return null;
+}
+/** connect.ts's reason, in plain words: an expired code apart, and without file names or error details. */
+function failure(why) {
+	if (why.includes("expired or been used")) return { kind: "gone" };
+	if (why.startsWith("the office said:")) return {
+		kind: "failed",
+		why
+	};
+	if (why.startsWith("the office couldn't be reached")) return {
+		kind: "failed",
+		why: "the office couldn't be reached"
+	};
+	if (why.startsWith("the confirmation couldn't be shown")) return {
+		kind: "failed",
+		why: "the window asking you to connect couldn't be shown on this computer"
+	};
+	if (why.includes("config.json")) return {
+		kind: "failed",
+		why: "Isoplan's settings on this computer couldn't be read"
+	};
+	return {
+		kind: "failed",
+		why
+	};
+}
+const AGAIN = "press Connect Claude Code on the Isoplan page to try again";
+/** The sentence for `result` (null: no answer yet) of connecting to the office at `host`. */
+function resultSentence(result, host) {
+	if (!result) return `The window on this computer asking to connect to ${host} hasn't been answered yet: answer it, then type /isoplan:connect to check.`;
+	switch (result.kind) {
+		case "connected": return `Connected to ${host} as ${result.email}: your Claude Code work shows on its floor from your next message.`;
+		case "cancelled": return `Not connected to ${host}, because the window was cancelled or ran out of time; ${AGAIN}.`;
+		case "gone": return `Not connected to ${host}, because the link has expired or was already used; press Connect Claude Code on the Isoplan page for a new one.`;
+		case "busy": return `Not connected to ${host}, because another window asking to connect is already open on this computer; answer that one first.`;
+		case "unfinished": return `${host} paired this computer, but it couldn't finish setting up here; the window that opened says what to do.`;
+		case "failed": return `Not connected to ${host}, because ${result.why}; ${AGAIN}.`;
+	}
+}
+const named = (o) => {
+	const host = new URL(o.server).host;
+	return o.label === host ? host : `${o.label} (${host})`;
+};
+const list = (names) => names.length < 2 ? names.join("") : `${names.slice(0, -1).join(", ")} and ${names.at(-1)}`;
+/** Whether this computer is connected, and to which offices; any it lists but isn't connected to after. */
+function statusSentence(offices) {
+	const yes = offices.filter((o) => o.connected).map(named);
+	const no = offices.filter((o) => !o.connected).map(named);
+	if (!yes.length) return "This computer isn't connected to an Isoplan office yet: press Connect Claude Code on your office's Isoplan page.";
+	const also = no.length ? ` It isn't connected to ${list(no)}: press Connect Claude Code on that office's Isoplan page to connect it.` : "";
+	return `This computer is connected to Isoplan at ${list(yes)}.${also}`;
+}
+//#endregion
 //#region src/connect/main.ts
 const ENV = "ISOPLAN_CONNECT_URL";
 const here = path.dirname(fileURLToPath(import.meta.url));
-const link = process.env[ENV] ?? process.argv[2];
+const mode = !process.env[ENV] && (process.argv[2] === "--wait" || process.argv[2] === "--status") ? process.argv[2] : null;
+const link = process.env[ENV] ?? process.argv[mode ? 3 : 2];
 const { dir: claudeDir, json: claudeJson } = claudePaths(process.env, os.homedir());
 const logFile = path.join(claudeDir, "isoplan", "logs", "connect.log");
-if (!process.env[ENV] && link) {
-	spawn(process.execPath, [fileURLToPath(import.meta.url)], {
-		detached: true,
-		windowsHide: true,
-		stdio: "ignore",
-		env: {
-			...process.env,
-			[ENV]: link
-		}
-	}).unref();
+const defaultsPath = path.join(here, "..", "config.json");
+const account = () => accountOf({
+	readText: (p) => fs.readFile(p, "utf8").catch(() => null),
+	run: nodeIo().run
+}, claudeJson, os.homedir());
+const startDetached = (link) => spawn(process.execPath, [fileURLToPath(import.meta.url)], {
+	detached: true,
+	windowsHide: true,
+	stdio: "ignore",
+	env: {
+		...process.env,
+		[ENV]: link
+	}
+}).unref();
+if (mode === "--status") {
+	const offices = officesOf(await loadConfig(nodeIo(), defaultsPath, path.join(claudeDir, "isoplan", "config.json")));
+	const [pairing, who] = await Promise.all([readPairing(pairingPath(claudeDir)), account()]);
+	process.stdout.write(statusSentence(offices.map((o) => ({
+		label: o.label,
+		server: o.server,
+		connected: !!pairingEntry(pairing, o.server, who.id)?.credential
+	}))) + "\n");
+} else if (mode === "--wait" && link) {
+	const parsed = parseLink(link);
+	if (typeof parsed === "string") {
+		process.stdout.write(`Not connected, because ${parsed}; press Connect Claude Code on the Isoplan page to try again.\n`);
+		process.exitCode = 1;
+	} else {
+		const since = (/* @__PURE__ */ new Date()).toISOString();
+		startDetached(link);
+		const result = await waitForResult(() => fs.readFile(logFile, "utf8").catch(() => ""), since, parsed.server);
+		process.stdout.write(resultSentence(result, parsed.host) + "\n");
+		if (result?.kind !== "connected") process.exitCode = 1;
+	}
+} else if (!process.env[ENV] && link) {
+	startDetached(link);
 	process.stdout.write(`A window is opening on this computer to connect Claude Code to Isoplan: answer it there. Run this only once. What happens is written to ${logFile}.\n`);
 } else if (!link) {
-	process.stderr.write("usage: node connect.js <isoplan://connect?...>\n");
+	process.stderr.write("usage: node connect.js [--wait] <isoplan://connect?...>, or node connect.js --status\n");
 	process.exitCode = 2;
 } else {
 	const log = (text) => {
@@ -7139,11 +7255,8 @@ if (!process.env[ENV] && link) {
 	try {
 		await connect(link, {
 			claudeDir,
-			defaultsPath: path.join(here, "..", "config.json"),
-			account: () => accountOf({
-				readText: (p) => fs.readFile(p, "utf8").catch(() => null),
-				run: nodeIo().run
-			}, claudeJson, os.homedir()),
+			defaultsPath,
+			account,
 			machine: os.hostname(),
 			ask: (title, text) => ask(process.platform, title, text),
 			tell: (title, text, problem) => tell(process.platform, title, text, problem),
