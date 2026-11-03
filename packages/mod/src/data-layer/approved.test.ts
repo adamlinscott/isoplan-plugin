@@ -125,6 +125,29 @@ test("a forced check waits behind one running and then runs, rather than being s
   expect([...approved.repos()!]).toEqual([]);
 });
 
+test("a process takes a later copy another process kept at its next refresh, not at its own next check; a forced check asks the server even then", async () => {
+  const file = folder();
+  const o = office([]);
+  let clock = 0;
+  const options = { ...LIST, server: SERVER, file, get: o.get, now: () => clock };
+  const session = createApproved(options);
+  await session.refresh();
+  expect([...session.repos()!]).toEqual([]);
+
+  // The admin adds the repo; a minute later another process (/isoplan:repos) checks at once.
+  o.change([APP]);
+  clock += MINUTE;
+  const command = createApproved(options);
+  await command.refresh(true);
+  expect(o.state.asked).toHaveLength(2);
+  expect([...command.repos()!]).toEqual([APP]);
+
+  // The session's own check is four minutes off, but it takes the copy on disk now, asking nothing.
+  await session.refresh();
+  expect([...session.repos()!]).toEqual([APP]);
+  expect(o.state.asked).toHaveLength(2);
+});
+
 test("two processes writing the copy keep the newer version, whichever confirmed its own last", async () => {
   const file = folder();
   const o = office();

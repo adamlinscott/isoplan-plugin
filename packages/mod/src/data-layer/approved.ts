@@ -13,7 +13,8 @@
 // is used as it is, an older one is asked for again with its version, which the server answers with
 // a 304 while it is current, and one not confirmed within `maxAgeMs` approves nothing, so a list the
 // machine can't check fails closed. Two processes writing it keep the newer version, whichever
-// confirmed its own last.
+// confirmed its own last. Every refresh reads the shared copy, due or not, so a later one another
+// process wrote (/isoplan:repos's, src/repos) is taken at once, not at this process's next check.
 
 import { randomBytes } from "node:crypto";
 import fs from "node:fs/promises";
@@ -66,7 +67,7 @@ export interface Approved {
   /** Why there is no list, or null when there is one. */
   problem(): ListProblem | null;
   /**
-   * Reads the list again once it is due; `force`, at once, and after a check already running, never
+   * Takes a later copy another process kept at once, and asks the server once it is due; `force`, at once, and after a check already running, never
    * skipped (as the link drops or reconnects, or the server says not-wanted). Never throws.
    */
   refresh(force?: boolean): Promise<void>;
@@ -141,11 +142,11 @@ export function createApproved({ server, file, pairing, refreshMs, maxAgeMs, log
     await writeFile(file, kept).catch((err: unknown) => tell(`couldn't keep the office's list of repos in ${file}: ${String((err as Error)?.message ?? err)}`));
   }
 
-  async function check(): Promise<void> {
-    // Another process of this machine may have checked it since.
+  async function check(force: boolean): Promise<void> {
+    // Another process of this machine may have checked it since; a forced check asks the server all the same.
     const shared = await readApproved(file, server);
     if (shared && later(shared, list)) take(shared);
-    if (list && now() < nextAt) return;
+    if (!force && now() < nextAt) return;
     let token: string | null | undefined;
     try {
       token = pairing ? await pairing.token() : undefined;
@@ -208,8 +209,7 @@ export function createApproved({ server, file, pairing, refreshMs, maxAgeMs, log
       });
       return queued;
     }
-    if (now() < nextAt) return Promise.resolve();
-    busy = check()
+    busy = check(force)
       .catch((err: unknown) => tell(`couldn't read which repos the office takes: ${String((err as Error)?.message ?? err)}`))
       .finally(() => (busy = null));
     return busy;

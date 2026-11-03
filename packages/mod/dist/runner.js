@@ -6943,10 +6943,10 @@ function createApproved({ server, file, pairing, refreshMs, maxAgeMs, log, get =
 		if (kept === theirs) return;
 		await writeFile(file, kept).catch((err) => tell(`couldn't keep the office's list of repos in ${file}: ${String(err?.message ?? err)}`));
 	}
-	async function check() {
+	async function check(force) {
 		const shared = await readApproved(file, server);
 		if (shared && later(shared, list)) take(shared);
-		if (list && now() < nextAt) return;
+		if (!force && now() < nextAt) return;
 		let token;
 		try {
 			token = pairing ? await pairing.token() : void 0;
@@ -7016,8 +7016,7 @@ function createApproved({ server, file, pairing, refreshMs, maxAgeMs, log, get =
 			});
 			return queued;
 		}
-		if (now() < nextAt) return Promise.resolve();
-		busy = check().catch((err) => tell(`couldn't read which repos the office takes: ${String(err?.message ?? err)}`)).finally(() => busy = null);
+		busy = check(force).catch((err) => tell(`couldn't read which repos the office takes: ${String(err?.message ?? err)}`)).finally(() => busy = null);
 		return busy;
 	}
 	return {
