@@ -24,13 +24,147 @@ function freshRepos(copy, maxAgeMs, now) {
 	return copy && now - copy.checked <= maxAgeMs ? new Set(copy.repos.map((r) => r.toLowerCase())) : null;
 }
 //#endregion
-//#region src/data-layer/pairing.ts
+//#region src/wake/lock.ts
+const lockPath = (claudeDir, sessionId) => path.join(claudeDir, "isoplan", "live", `${sessionId}.json`);
+async function readText(file) {
+	try {
+		const [text, st] = await Promise.all([fs.readFile(file, "utf8"), fs.stat(file)]);
+		return {
+			text,
+			mtimeMs: st.mtimeMs
+		};
+	} catch {
+		return null;
+	}
+}
+function parseLock(text, mtimeMs) {
+	try {
+		const { pid, until, ...extra } = JSON.parse(text);
+		return {
+			pid: Number.isSafeInteger(pid) && pid > 0 ? pid : null,
+			until: typeof until === "number" ? until : null,
+			mtimeMs,
+			extra
+		};
+	} catch {
+		return null;
+	}
+}
+async function readLock(file) {
+	const r = await readText(file);
+	return r && parseLock(r.text, r.mtimeMs);
+}
+/** The pid the lock names, or null when there is none or it can't be read. */
+async function lockHolder(file) {
+	return (await readLock(file))?.pid ?? null;
+}
+const held = (lock, now, { isAlive = alive, freshMs }) => !!lock && (lock.until !== null && lock.until > now || lock.pid !== null && isAlive(lock.pid) && (freshMs === void 0 || now - lock.mtimeMs < freshMs));
+/**
+* Takes the lock for `pid`; false when it is held (`isHeld`). With `force` (the plugin's data
+* layer) it is taken regardless: a detached one holding it sees that and steps aside. `extra` is
+* written into the lock beside the pid.
+*
+* A new lock is created exclusively, so of two takers at once only one gets it. A stale one is
+* moved aside by rename, which only one taker can do to the same file, and the taker checks that
+* what it moved is the lock it judged stale, by its text and its write time, so a lock its holder
+* refreshed meanwhile isn't taken: one that moved another's lock instead puts it back and loses.
+* With `force` a lock that can't be moved (on Windows a scanner may have it open) is tried again
+* after a short wait, then overwritten, so the plugin's data layer always gets it.
+*/
+async function takeLock(file, pid, isAlive = alive, force = false, now = Date.now(), { freshMs, extra = {} } = {}) {
+	await fs.mkdir(path.dirname(file), { recursive: true });
+	const body = JSON.stringify({
+		pid,
+		...extra
+	});
+	for (let tries = 0; tries < 5; tries++) {
+		if (tries && force) await new Promise((r) => setTimeout(r, 20 * tries));
+		try {
+			await fs.writeFile(file, body, { flag: "wx" });
+			return true;
+		} catch (err) {
+			if (err.code !== "EEXIST") throw err;
+		}
+		const seen = await readText(file);
+		if (!seen) continue;
+		const lock = parseLock(seen.text, seen.mtimeMs);
+		if (!force && lock?.pid !== pid && held(lock, now, {
+			isAlive,
+			freshMs
+		})) return false;
+		const aside = `${file}.${pid}-${Math.random().toString(36).slice(2)}`;
+		try {
+			await fs.rename(file, aside);
+		} catch (err) {
+			if ([
+				"ENOENT",
+				"EPERM",
+				"EBUSY",
+				"EACCES"
+			].includes(err.code ?? "")) continue;
+			throw err;
+		}
+		const moved = await fs.readFile(aside, "utf8").catch(() => null);
+		const movedAt = (await fs.stat(aside).catch(() => null))?.mtimeMs;
+		if (moved !== seen.text || movedAt !== seen.mtimeMs) {
+			await fs.link(aside, file).catch(() => {});
+			await fs.rm(aside, { force: true });
+			if (!force) return false;
+			continue;
+		}
+		await fs.rm(aside, { force: true });
+	}
+	if (!force) return false;
+	await fs.writeFile(file, body);
+	return true;
+}
+/** Removes the lock if it still names `pid`. */
+async function releaseLock(file, pid) {
+	if (await lockHolder(file) === pid) await fs.rm(file, { force: true });
+}
+function alive(pid) {
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch (err) {
+		return err.code === "EPERM";
+	}
+}
+/** pairing.write.lock: free once this old, and waited for at most WRITE_WAIT_MS. */
+const WRITE_FRESH_MS = 1e4;
+const WRITE_WAIT_MS = 1e4;
 const pairingPath = (claudeDir) => path.join(claudeDir, "isoplan", "pairing.json");
 /** The account's entry for `server`, or undefined: the one under `offices`, else the one under `accounts` when it is that server's. */
 function pairingEntry(all, server, account) {
 	const first = all.accounts[account];
 	return all.offices?.[server]?.[account] ?? (first?.server === server ? first : void 0);
 }
+/**
+* `all` with the account's entry for `server` set: under `accounts` only for the server a version
+* before #105 reports to (`legacy`, config.json's `server`), and only while `offices` holds none for
+* it, so pairingEntry reads it back; any other server's always under `offices`, so a version before
+* #105, which writes `accounts` for its own server, never wipes it.
+*/
+function withPairingEntry(all, server, account, entry, legacy) {
+	if (legacy && !all.offices?.[server]?.[account]) return {
+		...all,
+		accounts: {
+			...all.accounts,
+			[account]: entry
+		}
+	};
+	return {
+		...all,
+		offices: {
+			...all.offices,
+			[server]: {
+				...all.offices?.[server],
+				[account]: entry
+			}
+		}
+	};
+}
+const pairingWriteLockPath = (claudeDir) => path.join(claudeDir, "isoplan", "pairing.write.lock");
 const postJson = async (url, body) => {
 	const response = await fetch(url, {
 		method: "POST",
@@ -60,6 +194,57 @@ async function readPairing(file) {
 	} catch {
 		return { accounts: {} };
 	}
+}
+/** Written whole, through a temp file, so a reader never sees half of it; owner-only. */
+async function writePairing(file, value) {
+	await fs.mkdir(path.dirname(file), { recursive: true });
+	const temp = `${file}.${process.pid}.${randomBytes(4).toString("hex")}`;
+	await fs.writeFile(temp, JSON.stringify(value, null, 2) + "\n", { mode: 384 });
+	try {
+		await fs.rename(temp, file);
+	} catch (err) {
+		await fs.rm(temp, { force: true }).catch(() => {});
+		throw err;
+	}
+}
+const queues = /* @__PURE__ */ new Map();
+/** Runs `change` on pairing.json under both locks, and writes what it returns (or nothing, for null). */
+async function locked(file, writeLock, pid, isAlive, change) {
+	const run = async () => {
+		const until = Date.now() + WRITE_WAIT_MS;
+		while (!await takeLock(writeLock, pid, isAlive, false, Date.now(), { freshMs: WRITE_FRESH_MS })) {
+			if (Date.now() > until) throw new Error(`couldn't take ${writeLock} in ${WRITE_WAIT_MS / 1e3} s`);
+			await new Promise((r) => setTimeout(r, 25));
+		}
+		try {
+			const { write, result } = change(await readPairing(file));
+			if (write) await writePairing(file, write);
+			return result;
+		} finally {
+			await releaseLock(writeLock, pid).catch(() => {});
+		}
+	};
+	const next = (queues.get(file) ?? Promise.resolve()).then(run, run);
+	queues.set(file, next.catch(() => {}));
+	return next;
+}
+/**
+* Keeps an access token renewed with `used` outside createPairing (/isoplan:repos, src/repos), as
+* its renewal does: only while the entry still holds that credential. The server keeps a few live
+* tokens per pairing, the newest, so one renewed and not kept would push out the one sessions use.
+*/
+function keepToken({ file, writeLock, server, account, legacy = false, pid = process.pid, isAlive = alive }, used, token, tokenExpires) {
+	return locked(file, writeLock, pid, isAlive, (all) => {
+		const entry = pairingEntry(all, server, account);
+		return {
+			write: entry?.credential === used ? withPairingEntry(all, server, account, {
+				...entry,
+				token,
+				tokenExpires
+			}, legacy) : null,
+			result: void 0
+		};
+	});
 }
 //#endregion
 //#region src/data-layer/approved.ts
@@ -106,6 +291,7 @@ function createApproved({ server, file, pairing, refreshMs, maxAgeMs, log, get =
 	let list = null;
 	let problem = "unreachable";
 	let nextAt = -Infinity;
+	let failedAt = -Infinity;
 	let busy = null;
 	let queued = null;
 	let said = "";
@@ -128,23 +314,25 @@ function createApproved({ server, file, pairing, refreshMs, maxAgeMs, log, get =
 		if (kept === theirs) return;
 		await writeFile(file, kept).catch((err) => tell(`couldn't keep the office's list of repos in ${file}: ${String(err?.message ?? err)}`));
 	}
-	async function check(force) {
+	async function check(ask) {
 		const shared = await readApproved(file, server);
-		if (shared && later(shared, list)) take(shared);
-		if (!force && now() < nextAt) return;
+		if (shared && shared.checked > failedAt && later(shared, list)) take(shared);
+		if (!ask && now() < nextAt) return null;
 		let token;
 		try {
 			token = pairing ? await pairing.token() : void 0;
 		} catch (err) {
 			tell(`couldn't read which repos the office takes: ${String(err?.message ?? err)}`);
 			problem = "unreachable";
-			nextAt = now() + RETRY_MS;
-			return;
+			failedAt = now();
+			nextAt = failedAt + RETRY_MS;
+			return "unreachable";
 		}
 		if (token === null) {
 			problem = "pairing";
-			nextAt = now() + PAIR_POLL_MS;
-			return;
+			failedAt = now();
+			nextAt = failedAt + PAIR_POLL_MS;
+			return "pairing";
 		}
 		const headers = {};
 		if (token) headers.authorization = `Bearer ${token}`;
@@ -166,7 +354,9 @@ function createApproved({ server, file, pairing, refreshMs, maxAgeMs, log, get =
 				...list,
 				checked: at
 			});
-		} else if (answer.status === 200 && isList(answer.body)) {
+			return "listed";
+		}
+		if (answer.status === 200 && isList(answer.body)) {
 			said = "";
 			const same = list?.version === answer.body.version;
 			await keep({
@@ -176,39 +366,50 @@ function createApproved({ server, file, pairing, refreshMs, maxAgeMs, log, get =
 				fetched: same ? list.fetched : at,
 				checked: at
 			});
-		} else if (answer.status === 401 && pairing && (code === "not-paired" || code === "pairing-ended" || code === "token-expired")) {
+			return "listed";
+		}
+		failedAt = at;
+		if (answer.status === 401 && pairing && (code === "not-paired" || code === "pairing-ended" || code === "token-expired")) {
 			await pairing.refused(code, token).catch(() => {});
 			problem = "pairing";
 			nextAt = at + (code === "token-expired" || !token ? 0 : PAIR_POLL_MS);
-		} else if (answer.status === 404) {
+			return "pairing";
+		}
+		if (answer.status === 404) {
 			tell(`${server} is too old to say which repos its office takes, so nothing is sent to it; it needs updating`);
 			list = null;
 			problem = "too-old";
 			nextAt = at + refreshMs;
-		} else {
-			tell(`couldn't read which repos the office takes from ${server}: ${answer.status ? `it answered ${answer.status}` : String(answer.body)}`);
-			problem = "unreachable";
-			nextAt = at + RETRY_MS;
+			return "too-old";
 		}
+		tell(`couldn't read which repos the office takes from ${server}: ${answer.status ? `it answered ${answer.status}` : String(answer.body)}`);
+		problem = "unreachable";
+		nextAt = at + RETRY_MS;
+		return "unreachable";
 	}
-	function refresh(force = false) {
+	function run(force, ask = false) {
 		if (force) nextAt = -Infinity;
 		if (busy) {
 			if (!force) return busy;
+			if (ask) return busy.then(() => run(true, true));
 			queued ??= busy.then(() => {
 				queued = null;
-				return refresh(true);
+				return run(true);
 			});
 			return queued;
 		}
-		busy = check(force).catch((err) => tell(`couldn't read which repos the office takes: ${String(err?.message ?? err)}`)).finally(() => busy = null);
+		busy = check(ask).catch((err) => {
+			tell(`couldn't read which repos the office takes: ${String(err?.message ?? err)}`);
+			return "unreachable";
+		}).finally(() => busy = null);
 		return busy;
 	}
 	return {
 		repos: () => freshRepos(list, maxAgeMs, now()),
 		version: () => list?.version ?? null,
 		problem: () => list && !freshRepos(list, maxAgeMs, now()) ? "unreachable" : list ? null : problem,
-		refresh
+		refresh: (force = false) => run(force).then(() => {}),
+		ask: () => run(true, true).then((asked) => asked ?? "unreachable")
 	};
 }
 //#endregion
@@ -1081,7 +1282,7 @@ var $ZodEncodeError = class extends Error {
 };
 (_a$1 = globalThis).__zod_globalConfig ?? (_a$1.__zod_globalConfig = {});
 const globalConfig = globalThis.__zod_globalConfig;
-function config$1(newConfig) {
+function config(newConfig) {
 	if (newConfig) Object.assign(globalConfig, newConfig);
 	return globalConfig;
 }
@@ -1220,7 +1421,7 @@ const _parse = (_Err) => {
 		}, ctx);
 		if (result instanceof Promise) throw new $ZodAsyncError();
 		if (result.issues.length) {
-			const e = new ((_params?.Err) ?? _Err)(result.issues.map((iss) => finalizeIssue(iss, ctx, config$1())));
+			const e = new ((_params?.Err) ?? _Err)(result.issues.map((iss) => finalizeIssue(iss, ctx, config())));
 			captureStackTrace(e, _params?.callee ?? fn);
 			throw e;
 		}
@@ -1240,7 +1441,7 @@ const _parseAsync = (_Err) => {
 		}, ctx);
 		if (result instanceof Promise) result = await result;
 		if (result.issues.length) {
-			const e = new ((params?.Err) ?? _Err)(result.issues.map((iss) => finalizeIssue(iss, ctx, config$1())));
+			const e = new ((params?.Err) ?? _Err)(result.issues.map((iss) => finalizeIssue(iss, ctx, config())));
 			captureStackTrace(e, params?.callee ?? fn);
 			throw e;
 		}
@@ -1269,7 +1470,7 @@ function failure(Err, issues, ctx) {
 		success: false,
 		get error() {
 			if (!error) {
-				error = new Err(issues.map((iss) => finalizeIssue(iss, ctx, config$1())));
+				error = new Err(issues.map((iss) => finalizeIssue(iss, ctx, config())));
 				issues = void 0;
 				ctx = void 0;
 			}
@@ -1902,7 +2103,7 @@ const $ZodType = /*@__PURE__*/ $constructor("$ZodType", (inst, def) => {
 	}
 });
 /** The Standard Schema surface for `inst`. Shared so wrappers can extend it without forcing it. */
-const toStandardResult = (r, ctx) => r.issues.length ? { issues: r.issues.map((iss) => finalizeIssue(iss, ctx, config$1())) } : { value: r.value };
+const toStandardResult = (r, ctx) => r.issues.length ? { issues: r.issues.map((iss) => finalizeIssue(iss, ctx, config())) } : { value: r.value };
 async function validateAsync(inst, value) {
 	const ctx = { async: true };
 	return toStandardResult(await inst._zod.run({
@@ -2654,7 +2855,7 @@ function handleUnionResults(results, final, inst, ctx) {
 		code: "invalid_union",
 		input: final.value,
 		inst,
-		errors: results.map((result) => result.issues.map((iss) => finalizeIssue(iss, ctx, config$1())))
+		errors: results.map((result) => result.issues.map((iss) => finalizeIssue(iss, ctx, config())))
 	});
 	return final;
 }
@@ -2905,7 +3106,7 @@ const $ZodRecord = /*@__PURE__*/ $constructor("$ZodRecord", (inst, def) => {
 					payload.issues.push({
 						code: "invalid_key",
 						origin: "record",
-						issues: keyResult.issues.map((iss) => finalizeIssue(iss, ctx, config$1())),
+						issues: keyResult.issues.map((iss) => finalizeIssue(iss, ctx, config())),
 						input: key,
 						path: [key],
 						inst
@@ -2971,7 +3172,7 @@ const $ZodRecord = /*@__PURE__*/ $constructor("$ZodRecord", (inst, def) => {
 					} else payload.issues.push({
 						code: "invalid_key",
 						origin: "record",
-						issues: keyResult.issues.map((iss) => finalizeIssue(iss, ctx, config$1())),
+						issues: keyResult.issues.map((iss) => finalizeIssue(iss, ctx, config())),
 						input: key,
 						path: [key],
 						inst
@@ -3177,7 +3378,7 @@ function handleCatchResult(payload, result, def, ctx) {
 	payload.value = def.catchValue({
 		...result,
 		value: payload.value,
-		error: { issues: result.issues.map((iss) => finalizeIssue(iss, ctx, config$1())) },
+		error: { issues: result.issues.map((iss) => finalizeIssue(iss, ctx, config())) },
 		input: payload.value
 	});
 	return payload;
@@ -5143,10 +5344,10 @@ const safeDecodeAsync = /* @__PURE__ */ _safeDecodeAsync(ZodRealError);
 //#endregion
 //#region ../../node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/classic/schemas.js
 function _ensureDefaultLocale() {
-	if (!globalConfig.localeError) config$1(en_default());
+	if (!globalConfig.localeError) config(en_default());
 }
 function _ensureDefaultMemoizer() {
-	if (!globalConfig.memoizer) config$1({ memoizer: memoizer() });
+	if (!globalConfig.memoizer) config({ memoizer: memoizer() });
 }
 const ZodType = /*@__PURE__*/ $constructor("ZodType", (inst, def) => {
 	_ensureDefaultLocale();
@@ -6827,16 +7028,22 @@ function machineHomeIo(workspaceRepos, machine = os.hostname()) {
 }
 //#endregion
 //#region src/repos/repos.ts
-const TOKEN_LEFT_MS = 3e5;
-/** This machine's pairing with `server`, only read: undefined with none (an office that signs nobody in), null when the office won't swap its credential. */
-function readOnlyPairing(file, server, account, post = postJson, now = Date.now) {
+/**
+* This machine's pairing with `place.server`: undefined with none (an office that signs nobody in),
+* null when the office says the pairing has ended; throws when the office can't renew the token.
+*/
+function commandPairing(place, log, post = postJson, now = Date.now) {
 	return {
 		async token() {
-			const entry = pairingEntry(await readPairing(file), server, account);
+			const entry = pairingEntry(await readPairing(place.file), place.server, place.account);
 			if (!entry?.credential) return void 0;
-			if (entry.token && (entry.tokenExpires ?? 0) - TOKEN_LEFT_MS > now()) return entry.token;
-			const answer = await post(httpUrl(server, "/token"), { credential: entry.credential });
-			return answer.status === 200 && typeof answer.body.token === "string" ? answer.body.token : null;
+			if (entry.token && (entry.tokenExpires ?? 0) - 3e5 > now()) return entry.token;
+			const answer = await post(httpUrl(place.server, "/token"), { credential: entry.credential });
+			if (answer.status === 401) return null;
+			if (answer.status !== 200 || typeof answer.body.token !== "string") throw new Error(`the office answered ${answer.status} when renewing this machine's token`);
+			const expires = Date.parse(String(answer.body.expires));
+			await keepToken(place, entry.credential, answer.body.token, Number.isFinite(expires) ? expires : now()).catch((err) => log(`couldn't keep the renewed token for ${place.server}: ${String(err?.message ?? err)}`));
+			return answer.body.token;
 		},
 		refused: async () => {},
 		close: async () => {}
@@ -6844,27 +7051,16 @@ function readOnlyPairing(file, server, account, post = postJson, now = Date.now)
 }
 /** Asks `server` for its list now, keeping it in `file` for every process of the machine, and says what it answered. */
 async function checkOffice(options) {
-	const get = options.get ?? getJson;
-	let status = null;
 	const approved = createApproved({
 		...options,
-		log: () => {},
-		get: async (url, headers) => {
-			status = 0;
-			const answer = await get(url, headers);
-			status = answer.status;
-			return answer;
-		}
+		get: options.get ?? getJson
 	});
-	await approved.refresh(true);
-	const repos = approved.repos();
-	if ((status === 200 || status === 304) && repos) return {
+	const asked = await approved.ask();
+	if (asked === "listed") return {
 		kind: "listed",
-		repos
+		repos: approved.repos()
 	};
-	if (status === 401 || status === null && approved.problem() === "pairing") return { kind: "not-paired" };
-	if (status === 404) return { kind: "too-old" };
-	return { kind: "unreachable" };
+	return { kind: asked === "pairing" ? "not-paired" : asked };
 }
 /** The sentence for one office, named by `label`, about this folder's `projects` (one repo, or a workspace's). */
 function sentence(label, answer, projects, workspace) {
@@ -6874,10 +7070,12 @@ function sentence(label, answer, projects, workspace) {
 		case "too-old": return `${label} is too old to say which repos it takes, so nothing is sent to it: it needs updating.`;
 		case "unreachable": return `Couldn't reach ${label} to ask which repos it takes: try /isoplan:repos again in a minute.`;
 	}
+	if (!projects.length) return `Git couldn't read the repos in this folder, so nothing of this session is sent to ${label}.`;
 	const home = projects.find((p) => answer.repos.has(p.id.toLowerCase()));
+	const shows = "this session shows on its floor within a minute; if it doesn't, send any message in it.";
+	if (home && workspace) return `${label} takes ${home.id}, a repo in this folder: ${shows}`;
+	if (home) return `${label} takes this repo (${home.id}): ${shows}`;
 	const ids = projects.map((p) => p.id).join(", ");
-	if (home && workspace) return `${label} takes ${home.id}, a repo in this folder: this session shows on its floor within a minute.`;
-	if (home) return `${label} takes this repo (${home.id}): this session shows on its floor within a minute.`;
 	if (workspace) return `${label} takes none of the repos in this folder (${ids}): an admin can add one under Repos on the floor.`;
 	return `${label} doesn't take this repo (${ids}): an admin can add it under Repos on the floor.`;
 }
@@ -6885,23 +7083,41 @@ function sentence(label, answer, projects, workspace) {
 //#region src/repos/main.ts
 const here = path.dirname(fileURLToPath(import.meta.url));
 const { dir: claudeDir, json: claudeJson } = claudePaths(process.env, os.homedir());
+const userConfigPath = path.join(claudeDir, "isoplan", "config.json");
+const logFile = path.join(claudeDir, "isoplan", "logs", "repos.log");
+const log = (text) => {
+	fs.mkdir(path.dirname(logFile), { recursive: true }).then(() => fs.appendFile(logFile, `${(/* @__PURE__ */ new Date()).toISOString()} ${text}\n`)).catch(() => {});
+};
 const io = nodeIo();
-const config = await loadConfig(io, path.join(here, "..", "config.json"), path.join(claudeDir, "isoplan", "config.json"));
-const account = await accountOf({
-	readText: (p) => fs.readFile(p, "utf8").catch(() => null),
-	run: io.run
-}, claudeJson, os.homedir());
-const { projects, workspace } = await candidatesOf(process.env.CLAUDE_PROJECT_DIR || process.cwd(), machineHomeIo(config.workspaceRepos));
-const lines = await Promise.all(officesOf(config).map(async (office) => {
-	const answer = office.plainRefused ? { kind: "plain" } : await checkOffice({
-		server: office.server,
-		file: approvedPath(claudeDir, office.server),
-		pairing: readOnlyPairing(pairingPath(claudeDir), office.server, account.id),
-		refreshMs: config.approvedRefreshMinutes * 6e4,
-		maxAgeMs: config.approvedMaxAgeMinutes * 6e4
-	});
-	return sentence(office.label, answer, projects, workspace);
-}));
-process.stdout.write(lines.join("\n") + "\n");
+const mine = await fs.readFile(userConfigPath, "utf8").then((t) => JSON.parse(t), () => null) ?? {};
+if (!(Array.isArray(mine.servers) && mine.servers.length) && typeof mine.server !== "string") process.stdout.write("This computer isn't connected to an Isoplan office yet: press Connect Claude Code on your office's Isoplan page.\n");
+else {
+	const config = await loadConfig(io, path.join(here, "..", "config.json"), userConfigPath);
+	const account = await accountOf({
+		readText: (p) => fs.readFile(p, "utf8").catch(() => null),
+		run: io.run
+	}, claudeJson, os.homedir());
+	const session = process.env.CLAUDE_CODE_SESSION_ID;
+	const locked = session && /^[\w-]+$/.test(session) ? (await readLock(lockPath(claudeDir, session)))?.extra.cwd : void 0;
+	const { projects, workspace } = await candidatesOf(typeof locked === "string" && locked ? locked : process.env.CLAUDE_PROJECT_DIR || process.cwd(), machineHomeIo(config.workspaceRepos));
+	const lines = await Promise.all(officesOf(config).map(async (office) => {
+		const answer = office.plainRefused ? { kind: "plain" } : await checkOffice({
+			server: office.server,
+			file: approvedPath(claudeDir, office.server),
+			pairing: commandPairing({
+				file: pairingPath(claudeDir),
+				writeLock: pairingWriteLockPath(claudeDir),
+				server: office.server,
+				account: account.id,
+				legacy: !!office.legacy
+			}, log),
+			refreshMs: config.approvedRefreshMinutes * 6e4,
+			maxAgeMs: config.approvedMaxAgeMinutes * 6e4,
+			log
+		});
+		return sentence(office.label, answer, projects, workspace);
+	}));
+	process.stdout.write(lines.join("\n") + "\n");
+}
 //#endregion
 export {};

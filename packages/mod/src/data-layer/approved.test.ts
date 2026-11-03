@@ -125,7 +125,7 @@ test("a forced check waits behind one running and then runs, rather than being s
   expect([...approved.repos()!]).toEqual([]);
 });
 
-test("a process takes a later copy another process kept at its next refresh, not at its own next check; a forced check asks the server even then", async () => {
+test("ask asks the server past a fresh copy, and a session takes what it kept at its next refresh, not at its own next check", async () => {
   const file = folder();
   const o = office([]);
   let clock = 0;
@@ -134,11 +134,11 @@ test("a process takes a later copy another process kept at its next refresh, not
   await session.refresh();
   expect([...session.repos()!]).toEqual([]);
 
-  // The admin adds the repo; a minute later another process (/isoplan:repos) checks at once.
+  // The admin adds the repo; a minute later /isoplan:repos asks at once.
   o.change([APP]);
   clock += MINUTE;
   const command = createApproved(options);
-  await command.refresh(true);
+  expect(await command.ask()).toBe("listed");
   expect(o.state.asked).toHaveLength(2);
   expect([...command.repos()!]).toEqual([APP]);
 
@@ -146,6 +146,49 @@ test("a process takes a later copy another process kept at its next refresh, not
   await session.refresh();
   expect([...session.repos()!]).toEqual([APP]);
   expect(o.state.asked).toHaveLength(2);
+});
+
+test("a forced check uses a copy another process confirmed within refreshMs, so links dropping together ask the server once", async () => {
+  const file = folder();
+  const o = office();
+  let clock = 0;
+  const options = { ...LIST, server: SERVER, file, get: o.get, now: () => clock };
+  const one = createApproved(options);
+  const two = createApproved(options);
+  await one.refresh();
+  await two.refresh();
+  expect(o.state.asked).toHaveLength(1);
+
+  // The office restarts: both links drop, a minute later.
+  clock += MINUTE;
+  await one.refresh(true);
+  await two.refresh(true);
+  expect(o.state.asked).toHaveLength(2);
+  expect([...two.repos()!]).toEqual([APP]);
+});
+
+test("after a 404 the copy it replaced isn't taken back, and the server is asked again only once refreshMs is up", async () => {
+  const file = folder();
+  const o = office();
+  let clock = 0;
+  const approved = createApproved({ ...LIST, server: SERVER, file, get: o.get, now: () => clock });
+  await approved.refresh();
+  o.state.status = 404;
+  clock += 5 * MINUTE;
+  await approved.refresh();
+  expect(approved.problem()).toBe("too-old");
+  expect(o.state.asked).toHaveLength(2);
+
+  // Every pass after reads the old copy on disk, but neither takes it nor asks.
+  for (let i = 0; i < 5; i++) {
+    clock += 30000;
+    await approved.refresh();
+  }
+  expect(approved.repos()).toBeNull();
+  expect(o.state.asked).toHaveLength(2);
+  clock += 3 * MINUTE;
+  await approved.refresh();
+  expect(o.state.asked).toHaveLength(3);
 });
 
 test("two processes writing the copy keep the newer version, whichever confirmed its own last", async () => {

@@ -9471,10 +9471,6 @@ async function backfill(found, { claudeDir, dataLayer, spawn, isAlive = alive, p
 	}
 	return started;
 }
-//#endregion
-//#region src/data-layer/pairing.ts
-/** Renewed this long before it runs out. */
-const RENEW_EARLY_MS = 3e5;
 const PAIRING_REFRESH_MS = 2e4;
 /** pairing.write.lock: free once this old, and waited for at most WRITE_WAIT_MS. */
 const WRITE_FRESH_MS = 1e4;
@@ -9792,7 +9788,7 @@ function createPairing({ file, lock, writeLock, server, account, machine, emit, 
 	return {
 		async token() {
 			const entry = await mine();
-			if (entry.token && (entry.tokenExpires ?? 0) - RENEW_EARLY_MS > now()) {
+			if (entry.token && (entry.tokenExpires ?? 0) - 3e5 > now()) {
 				plainRefused();
 				return entry.token;
 			}
@@ -9897,6 +9893,7 @@ function createApproved({ server, file, pairing, refreshMs, maxAgeMs, log, get =
 	let list = null;
 	let problem = "unreachable";
 	let nextAt = -Infinity;
+	let failedAt = -Infinity;
 	let busy = null;
 	let queued = null;
 	let said = "";
@@ -9919,23 +9916,25 @@ function createApproved({ server, file, pairing, refreshMs, maxAgeMs, log, get =
 		if (kept === theirs) return;
 		await writeFile(file, kept).catch((err) => tell(`couldn't keep the office's list of repos in ${file}: ${String(err?.message ?? err)}`));
 	}
-	async function check(force) {
+	async function check(ask) {
 		const shared = await readApproved(file, server);
-		if (shared && later(shared, list)) take(shared);
-		if (!force && now() < nextAt) return;
+		if (shared && shared.checked > failedAt && later(shared, list)) take(shared);
+		if (!ask && now() < nextAt) return null;
 		let token;
 		try {
 			token = pairing ? await pairing.token() : void 0;
 		} catch (err) {
 			tell(`couldn't read which repos the office takes: ${String(err?.message ?? err)}`);
 			problem = "unreachable";
-			nextAt = now() + RETRY_MS;
-			return;
+			failedAt = now();
+			nextAt = failedAt + RETRY_MS;
+			return "unreachable";
 		}
 		if (token === null) {
 			problem = "pairing";
-			nextAt = now() + PAIR_POLL_MS;
-			return;
+			failedAt = now();
+			nextAt = failedAt + PAIR_POLL_MS;
+			return "pairing";
 		}
 		const headers = {};
 		if (token) headers.authorization = `Bearer ${token}`;
@@ -9957,7 +9956,9 @@ function createApproved({ server, file, pairing, refreshMs, maxAgeMs, log, get =
 				...list,
 				checked: at
 			});
-		} else if (answer.status === 200 && isList(answer.body)) {
+			return "listed";
+		}
+		if (answer.status === 200 && isList(answer.body)) {
 			said = "";
 			const same = list?.version === answer.body.version;
 			await keep({
@@ -9967,39 +9968,50 @@ function createApproved({ server, file, pairing, refreshMs, maxAgeMs, log, get =
 				fetched: same ? list.fetched : at,
 				checked: at
 			});
-		} else if (answer.status === 401 && pairing && (code === "not-paired" || code === "pairing-ended" || code === "token-expired")) {
+			return "listed";
+		}
+		failedAt = at;
+		if (answer.status === 401 && pairing && (code === "not-paired" || code === "pairing-ended" || code === "token-expired")) {
 			await pairing.refused(code, token).catch(() => {});
 			problem = "pairing";
 			nextAt = at + (code === "token-expired" || !token ? 0 : PAIR_POLL_MS);
-		} else if (answer.status === 404) {
+			return "pairing";
+		}
+		if (answer.status === 404) {
 			tell(`${server} is too old to say which repos its office takes, so nothing is sent to it; it needs updating`);
 			list = null;
 			problem = "too-old";
 			nextAt = at + refreshMs;
-		} else {
-			tell(`couldn't read which repos the office takes from ${server}: ${answer.status ? `it answered ${answer.status}` : String(answer.body)}`);
-			problem = "unreachable";
-			nextAt = at + RETRY_MS;
+			return "too-old";
 		}
+		tell(`couldn't read which repos the office takes from ${server}: ${answer.status ? `it answered ${answer.status}` : String(answer.body)}`);
+		problem = "unreachable";
+		nextAt = at + RETRY_MS;
+		return "unreachable";
 	}
-	function refresh(force = false) {
+	function run(force, ask = false) {
 		if (force) nextAt = -Infinity;
 		if (busy) {
 			if (!force) return busy;
+			if (ask) return busy.then(() => run(true, true));
 			queued ??= busy.then(() => {
 				queued = null;
-				return refresh(true);
+				return run(true);
 			});
 			return queued;
 		}
-		busy = check(force).catch((err) => tell(`couldn't read which repos the office takes: ${String(err?.message ?? err)}`)).finally(() => busy = null);
+		busy = check(ask).catch((err) => {
+			tell(`couldn't read which repos the office takes: ${String(err?.message ?? err)}`);
+			return "unreachable";
+		}).finally(() => busy = null);
 		return busy;
 	}
 	return {
 		repos: () => freshRepos(list, maxAgeMs, now()),
 		version: () => list?.version ?? null,
 		problem: () => list && !freshRepos(list, maxAgeMs, now()) ? "unreachable" : list ? null : problem,
-		refresh
+		refresh: (force = false) => run(force).then(() => {}),
+		ask: () => run(true, true).then((asked) => asked ?? "unreachable")
 	};
 }
 function createSessionGate({ approved, open }) {
@@ -10772,7 +10784,8 @@ async function main(argv) {
 		dataLayer: self,
 		detached,
 		since,
-		parent: process.ppid
+		parent: process.ppid,
+		cwd
 	};
 	const newest = () => newestDataLayer(place.plugins, self, project).catch(() => self);
 	const isOutdated = async () => await newest() !== self;

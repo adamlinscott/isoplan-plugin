@@ -50,7 +50,7 @@ import { officeDir } from "./approved-file.js";
 import { alive, refreshLock, releaseLock, takeLock } from "../wake/lock.js";
 
 /** Renewed this long before it runs out. */
-const RENEW_EARLY_MS = 5 * 60 * 1000;
+export const RENEW_EARLY_MS = 5 * 60 * 1000;
 /** pairing.lock counts as free once not refreshed for this long, whatever pid it names. */
 export const PAIRING_FRESH_MS = 60 * 1000;
 const PAIRING_REFRESH_MS = 20 * 1000;
@@ -238,6 +238,23 @@ export function keepCredential(
   return locked(file, writeLock, pid, isAlive, (all) => {
     const { token: _, tokenExpires: __, waiting: ___, ...rest } = pairingEntry(all, server, account) ?? { server };
     return { write: withPairingEntry(all, server, account, { ...rest, credential }, legacy), result: undefined };
+  });
+}
+
+/**
+ * Keeps an access token renewed with `used` outside createPairing (/isoplan:repos, src/repos), as
+ * its renewal does: only while the entry still holds that credential. The server keeps a few live
+ * tokens per pairing, the newest, so one renewed and not kept would push out the one sessions use.
+ */
+export function keepToken(
+  { file, writeLock, server, account, legacy = false, pid = process.pid, isAlive = alive }: Pick<PairingOptions, "file" | "writeLock" | "server" | "legacy" | "pid" | "isAlive"> & { account: string },
+  used: string,
+  token: string,
+  tokenExpires: number,
+): Promise<void> {
+  return locked(file, writeLock, pid, isAlive, (all) => {
+    const entry = pairingEntry(all, server, account);
+    return { write: entry?.credential === used ? withPairingEntry(all, server, account, { ...entry, token, tokenExpires }, legacy) : null, result: undefined };
   });
 }
 

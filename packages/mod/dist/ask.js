@@ -6522,10 +6522,6 @@ function alive(pid) {
 		return err.code === "EPERM";
 	}
 }
-//#endregion
-//#region src/data-layer/pairing.ts
-/** Renewed this long before it runs out. */
-const RENEW_EARLY_MS = 3e5;
 const PAIRING_REFRESH_MS = 2e4;
 /** pairing.write.lock: free once this old, and waited for at most WRITE_WAIT_MS. */
 const WRITE_FRESH_MS = 1e4;
@@ -6843,7 +6839,7 @@ function createPairing({ file, lock, writeLock, server, account, machine, emit, 
 	return {
 		async token() {
 			const entry = await mine();
-			if (entry.token && (entry.tokenExpires ?? 0) - RENEW_EARLY_MS > now()) {
+			if (entry.token && (entry.tokenExpires ?? 0) - 3e5 > now()) {
 				plainRefused();
 				return entry.token;
 			}
