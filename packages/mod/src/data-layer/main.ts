@@ -196,7 +196,8 @@ async function main(argv: string[]): Promise<number> {
   }
   // When this window's hooks module started: one it starts again keeps its window's place.
   const since = Number(value(argv, "--since")) || Date.now();
-  const lockExtra = { dataLayer: self, detached, since, parent: process.ppid };
+  // The session's folder too, so /isoplan:repos (src/repos) looks at the folder this reports as.
+  const lockExtra = { dataLayer: self, detached, since, parent: process.ppid, cwd };
   // The newest copy of the plugin installed for this session (state.ts): another one means this one is outdated.
   const newest = () => newestDataLayer(place.plugins, self, project).catch(() => self);
   const isOutdated = async () => (await newest()) !== self;

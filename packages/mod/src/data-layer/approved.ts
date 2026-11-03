@@ -9,10 +9,14 @@
 // machine's access token, so a machine not paired yet pairs here, from that refusal, as the link
 // would from a hello's; pairing sends only the machine's name, its id and the Claude account's
 // label, never a repo. It is kept in <claude dir>/isoplan/offices/<id>/approved.json, one per server
-// (#105), which every process of the machine shares (approved-file.ts): a copy confirmed within `refreshMs`
-// is used as it is, an older one is asked for again with its version, which the server answers with
-// a 304 while it is current, and one not confirmed within `maxAgeMs` approves nothing, so a list the
-// machine can't check fails closed. Two processes writing it keep the newer version, whichever
+// (#105), which every process of the machine shares (approved-file.ts). Every refresh reads it,
+// due or not, so a later copy another process kept (/isoplan:repos's, src/repos) is taken at the
+// next pass; a copy confirmed within `refreshMs` is used as it is, even by a forced check, so links
+// dropping on every session at once ask the server once; only `ask` always asks. An older one is
+// asked for again with its version, which the server answers with a 304 while it is current, and one
+// not confirmed within `maxAgeMs` approves nothing, so a list the machine can't check fails closed.
+// A copy confirmed before this process's last failed check is never taken, so a 404 or a refusal
+// isn't undone by the copy it replaced. Two processes writing it keep the newer version, whichever
 // confirmed its own last.
 
 import { randomBytes } from "node:crypto";
@@ -38,6 +42,9 @@ export const getJson: Get = async (url, headers) => {
   const response = await fetch(url, { headers, signal: AbortSignal.timeout(15000) });
   return { status: response.status, body: response.status === 200 || response.status === 401 ? await response.json().catch(() => null) : null };
 };
+
+/** What one check of the server found: the list (listed), or why not. */
+export type Asked = "listed" | ListProblem;
 
 /** Why the list isn't known: pairing (the machine waits to be paired), unreachable (or older than its maximum age), or too-old (the server lists no repos). */
 export type ListProblem = "pairing" | "unreachable" | "too-old";
@@ -66,10 +73,13 @@ export interface Approved {
   /** Why there is no list, or null when there is one. */
   problem(): ListProblem | null;
   /**
-   * Reads the list again once it is due; `force`, at once, and after a check already running, never
-   * skipped (as the link drops or reconnects, or the server says not-wanted). Never throws.
+   * Takes a later copy another process kept, and asks the server once it is due; `force`, at once
+   * unless another process confirmed a copy within `refreshMs`, and after a check already running,
+   * never skipped (as the link drops or reconnects, or the server says not-wanted). Never throws.
    */
   refresh(force?: boolean): Promise<void>;
+  /** Asks the server now, whatever any copy says, after a check already running (/isoplan:repos); what it found. Never throws. */
+  ask(): Promise<Asked>;
 }
 
 /** While the machine waits to be paired the list is asked for again this soon, and after a failure this soon. */
@@ -119,8 +129,9 @@ export function createApproved({ server, file, pairing, refreshMs, maxAgeMs, log
   let list: ApprovedFile | null = null;
   let problem: ListProblem | null = "unreachable";
   let nextAt = -Infinity;
-  let busy: Promise<void> | null = null;
-  let queued: Promise<void> | null = null;
+  let failedAt = -Infinity; // when a check last failed: a copy confirmed before it is never taken
+  let busy: Promise<Asked | null> | null = null;
+  let queued: Promise<Asked | null> | null = null;
   let said = ""; // the last problem logged, so a lasting one is logged once
 
   const take = (value: ApprovedFile) => {
@@ -141,25 +152,28 @@ export function createApproved({ server, file, pairing, refreshMs, maxAgeMs, log
     await writeFile(file, kept).catch((err: unknown) => tell(`couldn't keep the office's list of repos in ${file}: ${String((err as Error)?.message ?? err)}`));
   }
 
-  async function check(): Promise<void> {
+  // What the server answered; null when the copy was used as it is, without asking.
+  async function check(ask: boolean): Promise<Asked | null> {
     // Another process of this machine may have checked it since.
     const shared = await readApproved(file, server);
-    if (shared && later(shared, list)) take(shared);
-    if (list && now() < nextAt) return;
+    if (shared && shared.checked > failedAt && later(shared, list)) take(shared);
+    if (!ask && now() < nextAt) return null;
     let token: string | null | undefined;
     try {
       token = pairing ? await pairing.token() : undefined;
     } catch (err) {
       tell(`couldn't read which repos the office takes: ${String((err as Error)?.message ?? err)}`);
       problem = "unreachable";
-      nextAt = now() + RETRY_MS;
-      return;
+      failedAt = now();
+      nextAt = failedAt + RETRY_MS;
+      return "unreachable";
     }
     if (token === null) {
       // A link to pair this machine waits to be clicked; pairing shows it.
       problem = "pairing";
-      nextAt = now() + PAIR_POLL_MS;
-      return;
+      failedAt = now();
+      nextAt = failedAt + PAIR_POLL_MS;
+      return "pairing";
     }
     const headers: Record<string, string> = {};
     if (token) headers.authorization = `Bearer ${token}`;
@@ -175,42 +189,54 @@ export function createApproved({ server, file, pairing, refreshMs, maxAgeMs, log
     if (answer.status === 304 && list) {
       said = "";
       await keep({ ...list, checked: at });
-    } else if (answer.status === 200 && isList(answer.body)) {
+      return "listed";
+    }
+    if (answer.status === 200 && isList(answer.body)) {
       said = "";
       const same = list?.version === answer.body.version;
       await keep({ server, version: answer.body.version, repos: answer.body.repos, fetched: same ? list!.fetched : at, checked: at });
-    } else if (answer.status === 401 && pairing && (code === "not-paired" || code === "pairing-ended" || code === "token-expired")) {
+      return "listed";
+    }
+    failedAt = at;
+    if (answer.status === 401 && pairing && (code === "not-paired" || code === "pairing-ended" || code === "token-expired")) {
       // Pairs or renews, as for a hello refused; the list is asked for again at once.
       await pairing.refused(code as Refusal, token).catch(() => {});
       problem = "pairing";
       nextAt = at + (code === "token-expired" || !token ? 0 : PAIR_POLL_MS);
-    } else if (answer.status === 404) {
+      return "pairing";
+    }
+    if (answer.status === 404) {
       tell(`${server} is too old to say which repos its office takes, so nothing is sent to it; it needs updating`);
       list = null;
       problem = "too-old";
       nextAt = at + refreshMs;
-    } else {
-      // Anything else counts as out of reach: the copy stands until its maximum age, then approves nothing.
-      tell(`couldn't read which repos the office takes from ${server}: ${answer.status ? `it answered ${answer.status}` : String(answer.body)}`);
-      problem = "unreachable";
-      nextAt = at + RETRY_MS;
+      return "too-old";
     }
+    // Anything else counts as out of reach: the copy stands until its maximum age, then approves nothing.
+    tell(`couldn't read which repos the office takes from ${server}: ${answer.status ? `it answered ${answer.status}` : String(answer.body)}`);
+    problem = "unreachable";
+    nextAt = at + RETRY_MS;
+    return "unreachable";
   }
 
-  function refresh(force = false): Promise<void> {
+  function run(force: boolean, ask = false): Promise<Asked | null> {
     if (force) nextAt = -Infinity;
     if (busy) {
       if (!force) return busy;
+      // Asking waits for the check running, then asks itself.
+      if (ask) return busy.then(() => run(true, true));
       // A forced check waits for the one running, then runs: one queued serves every caller meanwhile.
       queued ??= busy.then(() => {
         queued = null;
-        return refresh(true);
+        return run(true);
       });
       return queued;
     }
-    if (now() < nextAt) return Promise.resolve();
-    busy = check()
-      .catch((err: unknown) => tell(`couldn't read which repos the office takes: ${String((err as Error)?.message ?? err)}`))
+    busy = check(ask)
+      .catch((err: unknown) => {
+        tell(`couldn't read which repos the office takes: ${String((err as Error)?.message ?? err)}`);
+        return "unreachable" as const;
+      })
       .finally(() => (busy = null));
     return busy;
   }
@@ -219,7 +245,8 @@ export function createApproved({ server, file, pairing, refreshMs, maxAgeMs, log
     repos: () => freshRepos(list, maxAgeMs, now()),
     version: () => list?.version ?? null,
     problem: () => (list && !freshRepos(list, maxAgeMs, now()) ? "unreachable" : list ? null : problem),
-    refresh,
+    refresh: (force = false) => run(force).then(() => {}),
+    ask: () => run(true, true).then((asked) => asked ?? "unreachable"),
   };
 }
 
