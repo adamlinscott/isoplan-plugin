@@ -42,7 +42,7 @@ test("ask: a room that answers while the agent waits gives the answer", async ()
     { type: "ask-room", v: PROTOCOL_VERSION, question: "Which branch?", key: "toolu_01" },
     { type: "asked-ack", v: PROTOCOL_VERSION, question: "q-1" },
   ]);
-  // Asked from a new session of the same person's own (adamlinscott/isoplan#109): their own session answers; anyone else's name reads as before.
+  // Asked from a new session of the same person's own (isoplan-app/isoplan#109): their own session answers; anyone else's name reads as before.
   for (const [me, own] of [["Adam", true], ["Sam", false]] as const) {
     const again = fakeServer((m) => (m.type === "ask-room" ? asked("asking") : null));
     setTimeout(() => again.push(asked("answered", { answer: "feat/migrate-v2.", owner: "Adam" })), 5);

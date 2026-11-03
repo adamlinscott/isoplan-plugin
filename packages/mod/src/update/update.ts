@@ -10,6 +10,16 @@
 //   plugin left it, and when, so uninstall takes `autoUpdate` out only from an entry nothing else
 //   has changed since, and otherwise leaves it on (install.ts). Claude Code's own records
 //   (known_marketplaces.json and the rest) are never written.
+// - before that, it points that entry at the marketplace's new address when it still names the old
+//   one: the repo moved from MOVED_FROM to MOVED_TO, and GitHub's redirect isn't relied on. Only an
+//   entry whose source is exactly the github repo MOVED_FROM is changed, and only its repo. Claude
+//   Code ignores a marketplace whose record in known_marketplaces.json names another source than
+//   its entry, so the record has to follow at once: `claude plugin marketplace add MOVED_TO` adds it
+//   again under the same name (a fresh clone, its record rewritten, the old clone removed, the
+//   plugins installed from it kept), which Claude Code refuses while the entry still names the old
+//   repo. That command writes the entry back as a bare source, so the entry's other fields are put
+//   back after it; when it fails, the entry goes back as it was, for a later check to try again.
+//   update.json's record of the entry moves with it, so uninstall still knows it as the plugin's.
 // - it runs `claude plugin marketplace update <marketplace>`, then `claude plugin update <id>
 //   --scope <scope>` for each install installed_plugins.json records (in its project's folder for a
 //   project or local one), which put the version the marketplace offers in Claude Code's plugin
@@ -179,6 +189,39 @@ export async function turnOnAutoUpdate(settings: string, marketplace: string): P
   return `turned on Claude Code's auto-update for the ${marketplace} marketplace in ${settings}`;
 }
 
+/** The marketplace's repo before it moved to the isoplan-app organisation, and after. */
+export const MOVED_FROM = "adamlinscott/isoplan-plugin";
+export const MOVED_TO = "isoplan-app/isoplan-plugin";
+
+/** What `moveMarketplace` changed: a line for the log, and the entry before and after, as JSON. */
+export interface Moved {
+  said: string;
+  before: string;
+  after: string;
+}
+
+/** Points `marketplace`'s entry in `settings` from MOVED_FROM to MOVED_TO (see above); what it changed, or null. */
+export async function moveMarketplace(settings: string, marketplace: string): Promise<Moved | null> {
+  const current = await readSettings(settings);
+  const known = current.extraKnownMarketplaces;
+  const entry = isObject(known) ? known[marketplace] : undefined;
+  if (!isObject(entry) || !isObject(entry.source) || Object.keys(entry.source).length !== 2 || entry.source.source !== "github" || entry.source.repo !== MOVED_FROM) return null;
+  const before = JSON.stringify(entry);
+  entry.source.repo = MOVED_TO;
+  await writeSettings(settings, current);
+  return { said: `pointed the ${marketplace} marketplace at ${MOVED_TO}, where it moved from ${MOVED_FROM}, in ${settings}`, before, after: JSON.stringify(entry) };
+}
+
+/** Writes `to` (JSON) as `marketplace`'s entry in `settings` when the entry there now passes `from`; whether it did. */
+export async function putEntry(settings: string, marketplace: string, from: (entry: unknown) => boolean, to: string): Promise<boolean> {
+  const current = await readSettings(settings);
+  const known = current.extraKnownMarketplaces;
+  if (!isObject(known) || !from(known[marketplace]) || JSON.stringify(known[marketplace]) === to) return false;
+  known[marketplace] = JSON.parse(to);
+  await writeSettings(settings, current);
+  return true;
+}
+
 /**
  * The `claude plugin update` runs for the plugin `id`: one per install recorded (scope and project
  * folder), each with its scope; one with no scope, in `cwd`, when the record can't be read.
@@ -222,6 +265,31 @@ export async function checkForUpdate({
     record.checkedAt = now();
     await write();
     const said: string[] = [];
+    const say = async (args: string[], at: string) => {
+      const r = await run([...claude, ...args], at, env);
+      const failed = r.error ?? (r.code === null ? "didn't finish" : r.code !== 0 ? `failed with exit code ${r.code}` : null);
+      said.push(`claude ${args.join(" ")}: ${[failed, lastLine(r.output)].filter(Boolean).join(": ")}`);
+      return !failed;
+    };
+    const moved = await moveMarketplace(settings, marketplace).catch((err: unknown) => `couldn't point the ${marketplace} marketplace at ${MOVED_TO}: ${(err as Error).message}`);
+    if (typeof moved === "string") said.push(moved);
+    else if (moved) {
+      said.push(moved.said);
+      const repo = (entry: unknown) => isObject(entry) && isObject(entry.source) && entry.source.repo;
+      if (await say(["plugin", "marketplace", "add", MOVED_TO], cwd)) {
+        const putBack = await putEntry(settings, marketplace, (entry) => repo(entry) === MOVED_TO, moved.after).catch((err: unknown) => `couldn't put back the rest of the ${marketplace} marketplace's entry in ${settings}: ${(err as Error).message}`);
+        if (putBack === true) said.push(`put back the rest of the ${marketplace} marketplace's entry in ${settings}`);
+        else if (putBack) said.push(putBack);
+        const on = record.autoUpdateOn;
+        if (isObject(on) && on.marketplace === marketplace && on.entry === moved.before) {
+          on.entry = moved.after;
+          await write();
+        }
+      } else {
+        const undone = await putEntry(settings, marketplace, (entry) => JSON.stringify(entry) === moved.after, moved.before).catch(() => false);
+        said.push(undone ? `pointed the ${marketplace} marketplace back at ${MOVED_FROM} in ${settings}, to try again later` : `left the ${marketplace} marketplace's entry in ${settings} as it is now`);
+      }
+    }
     const turnedOn = await turnOnAutoUpdate(settings, marketplace).catch((err: unknown) => `couldn't turn on Claude Code's auto-update for ${marketplace}: ${(err as Error).message}`);
     if (turnedOn) said.push(turnedOn);
     if (turnedOn?.startsWith("turned on")) {
@@ -230,12 +298,6 @@ export async function checkForUpdate({
       record.autoUpdateOn = { marketplace, entry: JSON.stringify(entry), at: now() };
       await write();
     }
-    const say = async (args: string[], at: string) => {
-      const r = await run([...claude, ...args], at, env);
-      const failed = r.error ?? (r.code === null ? "didn't finish" : r.code !== 0 ? `failed with exit code ${r.code}` : null);
-      said.push(`claude ${args.join(" ")}: ${[failed, lastLine(r.output)].filter(Boolean).join(": ")}`);
-      return !failed;
-    };
     if (!(await say(["plugin", "marketplace", "update", marketplace], cwd))) return { ran: true, said };
     for (const step of updateRuns(await installs(plugins), id, cwd)) {
       if (await fs.stat(step.cwd).then((s) => s.isDirectory(), () => false)) await say(step.args, step.cwd);

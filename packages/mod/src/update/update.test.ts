@@ -4,10 +4,10 @@ import { expect, test, vi } from "vitest";
 import { tempRoot } from "../data-layer/fixture.js";
 import { takeLock } from "../wake/lock.js";
 import { alive } from "../wake/lock.js";
-import { checkForUpdate, commandEnv, runHidden, START_GAP_MS, turnOnAutoUpdate, updateLockPath, updateRecordPath, updateRuns, updatesOffBy, type Ran } from "./update.js";
+import { checkForUpdate, commandEnv, moveMarketplace, MOVED_FROM, MOVED_TO, runHidden, START_GAP_MS, turnOnAutoUpdate, updateLockPath, updateRecordPath, updateRuns, updatesOffBy, type Ran } from "./update.js";
 
 const OTHER = 4242; // a pid that isn't this process
-const SOURCE = { source: "github", repo: "adamlinscott/isoplan-plugin" };
+const SOURCE = { source: "github", repo: "isoplan-app/isoplan-plugin" };
 
 function setup(settings: unknown = { extraKnownMarketplaces: { isoplan: { source: SOURCE } } }) {
   const root = tempRoot();
@@ -20,6 +20,7 @@ function setup(settings: unknown = { extraKnownMarketplaces: { isoplan: { source
   if (settings !== null) fs.writeFileSync(settingsFile, typeof settings === "string" ? settings : JSON.stringify(settings));
   const ran: { argv: string[]; cwd: string }[] = [];
   let answers: Ran[] = [];
+  let onRun = (_argv: string[]) => {};
   let clock = 1_000_000;
   const check = (gapMs = START_GAP_MS) =>
     checkForUpdate({
@@ -30,7 +31,7 @@ function setup(settings: unknown = { extraKnownMarketplaces: { isoplan: { source
       cwd: work,
       claude: ["/bin/node", "/lib/claude/cli.js"],
       gapMs,
-      run: async (argv, cwd) => (ran.push({ argv, cwd }), answers.shift() ?? { code: 0, output: "" }),
+      run: async (argv, cwd) => (ran.push({ argv, cwd }), onRun(argv), answers.shift() ?? { code: 0, output: "" }),
       now: () => clock,
       isAlive: (pid) => pid === OTHER || pid === process.pid,
     });
@@ -42,6 +43,7 @@ function setup(settings: unknown = { extraKnownMarketplaces: { isoplan: { source
     ran,
     check,
     answer: (...list: Ran[]) => void (answers = list),
+    onRun: (act: (argv: string[]) => void) => void (onRun = act),
     tick: (ms: number) => void (clock += ms),
     read: () => JSON.parse(fs.readFileSync(settingsFile, "utf8")),
   };
@@ -74,6 +76,61 @@ test("auto-update: turned on only on the marketplace's own entry, never over a c
   expect(fs.existsSync(missing.settingsFile)).toBe(false);
   const broken = setup("{ broken");
   await expect(turnOnAutoUpdate(broken.settingsFile, "isoplan")).rejects.toThrow(/isn't valid JSON/);
+});
+
+test("moved marketplace: an entry naming exactly the old repo is pointed at the new one, keeping every other field; any other is left alone", async () => {
+  const old = { source: "github", repo: MOVED_FROM };
+  const s = setup({ model: "opus", extraKnownMarketplaces: { isoplan: { source: old, autoUpdate: false }, other: { source: old } } });
+  expect((await moveMarketplace(s.settingsFile, "isoplan"))?.said).toBe(`pointed the isoplan marketplace at ${MOVED_TO}, where it moved from ${MOVED_FROM}, in ${s.settingsFile}`);
+  expect(s.read()).toEqual({ model: "opus", extraKnownMarketplaces: { isoplan: { source: SOURCE, autoUpdate: false }, other: { source: old } } });
+  expect(await moveMarketplace(s.settingsFile, "isoplan")).toBeNull();
+
+  const others = [SOURCE, { ...old, ref: "stable" }, { source: "github", repo: "AdamLinscott/isoplan-plugin" }, { source: "git", url: `https://github.com/${MOVED_FROM}.git` }, { source: "directory", path: "/work/isoplan-plugin" }];
+  for (const source of others) {
+    const t = setup({ extraKnownMarketplaces: { isoplan: { source } } });
+    const before = fs.readFileSync(t.settingsFile, "utf8");
+    expect(await moveMarketplace(t.settingsFile, "isoplan")).toBeNull();
+    expect(fs.readFileSync(t.settingsFile, "utf8")).toBe(before);
+  }
+  expect(await moveMarketplace(setup(null).settingsFile, "isoplan")).toBeNull();
+});
+
+test("check: an old entry is moved, Claude Code adds the marketplace again from the new repo, and the rest of the entry and the plugin's record of it follow", async () => {
+  const old = { source: "github", repo: MOVED_FROM };
+  // Auto-update turned on by an earlier version, on the old entry.
+  const s = setup({ model: "opus", extraKnownMarketplaces: { isoplan: { source: old, autoUpdate: true } } });
+  fs.mkdirSync(path.join(s.claudeDir, "isoplan"), { recursive: true });
+  fs.writeFileSync(updateRecordPath(s.claudeDir), JSON.stringify({ autoUpdateOn: { marketplace: "isoplan", entry: JSON.stringify({ source: old, autoUpdate: true }), at: 1 } }));
+  // As `claude plugin marketplace add` does: the entry written back as a bare source.
+  s.onRun((argv) => {
+    if (argv.includes("add")) fs.writeFileSync(s.settingsFile, JSON.stringify({ model: "opus", extraKnownMarketplaces: { isoplan: { source: SOURCE } } }));
+  });
+  s.answer({ code: 0, output: "✔ Successfully added marketplace: isoplan (declared in user settings)\n" });
+  const checked = await s.check();
+  expect(s.ran.map((r) => r.argv.slice(2).join(" "))).toEqual([`plugin marketplace add ${MOVED_TO}`, "plugin marketplace update isoplan", "plugin update isoplan@isoplan"]);
+  expect(checked.said.slice(0, 3)).toEqual([
+    `pointed the isoplan marketplace at ${MOVED_TO}, where it moved from ${MOVED_FROM}, in ${s.settingsFile}`,
+    `claude plugin marketplace add ${MOVED_TO}: ✔ Successfully added marketplace: isoplan (declared in user settings)`,
+    `put back the rest of the isoplan marketplace's entry in ${s.settingsFile}`,
+  ]);
+  expect(s.read()).toEqual({ model: "opus", extraKnownMarketplaces: { isoplan: { source: SOURCE, autoUpdate: true } } });
+  expect(JSON.parse(fs.readFileSync(updateRecordPath(s.claudeDir), "utf8")).autoUpdateOn).toEqual({ marketplace: "isoplan", entry: JSON.stringify({ source: SOURCE, autoUpdate: true }), at: 1 });
+
+  // With no auto-update yet: moved first, then turned on, and recorded as moved.
+  const fresh = setup({ extraKnownMarketplaces: { isoplan: { source: old } } });
+  expect((await fresh.check()).said.at(2)).toBe(`turned on Claude Code's auto-update for the isoplan marketplace in ${fresh.settingsFile}`);
+  expect(fresh.read().extraKnownMarketplaces.isoplan).toEqual({ source: SOURCE, autoUpdate: true });
+  expect(JSON.parse(fs.readFileSync(updateRecordPath(fresh.claudeDir), "utf8")).autoUpdateOn.entry).toBe(JSON.stringify({ source: SOURCE, autoUpdate: true }));
+});
+
+test("check: when Claude Code can't add the marketplace from the new repo, the entry goes back as it was, to try again later", async () => {
+  const old = { source: "github", repo: MOVED_FROM };
+  const s = setup({ extraKnownMarketplaces: { isoplan: { source: old, autoUpdate: false } } });
+  s.answer({ code: 1, output: "✘ Failed to add marketplace: network\n" });
+  const checked = await s.check();
+  expect(checked.said.slice(1, 3)).toEqual([`claude plugin marketplace add ${MOVED_TO}: failed with exit code 1: ✘ Failed to add marketplace: network`, `pointed the isoplan marketplace back at ${MOVED_FROM} in ${s.settingsFile}, to try again later`]);
+  expect(s.read()).toEqual({ extraKnownMarketplaces: { isoplan: { source: old, autoUpdate: false } } });
+  expect(s.ran.map((r) => r.argv.slice(2).join(" "))).toEqual([`plugin marketplace add ${MOVED_TO}`, "plugin marketplace update isoplan", "plugin update isoplan@isoplan"]);
 });
 
 test("check: refreshes the marketplace, then updates the plugin, hidden, in the session's project, and says what each said", async () => {

@@ -9,7 +9,7 @@ The office server and the floor are a separate, proprietary product.
 This repo is a Claude Code plugin marketplace. In Claude Code:
 
 ```
-/plugin marketplace add adamlinscott/isoplan-plugin
+/plugin marketplace add isoplan-app/isoplan-plugin
 /plugin install isoplan@isoplan
 ```
 

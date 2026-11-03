@@ -283,7 +283,7 @@ test("uninstall in the background: an uninstalled reading that doesn't hold a fe
 });
 
 test("uninstall: takes out the auto-update the plugin turned on from an entry nothing else changed, and otherwise leaves it on", async () => {
-  const source = { source: "github", repo: "adamlinscott/isoplan-plugin" };
+  const source = { source: "github", repo: "isoplan-app/isoplan-plugin" };
   const added = (entry: unknown) => JSON.stringify({ checkedAt: 1, autoUpdateOn: { marketplace: "isoplan", entry: JSON.stringify(entry), at: 1 } });
   const s = setup({ extraKnownMarketplaces: { isoplan: { source, autoUpdate: true }, other: { source, autoUpdate: true } } });
   await s.install();

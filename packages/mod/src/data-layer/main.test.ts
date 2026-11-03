@@ -1,8 +1,8 @@
 // The data layer's main loop, run as it ships (dist/data-layer.js, rebuilt with every change), in
 // detached mode so it installs nothing and starts no runner, against a stand-in office server, with
 // a throwaway Claude config folder: what it sends for a session in a repo the office doesn't take,
-// and when the copy of the office's list is too old (adamlinscott/isoplan#91); and what a copy in
-// the plugin cache does once Claude Code has installed a newer one (adamlinscott/isoplan#96).
+// and when the copy of the office's list is too old (isoplan-app/isoplan#91); and what a copy in
+// the plugin cache does once Claude Code has installed a newer one (isoplan-app/isoplan#96).
 
 import { execFileSync, spawn, type ChildProcess } from "node:child_process";
 import fs from "node:fs";

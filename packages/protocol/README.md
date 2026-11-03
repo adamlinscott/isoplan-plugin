@@ -1,6 +1,6 @@
 # @isoplan/protocol
 
-The wire protocol between [Isoplan](https://github.com/adamlinscott/isoplan-plugin)'s Claude Code plugin and an office server: the facts a session reports, the messages each side sends, and [zod](https://zod.dev) schemas that check them.
+The wire protocol between [Isoplan](https://github.com/isoplan-app/isoplan-plugin)'s Claude Code plugin and an office server: the facts a session reports, the messages each side sends, and [zod](https://zod.dev) schemas that check them.
 
 ```
 npm install @isoplan/protocol
@@ -30,4 +30,4 @@ else drop(result.error);
 
 ## Licence
 
-MIT. Source: [`packages/protocol`](https://github.com/adamlinscott/isoplan-plugin/tree/main/packages/protocol).
+MIT. Source: [`packages/protocol`](https://github.com/isoplan-app/isoplan-plugin/tree/main/packages/protocol).
