@@ -6,6 +6,7 @@
 //
 // Kept free of zod and the protocol so install stays small.
 
+import { execFile } from "node:child_process";
 import fs from "node:fs/promises";
 import path from "node:path";
 
@@ -50,3 +51,30 @@ export async function claudeBinary(claudeDir: string, env: Record<string, string
   }
   return findClaude(env, platform, home);
 }
+
+/** The oldest Claude Code that can hand a session to the Claude app (`claude --desktop --resume`). */
+export const DESKTOP_MIN_VERSION = "2.1.285";
+
+/** The version `claude --version` prints, such as "2.1.317", or null when it can't be run or says none. */
+export function claudeVersion(binary: string, env: Record<string, string | undefined> = process.env): Promise<string | null> {
+  const [cmd, ...args] = claudeCommand(binary);
+  return new Promise((resolve) => {
+    execFile(cmd!, [...args, "--version"], { env, timeout: 30000, windowsHide: true }, (err, stdout) => resolve(err ? null : versionOf(stdout)));
+  });
+}
+
+/** The version in `claude --version`'s output: the line "<x.y.z> (Claude Code)", else the last x.y.z in it. */
+export function versionOf(output: string): string | null {
+  return /^(\d+\.\d+\.\d+) \(Claude Code\)/m.exec(output)?.[1] ?? [...output.matchAll(/\d+\.\d+\.\d+/g)].at(-1)?.[0] ?? null;
+}
+
+/** Whether `version` is `min` or newer, comparing major, minor and patch as numbers. */
+export function atLeast(version: string, min: string): boolean {
+  const a = version.split(".").map(Number);
+  const b = min.split(".").map(Number);
+  for (let i = 0; i < 3; i++) if ((a[i] ?? 0) !== (b[i] ?? 0)) return (a[i] ?? 0) > (b[i] ?? 0);
+  return true;
+}
+
+/** Whether the Claude app can open Claude Code sessions on this OS: a Mac, or Windows on x64. */
+export const desktopPlatform = (platform: NodeJS.Platform, arch: string) => platform === "darwin" || (platform === "win32" && arch === "x64");

@@ -134,3 +134,43 @@ answer({ ok: false, error: { code: "unknown_command", message: "unknown command 
   const calls = () => (fs.existsSync(log) ? fs.readFileSync(log, "utf8").trim().split("\n").filter(Boolean).map((line) => JSON.parse(line) as string[]) : []);
   return { bin, workspaces, calls };
 }
+
+/**
+ * A fake Claude Code CLI at <root>/fake-claude.js, which the take runs with node (a .js binary, as an
+ * npm install's cli.js is): it logs each call's arguments and folder, and answers `--version`,
+ * `auth status --json` (`auth`, or exit code `authExit`), a `--print` run (a transcript in
+ * $CLAUDE_CONFIG_DIR/projects/fake/<id>.jsonl, then the JSON result naming its --session-id, or
+ * `printFails` on stderr with exit code 1 after appending to app.js when `printEdits`) and `--desktop`
+ * (exit 0, or `desktopFails` with exit code 1). It runs no session and opens nothing.
+ */
+export function fakeClaude(root: string, { version = "2.1.317", auth = { loggedIn: true, authMethod: "claude.ai", apiProvider: "firstParty" } as Record<string, unknown>, authExit = 0, printFails = "", printEdits = false, desktopFails = "" } = {}) {
+  const bin = path.join(root, "fake-claude.js");
+  const log = path.join(root, "fake-claude.log");
+  fs.writeFileSync(
+    bin,
+    `const fs = require("node:fs");
+const args = process.argv.slice(2);
+fs.appendFileSync(${JSON.stringify(log)}, JSON.stringify({ args, cwd: process.cwd() }) + "\\n");
+const fail = (text) => (process.stderr.write(text), process.exit(1));
+if (args[0] === "--version") (process.stdout.write(${JSON.stringify(`${version} (Claude Code)\n`)}), process.exit(0));
+if (args[0] === "auth") (process.stdout.write(${JSON.stringify(JSON.stringify(auth))}), process.exit(${authExit}));
+if (args.includes("--print")) {
+  const id = args[args.indexOf("--session-id") + 1];
+  const projects = require("node:path").join(process.env.CLAUDE_CONFIG_DIR, "projects", "fake");
+  fs.mkdirSync(projects, { recursive: true });
+  fs.writeFileSync(require("node:path").join(projects, id + ".jsonl"), "{}\\n");
+  if (${JSON.stringify(printEdits)}) fs.appendFileSync("app.js", "// edited\\n");
+  if (${JSON.stringify(printFails)}) (process.stdout.write('{"type":"result","is_error":true,"result":"secret model words"}'), fail(${JSON.stringify(printFails)}));
+  process.stdout.write(JSON.stringify({ type: "result", subtype: "success", is_error: false, result: "Read it.", session_id: id }) + "\\n");
+  process.exit(0);
+}
+if (args.includes("--desktop")) {
+  if (${JSON.stringify(desktopFails)}) fail(${JSON.stringify(desktopFails)});
+  process.exit(0);
+}
+fail("the fake claude wasn't asked that: " + args.join(" "));
+`,
+  );
+  const calls = () => (fs.existsSync(log) ? fs.readFileSync(log, "utf8").trim().split("\n").filter(Boolean).map((line) => JSON.parse(line) as { args: string[]; cwd: string }) : []);
+  return { bin, calls };
+}

@@ -5907,6 +5907,8 @@ const HelloMessageSchema = object({
 /**
 * The first message on a runner's link: the one link per machine that answers requests for its rooms.
 * `orca`: Orca's CLI is on this machine, so a handoff can be taken into Orca (mode `orca`).
+* `desktop` (protocol 0.4.0): Claude Code for the terminal, new enough to hand a session to the Claude
+* app, is on this machine, a Mac or Windows x64, so a handoff can be opened in the Claude app (mode `desktop`).
 */
 const RunnerHelloMessageSchema = object({
 	type: literal("runner"),
@@ -5914,7 +5916,8 @@ const RunnerHelloMessageSchema = object({
 	account: Account,
 	machine: Machine,
 	token: Token,
-	orca: boolean().optional()
+	orca: boolean().optional(),
+	desktop: boolean().optional()
 });
 /** All of the session's facts. Sent on connect and on repair. */
 const FullMessageSchema = object({
@@ -5953,7 +5956,8 @@ const ReplyMessageSchema = discriminatedUnion("kind", [
 		kind: literal("write-brief"),
 		handoff: HandoffSchema,
 		fallback: literal(true).optional(),
-		cap: CapSchema.optional()
+		cap: CapSchema.optional(),
+		noClaude: literal(true).optional()
 	}),
 	object({
 		type: literal("reply"),
@@ -6160,7 +6164,9 @@ const RequestMessageSchema = discriminatedUnion("kind", [
 ]);
 /**
 * The request is over (its handoff was cancelled, dismissed or replaced): the machine drops what it
-* holds for it, and doesn't send or push what it was still writing.
+* holds for it, and doesn't send or push what it was still writing. From protocol 0.4.0 `id` may be
+* a take's session id, to a runner taking a handoff from the floor that was cancelled or timed out:
+* the take opens nothing more (a take into the Claude app doesn't open the app).
 */
 const DropMessageSchema = object({
 	type: literal("drop"),
@@ -6188,7 +6194,8 @@ const HandoffMessageSchema = object({
 	mode: _enum([
 		"terminal",
 		"headless",
-		"orca"
+		"orca",
+		"desktop"
 	]).optional(),
 	session: string().uuid().optional()
 });

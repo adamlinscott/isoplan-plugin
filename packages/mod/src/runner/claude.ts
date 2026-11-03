@@ -143,7 +143,7 @@ export function createClaudeAnswerer({ claudeDir, binary, model, config, spawn =
       const id = forkableId(session);
       if (!id) return { ok: false, kind: "not-set-up", detail: `${session} isn't a Claude Code session this runner can fork`, usage: null };
       const bin = await binary();
-      if (!bin) return { ok: false, kind: "not-set-up", detail: "the claude binary wasn't found; run the plugin's install script, or set its path in ~/.claude/isoplan/claude-binary.json", usage: null };
+      if (!bin) return { ok: false, kind: "no-claude", detail: "the claude binary wasn't found; run the plugin's install script, or set its path in ~/.claude/isoplan/claude-binary.json", usage: null };
       let child: ChildProcessWithoutNullStreams;
       try {
         child = spawn([...claudeCommand(bin), ...forkArgs(id, await model())], { cwd: lead.cwd, env: forkEnv(env) });

@@ -24,7 +24,8 @@
 //
 // A brief (#48) is asked for with the session's untracked files named (`prepareBrief`), and ends
 // with the runner's note of what was pushed. When the fork can't write it (it failed, or a cap is
-// reached), the reply still goes, marked `fallback` (and with the `cap`, when one is why), with the
+// reached), the reply still goes, marked `fallback` (and with the `cap`, when one is why, or
+// `noClaude`, when the machine has no claude binary), with the
 // note alone, and the server writes the rest from the room's feed. Its branch is pushed (`push`)
 // only once the brief has cleared the scan or been released. The push scans what it would send: on
 // a match nothing is pushed, the refusal is `withheld` naming the files, in every repo (never the pattern), and the files it couldn't read, and the owner's
@@ -34,7 +35,9 @@
 // reserved, or is given back. Otherwise a `drop` ends a request: what
 // is held for it goes, and one still running neither pushes nor sends. A handoff to take goes to
 // `take`, with how to open its session; each take (the session id the server chose) runs once, however
-// often it is sent, and what it did goes back as `taken`. owner-answer requests go to the live session, not
+// often it is sent, and what it did goes back as `taken`. A `drop` naming a take's id (the server
+// cancelled it, or it timed out there) tells the take, which then doesn't open the Claude app; and a
+// take still running after takeCapMinutes is given up: `taken` says so, and the take is told it was dropped. owner-answer requests go to the live session, not
 // the runner (#50). A focus request (Focus this session, for a handoff this machine took into Orca)
 // goes to `focus`, and is answered with a focus reply, or refused `unavailable` saying why.
 
@@ -50,6 +53,8 @@ export interface RunnerSettings extends CapSettings {
   answerTimeoutSeconds: number;
   briefTimeoutSeconds: number;
   maxForks: number;
+  /** The longest a take may keep its handoff in hand on this machine: past it, the take is given up and said so. */
+  takeCapMinutes: number;
 }
 
 type Outgoing = ReplyMessage | RefusalMessage;
@@ -79,8 +84,8 @@ export interface RunnerOptions {
   push?: (session: string, lead: Lead, handoff: string, pushAnyway: Record<string, string> | null) => Promise<HandoffRepo[] | { held: string[]; commits: Record<string, string>; unchecked: string[] }>;
   /** The untracked files the brief names (null when unknown), and the note it ends with (#48). Throws PushFailed when there is no repo to push. */
   prepareBrief?: (lead: Lead, handoff: string) => Promise<{ files: string[] | null; note: string }>;
-  /** Takes a handoff on this machine (#48); without it, handoffs are logged as not handled. */
-  take?: (message: HandoffMessage) => Promise<TakenMessage>;
+  /** Takes a handoff on this machine (#48); without it, handoffs are logged as not handled. `dropped` says whether the server has dropped the take since, or it was given up. */
+  take?: (message: HandoffMessage, dropped: () => boolean) => Promise<TakenMessage>;
   /** Brings a handoff's session to the front in Orca: null when it is, else why not. Without it, focus requests are refused. */
   focus?: (handoff: string) => Promise<string | null>;
   /** The fork slots, shared by every office's runner on the machine; without it, this runner's own. */
@@ -131,6 +136,7 @@ const FAILED: Record<FailureKind, string> = {
   "timed-out": "the fork took too long to answer",
   failed: "the fork couldn't answer",
   "not-set-up": "this machine can't run the fork; its owner can see why in the runner's log",
+  "no-claude": "Claude Code for the terminal isn't installed on this machine, so it can't run the fork",
 };
 
 // Ids of replies dropped from the held set, remembered so a release for one says so.
@@ -145,6 +151,8 @@ export function createRunner({ answerer, ledger, settings, prompts, scan, send, 
   const dropped = new Set<string>(); // dropped from `held` to make room, oldest first
   const taking = new Set<string>(); // handoffs being taken now
   const takes = new Set<string>(); // the takes run so far, by take id, oldest first
+  const runningTakes = new Set<string>(); // take ids still running, given up ones too
+  const droppedTakes = new Set<string>(); // of those, the ones dropped by the server or given up
   const dropping = new Set<string>(); // requests dropped while they ran
 
   const unavailable = (id: string, detail: string): RefusalMessage => ({ type: "refusal", v: PROTOCOL_VERSION, id, reason: "unavailable", detail });
@@ -200,6 +208,7 @@ export function createRunner({ answerer, ledger, settings, prompts, scan, send, 
     const cap = overCap(ledger.entries(now()), room, expected, now(), s);
     let body: string;
     let isFallback = false;
+    let noClaude = false;
     if (cap) {
       if (!isBrief) return overCapRefusal(id, cap);
       body = fallback(`the ${cap} cap is reached`);
@@ -218,13 +227,14 @@ export function createRunner({ answerer, ledger, settings, prompts, scan, send, 
       const answered = await answerer.ask(session, lead, { instructions: p.instructions, request: text, timeoutMs: (isBrief ? s.briefTimeoutSeconds : s.answerTimeoutSeconds) * 1000 }).finally(free);
       // No fork ran when it couldn't be set up: the answer and its tokens are given back. One that ran
       // but failed before it was metered keeps its estimate.
-      const recorded = !answered.ok && answered.kind === "not-set-up" ? reservation.cancel() : reservation.settle(answered.usage ?? expected);
+      const recorded = !answered.ok && (answered.kind === "not-set-up" || answered.kind === "no-claude") ? reservation.cancel() : reservation.settle(answered.usage ?? expected);
       await recorded.catch((err: unknown) => log(`couldn't record ${id} in the ledger: ${(err as Error).message}`));
       if (!answered.ok) {
         log(`${id}: ${answered.detail}`);
         if (!isBrief) return unavailable(id, FAILED[answered.kind]);
         body = fallback(FAILED[answered.kind]);
         isFallback = true;
+        noClaude = answered.kind === "no-claude";
       } else {
         body = lead.compacted ? `${COMPACTED_NOTE}\n\n${answered.text}` : answered.text;
         if (brief.note) body = `${body}\n\n${brief.note}`;
@@ -249,7 +259,7 @@ export function createRunner({ answerer, ledger, settings, prompts, scan, send, 
         hold(id, () => pushAndReply({ ...pushAnyway, ...commits }));
         return { type: "refusal", v: PROTOCOL_VERSION, id, reason: "withheld", file, held: files.length, ...(unchecked.length ? { unchecked } : {}) };
       }
-      return { type: "reply", v: PROTOCOL_VERSION, id, kind: "write-brief", handoff: { id: (request as Extract<Ask, { kind: "write-brief" }>).handoff, brief: body, repos: pushed }, ...(isFallback ? { fallback: true as const } : {}), ...(cap ? { cap } : {}) };
+      return { type: "reply", v: PROTOCOL_VERSION, id, kind: "write-brief", handoff: { id: (request as Extract<Ask, { kind: "write-brief" }>).handoff, brief: body, repos: pushed }, ...(isFallback ? { fallback: true as const } : {}), ...(cap ? { cap } : {}), ...(noClaude ? { noClaude: true as const } : {}) };
     };
     const reply: () => Promise<Outgoing> = isBrief ? () => pushAndReply(null) : async () => ({ type: "reply", v: PROTOCOL_VERSION, id, kind: "answer-question", answer: body });
     const matched = await scan(body);
@@ -306,6 +316,7 @@ export function createRunner({ answerer, ledger, settings, prompts, scan, send, 
       if (message.type === "drop") {
         if (held.delete(message.id)) log(`dropped the withheld reply for ${message.id}: its handoff is over`);
         else if (running.has(message.id)) dropping.add(message.id);
+        else if (runningTakes.has(message.id)) droppedTakes.add(message.id);
         return;
       }
       if (message.type === "handoff") {
@@ -318,9 +329,29 @@ export function createRunner({ answerer, ledger, settings, prompts, scan, send, 
           takes.add(takeId);
           if (takes.size > REMEMBER) takes.delete(takes.values().next().value!);
           taking.add(handoff.id);
-          void take(message)
-            .then(send, (err: unknown) => log(`handoff ${handoff.id}: taking it failed: ${(err as Error)?.stack ?? String(err)}`))
-            .finally(() => taking.delete(handoff.id));
+          runningTakes.add(takeId);
+          // Whichever comes first, the take's own end or takeCapMinutes, ends it here: a take that
+          // never finishes can't keep its handoff in hand, and one given up opens nothing more.
+          let over = false;
+          let timer: ReturnType<typeof setTimeout> | undefined;
+          const finish = (m: TakenMessage | null) => {
+            if (over) return;
+            over = true;
+            clearTimeout(timer);
+            taking.delete(handoff.id);
+            if (m) send(m);
+          };
+          void settings().then((s) => {
+            if (over) return;
+            timer = setTimeout(() => {
+              droppedTakes.add(takeId);
+              log(`handoff ${handoff.id}: taking it didn't finish within ${s.takeCapMinutes} minutes, so it was given up`);
+              finish({ type: "taken", v: PROTOCOL_VERSION, handoff: handoff.id, failures: [{ step: "open", output: `Taking it didn't finish within ${s.takeCapMinutes} minutes on this machine, so it was given up: take it again from the floor.` }] });
+            }, s.takeCapMinutes * 60000);
+          });
+          void take(message, () => droppedTakes.has(takeId))
+            .then(finish, (err: unknown) => (log(`handoff ${handoff.id}: taking it failed: ${(err as Error)?.stack ?? String(err)}`), finish(null)))
+            .finally(() => (runningTakes.delete(takeId), droppedTakes.delete(takeId)));
         }
         return;
       }

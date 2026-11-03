@@ -191,6 +191,17 @@ test("runner: a brief the fork can't write still goes, marked fallback, with the
   expect(rejected.sent).toEqual([{ type: "refusal", v: PROTOCOL_VERSION, id: "b3", reason: "unavailable", detail: "the remote rejected the handoff's branch" }]);
 });
 
+test("runner: a brief that falls back because the machine has no claude binary says so, and gives its tokens back", async () => {
+  const repos: HandoffRepo[] = [{ path: ".", remote: "origin", branch: "isoplan/handoff/h-1", commit: "a".repeat(40) }];
+  const t = await setup({ prepareBrief: async () => ({ files: [], note: "The note." }), push: async () => repos });
+  t.runner.take(brief("b1"));
+  await t.asked(1);
+  t.asks[0]!.settle({ ok: false, kind: "no-claude", detail: "the claude binary wasn't found", usage: null });
+  await t.runner.settled();
+  expect(t.sent).toEqual([{ type: "reply", v: PROTOCOL_VERSION, id: "b1", kind: "write-brief", fallback: true, noClaude: true, handoff: { id: "h-1", brief: "No brief was written by the session: Claude Code for the terminal isn't installed on this machine, so it can't run the fork.\n\nThe note.", repos } }]);
+  expect(t.ledger.entries(NOW)).toEqual([]);
+});
+
 test("runner: a brief that falls back because a cap is reached names the cap", async () => {
   const repos: HandoffRepo[] = [{ path: ".", remote: "origin", branch: "isoplan/handoff/h-1", commit: "a".repeat(40) }];
   const t = await setup({ settings: { answersPerMachinePerDay: 1 }, entries: [{ at: NOW - 1000, room: "a", usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } }], prepareBrief: async () => ({ files: [], note: "The note." }), push: async () => repos });
@@ -268,6 +279,30 @@ test("runner: a drop ends a request: what is held goes, and one still being writ
   await running.runner.settled();
   expect(running.sent).toEqual([]);
   expect(pushes).toEqual([null]);
+});
+
+test("runner: a drop naming a running take's id tells the take; one past takeCapMinutes is given up and said so, and its late end isn't sent", async () => {
+  let finish: () => void = () => {};
+  let dropped: () => boolean = () => false;
+  const t = await setup({
+    settings: { takeCapMinutes: 0.002 },
+    take: async (m, d) => {
+      dropped = d;
+      await new Promise<void>((r) => (finish = r));
+      return { type: "taken", v: PROTOCOL_VERSION, handoff: m.handoff.id, session: "claude-code:late", failures: [] };
+    },
+  });
+  const session = "0b5c4d3e-0000-4000-8000-000000000002";
+  t.runner.take({ type: "handoff", v: PROTOCOL_VERSION, mode: "desktop", session, handoff: { id: "h-1", brief: "b", repos: [{ path: ".", remote: "origin", branch: "isoplan/handoff/h-1", commit: "a".repeat(40) }] } });
+  expect(dropped()).toBe(false);
+  t.runner.take({ type: "drop", v: PROTOCOL_VERSION, id: session });
+  expect(dropped()).toBe(true);
+  await t.sentN(1);
+  expect(t.sent).toEqual([{ type: "taken", v: PROTOCOL_VERSION, handoff: "h-1", failures: [{ step: "open", output: expect.stringContaining("didn't finish within 0.002 minutes on this machine, so it was given up") }] }]);
+  expect(t.runner.idle()).toBe(true);
+  finish();
+  await new Promise((r) => setTimeout(r, 20));
+  expect(t.sent).toHaveLength(1);
 });
 
 test("runner: a handoff to take goes to take once at a time, and what it did goes back as taken", async () => {

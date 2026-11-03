@@ -37,7 +37,7 @@ export interface Ask {
  * Why there is no answer, as the server is told it: a kind, never the fork's own output, which
  * hasn't been through the secret scan.
  */
-export type FailureKind = "timed-out" | "failed" | "not-set-up";
+export type FailureKind = "timed-out" | "failed" | "not-set-up" | "no-claude";
 
 /**
  * The answer's text, or why there is none: `kind` for the server, `detail` for the local log

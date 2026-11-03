@@ -5,7 +5,7 @@ import { expect, test, vi } from "vitest";
 import { tempRoot } from "../data-layer/fixture.js";
 import { nodeIo } from "../data-layer/io.js";
 import { createRunGit, pushHandoff, type RunGit } from "./git.js";
-import { fakeOrca, git, remoteAndClone, workspace } from "./fixture.js";
+import { fakeClaude, fakeOrca, git, remoteAndClone, workspace } from "./fixture.js";
 import { orcaRunner } from "./orca.js";
 import { checkoutHere, findClone, findWorkspace, launch, onTheWire, parseSetup, sessionArgv, takeHandoff, trustFolder, trustKey, type Background, type Launch, type TakeOptions } from "./take.js";
 
@@ -13,7 +13,7 @@ import { checkoutHere, findClone, findWorkspace, launch, onTheWire, parseSetup, 
 vi.setConfig({ testTimeout: 30000 });
 
 const run = createRunGit();
-const SETTINGS = { gitTimeoutSeconds: 30, setupTimeoutMinutes: 15, cloneSearchDays: 30, repoSearchDepth: 3 };
+const SETTINGS = { gitTimeoutSeconds: 30, setupTimeoutMinutes: 15, cloneSearchDays: 30, repoSearchDepth: 3, desktopReadTimeoutMinutes: 1, desktopReadMaxTurns: 10, desktopTakeBudgetMinutes: 15 };
 // A fake AWS key id, split so no key-shaped string sits in the source.
 const FAKE_KEY = "AKIA" + "IOSFODNN7EXAMPLE";
 const SESSION = "0b5c4d3e-0000-4000-8000-000000000001";
@@ -177,6 +177,87 @@ test("into Orca, a terminal Orca won't open is reported, and no session is taken
   const taken = await takeHandoff({ handoff: t.handoff, mode: "orca", session: SESSION }, options);
   expect(taken.session).toBe(undefined);
   expect(taken.failures).toEqual([{ step: "open", output: expect.stringMatching(/^Orca couldn't open Claude Code in .*handoff-h2r: runtime_unavailable$/) }]);
+});
+
+// A take into the Claude app with the fake claude CLI: what it was asked, and the take's options that use it.
+function intoDesktop(t: Awaited<ReturnType<typeof handedOver>>, setup: Parameters<typeof fakeClaude>[1] = {}, arch = "x64") {
+  const claude = fakeClaude(t.root, setup);
+  return { claude, options: { ...t.options, claude: async () => claude.bin, arch } };
+}
+
+test("into the Claude app: the same worktree and setup, the worktree alone trusted, the take's prompt run to its end under the server's session id, then the app opens that session", async () => {
+  const t = await handedOver("h2d", { command: "node -e \"require('fs').writeFileSync('setup-ran.txt', 'yes')\"" });
+  const { claude, options } = intoDesktop(t);
+  const taken = await takeHandoff({ handoff: t.handoff, mode: "desktop", session: SESSION }, options);
+  expect(taken).toEqual({ type: "taken", v: 1, handoff: "h2d", session: `claude-code:${SESSION}`, failures: [] });
+  const dir = `${t.receiver.clone}-handoff-h2d`;
+  expect(fs.readFileSync(path.join(dir, "setup-ran.txt"), "utf8")).toBe("yes");
+  expect(JSON.parse(fs.readFileSync(t.claudeJson, "utf8")).projects[trustKey(dir, "win32")]).toEqual({ hasTrustDialogAccepted: true });
+  const calls = claude.calls();
+  expect(calls.map((c) => c.args[0])).toEqual(["--version", "auth", expect.stringMatching(/^Isoplan handoff h2d: you are taking this work over\. Read its brief in /), "--desktop"]);
+  const [, , print, desktop] = calls;
+  expect(print!.cwd).toBe(dir);
+  // The default permission mode, whatever the branch's settings say, and a bounded number of turns.
+  expect(print!.args.slice(1, -1)).toEqual(["--print", "--output-format", "json", "--permission-mode", "default", "--max-turns", "10", "--session-id", SESSION, "--name", "Isoplan handoff h2d", "--add-dir"]);
+  expect(desktop).toEqual({ args: ["--desktop", "--resume", SESSION], cwd: dir });
+  // No window of Isoplan's own, and no background session.
+  expect(t.opened).toEqual([]);
+  expect(t.started).toEqual([]);
+});
+
+test("into the Claude app, a CLI that is too old, signed in with an API key, whose sign-in can't be checked, or on Windows on ARM: nothing is made, and the take says why", async () => {
+  const t = await handedOver("h2e");
+  const unchecked = await takeHandoff({ handoff: t.handoff, mode: "desktop", session: SESSION }, intoDesktop(t, { authExit: 1 }).options);
+  expect(unchecked.failures).toEqual([{ step: "open", output: expect.stringMatching(/^Couldn't check Claude Code's sign-in on sam-laptop: `claude auth status` exited with code 1, so nothing was made/) }]);
+  const unsaid = await takeHandoff({ handoff: t.handoff, mode: "desktop", session: SESSION }, intoDesktop(t, { auth: { authMethod: "claude.ai" } }).options);
+  expect(unsaid.failures).toEqual([{ step: "open", output: expect.stringContaining("didn't say whether it is signed in") }]);
+  const old = await takeHandoff({ handoff: t.handoff, mode: "desktop", session: SESSION }, intoDesktop(t, { version: "2.1.284" }).options);
+  expect(old.failures).toEqual([{ step: "open", output: "Install Claude Code for the terminal, version 2.1.285 or newer, to open handoffs in the Claude app. sam-laptop has version 2.1.284, so nothing was made." }]);
+  const key = await takeHandoff({ handoff: t.handoff, mode: "desktop", session: SESSION }, intoDesktop(t, { auth: { loggedIn: true, authMethod: "api_key", apiProvider: "firstParty" } }).options);
+  expect(key.failures).toEqual([{ step: "open", output: expect.stringContaining("only sessions signed in with a Claude subscription") }]);
+  const arm = await takeHandoff({ handoff: t.handoff, mode: "desktop", session: SESSION }, intoDesktop(t, {}, "arm64").options);
+  expect(arm.failures).toEqual([{ step: "open", output: expect.stringContaining("only on a Mac or on Windows x64") }]);
+  for (const r of [unchecked, unsaid, old, key, arm]) expect(r.session).toBe(undefined);
+  expect(fs.existsSync(`${t.receiver.clone}-handoff-h2e`)).toBe(false);
+});
+
+test("into the Claude app, a first turn that fails isn't opened in the app: its transcript is deleted, the failure has none of claude's output, and it says how to clear the worktree", async () => {
+  const t = await handedOver("h2f");
+  const printing = intoDesktop(t, { printFails: "Credit balance is too low", printEdits: true });
+  const read = await takeHandoff({ handoff: t.handoff, mode: "desktop", session: SESSION }, printing.options);
+  expect(read.session).toBe(undefined);
+  const [failure] = read.failures;
+  expect(failure!.output).toMatch(/^Claude Code couldn't read the handoff before the Claude app took it over: claude exited with code 1; this machine's runner log has more\. Its unfinished session was deleted\. The worktree is /);
+  expect(failure!.output).toContain("run `git reset --hard` in it");
+  expect(failure!.output).not.toMatch(/Credit balance|secret model words/);
+  expect(fs.existsSync(path.join(t.claudeDir, "projects", "fake", `${SESSION}.jsonl`))).toBe(false);
+  expect(printing.claude.calls().some((c) => c.args.includes("--desktop"))).toBe(false);
+});
+
+test("into the Claude app, an app that won't open leaves the session taken, and the failure says how to open it", async () => {
+  const t = await handedOver("h2h");
+  const app = await takeHandoff({ handoff: t.handoff, mode: "desktop", session: SESSION }, intoDesktop(t, { desktopFails: "The Claude app isn't installed" }).options);
+  expect(app.session).toBe(`claude-code:${SESSION}`);
+  expect(app.failures).toEqual([{ step: "open", output: expect.stringContaining(`The Claude app didn't open on the session: The Claude app isn't installed. The session is ready: open it from the Claude app's session list, or run \`claude --desktop --resume ${SESSION}\``) }]);
+});
+
+test("into the Claude app, a take the server dropped while the first turn ran doesn't open the app, and isn't taken", async () => {
+  const t = await handedOver("h2i");
+  const { claude, options } = intoDesktop(t);
+  const taken = await takeHandoff({ handoff: t.handoff, mode: "desktop", session: SESSION }, { ...options, dropped: () => claude.calls().some((c) => c.args.includes("--print")) });
+  expect(taken.session).toBe(undefined);
+  expect(taken.failures).toEqual([{ step: "open", output: expect.stringContaining("the take stopped before the Claude app was opened: it was cancelled or timed out on the floor") }]);
+  expect(claude.calls().some((c) => c.args.includes("--desktop"))).toBe(false);
+});
+
+test("terminal, headless and desktop look for the claude binary before making anything: without it nothing is made, and the take says to install Claude Code for the terminal", async () => {
+  const t = await handedOver("h2g");
+  for (const mode of ["terminal", "headless", "desktop"] as const) {
+    const taken = await takeHandoff({ handoff: t.handoff, mode, session: SESSION }, { ...t.options, claude: async () => null });
+    expect(taken.failures).toEqual([{ step: "open", output: expect.stringContaining(mode === "desktop" ? "Install Claude Code for the terminal, version 2.1.285 or newer" : "Claude Code for the terminal wasn't found on sam-laptop, so nothing was made") }]);
+  }
+  expect(fs.existsSync(`${t.receiver.clone}-handoff-h2g`)).toBe(false);
+  expect(git(t.receiver.clone, "worktree", "list")).not.toContain("handoff-h2g");
 });
 
 test("a handoff that doesn't say how to open its session is refused, and opens nothing", async () => {

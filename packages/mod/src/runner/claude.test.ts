@@ -3,7 +3,7 @@ import path from "node:path";
 import { expect, test } from "vitest";
 import { tempRoot } from "../data-layer/fixture.js";
 import type { Lead } from "./answerer.js";
-import { claudeCommand, findClaude } from "./claude-binary.js";
+import { atLeast, claudeCommand, findClaude, versionOf } from "./claude-binary.js";
 import { alive } from "../wake/lock.js";
 import { createClaudeAnswerer, FORK_ENV_DROPPED, forkArgs, forkEnv, forkableId } from "./claude.js";
 
@@ -166,7 +166,7 @@ test("fork: a session that isn't Claude Code's, or no binary, is a failure with 
   const f = fake();
   expect(await f.answerer.ask("codex:s", f.lead, ask)).toMatchObject({ ok: false, kind: "not-set-up", detail: "codex:s isn't a Claude Code session this runner can fork" });
   const none = createClaudeAnswerer({ claudeDir: "/x", binary: async () => null, model: async () => "opus", config: async () => ({ tailBytes: 1, stalledMinutes: 1 }) });
-  expect(await none.ask("claude-code:s", f.lead, ask)).toMatchObject({ ok: false, kind: "not-set-up", detail: expect.stringContaining("claude binary wasn't found") });
+  expect(await none.ask("claude-code:s", f.lead, ask)).toMatchObject({ ok: false, kind: "no-claude", detail: expect.stringContaining("claude binary wasn't found") });
   expect(await none.lead("codex:s")).toBe(null);
 });
 
@@ -186,4 +186,11 @@ test("binary: PATH first, then the installers' places, on Windows and on Mac", a
   expect(await findClaude(mac, "darwin", "/Users/ada", has("/Users/ada/.local/bin/claude", "/opt/homebrew/bin/claude"))).toBe("/Users/ada/.local/bin/claude");
   expect(await findClaude(mac, "darwin", "/Users/ada", has("/opt/homebrew/bin/claude"))).toBe("/opt/homebrew/bin/claude");
   expect(await findClaude(mac, "darwin", "/Users/ada", has())).toBe(null);
+});
+
+test("claude --version: the version on its own line wins over any other, else the last one in the output", () => {
+  expect(versionOf("Node 22.13.0 is old\n2.1.317 (Claude Code)\nUpdate 2.1.400 is out\n")).toBe("2.1.317");
+  expect(versionOf("a 1.2.3 then 2.1.300\n")).toBe("2.1.300");
+  expect(versionOf("no version")).toBe(null);
+  expect([atLeast("2.1.285", "2.1.285"), atLeast("2.1.284", "2.1.285"), atLeast("2.2.0", "2.1.285")]).toEqual([true, false, true]);
 });
