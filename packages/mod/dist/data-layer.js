@@ -9365,33 +9365,6 @@ async function turnOnAutoUpdate(settings, marketplace) {
 	await writeSettings(settings, current);
 	return `turned on Claude Code's auto-update for the ${marketplace} marketplace in ${settings}`;
 }
-/** The marketplace's repo before it moved to the isoplan-app organisation, and after. */
-const MOVED_FROM = "adamlinscott/isoplan-plugin";
-const MOVED_TO = "isoplan-app/isoplan-plugin";
-/** Points `marketplace`'s entry in `settings` from MOVED_FROM to MOVED_TO (see above); what it changed, or null. */
-async function moveMarketplace(settings, marketplace) {
-	const current = await readSettings(settings);
-	const known = current.extraKnownMarketplaces;
-	const entry = isObject(known) ? known[marketplace] : void 0;
-	if (!isObject(entry) || !isObject(entry.source) || Object.keys(entry.source).length !== 2 || entry.source.source !== "github" || entry.source.repo !== "adamlinscott/isoplan-plugin") return null;
-	const before = JSON.stringify(entry);
-	entry.source.repo = MOVED_TO;
-	await writeSettings(settings, current);
-	return {
-		said: `pointed the ${marketplace} marketplace at ${MOVED_TO}, where it moved from ${MOVED_FROM}, in ${settings}`,
-		before,
-		after: JSON.stringify(entry)
-	};
-}
-/** Writes `to` (JSON) as `marketplace`'s entry in `settings` when the entry there now passes `from`; whether it did. */
-async function putEntry(settings, marketplace, from, to) {
-	const current = await readSettings(settings);
-	const known = current.extraKnownMarketplaces;
-	if (!isObject(known) || !from(known[marketplace]) || JSON.stringify(known[marketplace]) === to) return false;
-	known[marketplace] = JSON.parse(to);
-	await writeSettings(settings, current);
-	return true;
-}
 /**
 * The `claude plugin update` runs for the plugin `id`: one per install recorded (scope and project
 * folder), each with its scope; one with no scope, in `cwd`, when the record can't be read.
@@ -9442,36 +9415,6 @@ async function checkForUpdate({ claudeDir, settings, plugins, id, cwd, claude, e
 		record.checkedAt = now();
 		await write();
 		const said = [];
-		const say = async (args, at) => {
-			const r = await run([...claude, ...args], at, env);
-			const failed = r.error ?? (r.code === null ? "didn't finish" : r.code !== 0 ? `failed with exit code ${r.code}` : null);
-			said.push(`claude ${args.join(" ")}: ${[failed, lastLine(r.output)].filter(Boolean).join(": ")}`);
-			return !failed;
-		};
-		const moved = await moveMarketplace(settings, marketplace).catch((err) => `couldn't point the ${marketplace} marketplace at ${MOVED_TO}: ${err.message}`);
-		if (typeof moved === "string") said.push(moved);
-		else if (moved) {
-			said.push(moved.said);
-			const repo = (entry) => isObject(entry) && isObject(entry.source) && entry.source.repo;
-			if (await say([
-				"plugin",
-				"marketplace",
-				"add",
-				"isoplan-app/isoplan-plugin"
-			], cwd)) {
-				const putBack = await putEntry(settings, marketplace, (entry) => repo(entry) === MOVED_TO, moved.after).catch((err) => `couldn't put back the rest of the ${marketplace} marketplace's entry in ${settings}: ${err.message}`);
-				if (putBack === true) said.push(`put back the rest of the ${marketplace} marketplace's entry in ${settings}`);
-				else if (putBack) said.push(putBack);
-				const on = record.autoUpdateOn;
-				if (isObject(on) && on.marketplace === marketplace && on.entry === moved.before) {
-					on.entry = moved.after;
-					await write();
-				}
-			} else {
-				const undone = await putEntry(settings, marketplace, (entry) => JSON.stringify(entry) === moved.after, moved.before).catch(() => false);
-				said.push(undone ? `pointed the ${marketplace} marketplace back at ${MOVED_FROM} in ${settings}, to try again later` : `left the ${marketplace} marketplace's entry in ${settings} as it is now`);
-			}
-		}
 		const turnedOn = await turnOnAutoUpdate(settings, marketplace).catch((err) => `couldn't turn on Claude Code's auto-update for ${marketplace}: ${err.message}`);
 		if (turnedOn) said.push(turnedOn);
 		if (turnedOn?.startsWith("turned on")) {
@@ -9483,6 +9426,12 @@ async function checkForUpdate({ claudeDir, settings, plugins, id, cwd, claude, e
 			};
 			await write();
 		}
+		const say = async (args, at) => {
+			const r = await run([...claude, ...args], at, env);
+			const failed = r.error ?? (r.code === null ? "didn't finish" : r.code !== 0 ? `failed with exit code ${r.code}` : null);
+			said.push(`claude ${args.join(" ")}: ${[failed, lastLine(r.output)].filter(Boolean).join(": ")}`);
+			return !failed;
+		};
 		if (!await say([
 			"plugin",
 			"marketplace",
