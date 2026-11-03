@@ -17,8 +17,12 @@
 //
 //   node dist/connect.js --wait <isoplan://connect?...>   starts it as above, then reads connect.log until it says how that ended, for up to WAIT_MS (status.ts)
 //   node dist/connect.js --status                         which offices this computer is connected to
+//
+// `--wait` hands the copy it starts a random run id ($ISOPLAN_CONNECT_RUN), which tags each of its
+// lines, so only its own lines are read, never another link's.
 
 import { spawn } from "node:child_process";
+import { randomBytes } from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -30,9 +34,11 @@ import { pairingEntry, pairingPath, readPairing } from "../data-layer/pairing.js
 import { connect, stopReporting } from "./connect.js";
 import { ask, tell } from "./dialog.js";
 import { parseLink } from "./link.js";
-import { resultSentence, statusSentence, waitForResult } from "./status.js";
+import { resultSentence, runTag, statusSentence, waitForResult } from "./status.js";
 
 const ENV = "ISOPLAN_CONNECT_URL";
+const RUN_ENV = "ISOPLAN_CONNECT_RUN";
+const run = /^[0-9a-f]{16}$/.test(process.env[RUN_ENV] ?? "") ? process.env[RUN_ENV]! : null;
 const here = path.dirname(fileURLToPath(import.meta.url));
 const mode = !process.env[ENV] && (process.argv[2] === "--wait" || process.argv[2] === "--status") ? process.argv[2] : null;
 const link = process.env[ENV] ?? process.argv[mode ? 3 : 2];
@@ -40,8 +46,13 @@ const { dir: claudeDir, json: claudeJson } = claudePaths(process.env, os.homedir
 const logFile = path.join(claudeDir, "isoplan", "logs", "connect.log");
 const defaultsPath = path.join(here, "..", "config.json");
 const account = () => accountOf({ readText: (p) => fs.readFile(p, "utf8").catch(() => null), run: nodeIo().run }, claudeJson, os.homedir());
-const startDetached = (link: string) =>
-  spawn(process.execPath, [fileURLToPath(import.meta.url)], { detached: true, windowsHide: true, stdio: "ignore", env: { ...process.env, [ENV]: link } }).unref();
+const startDetached = (link: string, run?: string) => {
+  const child = spawn(process.execPath, [fileURLToPath(import.meta.url)], { detached: true, windowsHide: true, stdio: "ignore", env: { ...process.env, [ENV]: link, ...(run && { [RUN_ENV]: run }) } });
+  child.unref();
+  let running = true;
+  child.on("exit", () => (running = false)).on("error", () => (running = false));
+  return () => running;
+};
 
 if (mode === "--status") {
   const offices = officesOf(await loadConfig(nodeIo(), defaultsPath, path.join(claudeDir, "isoplan", "config.json")));
@@ -53,10 +64,9 @@ if (mode === "--status") {
     process.stdout.write(`Not connected, because ${parsed}; press Connect Claude Code on the Isoplan page to try again.\n`);
     process.exitCode = 1;
   } else {
-    // The detached copy stamps its lines after this.
-    const since = new Date().toISOString();
-    startDetached(link);
-    const result = await waitForResult(() => fs.readFile(logFile, "utf8").catch(() => ""), since, parsed.server);
+    const id = randomBytes(8).toString("hex");
+    const running = startDetached(link, id);
+    const result = await waitForResult(() => fs.readFile(logFile, "utf8").catch(() => ""), id, { alive: running });
     process.stdout.write(resultSentence(result, parsed.host) + "\n");
     if (result?.kind !== "connected") process.exitCode = 1;
   }
@@ -70,7 +80,7 @@ if (mode === "--status") {
   const log = (text: string) => {
     void fs
       .mkdir(path.dirname(logFile), { recursive: true })
-      .then(() => fs.appendFile(logFile, `${new Date().toISOString()} ${text}\n`))
+      .then(() => fs.appendFile(logFile, `${new Date().toISOString()} ${run ? `${runTag(run)} ` : ""}${text}\n`))
       .catch(() => {});
   };
   try {

@@ -1,10 +1,10 @@
 import { execFile, spawn, spawnSync } from "node:child_process";
+import { randomBytes } from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { statSync } from "node:fs";
-import { randomBytes } from "node:crypto";
 import { promisify } from "node:util";
 //#region src/data-layer/config.ts
 async function loadConfig(io, defaultsPath, userPath) {
@@ -7113,78 +7113,71 @@ async function stopReporting(claudeDir, { isAlive = alive, commandOf = processCo
 }
 //#endregion
 //#region src/connect/status.ts
-/** How long `--wait` reads connect.log for an answer: under Claude Code's two-minute default for a command. */
-const WAIT_MS = 11e4;
-/**
-* How connecting to `server` ended, from connect.log's lines stamped at or after `since` (an ISO
-* time, as the log writes them), or null while none says. connect.lock lets one link through at a
-* time, so a line from then on is this link's, or says another was being handled.
-*/
-function resultOf(log, since, server) {
+/** How long `--wait` reads connect.log for an answer: the dialog's five minutes (dialog.ts) and a little. */
+const WAIT_MS = 31e4;
+/** The tag main.ts puts on each line the connect it started for `--wait` writes, after the time. */
+const runTag = (run) => `[run ${run}]`;
+const ISO = /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(\.\d+)?Z$/;
+const EMAIL = /^[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9-]{1,63}(\.[A-Za-z0-9-]{1,63})+$/;
+/** How the connect tagged `run` ended, from connect.log's lines, or null while none of its lines says. */
+function resultOf(log, run) {
+	const tag = ` ${runTag(run)} `;
 	for (const line of log.split("\n")) {
-		const at = line.indexOf(" ");
-		if (at < 0 || line.slice(0, at) < since) continue;
-		const text = line.slice(at + 1).trimEnd();
-		const connected = /^connected to (\S+) as (.+?)(, added to config\.json)?$/.exec(text);
-		if (connected?.[1] === server) return {
+		const at = line.indexOf(tag);
+		if (at < 0 || !ISO.test(line.slice(0, at))) continue;
+		const text = line.slice(at + tag.length).trimEnd();
+		const connected = /^connected to \S+ as (.+?)(, added to config\.json)?$/.exec(text);
+		if (connected) return {
 			kind: "connected",
-			email: connected[2]
+			email: connected[1].length <= 254 && EMAIL.test(connected[1]) ? connected[1] : null
 		};
-		if (text === `not connected to ${server}: cancelled`) return { kind: "cancelled" };
-		if (text.startsWith(`paired by ${server},`) || text.startsWith(`paired with ${server},`)) return { kind: "unfinished" };
+		if (/^not connected to \S+: cancelled$/.test(text)) return { kind: "cancelled" };
+		if (text.startsWith("paired by ") || text.startsWith("paired with ")) return { kind: "unfinished" };
 		if (text.startsWith("refused a connect link:")) return { kind: "busy" };
-		if (text.startsWith("couldn't connect:")) return {
-			kind: "failed",
-			why: "something went wrong on this computer"
-		};
+		if (text.startsWith("couldn't connect:")) return { kind: "failed" };
 		if (text.startsWith("not connected: ")) return failure(text.slice(15));
 	}
 	return null;
 }
-/** Reads connect.log (`read`) each second until resultOf has an answer, for up to `waitMs`; null when none came. */
-async function waitForResult(read, since, server, { waitMs = WAIT_MS, everyMs = 1e3, now = Date.now } = {}) {
+/** connect.ts's reason, as one of the fixed results. */
+function failure(why) {
+	if (why.startsWith("the office said:")) return { kind: why.includes("expired or been used") ? "gone" : "refused" };
+	if (why.startsWith("the office answered")) return { kind: "refused" };
+	if (why.startsWith("the office couldn't be reached")) return { kind: "unreachable" };
+	if (why.startsWith("the confirmation couldn't be shown")) return { kind: "no-window" };
+	if (why.includes("config.json")) return { kind: "settings" };
+	return { kind: "failed" };
+}
+/**
+* Reads connect.log (`read`) each second until resultOf has an answer for `run`, for up to `waitMs`;
+* null when none came. Once the connect it started has gone (`alive`) with nothing said, "died".
+*/
+async function waitForResult(read, run, { waitMs = WAIT_MS, everyMs = 1e3, now = Date.now, alive = () => true } = {}) {
 	for (const until = now() + waitMs; now() < until;) {
 		await new Promise((r) => setTimeout(r, everyMs));
-		const result = resultOf(await read(), since, server);
+		const result = resultOf(await read(), run);
 		if (result) return result;
+		if (!alive()) return resultOf(await read(), run) ?? { kind: "died" };
 	}
 	return null;
-}
-/** connect.ts's reason, in plain words: an expired code apart, and without file names or error details. */
-function failure(why) {
-	if (why.includes("expired or been used")) return { kind: "gone" };
-	if (why.startsWith("the office said:")) return {
-		kind: "failed",
-		why
-	};
-	if (why.startsWith("the office couldn't be reached")) return {
-		kind: "failed",
-		why: "the office couldn't be reached"
-	};
-	if (why.startsWith("the confirmation couldn't be shown")) return {
-		kind: "failed",
-		why: "the window asking you to connect couldn't be shown on this computer"
-	};
-	if (why.includes("config.json")) return {
-		kind: "failed",
-		why: "Isoplan's settings on this computer couldn't be read"
-	};
-	return {
-		kind: "failed",
-		why
-	};
 }
 const AGAIN = "press Connect Claude Code on the Isoplan page to try again";
 /** The sentence for `result` (null: no answer yet) of connecting to the office at `host`. */
 function resultSentence(result, host) {
 	if (!result) return `The window on this computer asking to connect to ${host} hasn't been answered yet: answer it, then type /isoplan:connect to check.`;
+	const not = (why) => `Not connected to ${host}, because ${why}; ${AGAIN}.`;
 	switch (result.kind) {
-		case "connected": return `Connected to ${host} as ${result.email}: your Claude Code work shows on its floor from your next message.`;
-		case "cancelled": return `Not connected to ${host}, because the window was cancelled or ran out of time; ${AGAIN}.`;
+		case "connected": return `Connected to ${host}${result.email ? ` as ${result.email}` : ""}. Your Claude Code work shows on its floor in new Claude Code windows.`;
+		case "cancelled": return not("the window was cancelled or ran out of time");
 		case "gone": return `Not connected to ${host}, because the link has expired or was already used; press Connect Claude Code on the Isoplan page for a new one.`;
 		case "busy": return `Not connected to ${host}, because another window asking to connect is already open on this computer; answer that one first.`;
 		case "unfinished": return `${host} paired this computer, but it couldn't finish setting up here; the window that opened says what to do.`;
-		case "failed": return `Not connected to ${host}, because ${result.why}; ${AGAIN}.`;
+		case "unreachable": return not("the office couldn't be reached");
+		case "no-window": return not("the window asking you to connect couldn't be shown on this computer");
+		case "settings": return not("Isoplan's settings on this computer couldn't be read");
+		case "refused": return not("the office refused the link");
+		case "failed": return not("something went wrong on this computer");
+		case "died": return `Not connected to ${host}, because the window didn't open; ${AGAIN}.`;
 	}
 }
 const named = (o) => {
@@ -7203,6 +7196,8 @@ function statusSentence(offices) {
 //#endregion
 //#region src/connect/main.ts
 const ENV = "ISOPLAN_CONNECT_URL";
+const RUN_ENV = "ISOPLAN_CONNECT_RUN";
+const run = /^[0-9a-f]{16}$/.test(process.env[RUN_ENV] ?? "") ? process.env[RUN_ENV] : null;
 const here = path.dirname(fileURLToPath(import.meta.url));
 const mode = !process.env[ENV] && (process.argv[2] === "--wait" || process.argv[2] === "--status") ? process.argv[2] : null;
 const link = process.env[ENV] ?? process.argv[mode ? 3 : 2];
@@ -7213,15 +7208,22 @@ const account = () => accountOf({
 	readText: (p) => fs.readFile(p, "utf8").catch(() => null),
 	run: nodeIo().run
 }, claudeJson, os.homedir());
-const startDetached = (link) => spawn(process.execPath, [fileURLToPath(import.meta.url)], {
-	detached: true,
-	windowsHide: true,
-	stdio: "ignore",
-	env: {
-		...process.env,
-		[ENV]: link
-	}
-}).unref();
+const startDetached = (link, run) => {
+	const child = spawn(process.execPath, [fileURLToPath(import.meta.url)], {
+		detached: true,
+		windowsHide: true,
+		stdio: "ignore",
+		env: {
+			...process.env,
+			[ENV]: link,
+			...run && { [RUN_ENV]: run }
+		}
+	});
+	child.unref();
+	let running = true;
+	child.on("exit", () => running = false).on("error", () => running = false);
+	return () => running;
+};
 if (mode === "--status") {
 	const offices = officesOf(await loadConfig(nodeIo(), defaultsPath, path.join(claudeDir, "isoplan", "config.json")));
 	const [pairing, who] = await Promise.all([readPairing(pairingPath(claudeDir)), account()]);
@@ -7236,9 +7238,8 @@ if (mode === "--status") {
 		process.stdout.write(`Not connected, because ${parsed}; press Connect Claude Code on the Isoplan page to try again.\n`);
 		process.exitCode = 1;
 	} else {
-		const since = (/* @__PURE__ */ new Date()).toISOString();
-		startDetached(link);
-		const result = await waitForResult(() => fs.readFile(logFile, "utf8").catch(() => ""), since, parsed.server);
+		const id = randomBytes(8).toString("hex");
+		const result = await waitForResult(() => fs.readFile(logFile, "utf8").catch(() => ""), id, { alive: startDetached(link, id) });
 		process.stdout.write(resultSentence(result, parsed.host) + "\n");
 		if (result?.kind !== "connected") process.exitCode = 1;
 	}
@@ -7250,7 +7251,7 @@ if (mode === "--status") {
 	process.exitCode = 2;
 } else {
 	const log = (text) => {
-		fs.mkdir(path.dirname(logFile), { recursive: true }).then(() => fs.appendFile(logFile, `${(/* @__PURE__ */ new Date()).toISOString()} ${text}\n`)).catch(() => {});
+		fs.mkdir(path.dirname(logFile), { recursive: true }).then(() => fs.appendFile(logFile, `${(/* @__PURE__ */ new Date()).toISOString()} ${run ? `${runTag(run)} ` : ""}${text}\n`)).catch(() => {});
 	};
 	try {
 		await connect(link, {

@@ -1,57 +1,70 @@
 // What /isoplan:connect tells the person (commands/connect.md), in one plain sentence each, with no
 // file names, tokens or credentials: how a link it just started connecting ended, read from the
-// lines connect.ts wrote to connect.log since (resultOf, resultSentence), or, without a link, which
+// lines its own run wrote to connect.log (resultOf, resultSentence), or, without a link, which
 // offices this computer is connected to (statusSentence). main.ts does the reading and the waiting.
+//
+// These sentences go into Claude's context, and the link may be anyone's, so nothing an office says
+// is passed on: a refusal is a fixed sentence, and the email the office gave is shown only when it
+// looks like one, after the person pressed Connect.
 
-/** How long `--wait` reads connect.log for an answer: under Claude Code's two-minute default for a command. */
-export const WAIT_MS = 110 * 1000;
+/** How long `--wait` reads connect.log for an answer: the dialog's five minutes (dialog.ts) and a little. */
+export const WAIT_MS = 310 * 1000;
 
-export type Result = { kind: "connected"; email: string } | { kind: "cancelled" } | { kind: "gone" } | { kind: "busy" } | { kind: "unfinished" } | { kind: "failed"; why: string };
+export type Result =
+  | { kind: "connected"; email: string | null }
+  | { kind: "cancelled" | "gone" | "busy" | "unfinished" | "unreachable" | "no-window" | "settings" | "refused" | "failed" | "died" };
 
-/**
- * How connecting to `server` ended, from connect.log's lines stamped at or after `since` (an ISO
- * time, as the log writes them), or null while none says. connect.lock lets one link through at a
- * time, so a line from then on is this link's, or says another was being handled.
- */
-export function resultOf(log: string, since: string, server: string): Result | null {
+/** The tag main.ts puts on each line the connect it started for `--wait` writes, after the time. */
+export const runTag = (run: string) => `[run ${run}]`;
+
+const ISO = /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(\.\d+)?Z$/;
+const EMAIL = /^[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9-]{1,63}(\.[A-Za-z0-9-]{1,63})+$/;
+
+/** How the connect tagged `run` ended, from connect.log's lines, or null while none of its lines says. */
+export function resultOf(log: string, run: string): Result | null {
+  const tag = ` ${runTag(run)} `;
   for (const line of log.split("\n")) {
-    const at = line.indexOf(" ");
-    if (at < 0 || line.slice(0, at) < since) continue;
-    const text = line.slice(at + 1).trimEnd();
-    const connected = /^connected to (\S+) as (.+?)(, added to config\.json)?$/.exec(text);
-    if (connected?.[1] === server) return { kind: "connected", email: connected[2]! };
-    if (text === `not connected to ${server}: cancelled`) return { kind: "cancelled" };
-    if (text.startsWith(`paired by ${server},`) || text.startsWith(`paired with ${server},`)) return { kind: "unfinished" };
+    const at = line.indexOf(tag);
+    if (at < 0 || !ISO.test(line.slice(0, at))) continue;
+    const text = line.slice(at + tag.length).trimEnd();
+    const connected = /^connected to \S+ as (.+?)(, added to config\.json)?$/.exec(text);
+    if (connected) return { kind: "connected", email: connected[1]!.length <= 254 && EMAIL.test(connected[1]!) ? connected[1]! : null };
+    if (/^not connected to \S+: cancelled$/.test(text)) return { kind: "cancelled" };
+    if (text.startsWith("paired by ") || text.startsWith("paired with ")) return { kind: "unfinished" };
     if (text.startsWith("refused a connect link:")) return { kind: "busy" };
-    if (text.startsWith("couldn't connect:")) return { kind: "failed", why: "something went wrong on this computer" };
+    if (text.startsWith("couldn't connect:")) return { kind: "failed" };
     if (text.startsWith("not connected: ")) return failure(text.slice("not connected: ".length));
   }
   return null;
 }
 
-/** Reads connect.log (`read`) each second until resultOf has an answer, for up to `waitMs`; null when none came. */
+/** connect.ts's reason, as one of the fixed results. */
+function failure(why: string): Result {
+  if (why.startsWith("the office said:")) return { kind: why.includes("expired or been used") ? "gone" : "refused" };
+  if (why.startsWith("the office answered")) return { kind: "refused" };
+  if (why.startsWith("the office couldn't be reached")) return { kind: "unreachable" };
+  if (why.startsWith("the confirmation couldn't be shown")) return { kind: "no-window" };
+  if (why.includes("config.json")) return { kind: "settings" };
+  return { kind: "failed" };
+}
+
+/**
+ * Reads connect.log (`read`) each second until resultOf has an answer for `run`, for up to `waitMs`;
+ * null when none came. Once the connect it started has gone (`alive`) with nothing said, "died".
+ */
 export async function waitForResult(
   read: () => Promise<string>,
-  since: string,
-  server: string,
-  { waitMs = WAIT_MS, everyMs = 1000, now = Date.now }: { waitMs?: number; everyMs?: number; now?: () => number } = {},
+  run: string,
+  { waitMs = WAIT_MS, everyMs = 1000, now = Date.now, alive = () => true }: { waitMs?: number; everyMs?: number; now?: () => number; alive?: () => boolean } = {},
 ): Promise<Result | null> {
   for (const until = now() + waitMs; now() < until; ) {
     await new Promise((r) => setTimeout(r, everyMs));
-    const result = resultOf(await read(), since, server);
+    const result = resultOf(await read(), run);
     if (result) return result;
+    // It may have written its last line between the read and now.
+    if (!alive()) return resultOf(await read(), run) ?? { kind: "died" };
   }
   return null;
-}
-
-/** connect.ts's reason, in plain words: an expired code apart, and without file names or error details. */
-function failure(why: string): Result {
-  if (why.includes("expired or been used")) return { kind: "gone" };
-  if (why.startsWith("the office said:")) return { kind: "failed", why };
-  if (why.startsWith("the office couldn't be reached")) return { kind: "failed", why: "the office couldn't be reached" };
-  if (why.startsWith("the confirmation couldn't be shown")) return { kind: "failed", why: "the window asking you to connect couldn't be shown on this computer" };
-  if (why.includes("config.json")) return { kind: "failed", why: "Isoplan's settings on this computer couldn't be read" };
-  return { kind: "failed", why };
 }
 
 const AGAIN = "press Connect Claude Code on the Isoplan page to try again";
@@ -59,19 +72,30 @@ const AGAIN = "press Connect Claude Code on the Isoplan page to try again";
 /** The sentence for `result` (null: no answer yet) of connecting to the office at `host`. */
 export function resultSentence(result: Result | null, host: string): string {
   if (!result) return `The window on this computer asking to connect to ${host} hasn't been answered yet: answer it, then type /isoplan:connect to check.`;
+  const not = (why: string) => `Not connected to ${host}, because ${why}; ${AGAIN}.`;
   switch (result.kind) {
     case "connected":
-      return `Connected to ${host} as ${result.email}: your Claude Code work shows on its floor from your next message.`;
+      return `Connected to ${host}${result.email ? ` as ${result.email}` : ""}. Your Claude Code work shows on its floor in new Claude Code windows.`;
     case "cancelled":
-      return `Not connected to ${host}, because the window was cancelled or ran out of time; ${AGAIN}.`;
+      return not("the window was cancelled or ran out of time");
     case "gone":
       return `Not connected to ${host}, because the link has expired or was already used; press Connect Claude Code on the Isoplan page for a new one.`;
     case "busy":
       return `Not connected to ${host}, because another window asking to connect is already open on this computer; answer that one first.`;
     case "unfinished":
       return `${host} paired this computer, but it couldn't finish setting up here; the window that opened says what to do.`;
+    case "unreachable":
+      return not("the office couldn't be reached");
+    case "no-window":
+      return not("the window asking you to connect couldn't be shown on this computer");
+    case "settings":
+      return not("Isoplan's settings on this computer couldn't be read");
+    case "refused":
+      return not("the office refused the link");
     case "failed":
-      return `Not connected to ${host}, because ${result.why}; ${AGAIN}.`;
+      return not("something went wrong on this computer");
+    case "died":
+      return `Not connected to ${host}, because the window didn't open; ${AGAIN}.`;
   }
 }
 
