@@ -35,7 +35,9 @@
 // reserved, or is given back. Otherwise a `drop` ends a request: what
 // is held for it goes, and one still running neither pushes nor sends. A handoff to take goes to
 // `take`, with how to open its session; each take (the session id the server chose) runs once, however
-// often it is sent, and what it did goes back as `taken`. owner-answer requests go to the live session, not
+// often it is sent, and what it did goes back as `taken`. A `drop` naming a take's id (the server
+// cancelled it, or it timed out there) tells the take, which then doesn't open the Claude app; and a
+// take still running after takeCapMinutes is given up: `taken` says so, and the take is told it was dropped. owner-answer requests go to the live session, not
 // the runner (#50). A focus request (Focus this session, for a handoff this machine took into Orca)
 // goes to `focus`, and is answered with a focus reply, or refused `unavailable` saying why.
 
@@ -51,6 +53,8 @@ export interface RunnerSettings extends CapSettings {
   answerTimeoutSeconds: number;
   briefTimeoutSeconds: number;
   maxForks: number;
+  /** The longest a take may keep its handoff in hand on this machine: past it, the take is given up and said so. */
+  takeCapMinutes: number;
 }
 
 type Outgoing = ReplyMessage | RefusalMessage;
@@ -80,8 +84,8 @@ export interface RunnerOptions {
   push?: (session: string, lead: Lead, handoff: string, pushAnyway: Record<string, string> | null) => Promise<HandoffRepo[] | { held: string[]; commits: Record<string, string>; unchecked: string[] }>;
   /** The untracked files the brief names (null when unknown), and the note it ends with (#48). Throws PushFailed when there is no repo to push. */
   prepareBrief?: (lead: Lead, handoff: string) => Promise<{ files: string[] | null; note: string }>;
-  /** Takes a handoff on this machine (#48); without it, handoffs are logged as not handled. */
-  take?: (message: HandoffMessage) => Promise<TakenMessage>;
+  /** Takes a handoff on this machine (#48); without it, handoffs are logged as not handled. `dropped` says whether the server has dropped the take since, or it was given up. */
+  take?: (message: HandoffMessage, dropped: () => boolean) => Promise<TakenMessage>;
   /** Brings a handoff's session to the front in Orca: null when it is, else why not. Without it, focus requests are refused. */
   focus?: (handoff: string) => Promise<string | null>;
   /** The fork slots, shared by every office's runner on the machine; without it, this runner's own. */
@@ -147,6 +151,8 @@ export function createRunner({ answerer, ledger, settings, prompts, scan, send, 
   const dropped = new Set<string>(); // dropped from `held` to make room, oldest first
   const taking = new Set<string>(); // handoffs being taken now
   const takes = new Set<string>(); // the takes run so far, by take id, oldest first
+  const runningTakes = new Set<string>(); // take ids still running, given up ones too
+  const droppedTakes = new Set<string>(); // of those, the ones dropped by the server or given up
   const dropping = new Set<string>(); // requests dropped while they ran
 
   const unavailable = (id: string, detail: string): RefusalMessage => ({ type: "refusal", v: PROTOCOL_VERSION, id, reason: "unavailable", detail });
@@ -310,6 +316,7 @@ export function createRunner({ answerer, ledger, settings, prompts, scan, send, 
       if (message.type === "drop") {
         if (held.delete(message.id)) log(`dropped the withheld reply for ${message.id}: its handoff is over`);
         else if (running.has(message.id)) dropping.add(message.id);
+        else if (runningTakes.has(message.id)) droppedTakes.add(message.id);
         return;
       }
       if (message.type === "handoff") {
@@ -322,9 +329,29 @@ export function createRunner({ answerer, ledger, settings, prompts, scan, send, 
           takes.add(takeId);
           if (takes.size > REMEMBER) takes.delete(takes.values().next().value!);
           taking.add(handoff.id);
-          void take(message)
-            .then(send, (err: unknown) => log(`handoff ${handoff.id}: taking it failed: ${(err as Error)?.stack ?? String(err)}`))
-            .finally(() => taking.delete(handoff.id));
+          runningTakes.add(takeId);
+          // Whichever comes first, the take's own end or takeCapMinutes, ends it here: a take that
+          // never finishes can't keep its handoff in hand, and one given up opens nothing more.
+          let over = false;
+          let timer: ReturnType<typeof setTimeout> | undefined;
+          const finish = (m: TakenMessage | null) => {
+            if (over) return;
+            over = true;
+            clearTimeout(timer);
+            taking.delete(handoff.id);
+            if (m) send(m);
+          };
+          void settings().then((s) => {
+            if (over) return;
+            timer = setTimeout(() => {
+              droppedTakes.add(takeId);
+              log(`handoff ${handoff.id}: taking it didn't finish within ${s.takeCapMinutes} minutes, so it was given up`);
+              finish({ type: "taken", v: PROTOCOL_VERSION, handoff: handoff.id, failures: [{ step: "open", output: `Taking it didn't finish within ${s.takeCapMinutes} minutes on this machine, so it was given up: take it again from the floor.` }] });
+            }, s.takeCapMinutes * 60000);
+          });
+          void take(message, () => droppedTakes.has(takeId))
+            .then(finish, (err: unknown) => (log(`handoff ${handoff.id}: taking it failed: ${(err as Error)?.stack ?? String(err)}`), finish(null)))
+            .finally(() => (runningTakes.delete(takeId), droppedTakes.delete(takeId)));
         }
         return;
       }

@@ -59,8 +59,13 @@ export const DESKTOP_MIN_VERSION = "2.1.285";
 export function claudeVersion(binary: string, env: Record<string, string | undefined> = process.env): Promise<string | null> {
   const [cmd, ...args] = claudeCommand(binary);
   return new Promise((resolve) => {
-    execFile(cmd!, [...args, "--version"], { env, timeout: 30000, windowsHide: true }, (err, stdout) => resolve(err ? null : (/\d+\.\d+\.\d+/.exec(stdout)?.[0] ?? null)));
+    execFile(cmd!, [...args, "--version"], { env, timeout: 30000, windowsHide: true }, (err, stdout) => resolve(err ? null : versionOf(stdout)));
   });
+}
+
+/** The version in `claude --version`'s output: the line "<x.y.z> (Claude Code)", else the last x.y.z in it. */
+export function versionOf(output: string): string | null {
+  return /^(\d+\.\d+\.\d+) \(Claude Code\)/m.exec(output)?.[1] ?? [...output.matchAll(/\d+\.\d+\.\d+/g)].at(-1)?.[0] ?? null;
 }
 
 /** Whether `version` is `min` or newer, comparing major, minor and patch as numbers. */

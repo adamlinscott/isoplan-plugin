@@ -57,13 +57,19 @@
 //      above several repos, which Orca can't hold.
 //    - `desktop`: in the Claude app, which runs its own Claude Code and opens a session of Claude
 //      Code for the terminal's with `claude --desktop --resume <id>` (2.1.285 on, a Mac or Windows
-//      x64, signed in with a Claude subscription). The worktree is trusted as for headless, then the
-//      take's prompt runs to its end, hidden, as a saved session under the server's id (`claude -p`,
-//      with no permissions beyond what the folder's trust gives, as headless has), so it has read the
-//      brief before the app takes it over and the two never write to it at once; then the app is
-//      asked to open it. The binary's version and sign-in are checked before anything is made.
+//      x64, signed in with a Claude subscription). The OS, the binary's version and its sign-in
+//      (`claude auth status`, which must answer, and say a subscription) are checked before anything
+//      is made. The worktree is trusted as for headless, then the take's prompt runs to its end,
+//      hidden, as a saved session under the server's id (`claude -p --permission-mode default`, so no
+//      `defaultMode` in the branch's settings loosens it, under `desktopReadMaxTurns` and
+//      `desktopReadTimeoutMinutes`), so it has read the brief before the app takes it over and the two
+//      never write to it at once. A first turn that fails has its transcript deleted. Then, unless the
+//      server has dropped the take (cancelled, or timed out) or it has run past
+//      `desktopTakeBudgetMinutes` (kept under the server's own take timeout), the app is asked to open
+//      it. A session the app didn't open is still taken, with the failure saying how to open it.
 //
-// The claude binary is looked for first, in every mode: without it nothing is made.
+// After Orca (for a take into Orca), the claude binary is looked for, in every mode, before anything
+// is made: without it nothing is.
 //
 // A failed setup script or repo checkout doesn't stop the rest: the session still opens, and the step is reported
 // with the end of its output. Output leaves the machine only after the secret scan.
@@ -95,8 +101,11 @@ export interface TakeSettings {
   gitTimeoutSeconds: number;
   setupTimeoutMinutes: number;
   cloneSearchDays: number;
-  /** How long a take into the Claude app may spend reading the brief before the app takes it over. */
+  /** How long a take into the Claude app may spend reading the brief before the app takes it over, and in how many turns. */
   desktopReadTimeoutMinutes: number;
+  desktopReadMaxTurns: number;
+  /** How long a take into the Claude app may run in all before the app is no longer opened: under the server's take timeout. */
+  desktopTakeBudgetMinutes: number;
 }
 
 /** What opens a terminal: a launcher script written to `file`, then the command that runs it. */
@@ -143,6 +152,8 @@ export interface TakeOptions {
   cloneFrom?: (remote: string) => boolean;
   /** Orca's CLI, for a take into Orca, or null when Orca isn't on this machine. */
   orca?: () => Promise<RunOrca | null>;
+  /** Whether the office server has dropped this take since (cancelled, or timed out): checked before the Claude app is opened. */
+  dropped?: () => boolean;
 }
 
 /** The handoff's folder on this machine: its brief, launcher and setup log. */
@@ -366,7 +377,9 @@ function hidden([cmd, ...args]: string[], cwd: string, env: Record<string, strin
     let stdout = "";
     let stderr = "";
     let timedOut = false;
-    const child = spawn(cmd!, args, { cwd, env, stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
+    // Its own process group on a Mac, as runShell's, so killTree ends whatever it started too, and
+    // nothing left holding its pipes keeps `close` from firing.
+    const child = spawn(cmd!, args, { cwd, env, stdio: ["ignore", "pipe", "pipe"], windowsHide: true, detached: process.platform !== "win32" });
     child.stdout.setEncoding("utf8").on("data", (piece: string) => (stdout += piece));
     child.stderr.setEncoding("utf8").on("data", (piece: string) => (stderr = (stderr + piece).slice(-OUTPUT_TAIL)));
     const timer = setTimeout(() => ((timedOut = true), killTree(child as never)), timeoutMs);
@@ -375,18 +388,27 @@ function hidden([cmd, ...args]: string[], cwd: string, env: Record<string, strin
   });
 }
 
-/** What a take into the Claude app needs and this machine lacks, in words, or null: the OS, the binary's version, and a subscription sign-in. */
+/**
+ * What a take into the Claude app needs and this machine lacks, in words, or null: the OS, the
+ * binary's version, and a subscription sign-in that `claude auth status` answers for. The runner
+ * offers the take only while this is null (runner/main.ts).
+ */
 export async function desktopProblem(bin: string, env: Record<string, string>, platform: NodeJS.Platform, arch: string, machine: string): Promise<string | null> {
   if (!desktopPlatform(platform, arch)) return `The Claude app opens Claude Code sessions only on a Mac or on Windows x64, and ${machine} is neither, so nothing was made: take it again from the floor another way.`;
   const version = await claudeVersion(bin, env);
   if (!version || !atLeast(version, DESKTOP_MIN_VERSION)) return `${INSTALL_FOR_DESKTOP} ${machine} has ${version ? `version ${version}` : "a version that didn't say which it is"}, so nothing was made.`;
-  // Only what `claude auth status` says plainly is refused: anything it doesn't say is left to the app.
+  // A sign-in that can't be checked is refused too: nothing is made on a guess.
   const r = await hidden([...claudeCommand(bin), "auth", "status", "--json"], os.tmpdir(), env, 30000);
-  let status: { loggedIn?: unknown; authMethod?: unknown; apiProvider?: unknown } = {};
-  try {
-    status = JSON.parse(r.stdout) as typeof status;
-  } catch {
-    return null;
+  const status = ((): { loggedIn?: unknown; authMethod?: unknown; apiProvider?: unknown } | null => {
+    try {
+      const value = JSON.parse(r.stdout) as unknown;
+      return value && typeof value === "object" && typeof (value as { loggedIn?: unknown }).loggedIn === "boolean" ? (value as { loggedIn: boolean }) : null;
+    } catch {
+      return null;
+    }
+  })();
+  if (r.code !== 0 || r.timedOut || !status) {
+    return `Couldn't check Claude Code's sign-in on ${machine}: \`claude auth status\` ${r.timedOut ? "didn't answer within 30 seconds" : r.code !== 0 ? `exited with code ${r.code}` : "didn't say whether it is signed in"}, so nothing was made. Run it there to see why, then take it again.`;
   }
   if (status.loggedIn === false) return `Claude Code for the terminal isn't signed in on ${machine}, so nothing was made: run \`claude auth login\` with your Claude subscription, then take it again.`;
   const provider = typeof status.apiProvider === "string" && status.apiProvider !== "firstParty";
@@ -394,6 +416,31 @@ export async function desktopProblem(bin: string, env: Record<string, string>, p
     return `The Claude app opens only sessions signed in with a Claude subscription, and Claude Code for the terminal on ${machine} uses ${provider ? `${status.apiProvider}` : "an API key"}, so nothing was made: sign it in with \`claude auth login\`, or take it again from the floor another way.`;
   }
   return null;
+}
+
+/**
+ * Deletes the transcript of session `id`, which a failed first turn left: its .jsonl and its folder of
+ * the same name, in whichever project folder Claude Code put them. The id is the take's own, new to
+ * this machine. Whether a transcript was there to delete.
+ */
+export async function removeTranscript(claudeDir: string, id: string): Promise<boolean> {
+  const projects = path.join(claudeDir, "projects");
+  let found = false;
+  for (const dir of await fs.readdir(projects).catch(() => [] as string[])) {
+    const file = path.join(projects, dir, `${id}.jsonl`);
+    if (await fs.rm(file).then(() => true, () => false)) found = true;
+    await fs.rm(path.join(projects, dir, id), { recursive: true, force: true }).catch(() => {});
+  }
+  return found;
+}
+
+// Whether the repo at `dir` has changes to tracked files, or commits its upstream doesn't have.
+async function changedSince(run: RunGit, dir: string, timeoutMs: number): Promise<boolean> {
+  const status = await run(["status", "--porcelain", "--untracked-files=no"], { cwd: dir, timeoutMs });
+  if (status.code !== 0) return false;
+  if (status.stdout.trim()) return true;
+  const ahead = await run(["rev-list", "--count", "@{upstream}..HEAD"], { cwd: dir, timeoutMs });
+  return ahead.code === 0 && Number(ahead.stdout.trim()) > 0;
 }
 
 const INSTALL_FOR_DESKTOP = `Install Claude Code for the terminal, version ${DESKTOP_MIN_VERSION} or newer, to open handoffs in the Claude app.`;
@@ -450,11 +497,14 @@ export function takePrompt(id: string, brief: string, setupLog: string | null, f
 
 /**
  * Claude Code's command line for the new session. The prompt comes first: `--add-dir` takes every
- * argument after it, and would take the prompt too. `print` runs the prompt to its end and says how
- * it went as JSON, for a take into the Claude app.
+ * argument after it, and would take the prompt too. `print` runs the prompt to its end, unattended,
+ * in at most `maxTurns` turns, and says how it went as JSON, for a take into the Claude app: with the
+ * default permission mode, whatever the folder's settings set as theirs, so nothing that would ask
+ * is allowed.
  */
-export function sessionArgv(bin: string, { prompt, session, name, folder, headless, print = false }: { prompt: string; session: string; name: string; folder: string; headless: boolean; print?: boolean }): string[] {
-  return [...claudeCommand(bin), prompt, ...(headless ? ["--bg"] : []), ...(print ? ["--print", "--output-format", "json"] : []), "--session-id", session, "--name", name, "--add-dir", folder];
+export function sessionArgv(bin: string, { prompt, session, name, folder, headless, print }: { prompt: string; session: string; name: string; folder: string; headless: boolean; print?: { maxTurns: number } }): string[] {
+  const printing = print ? ["--print", "--output-format", "json", "--permission-mode", "default", "--max-turns", String(print.maxTurns)] : [];
+  return [...claudeCommand(bin), prompt, ...(headless ? ["--bg"] : []), ...printing, "--session-id", session, "--name", name, "--add-dir", folder];
 }
 
 /** The commits this machine took of a handoff before, which a re-take may move past. */
@@ -516,6 +566,7 @@ export async function takeHandoff(message: Pick<HandoffMessage, "handoff" | "mod
     return done();
   }
   const desktop = message.mode === "desktop";
+  const startedAt = Date.now();
   try {
     if (message.mode === "orca") {
       orca = (await o.orca?.()) ?? null;
@@ -623,8 +674,16 @@ export async function takeHandoff(message: Pick<HandoffMessage, "handoff" | "mod
 
     const id = message.session ?? (o.newSession ?? randomUUID)();
     const name = `Isoplan handoff ${handoff.id}`;
-    const argv = sessionArgv(bin, { prompt: takePrompt(handoff.id, briefFile, setupLog, failedRepos), session: id, name, folder, headless, print: desktop });
+    const argv = sessionArgv(bin, { prompt: takePrompt(handoff.id, briefFile, setupLog, failedRepos), session: id, name, folder, headless, ...(desktop ? { print: { maxTurns: s.desktopReadMaxTurns } } : {}) });
     if (desktop) {
+      const budgetMs = s.desktopTakeBudgetMinutes * 60000;
+      const left = () => budgetMs - (Date.now() - startedAt);
+      const stopped = () => (o.dropped?.() ? "it was cancelled or timed out on the floor" : left() <= 0 ? `it ran past ${s.desktopTakeBudgetMinutes} minutes` : null);
+      const before = stopped();
+      if (before) {
+        await fail("open", `The take stopped before Claude Code read the handoff: ${before}. The worktree is ${dir}: take it again from the floor.`);
+        return done();
+      }
       try {
         // The floor told the receiver: this trusts the worktree, so its settings, hooks and scripts run.
         await trustFolder(o.claudeJson, dir, o.platform);
@@ -633,25 +692,40 @@ export async function takeHandoff(message: Pick<HandoffMessage, "handoff" | "mod
         return done();
       }
       // The first turn ends before the app opens the session, so the two never write to it at once.
-      const minutes = s.desktopReadTimeoutMinutes;
-      const read = await hidden(argv, dir, env, minutes * 60000);
-      const said = ((): { is_error?: unknown; session_id?: unknown } | null => {
+      const readMs = Math.min(s.desktopReadTimeoutMinutes * 60000, left());
+      const read = await hidden(argv, dir, env, readMs);
+      const said = ((): { is_error?: unknown; subtype?: unknown; session_id?: unknown } | null => {
         try {
-          return JSON.parse(read.stdout.trim().split(/\r?\n/).at(-1) ?? "") as { is_error?: unknown; session_id?: unknown };
+          return JSON.parse(read.stdout.trim().split(/\r?\n/).at(-1) ?? "") as { is_error?: unknown; subtype?: unknown; session_id?: unknown };
         } catch {
           return null;
         }
       })();
       if (read.code !== 0 || said?.is_error === true || said?.session_id !== id) {
-        const why = read.timedOut ? `it was stopped after ${minutes} minutes` : (read.stderr || read.stdout).trim() || `claude exited with code ${read.code}`;
-        await fail("open", `Claude Code couldn't read the handoff before the Claude app took it over: ${why}. The worktree is ${dir}.`);
+        // Fixed words only: what claude printed is the model's, and stays in the local log.
+        o.log(`handoff ${handoff.id}: the first turn of ${id} failed (code ${read.code}): ${read.stderr.trim().slice(-500)}`);
+        const kind = typeof said?.subtype === "string" && /^[a-z_]+$/.test(said.subtype) ? ` (${said.subtype})` : "";
+        const why = read.timedOut ? `it was stopped after ${Math.round(readMs / 60000)} minutes` : read.code !== 0 ? `claude exited with code ${read.code}` : said?.is_error === true ? `it ended in an error${kind}` : `it didn't say it ran session ${id}`;
+        const removed = await removeTranscript(o.claudeDir, id);
+        const changed = await changedSince(o.run, dir, timeoutMs);
+        await fail(
+          "open",
+          `Claude Code couldn't read the handoff before the Claude app took it over: ${why}; this machine's runner log has more. ${removed ? "Its unfinished session was deleted." : `Its unfinished session ${id} may be left in Claude Code's session list.`} The worktree is ${dir}.${changed ? " Tracked files in it have changed since it was made (by its setup or that turn), and a take again leaves a worktree with changes alone: run `git reset --hard` in it to drop them first." : ""}`,
+        );
+        return done();
+      }
+      const after = stopped();
+      if (after) {
+        await fail("open", `Claude Code read the handoff, but the take stopped before the Claude app was opened: ${after}. Its session ${id} is in ${dir}; take it again from the floor, or open it yourself with \`claude --resume ${id}\` there.`);
         return done();
       }
       const opened = await hidden([...claudeCommand(bin), "--desktop", "--resume", id], dir, env, 60000);
       if (opened.code !== 0) {
-        const why = opened.timedOut ? "it didn't return within a minute" : (opened.stderr || opened.stdout).trim() || `claude exited with code ${opened.code}`;
-        await fail("open", `The Claude app couldn't be opened on the session: ${why}. Is the Claude app installed? The worktree is ${dir}; \`claude --resume ${id}\` there opens the session in a terminal.`);
-        return done();
+        // The session is made and has read the brief: it is taken, and the failure says how to open it.
+        const why = opened.timedOut ? "it didn't return within a minute" : opened.stderr.trim() || `claude exited with code ${opened.code}`;
+        await fail("open", `The Claude app didn't open on the session: ${why}. The session is ready: open it from the Claude app's session list, or run \`claude --desktop --resume ${id}\` in ${dir}.`);
+        o.log(`handoff ${handoff.id}: Claude Code session ${id} is ready in ${dir}, but the Claude app didn't open on it`);
+        return done(`claude-code:${id}`);
       }
       o.log(`handoff ${handoff.id}: opened Claude Code session ${id} in the Claude app, in ${dir}`);
       return done(`claude-code:${id}`);

@@ -6134,7 +6134,9 @@ const RequestMessageSchema = discriminatedUnion("kind", [
 ]);
 /**
 * The request is over (its handoff was cancelled, dismissed or replaced): the machine drops what it
-* holds for it, and doesn't send or push what it was still writing.
+* holds for it, and doesn't send or push what it was still writing. From protocol 0.4.0 `id` may be
+* a take's session id, to a runner taking a handoff from the floor that was cancelled or timed out:
+* the take opens nothing more (a take into the Claude app doesn't open the app).
 */
 const DropMessageSchema = object({
 	type: literal("drop"),
@@ -9305,8 +9307,12 @@ function claudeVersion(binary, env = process.env) {
 			env,
 			timeout: 3e4,
 			windowsHide: true
-		}, (err, stdout) => resolve(err ? null : /\d+\.\d+\.\d+/.exec(stdout)?.[0] ?? null));
+		}, (err, stdout) => resolve(err ? null : versionOf(stdout)));
 	});
+}
+/** The version in `claude --version`'s output: the line "<x.y.z> (Claude Code)", else the last x.y.z in it. */
+function versionOf(output) {
+	return /^(\d+\.\d+\.\d+) \(Claude Code\)/m.exec(output)?.[1] ?? [...output.matchAll(/\d+\.\d+\.\d+/g)].at(-1)?.[0] ?? null;
 }
 /** Whether `version` is `min` or newer, comparing major, minor and patch as numbers. */
 function atLeast(version, min) {
@@ -10565,7 +10571,8 @@ function hidden([cmd, ...args], cwd, env, timeoutMs) {
 				"pipe",
 				"pipe"
 			],
-			windowsHide: true
+			windowsHide: true,
+			detached: process.platform !== "win32"
 		});
 		child.stdout.setEncoding("utf8").on("data", (piece) => stdout += piece);
 		child.stderr.setEncoding("utf8").on("data", (piece) => stderr = (stderr + piece).slice(-2e3));
@@ -10584,7 +10591,11 @@ function hidden([cmd, ...args], cwd, env, timeoutMs) {
 		})));
 	});
 }
-/** What a take into the Claude app needs and this machine lacks, in words, or null: the OS, the binary's version, and a subscription sign-in. */
+/**
+* What a take into the Claude app needs and this machine lacks, in words, or null: the OS, the
+* binary's version, and a subscription sign-in that `claude auth status` answers for. The runner
+* offers the take only while this is null (runner/main.ts).
+*/
 async function desktopProblem(bin, env, platform, arch, machine) {
 	if (!desktopPlatform(platform, arch)) return `The Claude app opens Claude Code sessions only on a Mac or on Windows x64, and ${machine} is neither, so nothing was made: take it again from the floor another way.`;
 	const version = await claudeVersion(bin, env);
@@ -10595,16 +10606,58 @@ async function desktopProblem(bin, env, platform, arch, machine) {
 		"status",
 		"--json"
 	], os.tmpdir(), env, 3e4);
-	let status = {};
-	try {
-		status = JSON.parse(r.stdout);
-	} catch {
-		return null;
-	}
+	const status = (() => {
+		try {
+			const value = JSON.parse(r.stdout);
+			return value && typeof value === "object" && typeof value.loggedIn === "boolean" ? value : null;
+		} catch {
+			return null;
+		}
+	})();
+	if (r.code !== 0 || r.timedOut || !status) return `Couldn't check Claude Code's sign-in on ${machine}: \`claude auth status\` ${r.timedOut ? "didn't answer within 30 seconds" : r.code !== 0 ? `exited with code ${r.code}` : "didn't say whether it is signed in"}, so nothing was made. Run it there to see why, then take it again.`;
 	if (status.loggedIn === false) return `Claude Code for the terminal isn't signed in on ${machine}, so nothing was made: run \`claude auth login\` with your Claude subscription, then take it again.`;
 	const provider = typeof status.apiProvider === "string" && status.apiProvider !== "firstParty";
 	if (provider || typeof status.authMethod === "string" && /api.?key/i.test(status.authMethod)) return `The Claude app opens only sessions signed in with a Claude subscription, and Claude Code for the terminal on ${machine} uses ${provider ? `${status.apiProvider}` : "an API key"}, so nothing was made: sign it in with \`claude auth login\`, or take it again from the floor another way.`;
 	return null;
+}
+/**
+* Deletes the transcript of session `id`, which a failed first turn left: its .jsonl and its folder of
+* the same name, in whichever project folder Claude Code put them. The id is the take's own, new to
+* this machine. Whether a transcript was there to delete.
+*/
+async function removeTranscript(claudeDir, id) {
+	const projects = path.join(claudeDir, "projects");
+	let found = false;
+	for (const dir of await fs.readdir(projects).catch(() => [])) {
+		const file = path.join(projects, dir, `${id}.jsonl`);
+		if (await fs.rm(file).then(() => true, () => false)) found = true;
+		await fs.rm(path.join(projects, dir, id), {
+			recursive: true,
+			force: true
+		}).catch(() => {});
+	}
+	return found;
+}
+async function changedSince(run, dir, timeoutMs) {
+	const status = await run([
+		"status",
+		"--porcelain",
+		"--untracked-files=no"
+	], {
+		cwd: dir,
+		timeoutMs
+	});
+	if (status.code !== 0) return false;
+	if (status.stdout.trim()) return true;
+	const ahead = await run([
+		"rev-list",
+		"--count",
+		"@{upstream}..HEAD"
+	], {
+		cwd: dir,
+		timeoutMs
+	});
+	return ahead.code === 0 && Number(ahead.stdout.trim()) > 0;
 }
 const INSTALL_FOR_DESKTOP = `Install Claude Code for the terminal, version ${DESKTOP_MIN_VERSION} or newer, to open handoffs in the Claude app.`;
 /** Starts `claude --bg`, hidden, which returns once the background session is up; rejects when it couldn't. */
@@ -10663,19 +10716,26 @@ function takePrompt(id, brief, setupLog, failedRepos = []) {
 }
 /**
 * Claude Code's command line for the new session. The prompt comes first: `--add-dir` takes every
-* argument after it, and would take the prompt too. `print` runs the prompt to its end and says how
-* it went as JSON, for a take into the Claude app.
+* argument after it, and would take the prompt too. `print` runs the prompt to its end, unattended,
+* in at most `maxTurns` turns, and says how it went as JSON, for a take into the Claude app: with the
+* default permission mode, whatever the folder's settings set as theirs, so nothing that would ask
+* is allowed.
 */
-function sessionArgv(bin, { prompt, session, name, folder, headless, print = false }) {
+function sessionArgv(bin, { prompt, session, name, folder, headless, print }) {
+	const printing = print ? [
+		"--print",
+		"--output-format",
+		"json",
+		"--permission-mode",
+		"default",
+		"--max-turns",
+		String(print.maxTurns)
+	] : [];
 	return [
 		...claudeCommand(bin),
 		prompt,
 		...headless ? ["--bg"] : [],
-		...print ? [
-			"--print",
-			"--output-format",
-			"json"
-		] : [],
+		...printing,
 		"--session-id",
 		session,
 		"--name",
@@ -10762,6 +10822,7 @@ async function takeHandoff(message, o) {
 		return done();
 	}
 	const desktop = message.mode === "desktop";
+	const startedAt = Date.now();
 	try {
 		if (message.mode === "orca") {
 			orca = await o.orca?.() ?? null;
@@ -10880,17 +10941,25 @@ async function takeHandoff(message, o) {
 			name,
 			folder,
 			headless,
-			print: desktop
+			...desktop ? { print: { maxTurns: s.desktopReadMaxTurns } } : {}
 		});
 		if (desktop) {
+			const budgetMs = s.desktopTakeBudgetMinutes * 6e4;
+			const left = () => budgetMs - (Date.now() - startedAt);
+			const stopped = () => o.dropped?.() ? "it was cancelled or timed out on the floor" : left() <= 0 ? `it ran past ${s.desktopTakeBudgetMinutes} minutes` : null;
+			const before = stopped();
+			if (before) {
+				await fail("open", `The take stopped before Claude Code read the handoff: ${before}. The worktree is ${dir}: take it again from the floor.`);
+				return done();
+			}
 			try {
 				await trustFolder(o.claudeJson, dir, o.platform);
 			} catch (err) {
 				await fail("open", `The session couldn't be readied for the Claude app: ${err.message}. The worktree is ${dir}.`);
 				return done();
 			}
-			const minutes = s.desktopReadTimeoutMinutes;
-			const read = await hidden(argv, dir, env, minutes * 6e4);
+			const readMs = Math.min(s.desktopReadTimeoutMinutes * 6e4, left());
+			const read = await hidden(argv, dir, env, readMs);
 			const said = (() => {
 				try {
 					return JSON.parse(read.stdout.trim().split(/\r?\n/).at(-1) ?? "");
@@ -10899,7 +10968,17 @@ async function takeHandoff(message, o) {
 				}
 			})();
 			if (read.code !== 0 || said?.is_error === true || said?.session_id !== id) {
-				await fail("open", `Claude Code couldn't read the handoff before the Claude app took it over: ${read.timedOut ? `it was stopped after ${minutes} minutes` : (read.stderr || read.stdout).trim() || `claude exited with code ${read.code}`}. The worktree is ${dir}.`);
+				o.log(`handoff ${handoff.id}: the first turn of ${id} failed (code ${read.code}): ${read.stderr.trim().slice(-500)}`);
+				const kind = typeof said?.subtype === "string" && /^[a-z_]+$/.test(said.subtype) ? ` (${said.subtype})` : "";
+				const why = read.timedOut ? `it was stopped after ${Math.round(readMs / 6e4)} minutes` : read.code !== 0 ? `claude exited with code ${read.code}` : said?.is_error === true ? `it ended in an error${kind}` : `it didn't say it ran session ${id}`;
+				const removed = await removeTranscript(o.claudeDir, id);
+				const changed = await changedSince(o.run, dir, timeoutMs);
+				await fail("open", `Claude Code couldn't read the handoff before the Claude app took it over: ${why}; this machine's runner log has more. ${removed ? "Its unfinished session was deleted." : `Its unfinished session ${id} may be left in Claude Code's session list.`} The worktree is ${dir}.${changed ? " Tracked files in it have changed since it was made (by its setup or that turn), and a take again leaves a worktree with changes alone: run `git reset --hard` in it to drop them first." : ""}`);
+				return done();
+			}
+			const after = stopped();
+			if (after) {
+				await fail("open", `Claude Code read the handoff, but the take stopped before the Claude app was opened: ${after}. Its session ${id} is in ${dir}; take it again from the floor, or open it yourself with \`claude --resume ${id}\` there.`);
 				return done();
 			}
 			const opened = await hidden([
@@ -10909,8 +10988,9 @@ async function takeHandoff(message, o) {
 				id
 			], dir, env, 6e4);
 			if (opened.code !== 0) {
-				await fail("open", `The Claude app couldn't be opened on the session: ${opened.timedOut ? "it didn't return within a minute" : (opened.stderr || opened.stdout).trim() || `claude exited with code ${opened.code}`}. Is the Claude app installed? The worktree is ${dir}; \`claude --resume ${id}\` there opens the session in a terminal.`);
-				return done();
+				await fail("open", `The Claude app didn't open on the session: ${opened.timedOut ? "it didn't return within a minute" : opened.stderr.trim() || `claude exited with code ${opened.code}`}. The session is ready: open it from the Claude app's session list, or run \`claude --desktop --resume ${id}\` in ${dir}.`);
+				o.log(`handoff ${handoff.id}: Claude Code session ${id} is ready in ${dir}, but the Claude app didn't open on it`);
+				return done(`claude-code:${id}`);
 			}
 			o.log(`handoff ${handoff.id}: opened Claude Code session ${id} in the Claude app, in ${dir}`);
 			return done(`claude-code:${id}`);
@@ -11615,6 +11695,8 @@ function createRunner({ answerer, ledger, settings, prompts, scan, send, log, is
 	const dropped = /* @__PURE__ */ new Set();
 	const taking = /* @__PURE__ */ new Set();
 	const takes = /* @__PURE__ */ new Set();
+	const runningTakes = /* @__PURE__ */ new Set();
+	const droppedTakes = /* @__PURE__ */ new Set();
 	const dropping = /* @__PURE__ */ new Set();
 	const unavailable = (id, detail) => ({
 		type: "refusal",
@@ -11821,6 +11903,7 @@ function createRunner({ answerer, ledger, settings, prompts, scan, send, log, is
 			if (message.type === "drop") {
 				if (held.delete(message.id)) log(`dropped the withheld reply for ${message.id}: its handoff is over`);
 				else if (running.has(message.id)) dropping.add(message.id);
+				else if (runningTakes.has(message.id)) droppedTakes.add(message.id);
 				return;
 			}
 			if (message.type === "handoff") {
@@ -11833,7 +11916,33 @@ function createRunner({ answerer, ledger, settings, prompts, scan, send, log, is
 					takes.add(takeId);
 					if (takes.size > REMEMBER) takes.delete(takes.values().next().value);
 					taking.add(handoff.id);
-					take(message).then(send, (err) => log(`handoff ${handoff.id}: taking it failed: ${err?.stack ?? String(err)}`)).finally(() => taking.delete(handoff.id));
+					runningTakes.add(takeId);
+					let over = false;
+					let timer;
+					const finish = (m) => {
+						if (over) return;
+						over = true;
+						clearTimeout(timer);
+						taking.delete(handoff.id);
+						if (m) send(m);
+					};
+					settings().then((s) => {
+						if (over) return;
+						timer = setTimeout(() => {
+							droppedTakes.add(takeId);
+							log(`handoff ${handoff.id}: taking it didn't finish within ${s.takeCapMinutes} minutes, so it was given up`);
+							finish({
+								type: "taken",
+								v: 1,
+								handoff: handoff.id,
+								failures: [{
+									step: "open",
+									output: `Taking it didn't finish within ${s.takeCapMinutes} minutes on this machine, so it was given up: take it again from the floor.`
+								}]
+							});
+						}, s.takeCapMinutes * 6e4);
+					});
+					take(message, () => droppedTakes.has(takeId)).then(finish, (err) => (log(`handoff ${handoff.id}: taking it failed: ${err?.stack ?? String(err)}`), finish(null))).finally(() => (runningTakes.delete(takeId), droppedTakes.delete(takeId)));
 				}
 				return;
 			}
@@ -11955,6 +12064,7 @@ function applyClaudeDir(argv, env, home) {
 //#region src/runner/main.ts
 const LOG_CAP_BYTES = 262144;
 const CHECK_MS = 6e4;
+const DESKTOP_CHECK_MS = 36e5;
 const MAX_PREPARED = 20;
 const self = fileURLToPath(import.meta.url);
 const here = path.dirname(self);
@@ -12069,9 +12179,13 @@ async function worker() {
 		const bin = await orca();
 		return bin ? orcaRunner(bin, forkEnv(process.env)) : null;
 	};
-	const claudeBin = desktopPlatform(process.platform, process.arch) ? await claudeBinary(claudeDir, process.env, process.platform, os.homedir()) : null;
-	const claudeAt = claudeBin ? await claudeVersion(claudeBin, forkEnv(process.env)) : null;
-	const hasDesktop = !!claudeAt && atLeast(claudeAt, "2.1.285");
+	let hasDesktop = false;
+	const checkDesktop = async () => {
+		const bin = await claudeBinary(claudeDir, process.env, process.platform, os.homedir());
+		hasDesktop = !!bin && await desktopProblem(bin, forkEnv(process.env), process.platform, process.arch, os.hostname()) === null;
+	};
+	await checkDesktop().catch((err) => log(`couldn't check whether the Claude app can take handoffs here: ${err.message}`));
+	setInterval(() => void checkDesktop().catch(() => {}), DESKTOP_CHECK_MS).unref();
 	const homeIo = machineHomeIo(first.workspaceRepos);
 	const ledger = await openLedger(path.join(isoplanDir, "runner", "ledger.json"));
 	const preparedFor = /* @__PURE__ */ new Map();
@@ -12151,8 +12265,9 @@ async function worker() {
 					}).catch((err) => Promise.reject(told(err)));
 					return "held" in pushed ? pushed : pushed.repos;
 				},
-				take: async (message) => {
+				take: async (message, dropped) => {
 					const taken = await takeHandoff(message, {
+						dropped,
 						run: git,
 						io,
 						claudeDir,

@@ -48,13 +48,13 @@ import { createPairing, pairingEntry, pairingLockPath, pairingPath, pairingWrite
 import { HOLD_OFF_MS, alive, holdOff, lockPath, readLock, refreshLock, releaseLock, takeLock } from "../wake/lock.js";
 import { openLedger } from "./caps.js";
 import { createClaudeAnswerer, forkableId, forkEnv } from "./claude.js";
-import { atLeast, claudeBinary, claudeVersion, DESKTOP_MIN_VERSION, desktopPlatform } from "./claude-binary.js";
+import { claudeBinary } from "./claude-binary.js";
 import { anyRoomSince, askableMs, NOT_WANTED_CODE, supervise, UNPAIRED_CODE } from "./lifecycle.js";
 import { loadPrompts } from "./prompts.js";
 import { createRunGit, gitFailed, handoffBranch, handoffNote, HandoffGitError, prepare, pushHandoff, type Prepared } from "../handoff/git.js";
 import { focusHandoff } from "../handoff/focus.js";
 import { findOrca, orcaRunner } from "../handoff/orca.js";
-import { takeHandoff, type TakeSettings } from "../handoff/take.js";
+import { desktopProblem, takeHandoff, type TakeSettings } from "../handoff/take.js";
 import { recordTakenOffice } from "../handoff/taken-office.js";
 import { answerOffices } from "./offices.js";
 import { createForkSlots, createRunner, PushFailed, type RunnerSettings } from "./runner.js";
@@ -66,6 +66,8 @@ import { applyClaudeDir, LOCK_REFRESH_MS, RUNNER_FRESH_MS, runnerCode, runnerLoc
 const LOG_CAP_BYTES = 256 * 1024;
 // How often the worker checks whether any room is still lit.
 const CHECK_MS = 60000;
+// How often the runner checks again whether the Claude app can take handoffs here.
+const DESKTOP_CHECK_MS = 3600000;
 // Prepares kept for their pushes; past this the oldest goes.
 const MAX_PREPARED = 20;
 
@@ -176,11 +178,17 @@ async function worker(): Promise<number> {
     const bin = await orca();
     return bin ? orcaRunner(bin, forkEnv(process.env)) : null;
   };
-  // Claude Code for the terminal, as the runner starts: the office offers a take into the Claude app
-  // only where it is new enough to hand a session over, on a Mac or Windows x64.
-  const claudeBin = desktopPlatform(process.platform, process.arch) ? await claudeBinary(claudeDir, process.env, process.platform, os.homedir()) : null;
-  const claudeAt = claudeBin ? await claudeVersion(claudeBin, forkEnv(process.env)) : null;
-  const hasDesktop = !!claudeAt && atLeast(claudeAt, DESKTOP_MIN_VERSION);
+  // The office offers a take into the Claude app only while this machine can do one (take.ts
+  // desktopProblem): Claude Code for the terminal new enough, signed in with a subscription, on a Mac
+  // or Windows x64. Checked as the runner starts and every hour after; each link says it in its hello
+  // as it opens.
+  let hasDesktop = false;
+  const checkDesktop = async () => {
+    const bin = await claudeBinary(claudeDir, process.env, process.platform, os.homedir());
+    hasDesktop = !!bin && (await desktopProblem(bin, forkEnv(process.env), process.platform, process.arch, os.hostname())) === null;
+  };
+  await checkDesktop().catch((err: Error) => log(`couldn't check whether the Claude app can take handoffs here: ${err.message}`));
+  setInterval(() => void checkDesktop().catch(() => {}), DESKTOP_CHECK_MS).unref();
   const homeIo = machineHomeIo(first.workspaceRepos);
   const ledger = await openLedger(path.join(isoplanDir, "runner", "ledger.json"));
   // What each brief's prepare found, by handoff, for its push and any push anyway after it.
@@ -250,8 +258,9 @@ async function worker(): Promise<number> {
         return "held" in pushed ? pushed : pushed.repos;
       },
       // The session it opens asks the room in this office (handoff/taken-office.ts).
-      take: async (message) => {
+      take: async (message, dropped) => {
         const taken = await takeHandoff(message, {
+          dropped,
           run: git,
           io,
           claudeDir,

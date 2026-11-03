@@ -281,6 +281,30 @@ test("runner: a drop ends a request: what is held goes, and one still being writ
   expect(pushes).toEqual([null]);
 });
 
+test("runner: a drop naming a running take's id tells the take; one past takeCapMinutes is given up and said so, and its late end isn't sent", async () => {
+  let finish: () => void = () => {};
+  let dropped: () => boolean = () => false;
+  const t = await setup({
+    settings: { takeCapMinutes: 0.002 },
+    take: async (m, d) => {
+      dropped = d;
+      await new Promise<void>((r) => (finish = r));
+      return { type: "taken", v: PROTOCOL_VERSION, handoff: m.handoff.id, session: "claude-code:late", failures: [] };
+    },
+  });
+  const session = "0b5c4d3e-0000-4000-8000-000000000002";
+  t.runner.take({ type: "handoff", v: PROTOCOL_VERSION, mode: "desktop", session, handoff: { id: "h-1", brief: "b", repos: [{ path: ".", remote: "origin", branch: "isoplan/handoff/h-1", commit: "a".repeat(40) }] } });
+  expect(dropped()).toBe(false);
+  t.runner.take({ type: "drop", v: PROTOCOL_VERSION, id: session });
+  expect(dropped()).toBe(true);
+  await t.sentN(1);
+  expect(t.sent).toEqual([{ type: "taken", v: PROTOCOL_VERSION, handoff: "h-1", failures: [{ step: "open", output: expect.stringContaining("didn't finish within 0.002 minutes on this machine, so it was given up") }] }]);
+  expect(t.runner.idle()).toBe(true);
+  finish();
+  await new Promise((r) => setTimeout(r, 20));
+  expect(t.sent).toHaveLength(1);
+});
+
 test("runner: a handoff to take goes to take once at a time, and what it did goes back as taken", async () => {
   let finish: () => void = () => {};
   const taken: string[] = [];

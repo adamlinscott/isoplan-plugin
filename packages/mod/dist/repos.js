@@ -6719,7 +6719,9 @@ const RequestMessageSchema = discriminatedUnion("kind", [
 ]);
 /**
 * The request is over (its handoff was cancelled, dismissed or replaced): the machine drops what it
-* holds for it, and doesn't send or push what it was still writing.
+* holds for it, and doesn't send or push what it was still writing. From protocol 0.4.0 `id` may be
+* a take's session id, to a runner taking a handoff from the floor that was cancelled or timed out:
+* the take opens nothing more (a take into the Claude app doesn't open the app).
 */
 const DropMessageSchema = object({
 	type: literal("drop"),
