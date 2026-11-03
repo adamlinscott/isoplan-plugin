@@ -24,7 +24,8 @@
 //
 // A brief (#48) is asked for with the session's untracked files named (`prepareBrief`), and ends
 // with the runner's note of what was pushed. When the fork can't write it (it failed, or a cap is
-// reached), the reply still goes, marked `fallback` (and with the `cap`, when one is why), with the
+// reached), the reply still goes, marked `fallback` (and with the `cap`, when one is why, or
+// `noClaude`, when the machine has no claude binary), with the
 // note alone, and the server writes the rest from the room's feed. Its branch is pushed (`push`)
 // only once the brief has cleared the scan or been released. The push scans what it would send: on
 // a match nothing is pushed, the refusal is `withheld` naming the files, in every repo (never the pattern), and the files it couldn't read, and the owner's
@@ -131,6 +132,7 @@ const FAILED: Record<FailureKind, string> = {
   "timed-out": "the fork took too long to answer",
   failed: "the fork couldn't answer",
   "not-set-up": "this machine can't run the fork; its owner can see why in the runner's log",
+  "no-claude": "Claude Code for the terminal isn't installed on this machine, so it can't run the fork",
 };
 
 // Ids of replies dropped from the held set, remembered so a release for one says so.
@@ -200,6 +202,7 @@ export function createRunner({ answerer, ledger, settings, prompts, scan, send, 
     const cap = overCap(ledger.entries(now()), room, expected, now(), s);
     let body: string;
     let isFallback = false;
+    let noClaude = false;
     if (cap) {
       if (!isBrief) return overCapRefusal(id, cap);
       body = fallback(`the ${cap} cap is reached`);
@@ -218,13 +221,14 @@ export function createRunner({ answerer, ledger, settings, prompts, scan, send, 
       const answered = await answerer.ask(session, lead, { instructions: p.instructions, request: text, timeoutMs: (isBrief ? s.briefTimeoutSeconds : s.answerTimeoutSeconds) * 1000 }).finally(free);
       // No fork ran when it couldn't be set up: the answer and its tokens are given back. One that ran
       // but failed before it was metered keeps its estimate.
-      const recorded = !answered.ok && answered.kind === "not-set-up" ? reservation.cancel() : reservation.settle(answered.usage ?? expected);
+      const recorded = !answered.ok && (answered.kind === "not-set-up" || answered.kind === "no-claude") ? reservation.cancel() : reservation.settle(answered.usage ?? expected);
       await recorded.catch((err: unknown) => log(`couldn't record ${id} in the ledger: ${(err as Error).message}`));
       if (!answered.ok) {
         log(`${id}: ${answered.detail}`);
         if (!isBrief) return unavailable(id, FAILED[answered.kind]);
         body = fallback(FAILED[answered.kind]);
         isFallback = true;
+        noClaude = answered.kind === "no-claude";
       } else {
         body = lead.compacted ? `${COMPACTED_NOTE}\n\n${answered.text}` : answered.text;
         if (brief.note) body = `${body}\n\n${brief.note}`;
@@ -249,7 +253,7 @@ export function createRunner({ answerer, ledger, settings, prompts, scan, send, 
         hold(id, () => pushAndReply({ ...pushAnyway, ...commits }));
         return { type: "refusal", v: PROTOCOL_VERSION, id, reason: "withheld", file, held: files.length, ...(unchecked.length ? { unchecked } : {}) };
       }
-      return { type: "reply", v: PROTOCOL_VERSION, id, kind: "write-brief", handoff: { id: (request as Extract<Ask, { kind: "write-brief" }>).handoff, brief: body, repos: pushed }, ...(isFallback ? { fallback: true as const } : {}), ...(cap ? { cap } : {}) };
+      return { type: "reply", v: PROTOCOL_VERSION, id, kind: "write-brief", handoff: { id: (request as Extract<Ask, { kind: "write-brief" }>).handoff, brief: body, repos: pushed }, ...(isFallback ? { fallback: true as const } : {}), ...(cap ? { cap } : {}), ...(noClaude ? { noClaude: true as const } : {}) };
     };
     const reply: () => Promise<Outgoing> = isBrief ? () => pushAndReply(null) : async () => ({ type: "reply", v: PROTOCOL_VERSION, id, kind: "answer-question", answer: body });
     const matched = await scan(body);

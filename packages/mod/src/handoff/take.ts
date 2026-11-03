@@ -55,6 +55,15 @@
 //      and the worktree are kept in orca.json in the handoff's folder.
 //      Without Orca's CLI nothing is made, and the take says so; nor for a handoff of a plain folder
 //      above several repos, which Orca can't hold.
+//    - `desktop`: in the Claude app, which runs its own Claude Code and opens a session of Claude
+//      Code for the terminal's with `claude --desktop --resume <id>` (2.1.285 on, a Mac or Windows
+//      x64, signed in with a Claude subscription). The worktree is trusted as for headless, then the
+//      take's prompt runs to its end, hidden, as a saved session under the server's id (`claude -p`,
+//      with no permissions beyond what the folder's trust gives, as headless has), so it has read the
+//      brief before the app takes it over and the two never write to it at once; then the app is
+//      asked to open it. The binary's version and sign-in are checked before anything is made.
+//
+// The claude binary is looked for first, in every mode: without it nothing is made.
 //
 // A failed setup script or repo checkout doesn't stop the rest: the session still opens, and the step is reported
 // with the end of its output. Output leaves the machine only after the secret scan.
@@ -69,7 +78,7 @@ import os from "node:os";
 import { promisify } from "node:util";
 import { normalize, pathKey } from "../data-layer/git.js";
 import type { NodeIo } from "../data-layer/io.js";
-import { claudeCommand } from "../runner/claude-binary.js";
+import { atLeast, claudeCommand, claudeVersion, DESKTOP_MIN_VERSION, desktopPlatform } from "../runner/claude-binary.js";
 import { forkEnv, killTree } from "../runner/claude.js";
 import { handoffBranch, remotesOf, sameRemote, type RunGit } from "./git.js";
 import type { RunOrca } from "./orca.js";
@@ -86,6 +95,8 @@ export interface TakeSettings {
   gitTimeoutSeconds: number;
   setupTimeoutMinutes: number;
   cloneSearchDays: number;
+  /** How long a take into the Claude app may spend reading the brief before the app takes it over. */
+  desktopReadTimeoutMinutes: number;
 }
 
 /** What opens a terminal: a launcher script written to `file`, then the command that runs it. */
@@ -107,6 +118,8 @@ export interface TakeOptions {
   claudeDir: string;
   machine: string;
   platform: NodeJS.Platform;
+  /** The processor, as Node names it: by default this one's. */
+  arch?: string;
   /** The environment the setup script and the session start from. */
   env: Record<string, string | undefined>;
   settings: () => Promise<TakeSettings>;
@@ -348,18 +361,42 @@ export async function openLaunch(l: Launch, env: Record<string, string>): Promis
 }
 
 // Runs a command hidden and waits for it, with its output; never opens a window.
-function hidden([cmd, ...args]: string[], cwd: string, env: Record<string, string>, timeoutMs: number): Promise<{ code: number | null; stdout: string; stderr: string }> {
+function hidden([cmd, ...args]: string[], cwd: string, env: Record<string, string>, timeoutMs: number): Promise<{ code: number | null; stdout: string; stderr: string; timedOut: boolean }> {
   return new Promise((resolve) => {
     let stdout = "";
     let stderr = "";
+    let timedOut = false;
     const child = spawn(cmd!, args, { cwd, env, stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
     child.stdout.setEncoding("utf8").on("data", (piece: string) => (stdout += piece));
     child.stderr.setEncoding("utf8").on("data", (piece: string) => (stderr = (stderr + piece).slice(-OUTPUT_TAIL)));
-    const timer = setTimeout(() => killTree(child as never), timeoutMs);
-    child.on("error", (err) => (clearTimeout(timer), resolve({ code: null, stdout, stderr: err.message })));
-    child.on("close", (code) => (clearTimeout(timer), resolve({ code, stdout, stderr })));
+    const timer = setTimeout(() => ((timedOut = true), killTree(child as never)), timeoutMs);
+    child.on("error", (err) => (clearTimeout(timer), resolve({ code: null, stdout, stderr: err.message, timedOut })));
+    child.on("close", (code) => (clearTimeout(timer), resolve({ code, stdout, stderr, timedOut })));
   });
 }
+
+/** What a take into the Claude app needs and this machine lacks, in words, or null: the OS, the binary's version, and a subscription sign-in. */
+export async function desktopProblem(bin: string, env: Record<string, string>, platform: NodeJS.Platform, arch: string, machine: string): Promise<string | null> {
+  if (!desktopPlatform(platform, arch)) return `The Claude app opens Claude Code sessions only on a Mac or on Windows x64, and ${machine} is neither, so nothing was made: take it again from the floor another way.`;
+  const version = await claudeVersion(bin, env);
+  if (!version || !atLeast(version, DESKTOP_MIN_VERSION)) return `${INSTALL_FOR_DESKTOP} ${machine} has ${version ? `version ${version}` : "a version that didn't say which it is"}, so nothing was made.`;
+  // Only what `claude auth status` says plainly is refused: anything it doesn't say is left to the app.
+  const r = await hidden([...claudeCommand(bin), "auth", "status", "--json"], os.tmpdir(), env, 30000);
+  let status: { loggedIn?: unknown; authMethod?: unknown; apiProvider?: unknown } = {};
+  try {
+    status = JSON.parse(r.stdout) as typeof status;
+  } catch {
+    return null;
+  }
+  if (status.loggedIn === false) return `Claude Code for the terminal isn't signed in on ${machine}, so nothing was made: run \`claude auth login\` with your Claude subscription, then take it again.`;
+  const provider = typeof status.apiProvider === "string" && status.apiProvider !== "firstParty";
+  if (provider || (typeof status.authMethod === "string" && /api.?key/i.test(status.authMethod))) {
+    return `The Claude app opens only sessions signed in with a Claude subscription, and Claude Code for the terminal on ${machine} uses ${provider ? `${status.apiProvider}` : "an API key"}, so nothing was made: sign it in with \`claude auth login\`, or take it again from the floor another way.`;
+  }
+  return null;
+}
+
+const INSTALL_FOR_DESKTOP = `Install Claude Code for the terminal, version ${DESKTOP_MIN_VERSION} or newer, to open handoffs in the Claude app.`;
 
 /** Starts `claude --bg`, hidden, which returns once the background session is up; rejects when it couldn't. */
 export async function startBackground({ argv, cwd }: Background, env: Record<string, string>): Promise<void> {
@@ -413,10 +450,11 @@ export function takePrompt(id: string, brief: string, setupLog: string | null, f
 
 /**
  * Claude Code's command line for the new session. The prompt comes first: `--add-dir` takes every
- * argument after it, and would take the prompt too.
+ * argument after it, and would take the prompt too. `print` runs the prompt to its end and says how
+ * it went as JSON, for a take into the Claude app.
  */
-export function sessionArgv(bin: string, { prompt, session, name, folder, headless }: { prompt: string; session: string; name: string; folder: string; headless: boolean }): string[] {
-  return [...claudeCommand(bin), prompt, ...(headless ? ["--bg"] : []), "--session-id", session, "--name", name, "--add-dir", folder];
+export function sessionArgv(bin: string, { prompt, session, name, folder, headless, print = false }: { prompt: string; session: string; name: string; folder: string; headless: boolean; print?: boolean }): string[] {
+  return [...claudeCommand(bin), prompt, ...(headless ? ["--bg"] : []), ...(print ? ["--print", "--output-format", "json"] : []), "--session-id", session, "--name", name, "--add-dir", folder];
 }
 
 /** The commits this machine took of a handoff before, which a re-take may move past. */
@@ -473,15 +511,31 @@ export async function takeHandoff(message: Pick<HandoffMessage, "handoff" | "mod
     failures.push({ step, ...(repo ? { repo } : {}), output: matched ? `The end of its output is withheld here: it matches a secret pattern. It is on ${o.machine}.` : tail(output) });
   };
   // A window opens only when the receiver asked for a terminal: a handoff that doesn't say is refused.
-  if (message.mode !== "terminal" && message.mode !== "headless" && message.mode !== "orca") {
+  if (message.mode !== "terminal" && message.mode !== "headless" && message.mode !== "orca" && message.mode !== "desktop") {
     await fail("open", "The office server didn't say how to open the session, so none was opened: take it again from the floor.");
     return done();
   }
+  const desktop = message.mode === "desktop";
   try {
     if (message.mode === "orca") {
       orca = (await o.orca?.()) ?? null;
       if (!orca) {
         await fail("open", `Orca wasn't found on ${o.machine}, so nothing was made or opened: take it again from the floor another way.`);
+        return done();
+      }
+    }
+    // Before anything is made, so a machine without Claude Code is left without a stray worktree.
+    const bin = await o.claude();
+    if (!bin) {
+      const where = "if it is installed, set its path in ~/.claude/isoplan/claude-binary.json";
+      await fail("open", desktop ? `${INSTALL_FOR_DESKTOP} It wasn't found on ${o.machine}, so nothing was made; ${where}.` : `Claude Code for the terminal wasn't found on ${o.machine}, so nothing was made: install it, then take the handoff again; ${where}.`);
+      return done();
+    }
+    const env = forkEnv(o.env);
+    if (desktop) {
+      const problem = await desktopProblem(bin, env, o.platform, o.arch ?? process.arch, o.machine);
+      if (problem) {
+        await fail("open", problem);
         return done();
       }
     }
@@ -535,7 +589,6 @@ export async function takeHandoff(message: Pick<HandoffMessage, "handoff" | "mod
     await fs.mkdir(folder, { recursive: true });
     const briefFile = path.join(folder, "brief.md");
     await fs.writeFile(briefFile, handoff.brief + "\n");
-    const env = forkEnv(o.env);
 
     // A new session is spawned, so the setup script always runs, when there is a repo to read it from.
     let setupLog: string | null = null;
@@ -568,14 +621,41 @@ export async function takeHandoff(message: Pick<HandoffMessage, "handoff" | "mod
       await fail(failed.step, failed.error, sub.path);
     }
 
-    const bin = await o.claude();
-    if (!bin) {
-      await fail("open", "The claude binary wasn't found on this machine: run the plugin's install script, or set its path in ~/.claude/isoplan/claude-binary.json.");
-      return done();
-    }
     const id = message.session ?? (o.newSession ?? randomUUID)();
     const name = `Isoplan handoff ${handoff.id}`;
-    const argv = sessionArgv(bin, { prompt: takePrompt(handoff.id, briefFile, setupLog, failedRepos), session: id, name, folder, headless });
+    const argv = sessionArgv(bin, { prompt: takePrompt(handoff.id, briefFile, setupLog, failedRepos), session: id, name, folder, headless, print: desktop });
+    if (desktop) {
+      try {
+        // The floor told the receiver: this trusts the worktree, so its settings, hooks and scripts run.
+        await trustFolder(o.claudeJson, dir, o.platform);
+      } catch (err) {
+        await fail("open", `The session couldn't be readied for the Claude app: ${(err as Error).message}. The worktree is ${dir}.`);
+        return done();
+      }
+      // The first turn ends before the app opens the session, so the two never write to it at once.
+      const minutes = s.desktopReadTimeoutMinutes;
+      const read = await hidden(argv, dir, env, minutes * 60000);
+      const said = ((): { is_error?: unknown; session_id?: unknown } | null => {
+        try {
+          return JSON.parse(read.stdout.trim().split(/\r?\n/).at(-1) ?? "") as { is_error?: unknown; session_id?: unknown };
+        } catch {
+          return null;
+        }
+      })();
+      if (read.code !== 0 || said?.is_error === true || said?.session_id !== id) {
+        const why = read.timedOut ? `it was stopped after ${minutes} minutes` : (read.stderr || read.stdout).trim() || `claude exited with code ${read.code}`;
+        await fail("open", `Claude Code couldn't read the handoff before the Claude app took it over: ${why}. The worktree is ${dir}.`);
+        return done();
+      }
+      const opened = await hidden([...claudeCommand(bin), "--desktop", "--resume", id], dir, env, 60000);
+      if (opened.code !== 0) {
+        const why = opened.timedOut ? "it didn't return within a minute" : (opened.stderr || opened.stdout).trim() || `claude exited with code ${opened.code}`;
+        await fail("open", `The Claude app couldn't be opened on the session: ${why}. Is the Claude app installed? The worktree is ${dir}; \`claude --resume ${id}\` there opens the session in a terminal.`);
+        return done();
+      }
+      o.log(`handoff ${handoff.id}: opened Claude Code session ${id} in the Claude app, in ${dir}`);
+      return done(`claude-code:${id}`);
+    }
     if (headless) {
       try {
         // The floor told the receiver: this trusts the worktree, so its settings, hooks and scripts run.

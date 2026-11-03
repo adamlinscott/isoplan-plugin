@@ -102,6 +102,8 @@ export const HelloMessageSchema = z.object({
 /**
  * The first message on a runner's link: the one link per machine that answers requests for its rooms.
  * `orca`: Orca's CLI is on this machine, so a handoff can be taken into Orca (mode `orca`).
+ * `desktop` (protocol 0.4.0): Claude Code for the terminal, new enough to hand a session to the Claude
+ * app, is on this machine, a Mac or Windows x64, so a handoff can be opened in the Claude app (mode `desktop`).
  */
 export const RunnerHelloMessageSchema = z.object({
   type: z.literal("runner"),
@@ -110,6 +112,7 @@ export const RunnerHelloMessageSchema = z.object({
   machine: Machine,
   token: Token,
   orca: z.boolean().optional(),
+  desktop: z.boolean().optional(),
 });
 
 /** All of the session's facts. Sent on connect and on repair. */
@@ -138,7 +141,8 @@ export const ReplyMessageSchema = z.discriminatedUnion("kind", [
   // `fallback`: the fork couldn't write the brief, so `brief` is only the runner's note of what was
   // pushed, and the server writes the rest from the room's feed. The branch is pushed either way.
   // `cap`: the cap that stopped the fork running, when that is why, named as in an over-cap refusal.
-  z.object({ type: z.literal("reply"), v: Version, id: RequestId, kind: z.literal("write-brief"), handoff: HandoffSchema, fallback: z.literal(true).optional(), cap: CapSchema.optional() }),
+  // `noClaude` (protocol 0.4.0): the fork couldn't run because the machine has no claude binary.
+  z.object({ type: z.literal("reply"), v: Version, id: RequestId, kind: z.literal("write-brief"), handoff: HandoffSchema, fallback: z.literal(true).optional(), cap: CapSchema.optional(), noClaude: z.literal(true).optional() }),
   // The owner's answer reached the question that was waiting for it. `closed`: the session never said
   // whether it took the answer, but the question has closed, by this answer or the terminal's. `late`:
   // it took the answer after this request was refused for taking too long, so this reply follows that
@@ -397,10 +401,10 @@ export const HandoffMessageSchema = z.object({
   type: z.literal("handoff"),
   v: Version,
   handoff: HandoffSchema,
-  // To a runner: how to open the session (a terminal, by default, headless, with no window, or in
-  // Orca, sent only to a runner that said `orca`), and the session id to open it under, which is the
-  // one the server will let join the room.
-  mode: z.enum(["terminal", "headless", "orca"]).optional(),
+  // To a runner: how to open the session (a terminal, by default, headless, with no window, in Orca,
+  // sent only to a runner that said `orca`, or in the Claude app, sent only to a runner that said
+  // `desktop`), and the session id to open it under, which is the one the server will let join the room.
+  mode: z.enum(["terminal", "headless", "orca", "desktop"]).optional(),
   session: z.string().uuid().optional(),
 });
 

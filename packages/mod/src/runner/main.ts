@@ -48,7 +48,7 @@ import { createPairing, pairingEntry, pairingLockPath, pairingPath, pairingWrite
 import { HOLD_OFF_MS, alive, holdOff, lockPath, readLock, refreshLock, releaseLock, takeLock } from "../wake/lock.js";
 import { openLedger } from "./caps.js";
 import { createClaudeAnswerer, forkableId, forkEnv } from "./claude.js";
-import { claudeBinary } from "./claude-binary.js";
+import { atLeast, claudeBinary, claudeVersion, DESKTOP_MIN_VERSION, desktopPlatform } from "./claude-binary.js";
 import { anyRoomSince, askableMs, NOT_WANTED_CODE, supervise, UNPAIRED_CODE } from "./lifecycle.js";
 import { loadPrompts } from "./prompts.js";
 import { createRunGit, gitFailed, handoffBranch, handoffNote, HandoffGitError, prepare, pushHandoff, type Prepared } from "../handoff/git.js";
@@ -176,6 +176,11 @@ async function worker(): Promise<number> {
     const bin = await orca();
     return bin ? orcaRunner(bin, forkEnv(process.env)) : null;
   };
+  // Claude Code for the terminal, as the runner starts: the office offers a take into the Claude app
+  // only where it is new enough to hand a session over, on a Mac or Windows x64.
+  const claudeBin = desktopPlatform(process.platform, process.arch) ? await claudeBinary(claudeDir, process.env, process.platform, os.homedir()) : null;
+  const claudeAt = claudeBin ? await claudeVersion(claudeBin, forkEnv(process.env)) : null;
+  const hasDesktop = !!claudeAt && atLeast(claudeAt, DESKTOP_MIN_VERSION);
   const homeIo = machineHomeIo(first.workspaceRepos);
   const ledger = await openLedger(path.join(isoplanDir, "runner", "ledger.json"));
   // What each brief's prepare found, by handoff, for its push and any push anyway after it.
@@ -292,6 +297,7 @@ async function worker(): Promise<number> {
           account,
           machine: { name: os.hostname() },
           ...(hasOrca ? { orca: true } : {}),
+          ...(hasDesktop ? { desktop: true } : {}),
         },
       });
     },

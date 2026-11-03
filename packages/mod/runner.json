@@ -13,6 +13,7 @@
   "maxForks": 2,
   "gitTimeoutSeconds": 120,
   "setupTimeoutMinutes": 15,
+  "desktopReadTimeoutMinutes": 5,
   "cloneSearchDays": 30,
   "repoSearchDepth": 3,
   "askPolls": 6,

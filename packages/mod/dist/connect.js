@@ -5932,6 +5932,8 @@ const HelloMessageSchema = object({
 /**
 * The first message on a runner's link: the one link per machine that answers requests for its rooms.
 * `orca`: Orca's CLI is on this machine, so a handoff can be taken into Orca (mode `orca`).
+* `desktop` (protocol 0.4.0): Claude Code for the terminal, new enough to hand a session to the Claude
+* app, is on this machine, a Mac or Windows x64, so a handoff can be opened in the Claude app (mode `desktop`).
 */
 const RunnerHelloMessageSchema = object({
 	type: literal("runner"),
@@ -5939,7 +5941,8 @@ const RunnerHelloMessageSchema = object({
 	account: Account,
 	machine: Machine,
 	token: Token,
-	orca: boolean().optional()
+	orca: boolean().optional(),
+	desktop: boolean().optional()
 });
 /** All of the session's facts. Sent on connect and on repair. */
 const FullMessageSchema = object({
@@ -5982,7 +5985,8 @@ discriminatedUnion("type", [
 			kind: literal("write-brief"),
 			handoff: HandoffSchema,
 			fallback: literal(true).optional(),
-			cap: CapSchema.optional()
+			cap: CapSchema.optional(),
+			noClaude: literal(true).optional()
 		}),
 		object({
 			type: literal("reply"),
@@ -6182,7 +6186,8 @@ const HandoffMessageSchema = object({
 	mode: _enum([
 		"terminal",
 		"headless",
-		"orca"
+		"orca",
+		"desktop"
 	]).optional(),
 	session: string().uuid().optional()
 });

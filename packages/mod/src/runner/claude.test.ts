@@ -166,7 +166,7 @@ test("fork: a session that isn't Claude Code's, or no binary, is a failure with 
   const f = fake();
   expect(await f.answerer.ask("codex:s", f.lead, ask)).toMatchObject({ ok: false, kind: "not-set-up", detail: "codex:s isn't a Claude Code session this runner can fork" });
   const none = createClaudeAnswerer({ claudeDir: "/x", binary: async () => null, model: async () => "opus", config: async () => ({ tailBytes: 1, stalledMinutes: 1 }) });
-  expect(await none.ask("claude-code:s", f.lead, ask)).toMatchObject({ ok: false, kind: "not-set-up", detail: expect.stringContaining("claude binary wasn't found") });
+  expect(await none.ask("claude-code:s", f.lead, ask)).toMatchObject({ ok: false, kind: "no-claude", detail: expect.stringContaining("claude binary wasn't found") });
   expect(await none.lead("codex:s")).toBe(null);
 });
 
