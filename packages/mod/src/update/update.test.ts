@@ -7,7 +7,7 @@ import { alive } from "../wake/lock.js";
 import { checkForUpdate, commandEnv, runHidden, START_GAP_MS, turnOnAutoUpdate, updateLockPath, updateRecordPath, updateRuns, updatesOffBy, type Ran } from "./update.js";
 
 const OTHER = 4242; // a pid that isn't this process
-const SOURCE = { source: "github", repo: "adamlinscott/isoplan-plugin" };
+const SOURCE = { source: "github", repo: "isoplan-app/isoplan-plugin" };
 
 function setup(settings: unknown = { extraKnownMarketplaces: { isoplan: { source: SOURCE } } }) {
   const root = tempRoot();

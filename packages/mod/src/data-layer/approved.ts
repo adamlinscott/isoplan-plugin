@@ -1,4 +1,4 @@
-// Which repos the office takes (adamlinscott/isoplan#91): only those an admin added to it. The data
+// Which repos the office takes (isoplan-app/isoplan#91): only those an admin added to it. The data
 // layer opens a session's link, and so sends its hello, its facts or anything else, only when the
 // session's repo is on this list (a workspace above several repos: when one of them is, which it
 // reports as), and the runner answers only for such sessions; a session in any other repo sends

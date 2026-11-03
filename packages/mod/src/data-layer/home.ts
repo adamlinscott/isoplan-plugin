@@ -1,4 +1,4 @@
-// Which projects a session may report as (adamlinscott/isoplan#91), in order: its folder's repo, or,
+// Which projects a session may report as (isoplan-app/isoplan#91), in order: its folder's repo, or,
 // for a workspace (a folder git can't place that holds one to `workspaceRepos` repos directly, never
 // the home folder or one above it), each of those repos by name. The session reports as the first
 // the office takes (approved.ts SessionGate), and a workspace's own folder needs no approving: it is

@@ -1,5 +1,5 @@
 // A manual check of what the hooks module relies on to answer an agent's question from the floor
-// (adamlinscott/isoplan#50): Claude Code's AskUserQuestion dialog shows while a tool.call hook that
+// (isoplan-app/isoplan#50): Claude Code's AskUserQuestion dialog shows while a tool.call hook that
 // has called `next` waits, and a hook that then answers `{ result: { questions, answers } }` closes
 // the dialog and is taken as the question's answer. It also records the shape the dialog itself
 // gives a multi-select answer, which the floor copies.

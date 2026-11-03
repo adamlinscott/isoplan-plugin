@@ -29,7 +29,7 @@
 // folder (isoplan/handoffs/out/<id>) goes once it is sent, and any left by a prepare that wasn't
 // followed up goes after a day.
 //
-// `--to me` (or `myself`) hands the room to a new session of the person's own (adamlinscott/isoplan#109):
+// `--to me` (or `myself`) hands the room to a new session of the person's own (isoplan-app/isoplan#109):
 // the office server takes it as the sender when nobody in the office is called that, the brief is
 // asked for as written for that new session, and what is printed says so.
 

@@ -5,7 +5,7 @@ const whose = (owner) => owner ? `the session of ${JSON.stringify(owner)}` : "th
 /**
 * The answer, or why there is none, for the agent; `late` when it arrives after the agent carried on.
 * `me`: this machine's own account name. An answer whose owner has it came from the same person's
-* session, which handed this room to a new session of their own (adamlinscott/isoplan#109).
+* session, which handed this room to a new session of their own (isoplan-app/isoplan#109).
 */
 function endText(m, late, me) {
 	const asked = late ? `Isoplan: a late reply to your question ${m.question} to ${whose(m.owner)}. You asked:\n${quote(m.text)}\n\n` : "";

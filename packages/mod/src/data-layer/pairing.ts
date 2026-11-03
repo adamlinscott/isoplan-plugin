@@ -1,4 +1,4 @@
-// Pairing this machine with an office server that signs people in (adamlinscott/isoplan#23). What
+// Pairing this machine with an office server that signs people in (isoplan-app/isoplan#23). What
 // the machine reports belongs to the person who approves the pairing; the Claude account it names
 // is only a label. Pairing happens on this machine, in its own browser:
 //
