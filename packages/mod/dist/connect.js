@@ -5918,6 +5918,35 @@ const HandoffSchema = object({
 * machine reports as `forged-hello`. A server that signs nobody in ignores it.
 */
 const Token = string().min(1).max(200).optional();
+/** The longest instruction a person may send a driven session, a start's first one included. */
+const MAX_INSTRUCTION_LENGTH = 2e4;
+/** The longest agent reply a `driven` reply carries; a longer one is cut to fit and marked `cut`. */
+const MAX_REPLY_LENGTH = 2e4;
+/** The longest full output a `driven` output carries; a longer one is cut to fit and marked `cut`. */
+const MAX_OUTPUT_LENGTH = 2e5;
+/** The longest description of what a permission prompt asks to do. */
+const MAX_PROMPT_LENGTH = 2e3;
+/** The longest error text or refusal detail. */
+const MAX_DETAIL_LENGTH = 1e3;
+/** A drive request's, an instruction's, a prompt's or a withheld text's id. */
+const DriveId = string().min(1).max(100);
+/** A driven session, by its id as its facts name it (`claude-code:<uuid>`). */
+const DrivenSessionId = string().min(1).max(200);
+/** A room on the floor, by the server's id for it. */
+const Room = string().min(1).max(200);
+const Instruction = string().trim().min(1).max(MAX_INSTRUCTION_LENGTH);
+const ToolName = string().min(1).max(100);
+const Detail = string().min(1).max(MAX_DETAIL_LENGTH);
+/** The text was longer than its field's limit, so the runner cut it to fit. */
+const Cut = literal(true).optional();
+/** The secret scan matched the text: it only says so, and its owner can release it by this id (drive `release`). */
+const Withheld = object({ id: DriveId }).optional();
+/**
+* The permission mode a driven session runs in: Claude Code's `auto`, the default, or
+* `bypassPermissions`, which skips its permission prompts, for a person who opted in, and only in a
+* project whose office allows it (`drive-policy`).
+*/
+const DrivePermissionsSchema = _enum(["auto", "bypassPermissions"]);
 /** The first message on a connection: who is reporting, from where, about which session. */
 const HelloMessageSchema = object({
 	type: literal("hello"),
@@ -5934,6 +5963,10 @@ const HelloMessageSchema = object({
 * `orca`: Orca's CLI is on this machine, so a handoff can be taken into Orca (mode `orca`).
 * `desktop` (protocol 0.4.0): Claude Code for the terminal, new enough to hand a session to the Claude
 * app, is on this machine, a Mac or Windows x64, so a handoff can be opened in the Claude app (mode `desktop`).
+* `drive` (protocol 0.5.0): this runner drives sessions from the floor: it takes `drive` requests and
+* `drive-policy`, sends `driven` messages, and takes a handoff as a driven session (mode `driven`). The
+* server sends none of these to a runner that didn't say it. A machine with no claude binary still says
+* it, and refuses each start `no-claude`.
 */
 const RunnerHelloMessageSchema = object({
 	type: literal("runner"),
@@ -5942,7 +5975,8 @@ const RunnerHelloMessageSchema = object({
 	machine: Machine,
 	token: Token,
 	orca: boolean().optional(),
-	desktop: boolean().optional()
+	desktop: boolean().optional(),
+	drive: boolean().optional()
 });
 /** All of the session's facts. Sent on connect and on repair. */
 const FullMessageSchema = object({
@@ -5965,119 +5999,344 @@ const CapSchema = _enum([
 	"owner-day",
 	"owner-tokens"
 ]);
+/** The answer to a request, carrying the request's id and kind. */
+const ReplyMessageSchema = discriminatedUnion("kind", [
+	object({
+		type: literal("reply"),
+		v: Version,
+		id: RequestId,
+		kind: literal("answer-question"),
+		answer: string().min(1)
+	}),
+	object({
+		type: literal("reply"),
+		v: Version,
+		id: RequestId,
+		kind: literal("write-brief"),
+		handoff: HandoffSchema,
+		fallback: literal(true).optional(),
+		cap: CapSchema.optional(),
+		noClaude: literal(true).optional()
+	}),
+	object({
+		type: literal("reply"),
+		v: Version,
+		id: RequestId,
+		kind: literal("owner-answer"),
+		closed: literal(true).optional(),
+		late: literal(true).optional()
+	}),
+	object({
+		type: literal("reply"),
+		v: Version,
+		id: RequestId,
+		kind: literal("focus")
+	})
+]);
+/**
+* A request the machine won't answer, sent in place of its reply. `over-cap` names the cap it would
+* go over. `withheld` means the secret scan matched; the reply follows if the owner releases it.
+* `unavailable` is anything else that stops the room answering now, such as its checkout being gone,
+* its lead being mid-turn or a push being rejected.
+*/
+const RefusalMessageSchema = discriminatedUnion("reason", [
+	object({
+		type: literal("refusal"),
+		v: Version,
+		id: RequestId,
+		reason: literal("over-cap"),
+		cap: CapSchema
+	}),
+	object({
+		type: literal("refusal"),
+		v: Version,
+		id: RequestId,
+		reason: literal("withheld"),
+		file: string().min(1).optional(),
+		held: number().int().positive().optional(),
+		unchecked: array(string().min(1)).optional()
+	}),
+	object({
+		type: literal("refusal"),
+		v: Version,
+		id: RequestId,
+		reason: literal("unavailable"),
+		detail: string().min(1)
+	})
+]);
+/**
+* The sender's session handed its room over with the command: its agent wrote the brief and pushed.
+* `to` is the receiver as the sender named them, for the server to find in the office.
+*/
+const HandOverMessageSchema = object({
+	type: literal("hand-over"),
+	v: Version,
+	to: string().min(1),
+	handoff: HandoffSchema
+});
+/**
+* The sender's session asks, before it pushes, whether a hand-over with this id to `to` would be
+* taken: the server answers hand-over-ready, or an error saying why not.
+*/
+const HandOverCheckMessageSchema = object({
+	type: literal("hand-over-check"),
+	v: Version,
+	to: string().min(1),
+	handoff: HandoffId
+});
+/** The receiver's session asks for the handoff a take code stands for. */
+const TakeMessageSchema = object({
+	type: literal("take"),
+	v: Version,
+	code: string().min(1)
+});
+/**
+* The receiver took the handoff and joins its room. Each step that failed is listed with the repo it
+* was for and the end of its output; a failed setup step doesn't stop the session opening. From a runner, `session` is the
+* session it opened, which joins the room; without one no session opened (no clone to work in, or
+* no terminal), so the handoff is still there to take. From a session, the session itself joins.
+* `clone` is a missing repo under the folder whose git clone failed.
+*/
+const TakenMessageSchema = object({
+	type: literal("taken"),
+	v: Version,
+	handoff: HandoffId,
+	session: string().min(1).optional(),
+	failures: array(object({
+		step: _enum([
+			"worktree",
+			"clone",
+			"setup",
+			"checkout",
+			"open"
+		]),
+		repo: string().min(1).optional(),
+		output: string()
+	}))
+});
+/**
+* The receiver's session asks the room it was handed a question (#49), on its own short link with
+* the session's hello: the room's lead, on its owner's machine, answers it. The server answers
+* `asked`, or an error (`ask-refused`) when the session may not ask. `key`, the asking side's own id
+* for this ask, makes a retry of it the same question rather than a second one.
+*/
+const AskRoomMessageSchema = object({
+	type: literal("ask-room"),
+	v: Version,
+	question: string().trim().min(1).max(4e3),
+	key: string().min(1).max(100).optional()
+});
+/** The asking session polls a question it asked: the server answers `asked`. */
+const AskCheckMessageSchema = object({
+	type: literal("ask-check"),
+	v: Version,
+	question: RequestId
+});
+/**
+* The asking session's agent was shown how a question ended (answered or dropped): the server stops
+* sending it again.
+*/
+const AskedAckMessageSchema = object({
+	type: literal("asked-ack"),
+	v: Version,
+	question: RequestId
+});
+/** The most driven sessions a `holding` message lists. */
+const MAX_HOLDING = 200;
+const driven = {
+	type: literal("driven"),
+	v: Version
+};
+/**
+* Why a runner won't do what a `drive` request asked, sent in place of its answer (protocol 0.5.0).
+* `not-owner`: the acting person isn't the session's owner, this runner's person. `not-found`: this
+* machine has no driven session by that id that it would act on. `bypass-off`: the start asked for
+* `bypassPermissions` in a project whose office doesn't allow it (`drive-policy`). `no-folder`: this
+* machine has no folder for the room's project. `no-claude`: it has no claude binary. `busy`: the
+* session can't take this now, such as while a turn runs. `no-prompt`: an answer names a prompt the
+* session isn't waiting on (never raised by this runner, answered already, timed out or cancelled).
+* `offline` is never sent by a runner: it is the server's own, for a request it refused at once
+* because the owner's runner isn't linked (nothing is queued), so the server and the floor read one
+* list of reasons. `cap-reached`: the project already has `limit` driven sessions running on this
+* machine. `unavailable` is anything else, saying what in `detail`.
+*/
+const DrivenRefusedSchema = discriminatedUnion("reason", [
+	object({
+		...driven,
+		kind: literal("refused"),
+		id: DriveId,
+		reason: _enum([
+			"not-owner",
+			"not-found",
+			"bypass-off",
+			"no-folder",
+			"no-claude",
+			"busy",
+			"no-prompt",
+			"offline"
+		]),
+		detail: Detail.optional()
+	}),
+	object({
+		...driven,
+		kind: literal("refused"),
+		id: DriveId,
+		reason: literal("cap-reached"),
+		limit: number().int().positive(),
+		detail: Detail.optional()
+	}),
+	object({
+		...driven,
+		kind: literal("refused"),
+		id: DriveId,
+		reason: literal("unavailable"),
+		detail: Detail
+	})
+]);
 discriminatedUnion("type", [
 	HelloMessageSchema,
 	RunnerHelloMessageSchema,
 	FullMessageSchema,
 	ChangesMessageSchema,
+	ReplyMessageSchema,
+	RefusalMessageSchema,
+	HandOverMessageSchema,
+	HandOverCheckMessageSchema,
+	TakeMessageSchema,
+	TakenMessageSchema,
+	AskRoomMessageSchema,
+	AskCheckMessageSchema,
+	AskedAckMessageSchema,
 	discriminatedUnion("kind", [
 		object({
-			type: literal("reply"),
-			v: Version,
-			id: RequestId,
-			kind: literal("answer-question"),
-			answer: string().min(1)
+			...driven,
+			kind: literal("started"),
+			id: DriveId,
+			session: DrivenSessionId,
+			room: Room,
+			permissions: DrivePermissionsSchema
 		}),
 		object({
-			type: literal("reply"),
-			v: Version,
-			id: RequestId,
-			kind: literal("write-brief"),
-			handoff: HandoffSchema,
-			fallback: literal(true).optional(),
-			cap: CapSchema.optional(),
-			noClaude: literal(true).optional()
+			...driven,
+			kind: literal("turn-started"),
+			session: DrivenSessionId,
+			turn: DriveId
 		}),
 		object({
-			type: literal("reply"),
-			v: Version,
-			id: RequestId,
-			kind: literal("owner-answer"),
-			closed: literal(true).optional(),
-			late: literal(true).optional()
+			...driven,
+			kind: literal("tool"),
+			session: DrivenSessionId,
+			turn: DriveId,
+			tool: ToolName,
+			summary: string().min(1).max(500).optional(),
+			withheld: literal(true).optional()
 		}),
 		object({
-			type: literal("reply"),
-			v: Version,
-			id: RequestId,
-			kind: literal("focus")
-		})
-	]),
-	discriminatedUnion("reason", [
-		object({
-			type: literal("refusal"),
-			v: Version,
-			id: RequestId,
-			reason: literal("over-cap"),
-			cap: CapSchema
+			...driven,
+			kind: literal("reply"),
+			session: DrivenSessionId,
+			turn: DriveId,
+			text: string().min(1).max(MAX_REPLY_LENGTH),
+			cut: Cut,
+			withheld: Withheld
 		}),
 		object({
-			type: literal("refusal"),
-			v: Version,
-			id: RequestId,
-			reason: literal("withheld"),
-			file: string().min(1).optional(),
-			held: number().int().positive().optional(),
-			unchecked: array(string().min(1)).optional()
+			...driven,
+			kind: literal("turn-ended"),
+			session: DrivenSessionId,
+			turn: DriveId,
+			outcome: _enum([
+				"done",
+				"failed",
+				"stopped"
+			])
 		}),
 		object({
-			type: literal("refusal"),
-			v: Version,
-			id: RequestId,
-			reason: literal("unavailable"),
-			detail: string().min(1)
-		})
-	]),
-	object({
-		type: literal("hand-over"),
-		v: Version,
-		to: string().min(1),
-		handoff: HandoffSchema
-	}),
-	object({
-		type: literal("hand-over-check"),
-		v: Version,
-		to: string().min(1),
-		handoff: HandoffId
-	}),
-	object({
-		type: literal("take"),
-		v: Version,
-		code: string().min(1)
-	}),
-	object({
-		type: literal("taken"),
-		v: Version,
-		handoff: HandoffId,
-		session: string().min(1).optional(),
-		failures: array(object({
-			step: _enum([
-				"worktree",
-				"clone",
-				"setup",
-				"checkout",
-				"open"
+			...driven,
+			kind: literal("error"),
+			session: DrivenSessionId,
+			turn: DriveId.optional(),
+			text: Detail
+		}),
+		object({
+			...driven,
+			kind: literal("output"),
+			id: DriveId,
+			session: DrivenSessionId,
+			turn: DriveId.optional(),
+			text: string().min(1).max(MAX_OUTPUT_LENGTH),
+			cut: Cut,
+			withheld: Withheld
+		}),
+		object({
+			...driven,
+			kind: literal("prompt"),
+			session: DrivenSessionId,
+			turn: DriveId.optional(),
+			prompt: DriveId,
+			tool: ToolName,
+			description: string().min(1).max(MAX_PROMPT_LENGTH),
+			withheld: literal(true).optional(),
+			expires: datetime({ offset: true })
+		}),
+		object({
+			...driven,
+			kind: literal("prompt-ended"),
+			session: DrivenSessionId,
+			prompt: DriveId,
+			outcome: _enum([
+				"allowed",
+				"denied",
+				"timed-out",
+				"cancelled"
 			]),
-			repo: string().min(1).optional(),
-			output: string()
-		}))
-	}),
-	object({
-		type: literal("ask-room"),
-		v: Version,
-		question: string().trim().min(1).max(4e3),
-		key: string().min(1).max(100).optional()
-	}),
-	object({
-		type: literal("ask-check"),
-		v: Version,
-		question: RequestId
-	}),
-	object({
-		type: literal("asked-ack"),
-		v: Version,
-		question: RequestId
-	})
+			id: DriveId.optional()
+		}),
+		object({
+			...driven,
+			kind: literal("held"),
+			session: DrivenSessionId,
+			room: Room,
+			why: _enum([
+				"started",
+				"reopened",
+				"restored"
+			]),
+			permissions: DrivePermissionsSchema
+		}),
+		object({
+			...driven,
+			kind: literal("released"),
+			session: DrivenSessionId,
+			why: _enum([
+				"stopped",
+				"handed-back",
+				"idle-closed",
+				"crashed"
+			]),
+			id: DriveId.optional()
+		}),
+		object({
+			...driven,
+			kind: literal("handed-back"),
+			id: DriveId,
+			session: DrivenSessionId,
+			command: string().min(1).max(500),
+			folder: string().min(1).max(4096)
+		}),
+		DrivenRefusedSchema,
+		object({
+			...driven,
+			kind: literal("holding"),
+			sessions: array(object({
+				session: DrivenSessionId,
+				room: Room,
+				held: boolean(),
+				permissions: DrivePermissionsSchema,
+				turn: DriveId.optional()
+			})).max(MAX_HOLDING)
+		})
+	])
 ]);
 /** Asks the data layer to send its facts in full. */
 const RepairMessageSchema = object({
@@ -6189,9 +6448,25 @@ const HandoffMessageSchema = object({
 		"terminal",
 		"headless",
 		"orca",
-		"desktop"
+		"desktop",
+		"driven"
 	]).optional(),
-	session: string().uuid().optional()
+	session: string().uuid().optional(),
+	by: Account.optional(),
+	room: Room.optional(),
+	permissions: DrivePermissionsSchema.optional()
+}).superRefine((message, context) => {
+	if (message.mode !== "driven") return;
+	for (const key of [
+		"session",
+		"by",
+		"room",
+		"permissions"
+	]) if (message[key] === void 0) context.addIssue({
+		code: "custom",
+		path: [key],
+		message: "required for a take as a driven session"
+	});
 });
 /** A hand-over-check passed: `to` is the receiver the server found for the name given. */
 const HandOverReadyMessageSchema = object({
@@ -6200,6 +6475,61 @@ const HandOverReadyMessageSchema = object({
 	handoff: HandoffId,
 	to: Account
 });
+/** The sender's hand-over reached the room: `to` is the receiver the server found for the name given. */
+const HandedOverMessageSchema = object({
+	type: literal("handed-over"),
+	v: Version,
+	handoff: HandoffId,
+	to: Account
+});
+/**
+* Where a question asked of the room stands (#49), sent in answer to ask-room and ask-check, and
+* down the asking session's own link when an answer arrives after it stopped polling. `queued`: the
+* owner's machine can't answer now (it is off, its runner is away, a cap is reached, or the fork
+* couldn't answer), and it is asked again later; `note` says why. `asking`: the owner's runner is
+* answering. `withheld`: the answer matched a secret pattern on the owner's machine, which keeps it
+* until they release it. `answered`, with `answer`. `dropped`: it won't be answered (the owner
+* turned asking off, the handoff was dismissed, or it ran out of tries or time); `note` says why.
+* `text` is the question as it was asked, `owner` the name of the person whose session answers, and
+* `key` the ask's own key.
+* An answered or dropped question is sent again down the session's own link until it is acked.
+*/
+const AskedMessageSchema = object({
+	type: literal("asked"),
+	v: Version,
+	question: RequestId,
+	text: string().min(1),
+	state: _enum([
+		"queued",
+		"asking",
+		"withheld",
+		"answered",
+		"dropped"
+	]),
+	answer: string().min(1).optional(),
+	note: string().min(1).optional(),
+	owner: string().optional(),
+	/** The `key` the question was asked under, so the asking side knows which of its asks it was. */
+	key: string().min(1).max(100).optional()
+});
+/**
+* Whether this session may ask `room` now (#49), sent down its own link when it connects in a room
+* that was handed to its person, and whenever that changes: a take grants it, and the owner can
+* turn it off and on again.
+*/
+const AskRightsMessageSchema = object({
+	type: literal("ask-rights"),
+	v: Version,
+	room: string().min(1),
+	owner: Account,
+	granted: boolean()
+});
+const drive = {
+	type: literal("drive"),
+	v: Version,
+	id: DriveId,
+	by: Account
+};
 discriminatedUnion("type", [
 	RepairMessageSchema,
 	WelcomeMessageSchema,
@@ -6208,38 +6538,61 @@ discriminatedUnion("type", [
 	RequestMessageSchema,
 	ReleaseMessageSchema,
 	HandoffMessageSchema,
-	object({
-		type: literal("handed-over"),
-		v: Version,
-		handoff: HandoffId,
-		to: Account
-	}),
+	HandedOverMessageSchema,
 	HandOverReadyMessageSchema,
 	DropMessageSchema,
+	AskedMessageSchema,
+	AskRightsMessageSchema,
+	discriminatedUnion("kind", [
+		object({
+			...drive,
+			kind: literal("start"),
+			room: Room,
+			project: ProjectSchema,
+			roomSessions: array(DrivenSessionId).max(20).optional(),
+			instruction: Instruction.optional(),
+			permissions: DrivePermissionsSchema
+		}),
+		object({
+			...drive,
+			kind: literal("instruct"),
+			session: DrivenSessionId,
+			text: Instruction
+		}),
+		object({
+			...drive,
+			kind: literal("stop"),
+			session: DrivenSessionId
+		}),
+		object({
+			...drive,
+			kind: literal("hand-back"),
+			session: DrivenSessionId
+		}),
+		object({
+			...drive,
+			kind: literal("output"),
+			session: DrivenSessionId,
+			turn: DriveId.optional()
+		}),
+		object({
+			...drive,
+			kind: literal("answer"),
+			session: DrivenSessionId,
+			prompt: DriveId,
+			answer: _enum(["allow", "deny"])
+		}),
+		object({
+			...drive,
+			kind: literal("release"),
+			session: DrivenSessionId,
+			withheld: DriveId
+		})
+	]),
 	object({
-		type: literal("asked"),
+		type: literal("drive-policy"),
 		v: Version,
-		question: RequestId,
-		text: string().min(1),
-		state: _enum([
-			"queued",
-			"asking",
-			"withheld",
-			"answered",
-			"dropped"
-		]),
-		answer: string().min(1).optional(),
-		note: string().min(1).optional(),
-		owner: string().optional(),
-		/** The `key` the question was asked under, so the asking side knows which of its asks it was. */
-		key: string().min(1).max(100).optional()
-	}),
-	object({
-		type: literal("ask-rights"),
-		v: Version,
-		room: string().min(1),
-		owner: Account,
-		granted: boolean()
+		bypassAllowed: array(string().min(1).max(300)).max(1e3)
 	})
 ]);
 //#endregion

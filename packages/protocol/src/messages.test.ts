@@ -1,5 +1,8 @@
 import { describe, expect, test } from "vitest";
 import {
+  MAX_INSTRUCTION_LENGTH,
+  MAX_OUTPUT_LENGTH,
+  MAX_REPLY_LENGTH,
   parseDataLayerMessage,
   parseOfficeServerMessage,
   PROTOCOL_VERSION,
@@ -98,6 +101,9 @@ const handoff: Handoff = {
     { path: "libs/core", remote: "github.com/adamlinscott/core", branch: "isoplan/handoff/h7k2", commit: "89abcdef0123456789abcdef0123456789abcdef" },
   ],
 };
+const room = "room:claude-code:s1";
+const driving = "claude-code:0b5c4d3e-0000-4000-8000-000000000001";
+const isoplan = { id: "github.com/isoplan-app/isoplan", name: "isoplan" };
 
 const valid = {
   hello: {
@@ -171,6 +177,32 @@ const valid = {
   "ask-check": { type: "ask-check", v, question: "q-4f9c" },
   asked: { type: "asked", v, question: "q-4f9c", text: "Why does the CRLF check exist?", state: "answered", answer: "Windows checkouts.", owner: "Adam", key: "toolu_01" },
   "asked queued": { type: "asked", v, question: "q-4f9c", text: "Why does the CRLF check exist?", state: "queued", note: "Adam's machine isn't reachable." },
+  "runner that drives sessions": { type: "runner", v, account: adam, machine: { name: "sevengill" }, drive: true },
+  "handoff as a driven session": { type: "handoff", v, handoff, mode: "driven", session: "0b5c4d3e-0000-4000-8000-000000000001", by: sam, room, permissions: "auto" },
+  "drive start": { type: "drive", v, kind: "start", id: "d1", by: adam, room, project: isoplan, roomSessions: ["claude-code:s1"], instruction: "Fix the failing test in src/a.ts.", permissions: "auto" },
+  "drive instruct": { type: "drive", v, kind: "instruct", id: "i2", by: adam, session: driving, text: "Now run the whole suite." },
+  "drive stop": { type: "drive", v, kind: "stop", id: "d3", by: adam, session: driving },
+  "drive hand-back": { type: "drive", v, kind: "hand-back", id: "d4", by: adam, session: driving },
+  "drive output": { type: "drive", v, kind: "output", id: "d5", by: adam, session: driving, turn: "i2" },
+  "drive answer": { type: "drive", v, kind: "answer", id: "d6", by: adam, session: driving, prompt: "p1", answer: "allow" },
+  "drive release": { type: "drive", v, kind: "release", id: "d7", by: adam, session: driving, withheld: "w1" },
+  "drive-policy": { type: "drive-policy", v, bypassAllowed: ["github.com/isoplan-app/isoplan"] },
+  "driven started": { type: "driven", v, kind: "started", id: "d1", session: driving, room, permissions: "auto" },
+  "driven turn-started": { type: "driven", v, kind: "turn-started", session: driving, turn: "i2" },
+  "driven tool": { type: "driven", v, kind: "tool", session: driving, turn: "i2", tool: "Bash", summary: "pnpm test" },
+  "driven reply": { type: "driven", v, kind: "reply", session: driving, turn: "i2", text: "All 252 tests pass." },
+  "driven turn-ended": { type: "driven", v, kind: "turn-ended", session: driving, turn: "i2", outcome: "done" },
+  "driven error": { type: "driven", v, kind: "error", session: driving, text: "Claude Code couldn't resume this session." },
+  "driven output": { type: "driven", v, kind: "output", id: "d5", session: driving, turn: "i2", text: "> pnpm test\n\nAll 252 tests pass." },
+  "driven prompt": { type: "driven", v, kind: "prompt", session: driving, turn: "i2", prompt: "p1", tool: "Bash", description: "Run git push origin main", expires: "2026-11-05T09:05:00.000Z" },
+  "driven prompt-ended": { type: "driven", v, kind: "prompt-ended", session: driving, prompt: "p1", outcome: "allowed", id: "d6" },
+  "driven held": { type: "driven", v, kind: "held", session: driving, room, why: "restored", permissions: "bypassPermissions" },
+  "driven released": { type: "driven", v, kind: "released", session: driving, why: "handed-back", id: "d4" },
+  "driven handed-back": { type: "driven", v, kind: "handed-back", id: "d4", session: driving, command: "claude --resume 0b5c4d3e-0000-4000-8000-000000000001", folder: "C:/w/repo" },
+  "driven refused": { type: "driven", v, kind: "refused", id: "d1", reason: "no-folder" },
+  "driven refused at the cap": { type: "driven", v, kind: "refused", id: "d1", reason: "cap-reached", limit: 4 },
+  "driven refused unavailable": { type: "driven", v, kind: "refused", id: "d1", reason: "unavailable", detail: "Claude Code isn't signed in on this machine." },
+  "driven holding": { type: "driven", v, kind: "holding", sessions: [{ session: driving, room, held: true, permissions: "auto", turn: "i2" }] },
 };
 
 const parsers = {
@@ -220,6 +252,32 @@ const parsers = {
   "ask-check": parseDataLayerMessage,
   asked: parseOfficeServerMessage,
   "asked queued": parseOfficeServerMessage,
+  "runner that drives sessions": parseDataLayerMessage,
+  "handoff as a driven session": parseOfficeServerMessage,
+  "drive start": parseOfficeServerMessage,
+  "drive instruct": parseOfficeServerMessage,
+  "drive stop": parseOfficeServerMessage,
+  "drive hand-back": parseOfficeServerMessage,
+  "drive output": parseOfficeServerMessage,
+  "drive answer": parseOfficeServerMessage,
+  "drive release": parseOfficeServerMessage,
+  "drive-policy": parseOfficeServerMessage,
+  "driven started": parseDataLayerMessage,
+  "driven turn-started": parseDataLayerMessage,
+  "driven tool": parseDataLayerMessage,
+  "driven reply": parseDataLayerMessage,
+  "driven turn-ended": parseDataLayerMessage,
+  "driven error": parseDataLayerMessage,
+  "driven output": parseDataLayerMessage,
+  "driven prompt": parseDataLayerMessage,
+  "driven prompt-ended": parseDataLayerMessage,
+  "driven held": parseDataLayerMessage,
+  "driven released": parseDataLayerMessage,
+  "driven handed-back": parseDataLayerMessage,
+  "driven refused": parseDataLayerMessage,
+  "driven refused at the cap": parseDataLayerMessage,
+  "driven refused unavailable": parseDataLayerMessage,
+  "driven holding": parseDataLayerMessage,
 } satisfies Record<keyof typeof valid, (value: unknown) => ParseResult<unknown>>;
 
 // Each message with one field made wrong, and the path the error should name.
@@ -270,6 +328,32 @@ const broken: Record<keyof typeof valid, [unknown, string]> = {
   "ask-check": [{ ...valid["ask-check"], question: "" }, "question"],
   asked: [{ ...valid.asked, state: "lost" }, "state"],
   "asked queued": [{ ...valid["asked queued"], note: "" }, "note"],
+  "runner that drives sessions": [{ ...valid["runner that drives sessions"], drive: "yes" }, "drive"],
+  "handoff as a driven session": [{ ...valid["handoff as a driven session"], room: undefined }, "room"],
+  "drive start": [{ ...valid["drive start"], permissions: "default" }, "permissions"],
+  "drive instruct": [{ ...valid["drive instruct"], text: "x".repeat(MAX_INSTRUCTION_LENGTH + 1) }, "text"],
+  "drive stop": [{ ...valid["drive stop"], by: undefined }, "by"],
+  "drive hand-back": [{ ...valid["drive hand-back"], session: "" }, "session"],
+  "drive output": [{ ...valid["drive output"], turn: "" }, "turn"],
+  "drive answer": [{ ...valid["drive answer"], answer: "always" }, "answer"],
+  "drive release": [{ ...valid["drive release"], withheld: "" }, "withheld"],
+  "drive-policy": [{ ...valid["drive-policy"], bypassAllowed: [""] }, "bypassAllowed[0]"],
+  "driven started": [{ ...valid["driven started"], room: undefined }, "room"],
+  "driven turn-started": [{ ...valid["driven turn-started"], turn: "x".repeat(101) }, "turn"],
+  "driven tool": [{ ...valid["driven tool"], summary: "x".repeat(501) }, "summary"],
+  "driven reply": [{ ...valid["driven reply"], text: "x".repeat(MAX_REPLY_LENGTH + 1) }, "text"],
+  "driven turn-ended": [{ ...valid["driven turn-ended"], outcome: "cancelled" }, "outcome"],
+  "driven error": [{ ...valid["driven error"], text: "" }, "text"],
+  "driven output": [{ ...valid["driven output"], cut: false }, "cut"],
+  "driven prompt": [{ ...valid["driven prompt"], expires: "in a minute" }, "expires"],
+  "driven prompt-ended": [{ ...valid["driven prompt-ended"], outcome: "expired" }, "outcome"],
+  "driven held": [{ ...valid["driven held"], why: "stopped" }, "why"],
+  "driven released": [{ ...valid["driven released"], why: "restored" }, "why"],
+  "driven handed-back": [{ ...valid["driven handed-back"], command: undefined }, "command"],
+  "driven refused": [{ ...valid["driven refused"], reason: "nope" }, "reason"],
+  "driven refused at the cap": [{ ...valid["driven refused at the cap"], limit: 0 }, "limit"],
+  "driven refused unavailable": [{ ...valid["driven refused unavailable"], detail: undefined }, "detail"],
+  "driven holding": [{ ...valid["driven holding"], sessions: [{ ...valid["driven holding"].sessions[0], held: "yes" }] }, "sessions[0].held"],
 };
 
 describe.each(Object.keys(valid) as (keyof typeof valid)[])("%s", (type) => {
@@ -451,5 +535,61 @@ describe("changes", () => {
     const result = parseDataLayerMessage({ ...valid.changes, remove: { waits: [{ waiter: lead.id }] } });
     expect(result).toMatchObject({ ok: false, kind: "invalid" });
     expect(!result.ok && result.error).toContain("remove.waits[0].on");
+  });
+});
+
+describe("driven sessions", () => {
+  test("a reply or output at its limit parses, cut or withheld, and one past it doesn't", () => {
+    const reply = { ...valid["driven reply"], text: "x".repeat(MAX_REPLY_LENGTH), cut: true };
+    const output = { ...valid["driven output"], text: "x".repeat(MAX_OUTPUT_LENGTH), cut: true };
+    const withheld = { ...valid["driven reply"], text: "Withheld here: it matches a secret pattern.", withheld: { id: "w1" } };
+    for (const message of [reply, output, withheld]) expect(parseDataLayerMessage(message)).toEqual({ ok: true, message });
+    expect(parseDataLayerMessage({ ...output, text: "x".repeat(MAX_OUTPUT_LENGTH + 1) })).toMatchObject({ ok: false, kind: "invalid" });
+    expect(parseDataLayerMessage({ ...withheld, withheld: { id: "" } })).toMatchObject({ ok: false, kind: "invalid" });
+  });
+
+  test("a tool summary or prompt the scan matched is marked withheld, and not with false", () => {
+    const { summary: _, ...tool } = { ...valid["driven tool"], withheld: true as const };
+    const prompt = { ...valid["driven prompt"], description: "Withheld here: it matches a secret pattern.", withheld: true };
+    for (const message of [tool, prompt]) expect(parseDataLayerMessage(message)).toEqual({ ok: true, message });
+    expect(parseDataLayerMessage({ ...prompt, withheld: false })).toMatchObject({ ok: false, kind: "invalid" });
+  });
+
+  test("an instruction is trimmed, and one of only spaces is invalid", () => {
+    expect(parseOfficeServerMessage({ ...valid["drive start"], instruction: "  Fix it.\n" })).toMatchObject({ ok: true, message: { instruction: "Fix it." } });
+    const { instruction: _, ...start } = valid["drive start"];
+    expect(parseOfficeServerMessage(start)).toEqual({ ok: true, message: start });
+    expect(parseOfficeServerMessage({ ...valid["drive instruct"], text: " \n " })).toMatchObject({ ok: false, kind: "invalid" });
+  });
+
+  test.each(["session", "by", "room", "permissions"])("a take as a driven session needs its %s", (key) => {
+    const result = parseOfficeServerMessage({ ...valid["handoff as a driven session"], [key]: undefined });
+    expect(result).toMatchObject({ ok: false, kind: "invalid" });
+    expect(!result.ok && result.error).toContain(key);
+  });
+
+  test.each(["not-owner", "not-found", "bypass-off", "no-folder", "no-claude", "busy", "no-prompt", "offline"])("a drive request can be refused %s", (reason) => {
+    const message = { ...valid["driven refused"], reason, detail: "In plain words." };
+    expect(parseDataLayerMessage(message)).toEqual({ ok: true, message });
+  });
+
+  test("only a refusal at the cap names its limit, and it must", () => {
+    expect(parseDataLayerMessage({ ...valid["driven refused at the cap"], limit: undefined })).toMatchObject({ ok: false, kind: "invalid" });
+    expect(parseDataLayerMessage({ ...valid["driven refused"], limit: 4 })).toEqual({ ok: true, message: valid["driven refused"] });
+  });
+
+  test("a policy that allows skipping nowhere, and a runner holding no sessions, parse", () => {
+    for (const [message, parse] of [
+      [{ ...valid["drive-policy"], bypassAllowed: [] }, parseOfficeServerMessage],
+      [{ ...valid["driven holding"], sessions: [] }, parseDataLayerMessage],
+    ] as const)
+      expect(parse(message)).toEqual({ ok: true, message });
+  });
+
+  test("a drive or driven message of a kind the channel doesn't have is invalid, naming the kind", () => {
+    for (const result of [parseOfficeServerMessage({ ...valid["drive stop"], kind: "pause" }), parseDataLayerMessage({ ...valid["driven turn-started"], kind: "paused" })]) {
+      expect(result).toMatchObject({ ok: false, kind: "invalid" });
+      expect(!result.ok && result.error).toContain("kind");
+    }
   });
 });

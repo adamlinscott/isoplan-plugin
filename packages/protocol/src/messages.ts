@@ -85,6 +85,47 @@ export const HandoffSchema = z
  */
 const Token = z.string().min(1).max(200).optional();
 
+// Driven sessions (protocol 0.5.0): a Claude Code session the runner runs on its person's machine,
+// which that person drives from the floor: starts, instructs, reads, answers its permission prompts,
+// stops and hands back to their terminal (isoplan-app docs/designs/web-session-view.md). The server
+// sends `drive` requests and `drive-policy`; the runner sends `driven` messages. Only the session's
+// owner acts on it: the server checks, and every `drive` request names who is acting (`by`) so the
+// runner checks again.
+
+/** The longest instruction a person may send a driven session, a start's first one included. */
+export const MAX_INSTRUCTION_LENGTH = 20000;
+/** The longest agent reply a `driven` reply carries; a longer one is cut to fit and marked `cut`. */
+export const MAX_REPLY_LENGTH = 20000;
+/** The longest full output a `driven` output carries; a longer one is cut to fit and marked `cut`. */
+export const MAX_OUTPUT_LENGTH = 200000;
+/** The longest summary of what a tool use was for. */
+export const MAX_SUMMARY_LENGTH = 500;
+/** The longest description of what a permission prompt asks to do. */
+export const MAX_PROMPT_LENGTH = 2000;
+/** The longest error text or refusal detail. */
+export const MAX_DETAIL_LENGTH = 1000;
+
+/** A drive request's, an instruction's, a prompt's or a withheld text's id. */
+const DriveId = z.string().min(1).max(100);
+/** A driven session, by its id as its facts name it (`claude-code:<uuid>`). */
+const DrivenSessionId = z.string().min(1).max(200);
+/** A room on the floor, by the server's id for it. */
+const Room = z.string().min(1).max(200);
+const Instruction = z.string().trim().min(1).max(MAX_INSTRUCTION_LENGTH);
+const ToolName = z.string().min(1).max(100);
+const Detail = z.string().min(1).max(MAX_DETAIL_LENGTH);
+/** The text was longer than its field's limit, so the runner cut it to fit. */
+const Cut = z.literal(true).optional();
+/** The secret scan matched the text: it only says so, and its owner can release it by this id (drive `release`). */
+const Withheld = z.object({ id: DriveId }).optional();
+
+/**
+ * The permission mode a driven session runs in: Claude Code's `auto`, the default, or
+ * `bypassPermissions`, which skips its permission prompts, for a person who opted in, and only in a
+ * project whose office allows it (`drive-policy`).
+ */
+export const DrivePermissionsSchema = z.enum(["auto", "bypassPermissions"]);
+
 // Data layer → office server.
 
 /** The first message on a connection: who is reporting, from where, about which session. */
@@ -104,6 +145,10 @@ export const HelloMessageSchema = z.object({
  * `orca`: Orca's CLI is on this machine, so a handoff can be taken into Orca (mode `orca`).
  * `desktop` (protocol 0.4.0): Claude Code for the terminal, new enough to hand a session to the Claude
  * app, is on this machine, a Mac or Windows x64, so a handoff can be opened in the Claude app (mode `desktop`).
+ * `drive` (protocol 0.5.0): this runner drives sessions from the floor: it takes `drive` requests and
+ * `drive-policy`, sends `driven` messages, and takes a handoff as a driven session (mode `driven`). The
+ * server sends none of these to a runner that didn't say it. A machine with no claude binary still says
+ * it, and refuses each start `no-claude`.
  */
 export const RunnerHelloMessageSchema = z.object({
   type: z.literal("runner"),
@@ -113,6 +158,7 @@ export const RunnerHelloMessageSchema = z.object({
   token: Token,
   orca: z.boolean().optional(),
   desktop: z.boolean().optional(),
+  drive: z.boolean().optional(),
 });
 
 /** All of the session's facts. Sent on connect and on repair. */
@@ -266,6 +312,97 @@ export const AskedAckMessageSchema = z.object({
   question: RequestId,
 });
 
+/** The most driven sessions a `holding` message lists. */
+const MAX_HOLDING = 200;
+
+const driven = { type: z.literal("driven"), v: Version };
+
+/**
+ * Why a runner won't do what a `drive` request asked, sent in place of its answer (protocol 0.5.0).
+ * `not-owner`: the acting person isn't the session's owner, this runner's person. `not-found`: this
+ * machine has no driven session by that id that it would act on. `bypass-off`: the start asked for
+ * `bypassPermissions` in a project whose office doesn't allow it (`drive-policy`). `no-folder`: this
+ * machine has no folder for the room's project. `no-claude`: it has no claude binary. `busy`: the
+ * session can't take this now, such as while a turn runs. `no-prompt`: an answer names a prompt the
+ * session isn't waiting on (never raised by this runner, answered already, timed out or cancelled).
+ * `offline` is never sent by a runner: it is the server's own, for a request it refused at once
+ * because the owner's runner isn't linked (nothing is queued), so the server and the floor read one
+ * list of reasons. `cap-reached`: the project already has `limit` driven sessions running on this
+ * machine. `unavailable` is anything else, saying what in `detail`.
+ */
+const DrivenRefusedSchema = z.discriminatedUnion("reason", [
+  z.object({
+    ...driven,
+    kind: z.literal("refused"),
+    id: DriveId,
+    reason: z.enum(["not-owner", "not-found", "bypass-off", "no-folder", "no-claude", "busy", "no-prompt", "offline"]),
+    detail: Detail.optional(),
+  }),
+  z.object({ ...driven, kind: z.literal("refused"), id: DriveId, reason: z.literal("cap-reached"), limit: z.number().int().positive(), detail: Detail.optional() }),
+  z.object({ ...driven, kind: z.literal("refused"), id: DriveId, reason: z.literal("unavailable"), detail: Detail }),
+]);
+
+/**
+ * What a runner says of the driven sessions it holds (protocol 0.5.0), sent only by a runner that said
+ * `drive`. `started`, `output` and `handed-back` answer a `drive` request by its `id`, and `refused` is
+ * sent in place of any answer; the rest are the sessions' own events, in the order they happened. A
+ * turn is named by the instruction that started it (`turn`): a start's first instruction by the start's
+ * `id`, and a driven take's first turn by the take's session id.
+ *
+ * Every `driven` message is live-only: it goes only while the runner's link is up and never waits in
+ * the link's reply outbox, so a long turn can't push the replies to the server's requests out of it,
+ * and a prompt that has timed out isn't shown again. After every hello, `holding` says where each
+ * session stands.
+ *
+ * Nothing from a session leaves the machine without the runner's secret scan. A reply or output it
+ * matched has a `text` that only says so, and `withheld.id` for the owner to release it (drive
+ * `release`); a tool summary it matched isn't sent, and a prompt description it matched only says so,
+ * both marked `withheld`.
+ */
+export const DrivenMessageSchema = z.discriminatedUnion("kind", [
+  // The session a start asked for is running, in `room`; `permissions` is the mode it runs in.
+  z.object({ ...driven, kind: z.literal("started"), id: DriveId, session: DrivenSessionId, room: Room, permissions: DrivePermissionsSchema }),
+  // The agent took the instruction `turn`.
+  z.object({ ...driven, kind: z.literal("turn-started"), session: DrivenSessionId, turn: DriveId }),
+  // The agent used a tool in the turn: its name, and a short summary of what for.
+  z.object({ ...driven, kind: z.literal("tool"), session: DrivenSessionId, turn: DriveId, tool: ToolName, summary: z.string().min(1).max(MAX_SUMMARY_LENGTH).optional(), withheld: z.literal(true).optional() }),
+  // The agent's own reply to the turn's instruction, what it said as the turn ended.
+  z.object({ ...driven, kind: z.literal("reply"), session: DrivenSessionId, turn: DriveId, text: z.string().min(1).max(MAX_REPLY_LENGTH), cut: Cut, withheld: Withheld }),
+  // The turn is over: `done`; `failed`, when Claude Code said it failed or its process ended mid-turn;
+  // or `stopped`, when the session was stopped or handed back mid-turn.
+  z.object({ ...driven, kind: z.literal("turn-ended"), session: DrivenSessionId, turn: DriveId, outcome: z.enum(["done", "failed", "stopped"]) }),
+  // Something went wrong in the session, in the runner's own words: never the model's output.
+  z.object({ ...driven, kind: z.literal("error"), session: DrivenSessionId, turn: DriveId.optional(), text: Detail }),
+  // The full output asked for, as plain text: of `turn`, or of the whole session without one.
+  z.object({ ...driven, kind: z.literal("output"), id: DriveId, session: DrivenSessionId, turn: DriveId.optional(), text: z.string().min(1).max(MAX_OUTPUT_LENGTH), cut: Cut, withheld: Withheld }),
+  // The session asks permission for a tool use (`--permission-prompts host`), under the runner's own
+  // `prompt` id, which an answer must name. With no answer by `expires` the runner denies it.
+  z.object({ ...driven, kind: z.literal("prompt"), session: DrivenSessionId, turn: DriveId.optional(), prompt: DriveId, tool: ToolName, description: z.string().min(1).max(MAX_PROMPT_LENGTH), withheld: z.literal(true).optional(), expires: z.iso.datetime({ offset: true }) }),
+  // How a prompt ended. `id`: the answer request that ended it, when one did.
+  z.object({ ...driven, kind: z.literal("prompt-ended"), session: DrivenSessionId, prompt: DriveId, outcome: z.enum(["allowed", "denied", "timed-out", "cancelled"]), id: DriveId.optional() }),
+  // A process of the runner's holds the session now, so resuming it in a terminal as well would make
+  // two writers: just `started`, `reopened` for an instruction after it was closed, or `restored`
+  // after the runner itself restarted.
+  z.object({ ...driven, kind: z.literal("held"), session: DrivenSessionId, room: Room, why: z.enum(["started", "reopened", "restored"]), permissions: DrivePermissionsSchema }),
+  // No process holds the session now: `stopped`, `handed-back`, `idle-closed` (nothing happened in it
+  // for the runner's idle time) or `crashed`. `id`: the stop or hand-back request it answers, if any.
+  z.object({ ...driven, kind: z.literal("released"), session: DrivenSessionId, why: z.enum(["stopped", "handed-back", "idle-closed", "crashed"]), id: DriveId.optional() }),
+  // The session is back in its person's hands: `command` (`claude --resume <id>`) continues it in a
+  // terminal opened in `folder`, a path on the runner's machine.
+  z.object({ ...driven, kind: z.literal("handed-back"), id: DriveId, session: DrivenSessionId, command: z.string().min(1).max(500), folder: z.string().min(1).max(4096) }),
+  DrivenRefusedSchema,
+  // Sent after every hello: each driven session the runner holds, or would reopen for an instruction.
+  // `held`: a process holds it now. `turn`: the turn running now, if any. The server takes it in place
+  // of what it knew of this runner's driven sessions, so the floor's held state survives a reconnect.
+  z.object({
+    ...driven,
+    kind: z.literal("holding"),
+    sessions: z
+      .array(z.object({ session: DrivenSessionId, room: Room, held: z.boolean(), permissions: DrivePermissionsSchema, turn: DriveId.optional() }))
+      .max(MAX_HOLDING),
+  }),
+]);
+
 export const DataLayerMessageSchema = z.discriminatedUnion("type", [
   HelloMessageSchema,
   RunnerHelloMessageSchema,
@@ -280,6 +417,7 @@ export const DataLayerMessageSchema = z.discriminatedUnion("type", [
   AskRoomMessageSchema,
   AskCheckMessageSchema,
   AskedAckMessageSchema,
+  DrivenMessageSchema,
 ]);
 
 // Office server → data layer.
@@ -399,16 +537,29 @@ export const ReleaseMessageSchema = z.object({
  * A handoff for the receiver to take: sent to their runner when they take it from the floor, or to
  * their session in answer to a take code.
  */
-export const HandoffMessageSchema = z.object({
-  type: z.literal("handoff"),
-  v: Version,
-  handoff: HandoffSchema,
-  // To a runner: how to open the session (a terminal, by default, headless, with no window, in Orca,
-  // sent only to a runner that said `orca`, or in the Claude app, sent only to a runner that said
-  // `desktop`), and the session id to open it under, which is the one the server will let join the room.
-  mode: z.enum(["terminal", "headless", "orca", "desktop"]).optional(),
-  session: z.string().uuid().optional(),
-});
+export const HandoffMessageSchema = z
+  .object({
+    type: z.literal("handoff"),
+    v: Version,
+    handoff: HandoffSchema,
+    // To a runner: how to open the session (a terminal, by default, headless, with no window, in Orca,
+    // sent only to a runner that said `orca`, in the Claude app, sent only to a runner that said
+    // `desktop`, or, from protocol 0.5.0, as a session driven from the floor, sent only to a runner that
+    // said `drive`), and the session id to open it under, which is the one the server will let join the room.
+    mode: z.enum(["terminal", "headless", "orca", "desktop", "driven"]).optional(),
+    session: z.string().uuid().optional(),
+    // With mode `driven`, and then all required: the person taking it, whom the runner checks is its
+    // own person, as for a drive request; the room it joins; and the permission mode they asked for.
+    by: Account.optional(),
+    room: Room.optional(),
+    permissions: DrivePermissionsSchema.optional(),
+  })
+  .superRefine((message, context) => {
+    if (message.mode !== "driven") return;
+    for (const key of ["session", "by", "room", "permissions"] as const) {
+      if (message[key] === undefined) context.addIssue({ code: "custom", path: [key], message: "required for a take as a driven session" });
+    }
+  });
 
 /** A hand-over-check passed: `to` is the receiver the server found for the name given. */
 export const HandOverReadyMessageSchema = z.object({
@@ -464,6 +615,62 @@ export const AskRightsMessageSchema = z.object({
   granted: z.boolean(),
 });
 
+const drive = { type: z.literal("drive"), v: Version, id: DriveId, by: Account };
+
+/**
+ * A person acting on a driven session from the floor (protocol 0.5.0), sent only to a runner that said
+ * `drive`, and only to the owner's own runner. `by` is the person acting, whom the runner checks is its
+ * own person, and refuses `not-owner` otherwise. The runner answers by `id` (see `driven`). Nothing is
+ * queued: the server refuses a request for a runner that isn't linked at once (`offline`).
+ */
+export const DriveMessageSchema = z.discriminatedUnion("kind", [
+  // Start a driven session for `room`, a room of `project` that `by` is in. It opens in the folder of
+  // the first of `roomSessions` (the room's sessions on this machine, newest first) that the runner
+  // reports, by its own record of that folder, or else in a checkout of `project` it finds, as a take
+  // does. `instruction`, the first, is the turn named by this request's id. `permissions` is the mode
+  // the person asked for; the runner runs `bypassPermissions` only where `drive-policy` allows it.
+  z.object({
+    ...drive,
+    kind: z.literal("start"),
+    room: Room,
+    project: ProjectSchema,
+    roomSessions: z.array(DrivenSessionId).max(20).optional(),
+    instruction: Instruction.optional(),
+    permissions: DrivePermissionsSchema,
+  }),
+  // The next instruction, `text`; this request's id names the turn it starts.
+  z.object({ ...drive, kind: z.literal("instruct"), session: DrivenSessionId, text: Instruction }),
+  // End the session's process, mid-turn or not.
+  z.object({ ...drive, kind: z.literal("stop"), session: DrivenSessionId }),
+  // Take it back to my terminal: end the process cleanly and answer `handed-back` with the command.
+  z.object({ ...drive, kind: z.literal("hand-back"), session: DrivenSessionId }),
+  // Send the full output of `turn`, or of the whole session without one.
+  z.object({ ...drive, kind: z.literal("output"), session: DrivenSessionId, turn: DriveId.optional() }),
+  // The owner's answer to the runner's prompt `prompt`.
+  z.object({ ...drive, kind: z.literal("answer"), session: DrivenSessionId, prompt: DriveId, answer: z.enum(["allow", "deny"]) }),
+  // The owner released the reply or output the secret scan withheld as `withheld`: the runner sends it.
+  z.object({ ...drive, kind: z.literal("release"), session: DrivenSessionId, withheld: DriveId }),
+]);
+
+/**
+ * Where people may skip permission prompts in driven sessions (protocol 0.5.0): `bypassAllowed` lists
+ * the projects, lower-cased, whose office allows `bypassPermissions`; an admin can turn it off for the
+ * whole office. Sent to a runner that said `drive` once its hello is let in, before any drive request,
+ * and again whenever an admin changes it. Until one arrives on a connection, and in any project it
+ * doesn't list, the runner runs no session with `bypassPermissions`.
+ *
+ * It is a message of its own, not a field of each start, because the runner enforces it as a standing
+ * rule: a change has to reach sessions already running, and a session the runner restores after its own
+ * restart comes with no start. Kept apart from a start's `permissions`, which is the person's own
+ * choice, a mistake in the server's start path alone can't skip prompts. It is by project because one
+ * server can host several offices, and a runner's link serves all of them.
+ */
+export const DrivePolicyMessageSchema = z.object({
+  type: z.literal("drive-policy"),
+  v: Version,
+  bypassAllowed: z.array(z.string().min(1).max(300)).max(1000),
+});
+
 export const OfficeServerMessageSchema = z.discriminatedUnion("type", [
   RepairMessageSchema,
   WelcomeMessageSchema,
@@ -477,6 +684,8 @@ export const OfficeServerMessageSchema = z.discriminatedUnion("type", [
   DropMessageSchema,
   AskedMessageSchema,
   AskRightsMessageSchema,
+  DriveMessageSchema,
+  DrivePolicyMessageSchema,
 ]);
 
 export type HandoffRepo = z.infer<typeof HandoffRepoSchema>;
@@ -509,6 +718,14 @@ export type AskedAckMessage = z.infer<typeof AskedAckMessageSchema>;
 export type AskRightsMessage = z.infer<typeof AskRightsMessageSchema>;
 export type OfficeServerMessage = z.infer<typeof OfficeServerMessageSchema>;
 export type WelcomeMessage = z.infer<typeof WelcomeMessageSchema>;
+export type DrivePermissions = z.infer<typeof DrivePermissionsSchema>;
+export type DriveMessage = z.infer<typeof DriveMessageSchema>;
+export type DriveKind = DriveMessage["kind"];
+export type DrivePolicyMessage = z.infer<typeof DrivePolicyMessageSchema>;
+export type DrivenMessage = z.infer<typeof DrivenMessageSchema>;
+export type DrivenKind = DrivenMessage["kind"];
+export type DriveRefusal = Extract<DrivenMessage, { kind: "refused" }>;
+export type DriveRefusalReason = DriveRefusal["reason"];
 
 /**
  * A parsed message, or why it was refused: `unsupported-version` when it carries a protocol
