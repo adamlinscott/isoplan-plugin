@@ -20,5 +20,6 @@
   "cloneSearchDays": 30,
   "repoSearchDepth": 3,
   "askPolls": 6,
-  "askPollSeconds": 10
+  "askPollSeconds": 10,
+  "startAtLogin": true
 }

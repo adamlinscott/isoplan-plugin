@@ -4,7 +4,8 @@ import { expect, test } from "vitest";
 import type { Exec } from "../connect/dialog.js";
 import { tempRoot } from "../data-layer/fixture.js";
 import { connectScriptPath, installWake, uninstall } from "./install.js";
-import { desktopEntry, macAppPath, macScript, registerLinkHandler, unregisterLinkHandler, windowsCommand } from "./link-handler.js";
+import { hiddenLauncher, launcherPaths, wscriptPath } from "./hidden-launch.js";
+import { desktopEntry, directCommand, linkLauncherPath, macAppPath, macScript, registerLinkHandler, unregisterLinkHandler, windowsCommand } from "./link-handler.js";
 
 const NODE = "C:\\Program Files\\nodejs\\node.exe";
 const SCRIPT = "C:\\Users\\ada\\.claude\\isoplan\\runner\\app\\dist\\connect.mjs";
@@ -21,18 +22,38 @@ function fakeOs(answer: (file: string, args: string[]) => { code: number | null;
 }
 
 const queried = (value: string) => ({ code: 0, stdout: `\r\nHKEY_CURRENT_USER\\Software\\Classes\\isoplan\\shell\\open\\command\r\n    (Default)    REG_SZ    ${value}\r\n\r\n` });
+const COMMAND_KEY = "HKCU\\Software\\Classes\\isoplan\\shell\\open\\command";
+/** Windows Script Host turned off by policy, as `reg query` prints it. */
+const SCRIPT_HOST_OFF = { code: 0, stdout: "\r\nHKEY_LOCAL_MACHINE\\Software\\Microsoft\\Windows Script Host\\Settings\r\n    Enabled    REG_DWORD    0x0\r\n\r\n" };
+/** An OS where the protocol's command is `command` (none when null) and Script Host is on unless `off`. */
+const windows = (command: string | null, off = false) =>
+  fakeOs((_, args) => {
+    if (args[0] !== "query") return { code: 0 };
+    if (args[1] === COMMAND_KEY) return command === null ? { code: 1 } : queried(command);
+    return off ? SCRIPT_HOST_OFF : { code: 1 };
+  });
 
-test("Windows: the isoplan URL protocol goes under HKCU, running node on the handler with the link, once", async () => {
+test("Windows: the isoplan URL protocol goes under HKCU, named Isoplan, through a launcher that hands the link to node hidden, once", async () => {
   const claudeDir = path.join(tempRoot(), ".claude");
-  const os = fakeOs((_, args) => (args[0] === "query" ? { code: 1 } : { code: 0 }));
+  const os = windows(null);
   const h = { platform: "win32" as const, claudeDir, home: "C:\\Users\\ada", node: NODE, script: SCRIPT, run: os.run };
-  expect(await registerLinkHandler(h)).toEqual([`registered isoplan:// links to open ${SCRIPT}`]);
+  const launcher = linkLauncherPath(claudeDir);
+  expect(await registerLinkHandler(h)).toEqual([`registered isoplan:// links to open ${SCRIPT}, through ${launcher}`]);
   expect(os.calls).toEqual([
-    ["reg", "query", "HKCU\\Software\\Classes\\isoplan\\shell\\open\\command", "/ve"],
+    ["reg", "query", COMMAND_KEY, "/ve"],
+    ["reg", "query", "HKCU\\Software\\Microsoft\\Windows Script Host\\Settings", "/v", "Enabled"],
+    ["reg", "query", "HKLM\\Software\\Microsoft\\Windows Script Host\\Settings", "/v", "Enabled"],
     ["reg", "add", "HKCU\\Software\\Classes\\isoplan", "/ve", "/d", "URL:Isoplan", "/f"],
     ["reg", "add", "HKCU\\Software\\Classes\\isoplan", "/v", "URL Protocol", "/d", "", "/f"],
-    ["reg", "add", "HKCU\\Software\\Classes\\isoplan\\shell\\open\\command", "/ve", "/d", `"${NODE}" "${SCRIPT}" "%1"`, "/f"],
+    ["reg", "add", "HKCU\\Software\\Classes\\isoplan\\shell\\open", "/v", "FriendlyAppName", "/d", "Isoplan", "/f"],
+    ["reg", "add", COMMAND_KEY, "/ve", "/d", `"${wscriptPath()}" //B //NoLogo "${launcher}" "%1"`, "/f"],
   ]);
+  // The launcher puts the link in node's environment, never on its command line, and starts it with window style 0.
+  const text = fs.readFileSync(launcher, "utf8");
+  expect(text).toBe(hiddenLauncher(NODE, SCRIPT, { link: true }));
+  expect(text).toContain('shell.Environment("PROCESS")("ISOPLAN_CONNECT_URL") = WScript.Arguments(0);');
+  expect(text).toContain(`shell.Run(${JSON.stringify(`"${NODE}" "${SCRIPT}"`)}, 0, false);`);
+  expect(launcherPaths(text)).toEqual({ node: NODE, script: SCRIPT });
 });
 
 /** A node and a handler that exist, in a temp folder. */
@@ -45,16 +66,23 @@ function realFiles() {
   return { node, script };
 }
 
-test("Windows: a registration whose node and handler exist is left alone, even naming another node; one naming a path that has gone is redone", async () => {
+test("Windows: a launcher whose node and handler exist is left alone, even another folder's; one naming a path that has gone, or the old direct command, is redone", async () => {
   const claudeDir = path.join(tempRoot(), ".claude");
   const there = realFiles();
   const h = { platform: "win32" as const, claudeDir, home: "C:\\Users\\ada", node: NODE, script: SCRIPT };
-  const working = fakeOs(() => queried(windowsCommand(there.node, there.script)));
+  const theirs = path.join(tempRoot(), "open-link.js");
+  fs.writeFileSync(theirs, hiddenLauncher(there.node, there.script, { link: true }));
+  const working = windows(windowsCommand(theirs));
   expect(await registerLinkHandler({ ...h, run: working.run })).toEqual([]);
   expect(working.calls).toHaveLength(1);
-  const broken = fakeOs((_, args) => (args[0] === "query" ? queried(windowsCommand(there.node, path.join(path.dirname(there.script), "gone.mjs"))) : { code: 0 }));
+  fs.writeFileSync(theirs, hiddenLauncher(there.node, path.join(path.dirname(there.script), "gone.mjs"), { link: true }));
+  const broken = windows(windowsCommand(theirs));
   expect(await registerLinkHandler({ ...h, run: broken.run })).toHaveLength(1);
-  expect(broken.calls).toHaveLength(4);
+  expect(broken.calls).toHaveLength(7);
+  // Node straight from the registry opens a console window, so a working one of that form goes through the launcher now.
+  const direct = windows(directCommand(there.node, there.script));
+  expect(await registerLinkHandler({ ...h, run: direct.run })).toHaveLength(1);
+  expect(direct.calls.at(-1)).toEqual(["reg", "add", COMMAND_KEY, "/ve", "/d", windowsCommand(linkLauncherPath(claudeDir)), "/f"]);
   // Another install registering at the same moment leaves it to that one.
   fs.writeFileSync(path.join(claudeDir, "isoplan", "link-handler.lock"), JSON.stringify({ pid: process.ppid }));
   const held = fakeOs(() => ({ code: 1 }));
@@ -62,13 +90,32 @@ test("Windows: a registration whose node and handler exist is left alone, even n
   expect(held.calls).toEqual([]);
 });
 
-test("Windows: uninstall takes the protocol out only when it runs this config folder's handler", async () => {
+test("Windows: with Script Host turned off, links run node directly, and a working direct command is kept", async () => {
+  const claudeDir = path.join(tempRoot(), ".claude");
+  const there = realFiles();
+  const h = { platform: "win32" as const, claudeDir, home: "C:\\Users\\ada", node: NODE, script: SCRIPT };
+  const none = windows(null, true);
+  expect(await registerLinkHandler({ ...h, run: none.run })).toEqual([expect.stringContaining("Windows Script Host is turned off")]);
+  expect(none.calls.at(-1)).toEqual(["reg", "add", COMMAND_KEY, "/ve", "/d", `"${NODE}" "${SCRIPT}" "%1"`, "/f"]);
+  expect(fs.existsSync(linkLauncherPath(claudeDir))).toBe(false);
+  const kept = windows(directCommand(there.node, there.script), true);
+  expect(await registerLinkHandler({ ...h, run: kept.run })).toEqual([]);
+  expect(kept.calls.filter((c) => c[1] === "add")).toEqual([]);
+});
+
+test("Windows: uninstall takes the protocol out only when it runs this config folder's handler or launcher, and the launcher goes", async () => {
   const claudeDir = path.join(tempRoot(), ".claude");
   const h = { platform: "win32" as const, claudeDir, home: "C:\\Users\\ada", script: SCRIPT };
-  const mine = fakeOs((_, args) => (args[0] === "query" ? queried(windowsCommand(NODE, SCRIPT.replace(/\\/g, "/"))) : { code: 0 }));
+  const launcher = linkLauncherPath(claudeDir);
+  fs.mkdirSync(path.dirname(launcher), { recursive: true });
+  fs.writeFileSync(launcher, hiddenLauncher(NODE, SCRIPT, { link: true }));
+  const mine = windows(windowsCommand(launcher));
   expect(await unregisterLinkHandler({ ...h, run: mine.run })).toEqual(["removed the isoplan:// link handler"]);
   expect(mine.calls.at(-1)).toEqual(["reg", "delete", "HKCU\\Software\\Classes\\isoplan", "/f"]);
-  const another = fakeOs(() => queried(windowsCommand(NODE, "D:\\other\\.claude\\isoplan\\runner\\app\\dist\\connect.mjs")));
+  expect(fs.existsSync(launcher)).toBe(false);
+  const direct = windows(directCommand(NODE, SCRIPT.replace(/\\/g, "/")));
+  expect(await unregisterLinkHandler({ ...h, run: direct.run })).toEqual(["removed the isoplan:// link handler"]);
+  const another = windows(windowsCommand("D:\\other\\.claude\\isoplan\\open-link.js"));
   expect(await unregisterLinkHandler({ ...h, run: another.run })).toEqual([]);
   expect(another.calls).toHaveLength(1);
 });

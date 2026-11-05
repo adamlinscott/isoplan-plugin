@@ -1,6 +1,6 @@
 import { expect, test } from "vitest";
 import type { Config } from "../data-layer/config.js";
-import { parseLink, withOffice } from "./link.js";
+import { isStartRunnerLink, parseLink, withOffice } from "./link.js";
 
 const CODE = "A".repeat(42) + "b";
 const link = (office: string, name = "Team office", code = CODE) => `isoplan://connect?${new URLSearchParams({ office, code, name })}`;
@@ -68,4 +68,12 @@ test("config.json: with only a `server` of the person's own, that office goes in
   expect((withOffice({ servers: taken }, config({ servers: taken }), team)!.servers as unknown[]).at(-1)).toEqual({ label: "team-office-2", server: team.server });
   // A name with nothing to make a label of is labelled by its host.
   expect((withOffice({}, config(), { ...team, name: "办公室" })!.servers as unknown[]).at(-1)).toEqual({ label: "office.team.com", server: team.server });
+});
+
+test("the restart link is isoplan://start-runner and nothing more", () => {
+  expect(isStartRunnerLink("isoplan://start-runner")).toBe(true);
+  expect(isStartRunnerLink("isoplan://start-runner/")).toBe(true);
+  for (const other of ["isoplan://start-runner?", "isoplan://start-runner?office=x", "isoplan://start-runner#x", "isoplan://start-runner/now", "isoplan://user@start-runner", "isoplan://stop-runner", "https://start-runner", link("https://office.team.com"), "not a link"]) {
+    expect(isStartRunnerLink(other)).toBe(false);
+  }
 });

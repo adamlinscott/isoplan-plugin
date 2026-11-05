@@ -253,6 +253,7 @@ async function main(argv: string[]): Promise<number> {
         runnerFrom: path.join(here, ".."),
         findClaude: () => findClaude(process.env, process.platform, os.homedir()),
         linkHandler: { platform: process.platform, home: os.homedir(), dataHome: process.env.XDG_DATA_HOME, node: process.execPath },
+        loginItem: { platform: process.platform, home: os.homedir(), configHome: process.env.XDG_CONFIG_HOME, uid: process.getuid?.(), node: process.execPath },
       }).then(
         (changes) => (changes.forEach((text) => emit({ type: "log", text })), changes),
         (err: unknown) => (emit({ type: "log", text: `couldn't install the wake hook: ${String((err as Error)?.message ?? err)}` }), []),

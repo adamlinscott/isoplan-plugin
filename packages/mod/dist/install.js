@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { statSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { promisify } from "node:util";
 //#region src/data-layer/git.ts
 function isAbsolute(p) {
@@ -7249,16 +7250,71 @@ const exec = (file, args, env) => new Promise((resolve) => {
 	"if ($r -eq [System.Windows.Forms.DialogResult]::OK) { exit 0 } else { exit 2 }"
 ].join("\n");
 //#endregion
+//#region src/install/hidden-launch.ts
+/** wscript.exe, by its full path, so no other program of that name is found first. */
+const wscriptPath = (env = process.env) => path.win32.join(env.SystemRoot || "C:\\Windows", "System32", "wscript.exe");
+/** The command Windows runs: wscript in batch mode (no prompts, no logo) on `launcher`, then `args`. */
+const launchCommand = (launcher, args = "") => `"${wscriptPath()}" //B //NoLogo "${launcher}"${args ? ` ${args}` : ""}`;
+/** The launcher `launchCommand` names in a command; null for any other command. */
+const launcherOf = (command) => command ? /^"[^"]+\\wscript\.exe" \/\/B \/\/NoLogo "([^"]+)"/i.exec(command)?.[1] ?? null : null;
+/**
+* The launcher: runs `"<node>" "<script>" <args>` hidden. With `link`, the link Windows gives it goes
+* to node in ISOPLAN_CONNECT_URL, never on a command line, as the Mac handler passes it.
+*/
+function hiddenLauncher(node, script, { args = "", link = false } = {}) {
+	const command = `"${node}" "${script}"${args ? ` ${args}` : ""}`;
+	return [
+		"// Isoplan: starts node with no window. The plugin's install wrote this file; uninstall removes it.",
+		`var isoplan = ${JSON.stringify({
+			node,
+			script
+		})};`,
+		"var shell = new ActiveXObject(\"WScript.Shell\");",
+		...link ? ["shell.Environment(\"PROCESS\")(\"ISOPLAN_CONNECT_URL\") = WScript.Arguments(0);"] : [],
+		`shell.Run(${JSON.stringify(command)}, 0, false);`,
+		""
+	].join("\r\n");
+}
+/** The node and script a launcher names, as hiddenLauncher writes them; null when it isn't one. */
+function launcherPaths(text) {
+	const line = text ? /^var isoplan = (.*);\r?$/m.exec(text)?.[1] : void 0;
+	try {
+		return line ? JSON.parse(line) : null;
+	} catch {
+		return null;
+	}
+}
+const SCRIPT_HOST_KEYS = ["HKCU\\Software\\Microsoft\\Windows Script Host\\Settings", "HKLM\\Software\\Microsoft\\Windows Script Host\\Settings"];
+/** Whether Windows Script Host is turned off for this person or this computer (`Enabled` set to 0). */
+async function scriptHostOff(run) {
+	for (const key of SCRIPT_HOST_KEYS) {
+		const value = /\bEnabled[ \t]+REG_\w+[ \t]+(\S+)/i.exec((await run("reg", [
+			"query",
+			key,
+			"/v",
+			"Enabled"
+		])).stdout)?.[1];
+		if (value !== void 0 && /^(0|0x0+)$/i.test(value)) return true;
+	}
+	return false;
+}
+//#endregion
 //#region src/install/link-handler.ts
 const KEY = "HKCU\\Software\\Classes\\isoplan";
-const COMMAND_KEY = `${KEY}\\shell\\open\\command`;
+const OPEN_KEY = `${KEY}\\shell\\open`;
+const COMMAND_KEY = `${OPEN_KEY}\\command`;
 const LSREGISTER = "/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister";
 const DESKTOP = "isoplan-connect.desktop";
 const macAppPath = (claudeDir) => path.join(claudeDir, "isoplan", "Isoplan Connect.app");
 const macMarker = (app) => path.join(app, "Contents", "Resources", "isoplan-handler.json");
 const desktopPath = (h) => path.join(h.dataHome || path.join(h.home, ".local", "share"), "applications", DESKTOP);
-/** The Windows open command: node and the handler, quoted, and the link. */
-const windowsCommand = (node, script) => `"${node}" "${script}" "%1"`;
+/** The Windows launcher the open command runs. */
+const linkLauncherPath = (claudeDir) => path.join(claudeDir, "isoplan", "open-link.js");
+/** The Windows open command: wscript on the launcher, and the link. */
+const windowsCommand = (launcher) => launchCommand(launcher, "\"%1\"");
+/** The open command where Windows Script Host is off: node and the handler, quoted, and the link. */
+const directCommand = (node, script) => `"${node}" "${script}" "%1"`;
+/** The value `reg query` prints for a key's default or a named value, whatever the language of its "(Default)" label. */
 const regValue = (stdout) => /REG_SZ[ \t]+(.*?)\s*$/m.exec(stdout)?.[1] ?? null;
 const norm = (p) => p.replace(/\\/g, "/").toLowerCase();
 const appleString = (text) => `"${text.replace(/\\/g, "\\\\").replace(/"/g, "\\\"")}"`;
@@ -7272,14 +7328,15 @@ const macScript = (node, script) => [
 const exists$1 = (file) => fs.stat(file).then(() => true, () => false);
 /** Whether a registration naming this node and this handler still works: both are there. */
 const works = async (paths) => !!paths && typeof paths.node === "string" && typeof paths.script === "string" && await exists$1(paths.node) && await exists$1(paths.script);
-/** The node and handler a Windows open command names, as windowsCommand writes it. */
-const windowsPaths = (command) => {
+/** The node and handler a direct Windows open command names, as directCommand writes it. */
+const directPaths = (command) => {
 	const m = command ? /^"([^"]+)" "([^"]+)" "%1"$/.exec(command) : null;
 	return m ? {
 		node: m[1],
 		script: m[2]
 	} : null;
 };
+/** A desktop entry's Exec argument, quoted as the Desktop Entry spec asks, then escaped as its strings are. */
 const execArg = (value) => `"${value.replace(/(["`$\\])/g, "\\$1")}"`.replace(/\\/g, "\\\\");
 /** The Linux desktop entry. */
 const desktopEntry = (node, script) => [
@@ -7310,12 +7367,12 @@ async function registerLinkHandler(given) {
 	const lock = linkHandlerLockPath(given.claudeDir);
 	if (!await takeLock(lock, process.pid, alive, false, Date.now(), { freshMs: 12e4 })) return [];
 	try {
-		return await register(given);
+		return await register$1(given);
 	} finally {
 		await releaseLock(lock, process.pid).catch(() => {});
 	}
 }
-async function register(given) {
+async function register$1(given) {
 	const h = {
 		...given,
 		node: await fs.realpath(given.node).catch(() => given.node)
@@ -7326,12 +7383,20 @@ async function register(given) {
 		if (r.code !== 0) throw new Error(`${path.basename(file)} ${args[0] ?? ""} failed${r.code === null ? " to start" : ` (${r.code})`}`);
 	};
 	if (h.platform === "win32") {
-		const want = windowsCommand(h.node, h.script);
-		if (await works(windowsPaths(regValue((await run("reg", [
+		const current = regValue((await run("reg", [
 			"query",
 			COMMAND_KEY,
 			"/ve"
-		])).stdout)))) return [];
+		])).stdout);
+		const launcher = launcherOf(current);
+		if (launcher && await works(launcherPaths(await fs.readFile(launcher, "utf8").catch(() => null)))) return [];
+		const off = await scriptHostOff(run);
+		if (off && await works(directPaths(current))) return [];
+		const file = linkLauncherPath(h.claudeDir);
+		if (!off) {
+			await fs.mkdir(path.dirname(file), { recursive: true });
+			await fs.writeFile(file, hiddenLauncher(h.node, h.script, { link: true }));
+		}
 		await must("reg", [
 			"add",
 			KEY,
@@ -7351,13 +7416,22 @@ async function register(given) {
 		]);
 		await must("reg", [
 			"add",
+			OPEN_KEY,
+			"/v",
+			"FriendlyAppName",
+			"/d",
+			"Isoplan",
+			"/f"
+		]);
+		await must("reg", [
+			"add",
 			COMMAND_KEY,
 			"/ve",
 			"/d",
-			want,
+			off ? directCommand(h.node, h.script) : windowsCommand(file),
 			"/f"
 		]);
-		return [`registered isoplan:// links to open ${h.script}`];
+		return [off ? `registered isoplan:// links to open ${h.script}; Windows Script Host is turned off, so a link shows a console window for a moment` : `registered isoplan:// links to open ${h.script}, through ${file}`];
 	}
 	if (h.platform === "darwin") {
 		const app = macAppPath(h.claudeDir);
@@ -7448,7 +7522,9 @@ async function unregisterLinkHandler(h) {
 			COMMAND_KEY,
 			"/ve"
 		])).stdout);
-		if (!value || !norm(value).includes(norm(h.script))) return [];
+		const launcher = linkLauncherPath(h.claudeDir);
+		await fs.rm(launcher, { force: true });
+		if (!value || ![h.script, launcher].some((p) => norm(value).includes(norm(p)))) return [];
 		await run("reg", [
 			"delete",
 			KEY,
@@ -7472,6 +7548,191 @@ async function unregisterLinkHandler(h) {
 		await fs.rm(file, { force: true });
 		await run("update-desktop-database", [path.dirname(file)]);
 		return [`removed the isoplan:// link handler, ${file}`];
+	}
+	return [];
+}
+//#endregion
+//#region src/install/login-item.ts
+/** What the item passes the wake hook. */
+const LOGIN_ARG = "--login";
+const RUN_KEY = "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+/** A short id of the config folder, so each folder's item has its own name. */
+const loginItemId = (claudeDir, platform) => createHash("sha256").update(normalPath(claudeDir, platform)).digest("hex").slice(0, 8);
+const runValueName = (claudeDir) => `Isoplan runner ${loginItemId(claudeDir, "win32")}`;
+const loginLauncherPath = (claudeDir) => path.join(claudeDir, "isoplan", "start-at-login.js");
+const launchAgentLabel = (claudeDir) => `dev.isoplan.runner.${loginItemId(claudeDir, "darwin")}`;
+const launchAgentPath = (home, claudeDir) => path.join(home, "Library", "LaunchAgents", `${launchAgentLabel(claudeDir)}.plist`);
+const autostartPath = (h) => path.join(h.configHome || path.join(h.home, ".config"), "autostart", `isoplan-runner-${loginItemId(h.claudeDir, "linux")}.desktop`);
+/** The Run value: wscript on the launcher. */
+const windowsLoginCommand = (claudeDir) => launchCommand(loginLauncherPath(claudeDir));
+const xml = (text) => text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+const unxml = (text) => text.replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&amp;/g, "&");
+/**
+* The LaunchAgent. AbandonProcessGroup, since launchd otherwise ends what is left in the job's
+* process group once the job exits, and the job exits as soon as it has started the runner.
+*/
+const launchAgentPlist = (label, node, script) => [
+	"<?xml version=\"1.0\" encoding=\"UTF-8\"?>",
+	"<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">",
+	"<plist version=\"1.0\">",
+	"<dict>",
+	"	<key>Label</key>",
+	`\t<string>${xml(label)}</string>`,
+	"	<key>ProgramArguments</key>",
+	"	<array>",
+	...[
+		node,
+		script,
+		LOGIN_ARG
+	].map((arg) => `\t\t<string>${xml(arg)}</string>`),
+	"	</array>",
+	"	<key>RunAtLoad</key>",
+	"	<true/>",
+	"	<key>AbandonProcessGroup</key>",
+	"	<true/>",
+	"</dict>",
+	"</plist>",
+	""
+].join("\n");
+const plistPaths = (text) => {
+	const args = text ? /<key>ProgramArguments<\/key>\s*<array>([\s\S]*?)<\/array>/.exec(text)?.[1] : void 0;
+	const [node, script] = args ? [...args.matchAll(/<string>([^<]*)<\/string>/g)].map((m) => unxml(m[1])) : [];
+	return node && script ? {
+		node,
+		script
+	} : null;
+};
+/** The XDG autostart entry. */
+const autostartEntry = (node, script) => [
+	"[Desktop Entry]",
+	"Type=Application",
+	"Name=Isoplan",
+	"Comment=Starts Isoplan's runner when you log in",
+	`Exec=${execArg(node)} ${execArg(script)} ${LOGIN_ARG}`,
+	"Terminal=false",
+	"NoDisplay=true",
+	`X-Isoplan-Login=${JSON.stringify({
+		node,
+		script
+	})}`,
+	""
+].join("\n");
+const autostartPaths = (entry) => {
+	const line = entry ? /^X-Isoplan-Login=(.*)$/m.exec(entry)?.[1] : void 0;
+	try {
+		return line ? JSON.parse(line) : null;
+	} catch {
+		return null;
+	}
+};
+const read = (file) => fs.readFile(file, "utf8").catch(() => null);
+/** Whether runner.json (`defaultsPath`, overridden by the person's `userPath`) has the runner start at login; on unless it says false. */
+async function startsAtLogin(defaultsPath, userPath) {
+	return (await loadSettings(nodeIo(), defaultsPath, userPath).catch(() => null))?.startAtLogin !== false;
+}
+const loginItemLockPath = (claudeDir) => path.join(claudeDir, "isoplan", "login-item.lock");
+/** Registers the login item unless a working one is there; says what it changed. Another install registering at the same moment leaves it to that one. */
+async function registerLoginItem(given) {
+	const lock = loginItemLockPath(given.claudeDir);
+	if (!await takeLock(lock, process.pid, alive, false, Date.now(), { freshMs: 12e4 })) return [];
+	try {
+		return await register(given);
+	} finally {
+		await releaseLock(lock, process.pid).catch(() => {});
+	}
+}
+async function register(given) {
+	const h = {
+		...given,
+		node: await fs.realpath(given.node).catch(() => given.node)
+	};
+	const run = h.run ?? exec;
+	const must = async (file, args) => {
+		const r = await run(file, args);
+		if (r.code !== 0) throw new Error(`${path.basename(file)} ${args[0] ?? ""} failed${r.code === null ? " to start" : ` (${r.code})`}`);
+	};
+	if (h.platform === "win32") {
+		const launcher = loginLauncherPath(h.claudeDir);
+		const want = windowsLoginCommand(h.claudeDir);
+		if (regValue((await run("reg", [
+			"query",
+			RUN_KEY,
+			"/v",
+			runValueName(h.claudeDir)
+		])).stdout) === want && await works(launcherPaths(await read(launcher)))) return [];
+		if (await scriptHostOff(run)) throw new Error("Windows Script Host is turned off on this computer, and without it the runner can't start with no window");
+		await fs.mkdir(path.dirname(launcher), { recursive: true });
+		await fs.writeFile(launcher, hiddenLauncher(h.node, h.script, { args: LOGIN_ARG }));
+		await must("reg", [
+			"add",
+			RUN_KEY,
+			"/v",
+			runValueName(h.claudeDir),
+			"/d",
+			want,
+			"/f"
+		]);
+		return [`set the runner to start at login, through ${launcher}`];
+	}
+	if (h.platform === "darwin") {
+		const file = launchAgentPath(h.home, h.claudeDir);
+		const label = launchAgentLabel(h.claudeDir);
+		if (await works(plistPaths(await read(file)))) return [];
+		await run("launchctl", ["bootout", `gui/${h.uid}/${label}`]);
+		await fs.mkdir(path.dirname(file), { recursive: true });
+		await fs.writeFile(file, launchAgentPlist(label, h.node, h.script));
+		await must("launchctl", [
+			"bootstrap",
+			`gui/${h.uid}`,
+			file
+		]);
+		return [`set the runner to start at login, through ${file}`];
+	}
+	if (h.platform === "linux") {
+		const file = autostartPath(h);
+		if (await works(autostartPaths(await read(file)))) return [];
+		await fs.mkdir(path.dirname(file), { recursive: true });
+		await fs.writeFile(file, autostartEntry(h.node, h.script));
+		return [`set the runner to start at login, through ${file}`];
+	}
+	return [];
+}
+/** Takes this config folder's login item out; says what it changed. */
+async function unregisterLoginItem(h) {
+	const run = h.run ?? exec;
+	const removed = (where) => [`took out the runner's start at login (${where})`];
+	if (h.platform === "win32") {
+		const name = runValueName(h.claudeDir);
+		const had = (await run("reg", [
+			"query",
+			RUN_KEY,
+			"/v",
+			name
+		])).code === 0;
+		if (had) await run("reg", [
+			"delete",
+			RUN_KEY,
+			"/v",
+			name,
+			"/f"
+		]);
+		const launcher = loginLauncherPath(h.claudeDir);
+		const hadLauncher = !!await fs.stat(launcher).catch(() => null);
+		await fs.rm(launcher, { force: true });
+		return had || hadLauncher ? removed(`${RUN_KEY}\\${name}`) : [];
+	}
+	if (h.platform === "darwin") {
+		const file = launchAgentPath(h.home, h.claudeDir);
+		if (!await fs.stat(file).catch(() => null)) return [];
+		await run("launchctl", ["bootout", `gui/${h.uid}/${launchAgentLabel(h.claudeDir)}`]);
+		await fs.rm(file, { force: true });
+		return removed(file);
+	}
+	if (h.platform === "linux") {
+		const file = autostartPath(h);
+		if (!await fs.stat(file).catch(() => null)) return [];
+		await fs.rm(file, { force: true });
+		return removed(file);
 	}
 	return [];
 }
@@ -7531,7 +7792,7 @@ const isWakeFor = (claudeDir) => {
 * script failing. An uninstall that failed, or whose process has gone, leaves its lock and log,
 * which go now, since the plugin is wanted after all.
 */
-async function installWake(paths, dataLayer, wakeSource, { auto = false, runnerFrom, findClaude, waitMs = INSTALL_WAIT_MS, linkHandler } = {}) {
+async function installWake(paths, dataLayer, wakeSource, { auto = false, runnerFrom, findClaude, waitMs = INSTALL_WAIT_MS, linkHandler, loginItem } = {}) {
 	const { claudeDir, settings } = paths;
 	if (auto && await isOptedOut(claudeDir)) return finishOptOut(paths);
 	if (auto && await pluginState(paths, dataLayer) === "uninstalled") return [];
@@ -7605,6 +7866,15 @@ async function installWake(paths, dataLayer, wakeSource, { auto = false, runnerF
 		claudeDir,
 		script: connectScriptPath(claudeDir)
 	}).catch((err) => [`couldn't register isoplan:// links: ${String(err?.message ?? err)}`]));
+	if (runnerFrom && loginItem) {
+		const item = {
+			...loginItem,
+			claudeDir,
+			script
+		};
+		const on = await startsAtLogin(path.join(runnerFrom, "runner.json"), path.join(claudeDir, "isoplan", "runner.json"));
+		changes.push(...await (on ? registerLoginItem(item) : unregisterLoginItem(item)).catch((err) => [`couldn't ${on ? "set the runner to start" : "take out the runner's start"} at login: ${String(err?.message ?? err)}`]));
+	}
 	if (done.length) await writeSettings(settings, current);
 	return [...changes, ...done];
 }
@@ -7669,7 +7939,7 @@ const SESSION_TRACES = [
 * person writes, is kept, and the folder goes once it is empty. Throws when settings.json can't be
 * merged, with the hooks and wake.mjs still in place and settings.json not written.
 */
-async function uninstall$1(paths, { optOut = false, settleMs = 0, confirm, runner = {}, linkHandler } = {}) {
+async function uninstall$1(paths, { optOut = false, settleMs = 0, confirm, runner = {}, linkHandler, loginItem } = {}) {
 	const changes = [];
 	const dir = path.dirname(wakeScriptPath(paths.claudeDir));
 	const remove = async (file) => {
@@ -7698,6 +7968,14 @@ async function uninstall$1(paths, { optOut = false, settleMs = 0, confirm, runne
 			script: connectScriptPath(paths.claudeDir)
 		});
 		changes.push(...await unregistered.catch((err) => [`couldn't take out the isoplan:// link handler: ${String(err?.message ?? err)}`]));
+	}
+	if (loginItem) {
+		const unregistered = unregisterLoginItem({
+			...loginItem,
+			claudeDir: paths.claudeDir,
+			script: wakeScriptPath(paths.claudeDir)
+		});
+		changes.push(...await unregistered.catch((err) => [`couldn't take out the runner's start at login: ${String(err?.message ?? err)}`]));
 	}
 	await remove(path.join(dir, "live"));
 	if (settleMs) await new Promise((r) => setTimeout(r, settleMs));
@@ -7923,6 +8201,13 @@ const linkHandler = {
 	dataHome: process.env.XDG_DATA_HOME,
 	node: process.execPath
 };
+const loginItem = {
+	platform: process.platform,
+	home: os.homedir(),
+	configHome: process.env.XDG_CONFIG_HOME,
+	uid: process.getuid?.(),
+	node: process.execPath
+};
 const start = (args, cwd, env) => spawn(process.execPath, args, {
 	cwd,
 	env,
@@ -7939,11 +8224,13 @@ try {
 			commandOf: processCommand,
 			waitMs: RUNNER_EXIT_MS
 		},
-		linkHandler
+		linkHandler,
+		loginItem
 	})).changes : await installWake(paths, path.join(here, "data-layer.js"), path.join(here, "wake.js"), {
 		runnerFrom: path.join(here, ".."),
 		findClaude: () => findClaude(process.env, process.platform, os.homedir()),
-		linkHandler
+		linkHandler,
+		loginItem
 	});
 	for (const change of changes) console.log(change);
 	if (!changes.length) console.log(uninstall ? "Nothing of Isoplan's was installed; nothing to remove." : "The wake hook is already installed; nothing changed.");

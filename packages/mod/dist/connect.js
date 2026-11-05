@@ -1,5 +1,5 @@
 import { execFile, spawn, spawnSync } from "node:child_process";
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -9,7 +9,7 @@ import { promisify } from "node:util";
 //#region src/data-layer/config.ts
 async function loadConfig(io, defaultsPath, userPath) {
 	const config = await loadSettings(io, defaultsPath, userPath);
-	const asked = (await readJson(io, userPath, true)).server;
+	const asked = (await readJson$1(io, userPath, true)).server;
 	if (typeof asked === "string" && URL.canParse(asked) && new URL(asked).protocol === "ws:" && !LOOPBACK$1.has(new URL(asked).hostname)) {
 		if (config.allowPlainWs) config.server = asked;
 		else config.plainRefused = asked;
@@ -44,8 +44,8 @@ function officesOf(config) {
 }
 /** The same per-key override for any settings file of the mod's, such as the runner's runner.json. */
 async function loadSettings(io, defaultsPath, userPath) {
-	const defaults = await readJson(io, defaultsPath);
-	const user = await readJson(io, userPath, true);
+	const defaults = await readJson$1(io, defaultsPath);
+	const user = await readJson$1(io, userPath, true);
 	const config = {};
 	for (const [key, fallback] of Object.entries(defaults)) config[key] = fits(key, user[key], fallback) ? user[key] : fallback;
 	return config;
@@ -73,7 +73,7 @@ function isWebSocketUrl(value) {
 	const url = new URL(value);
 	return url.protocol === "wss:" || url.protocol === "ws:" && LOOPBACK$1.has(url.hostname);
 }
-async function readJson(io, p, optional = false) {
+async function readJson$1(io, p, optional = false) {
 	if (optional && !await io.stat(p)) return {};
 	try {
 		const value = JSON.parse(await io.read(p));
@@ -203,7 +203,7 @@ function slugify(input) {
 	return input.toLowerCase().trim().replace(/[^\w\s-]/g, "").replace(/[\s_-]+/g, "-").replace(/^-+|-+$/g, "");
 }
 const captureStackTrace = "captureStackTrace" in Error ? Error.captureStackTrace : (..._args) => {};
-function isObject(data) {
+function isObject$1(data) {
 	return typeof data === "object" && data !== null && !Array.isArray(data);
 }
 const allowsEval = /* @__PURE__*/ cached(() => {
@@ -217,12 +217,12 @@ const allowsEval = /* @__PURE__*/ cached(() => {
 	}
 });
 function isPlainObject(o) {
-	if (isObject(o) === false) return false;
+	if (isObject$1(o) === false) return false;
 	const ctor = o.constructor;
 	if (ctor === void 0) return true;
 	if (typeof ctor !== "function") return true;
 	const prot = ctor.prototype;
-	if (isObject(prot) === false) return false;
+	if (isObject$1(prot) === false) return false;
 	if (Object.prototype.hasOwnProperty.call(prot, "isPrototypeOf") === false) return false;
 	return true;
 }
@@ -2116,7 +2116,7 @@ const $ZodObject = /*@__PURE__*/ $constructor("$ZodObject", (inst, def) => {
 		}
 		return propValues;
 	});
-	const isObject$1 = isObject;
+	const isObject = isObject$1;
 	const catchall = def.catchall;
 	let value;
 	const memo = globalConfig.memoizer;
@@ -2124,7 +2124,7 @@ const $ZodObject = /*@__PURE__*/ $constructor("$ZodObject", (inst, def) => {
 	inst._zod.parse = (payload, ctx) => {
 		value ?? (value = _normalized.value);
 		const input = payload.value;
-		if (!isObject$1(input)) {
+		if (!isObject(input)) {
 			payload.issues.push({
 				expected: "object",
 				code: "invalid_type",
@@ -2254,7 +2254,7 @@ const $ZodObjectJIT = /*@__PURE__*/ $constructor("$ZodObjectJIT", (inst, def) =>
 		return doc.compile();
 	};
 	let fastpass;
-	const isObject$2 = isObject;
+	const isObject = isObject$1;
 	const jit = !globalConfig.jitless;
 	const fastEnabled = jit && allowsEval.value;
 	const catchall = def.catchall;
@@ -2262,7 +2262,7 @@ const $ZodObjectJIT = /*@__PURE__*/ $constructor("$ZodObjectJIT", (inst, def) =>
 	inst._zod.parse = (payload, ctx) => {
 		value ?? (value = _normalized.value);
 		const input = payload.value;
-		if (!isObject$2(input)) {
+		if (!isObject(input)) {
 			payload.issues.push({
 				expected: "object",
 				code: "invalid_type",
@@ -2373,7 +2373,7 @@ const $ZodDiscriminatedUnion = /*@__PURE__*/ $constructor("$ZodDiscriminatedUnio
 	const disc = cached(() => discriminatorMap(def));
 	inst._zod.parse = (payload, ctx) => {
 		const input = payload.value;
-		if (!isObject(input)) {
+		if (!isObject$1(input)) {
 			payload.issues.push({
 				code: "invalid_type",
 				expected: "object",
@@ -6787,6 +6787,13 @@ async function lockHolder(file) {
 	return (await readLock(file))?.pid ?? null;
 }
 const held = (lock, now, { isAlive = alive, freshMs }) => !!lock && (lock.until !== null && lock.until > now || lock.pid !== null && isAlive(lock.pid) && (freshMs === void 0 || now - lock.mtimeMs < freshMs));
+/** Whether the lock is held: by a live pid (kept fresh, under `freshMs`), or by a hold-off that hasn't ended. */
+async function isHeld(file, now = Date.now(), isAlive = alive, rule = {}) {
+	return held(await readLock(file), now, {
+		...rule,
+		isAlive
+	});
+}
 /**
 * Takes the lock for `pid`; false when it is held (`isHeld`). With `force` (the plugin's data
 * layer) it is taken regardless: a detached one holding it sees that and steps aside. `extra` is
@@ -6994,15 +7001,219 @@ function keepCredential({ file, writeLock, server, account, legacy = false, pid 
 }
 //#endregion
 //#region src/install/state.ts
+/** Claude Code's plugins folder: $CLAUDE_CODE_PLUGIN_CACHE_DIR when it is set, else <claude dir>/plugins. */
+const pluginsDir = (claudeDir, env) => env.CLAUDE_CODE_PLUGIN_CACHE_DIR || path.join(claudeDir, "plugins");
+/** The folders $CLAUDE_CODE_PLUGIN_DIRS names. */
+const pluginDirsOf = (env) => (env.CLAUDE_CODE_PLUGIN_DIRS ?? "").split(path.delimiter).filter(Boolean);
+/** The system folder Claude Code reads managed-settings.json from. */
+function managedDir(platform) {
+	if (platform === "win32") return "C:\\Program Files\\ClaudeCode";
+	if (platform === "darwin") return "/Library/Application Support/ClaudeCode";
+	return "/etc/claude-code";
+}
 /** A path as compared: resolved, with forward slashes, and on Windows and macOS without regard to case. */
 function normalPath(p, platform = process.platform) {
 	const resolved = path.resolve(p).replace(/\\/g, "/");
 	return platform === "win32" || platform === "darwin" ? resolved.toLowerCase() : resolved;
 }
+function cacheParts(cache, file) {
+	const relative = path.relative(cache, path.resolve(file));
+	if (path.isAbsolute(relative)) return null;
+	const parts = relative.split(path.sep);
+	return parts.length >= 4 && parts[0] !== ".." ? parts : null;
+}
+async function realCacheParts(plugins, file) {
+	const cache = await fs.realpath(path.join(plugins, "cache")).catch(() => path.join(plugins, "cache"));
+	return {
+		cache,
+		parts: cacheParts(cache, await fs.realpath(file).catch(() => file))
+	};
+}
+const appliesTo = (install, project) => !project || !(install.scope === "project" || install.scope === "local") || !install.projectPath || normalPath(install.projectPath) === normalPath(project);
+const nameOf = (id) => id.slice(0, id.lastIndexOf("@"));
+/** Every install installed_plugins.json records; null when it is missing, can't be read, or isn't the shape known. */
+async function installs(plugins) {
+	const record = await readJson(path.join(plugins, "installed_plugins.json"));
+	const list = record?.plugins;
+	if (record?.version !== 2 || !isObject(list) || !Object.values(list).every(Array.isArray)) return null;
+	return Object.entries(list).flatMap(([id, entries]) => entries.map((entry) => {
+		const e = isObject(entry) ? entry : {};
+		const text = (key) => typeof e[key] === "string" ? e[key] : null;
+		return {
+			id,
+			scope: text("scope"),
+			projectPath: text("projectPath"),
+			installPath: text("installPath"),
+			version: text("version"),
+			lastUpdated: text("lastUpdated")
+		};
+	}));
+}
+/** Whether `enabledPlugins` names the plugin `id` enabled, disabled, or not at all (null). */
+async function enabledIn(file, id) {
+	const value = (await readJson(file))?.enabledPlugins;
+	return isObject(value) && typeof value[id] === "boolean" ? value[id] : null;
+}
+/**
+* What Claude Code says of the plugin `dataLayer` belongs to. With `project` (a session's project
+* folder) the project's settings and installs count too; without, only the machine's: the
+* managed files, the user's settings, and every install.
+*/
+async function pluginState(place, dataLayer, project) {
+	const { parts } = await realCacheParts(place.plugins, dataLayer);
+	if (!parts) return "enabled";
+	const id = `${parts[1]}@${parts[0]}`;
+	const name = nameOf(id);
+	const all = await installs(place.plugins);
+	let ids = [id];
+	if (all) {
+		const mine = all.filter((i) => nameOf(i.id) === name);
+		if (!mine.length) return await isInPluginDirs(place.pluginDirs ?? [], name) ? "enabled" : "uninstalled";
+		const here = mine.filter((i) => appliesTo(i, project));
+		if (!here.length) return "disabled";
+		ids = [...new Set(here.map((i) => i.id))];
+	}
+	return (await Promise.all(ids.map((one) => enabledFor(place, one, project)))).includes(true) ? "enabled" : "disabled";
+}
+async function enabledFor(place, id, project) {
+	const managed = await Promise.all((await managedFiles(place.managed)).map((file) => enabledIn(file, id)));
+	if (managed.includes(false)) return false;
+	if (managed.includes(true)) return true;
+	for (const file of await ownFiles(place, project)) {
+		const enabled = await enabledIn(file, id);
+		if (enabled !== null) return enabled;
+	}
+	return true;
+}
+async function isInPluginDirs(dirs, name) {
+	for (const dir of dirs) if ((await readJson(path.join(dir, ".claude-plugin", "plugin.json")))?.name === name) return true;
+	return false;
+}
+async function managedFiles(managed) {
+	const dropIns = await fs.readdir(path.join(managed, "managed-settings.d")).then((names) => names.filter((n) => n.endsWith(".json")).map((n) => path.join(managed, "managed-settings.d", n)), () => []);
+	return [path.join(managed, "managed-settings.json"), ...dropIns];
+}
+async function ownFiles({ claudeDir }, project) {
+	const files = [];
+	if (project) {
+		const root = await gitRoot(project);
+		if (root && normalPath(root) !== normalPath(project)) files.push(path.join(root, ".claude", "settings.local.json"));
+		files.push(path.join(project, ".claude", "settings.local.json"), path.join(project, ".claude", "settings.json"));
+	}
+	files.push(path.join(claudeDir, "settings.json"));
+	return files;
+}
+async function gitRoot(dir) {
+	for (let at = path.resolve(dir);; at = path.dirname(at)) {
+		if (await fs.stat(path.join(at, ".git")).then(() => true, () => false)) return at;
+		if (path.dirname(at) === at) return null;
+	}
+}
+const isObject = (value) => !!value && typeof value === "object" && !Array.isArray(value);
+async function readJson(file) {
+	try {
+		const value = JSON.parse((await fs.readFile(file, "utf8")).replace(/^\uFEFF/, ""));
+		return isObject(value) ? value : null;
+	} catch {
+		return null;
+	}
+}
+//#endregion
+//#region src/wake/wake.ts
+const wakeRecordPath = (claudeDir) => path.join(claudeDir, "isoplan", "wake.json");
+//#endregion
+//#region src/runner/environment.ts
+const runnerEnvPath = (claudeDir) => path.join(claudeDir, "isoplan", "runner", "environment.json");
+/** The recorded environment, or null when there is none, or it doesn't parse, so the starter's is used. */
+async function recordedEnv(claudeDir) {
+	try {
+		const { env } = JSON.parse(await fs.readFile(runnerEnvPath(claudeDir), "utf8"));
+		if (!env || typeof env !== "object" || Array.isArray(env)) return null;
+		return Object.fromEntries(Object.entries(env).filter((e) => typeof e[1] === "string"));
+	} catch {
+		return null;
+	}
+}
 //#endregion
 //#region src/runner/start.ts
 /** The runner's lock: `{ pid, code }` of the supervisor that holds it. */
 const runnerLockPath = (claudeDir) => path.join(claudeDir, "isoplan", "runner", "lock.json");
+/** What names a runner.js's code: its size and write time. Null when it is gone. */
+async function runnerCode(file) {
+	const st = await fs.stat(file).catch(() => null);
+	return st && st.isFile() ? `${st.size}-${Math.round(st.mtimeMs)}` : null;
+}
+/** The live runner's lock: a hold-off that hasn't ended, or a live pid that keeps it fresh. */
+async function liveRunner(claudeDir, now, isAlive) {
+	const lock = await readLock(runnerLockPath(claudeDir));
+	if (!lock) return null;
+	if (lock.until !== null && lock.until > now) return {
+		...lock,
+		isHoldOff: true
+	};
+	if (lock.pid !== null && isAlive(lock.pid) && now - lock.mtimeMs < 9e4) return {
+		...lock,
+		isHoldOff: false
+	};
+	return null;
+}
+/**
+* Starts the recorded runner unless a live one runs the recorded code. One on older code is
+* replaced. A hold-off keeps it from starting, except a crash loop's hold-off on older code: a new
+* version may have fixed what crashed.
+*/
+async function startRunner({ claudeDir, spawn, isAlive = alive, kill = (pid) => process.kill(pid), now = Date.now }) {
+	let runner;
+	try {
+		runner = JSON.parse(await fs.readFile(wakeRecordPath(claudeDir), "utf8")).runner;
+	} catch {
+		return "not-installed";
+	}
+	if (typeof runner !== "string") return "not-installed";
+	const code = await runnerCode(runner);
+	if (!code) return "not-installed";
+	const lockFile = runnerLockPath(claudeDir);
+	const live = await liveRunner(claudeDir, now(), isAlive);
+	if (live?.isHoldOff) {
+		if (live.extra.reason !== "gave-up" || live.extra.code === code) return "held-off";
+		if ((await readLock(lockFile))?.until === live.until) await fs.rm(lockFile, { force: true });
+	} else if (live) {
+		if (live.extra.code === code) return "running";
+		await stopRunner(claudeDir, {
+			isAlive,
+			kill,
+			now,
+			expect: {
+				pid: live.pid,
+				code: live.extra.code
+			}
+		});
+	}
+	const env = await recordedEnv(claudeDir);
+	spawn([
+		runner,
+		"--claude-dir",
+		claudeDir,
+		...env ? [] : ["--inherited-env"]
+	], claudeDir, env ?? void 0);
+	return "started";
+}
+/**
+* Ends the running runner, for uninstall and updates: its worker and forks follow once its
+* supervisor has gone. True when one was running. A stale lock's pid is never killed. With
+* `expect`, only the runner judged outdated is: if the lock names another pid or code by now
+* (another starter replaced it already), it is left.
+*/
+async function stopRunner(claudeDir, { isAlive = alive, kill = (pid) => process.kill(pid), now = Date.now, expect } = {}) {
+	const live = await liveRunner(claudeDir, now(), isAlive);
+	if (!live || live.isHoldOff || live.pid === null) return false;
+	if (expect && (live.pid !== expect.pid || live.extra.code !== expect.code)) return false;
+	try {
+		kill(live.pid);
+	} catch {}
+	await releaseLock(runnerLockPath(claudeDir), live.pid);
+	return true;
+}
 //#endregion
 //#region src/connect/dialog.ts
 const exec = (file, args, env) => new Promise((resolve) => {
@@ -7135,11 +7346,83 @@ async function tell(platform, title, text, problem = false, run = exec) {
 	]);
 }
 //#endregion
+//#region src/install/login-item.ts
+const RUN_KEY = "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+/** A short id of the config folder, so each folder's item has its own name. */
+const loginItemId = (claudeDir, platform) => createHash("sha256").update(normalPath(claudeDir, platform)).digest("hex").slice(0, 8);
+const runValueName = (claudeDir) => `Isoplan runner ${loginItemId(claudeDir, "win32")}`;
+const loginLauncherPath = (claudeDir) => path.join(claudeDir, "isoplan", "start-at-login.js");
+const launchAgentLabel = (claudeDir) => `dev.isoplan.runner.${loginItemId(claudeDir, "darwin")}`;
+const launchAgentPath = (home, claudeDir) => path.join(home, "Library", "LaunchAgents", `${launchAgentLabel(claudeDir)}.plist`);
+const autostartPath = (h) => path.join(h.configHome || path.join(h.home, ".config"), "autostart", `isoplan-runner-${loginItemId(h.claudeDir, "linux")}.desktop`);
+/** Whether runner.json (`defaultsPath`, overridden by the person's `userPath`) has the runner start at login; on unless it says false. */
+async function startsAtLogin(defaultsPath, userPath) {
+	return (await loadSettings(nodeIo(), defaultsPath, userPath).catch(() => null))?.startAtLogin !== false;
+}
+/** Takes this config folder's login item out; says what it changed. */
+async function unregisterLoginItem(h) {
+	const run = h.run ?? exec;
+	const removed = (where) => [`took out the runner's start at login (${where})`];
+	if (h.platform === "win32") {
+		const name = runValueName(h.claudeDir);
+		const had = (await run("reg", [
+			"query",
+			RUN_KEY,
+			"/v",
+			name
+		])).code === 0;
+		if (had) await run("reg", [
+			"delete",
+			RUN_KEY,
+			"/v",
+			name,
+			"/f"
+		]);
+		const launcher = loginLauncherPath(h.claudeDir);
+		const hadLauncher = !!await fs.stat(launcher).catch(() => null);
+		await fs.rm(launcher, { force: true });
+		return had || hadLauncher ? removed(`${RUN_KEY}\\${name}`) : [];
+	}
+	if (h.platform === "darwin") {
+		const file = launchAgentPath(h.home, h.claudeDir);
+		if (!await fs.stat(file).catch(() => null)) return [];
+		await run("launchctl", ["bootout", `gui/${h.uid}/${launchAgentLabel(h.claudeDir)}`]);
+		await fs.rm(file, { force: true });
+		return removed(file);
+	}
+	if (h.platform === "linux") {
+		const file = autostartPath(h);
+		if (!await fs.stat(file).catch(() => null)) return [];
+		await fs.rm(file, { force: true });
+		return removed(file);
+	}
+	return [];
+}
+//#endregion
 //#region src/install/install.ts
+const wakeScriptPath = (claudeDir) => path.join(claudeDir, "isoplan", "wake.mjs");
 /** Where install copies the runner and the defaults it reads, under the plugin's own layout. */
 const runnerAppDir = (claudeDir) => path.join(claudeDir, "isoplan", "runner", "app");
 /** A file's name in the copy: the bundle is an ES module and no package.json beside the copy says so, so it is .mjs, as wake.mjs is. */
 const copiedAs = (file) => file.replace(/\.js$/, ".mjs");
+/** The uninstall's lock, which also holds off a retry once one has failed. */
+const uninstallLockPath = (claudeDir) => path.join(claudeDir, "isoplan", "uninstall.json");
+/** The data layer wake.json records; null when there is none. */
+async function recordedDataLayer(claudeDir) {
+	try {
+		const { dataLayer } = JSON.parse(await fs.readFile(wakeRecordPath(claudeDir), "utf8"));
+		return typeof dataLayer === "string" ? dataLayer : null;
+	} catch {
+		return null;
+	}
+}
+/** What Claude Code says of the plugin whose data layer wake.json records (state.ts); enabled when none is recorded. */
+async function recordedState(paths, cwd) {
+	const dataLayer = await recordedDataLayer(paths.claudeDir);
+	return dataLayer ? pluginState(paths, dataLayer, cwd) : "enabled";
+}
+/** Whether a background uninstall is running, or holding off after one failed. */
+const isUninstalling = (claudeDir) => isHeld(uninstallLockPath(claudeDir));
 /**
 * Ends the runner its lock names, and waits up to `waitMs` for it to exit; its worker and forks
 * follow its supervisor. One whose lock is stale (not kept fresh, after a sleep, say) is ended only
@@ -7205,6 +7488,30 @@ async function processCommand(pid, platform = process.platform) {
 	}
 }
 //#endregion
+//#region src/wake/outside.ts
+async function startFromOutside({ paths, spawn, login, isAlive }) {
+	const { claudeDir } = paths;
+	const state = await recordedState(paths).catch(() => "enabled");
+	if (state === "uninstalled") {
+		if (!await isUninstalling(claudeDir)) spawn([wakeScriptPath(claudeDir), "--uninstall"], claudeDir);
+		return "uninstalling";
+	}
+	if (state === "disabled") return "disabled";
+	if (login && !await startsAtLogin(path.join(runnerAppDir(claudeDir), "runner.json"), path.join(claudeDir, "isoplan", "runner.json"))) {
+		await unregisterLoginItem({
+			...login,
+			claudeDir,
+			script: wakeScriptPath(claudeDir)
+		}).catch(() => []);
+		return "off";
+	}
+	return startRunner({
+		claudeDir,
+		spawn,
+		...isAlive && { isAlive }
+	});
+}
+//#endregion
 //#region src/connect/link.ts
 const LOOPBACK = /* @__PURE__ */ new Set([
 	"127.0.0.1",
@@ -7250,6 +7557,16 @@ function parseLink(text) {
 		code,
 		name
 	};
+}
+/**
+* Whether `text` is the link that starts this computer's runner, isoplan://start-runner, as the web
+* app's "Restart Isoplan on this machine" opens it: exactly that, with nothing after it, since any
+* web page can open one.
+*/
+function isStartRunnerLink(text) {
+	if (!URL.canParse(text)) return false;
+	const url = new URL(text);
+	return url.protocol === "isoplan:" && url.host === "start-runner" && ["", "/"].includes(url.pathname) && !url.search && !url.hash && !url.username && !url.password && !/[?#]/.test(text);
 }
 /** The office's label in config.json: its name, lower case, letters, digits and dashes. */
 const labelOf = (name) => name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 32).replace(/-+$/, "");
@@ -7589,7 +7906,39 @@ const startDetached = (link, run) => {
 	child.on("exit", () => running = false).on("error", () => running = false);
 	return () => running;
 };
-if (mode === "--status") {
+const log = (text) => {
+	fs.mkdir(path.dirname(logFile), { recursive: true }).then(() => fs.appendFile(logFile, `${(/* @__PURE__ */ new Date()).toISOString()} ${run ? `${runTag(run)} ` : ""}${text}\n`)).catch(() => {});
+};
+const STARTED = {
+	started: "Started Isoplan on this computer.",
+	running: "Isoplan was already running on this computer.",
+	"held-off": "Isoplan is holding off on this computer for up to an hour (the office didn't want it, or it kept stopping); see runner.log beside this log.",
+	"not-installed": "Isoplan isn't set up on this computer yet: start Claude Code once, so the plugin sets itself up.",
+	disabled: "Isoplan's plugin is turned off on this computer, so nothing was started.",
+	uninstalling: "Isoplan's plugin was uninstalled, so it is being taken off this computer.",
+	off: "Isoplan no longer starts when you log in on this computer."
+};
+if (link && !mode && isStartRunnerLink(link)) {
+	const hidden = (args, cwd, env) => spawn(process.execPath, args, {
+		cwd,
+		env,
+		detached: true,
+		stdio: "ignore",
+		windowsHide: true
+	}).on("error", () => {}).unref();
+	const said = STARTED[await startFromOutside({
+		paths: {
+			claudeDir,
+			settings: path.join(claudeDir, "settings.json"),
+			plugins: pluginsDir(claudeDir, process.env),
+			managed: managedDir(process.platform),
+			pluginDirs: pluginDirsOf(process.env)
+		},
+		spawn: hidden
+	})];
+	log(`isoplan://start-runner: ${said}`);
+	process.stdout.write(said + "\n");
+} else if (mode === "--status") {
 	const offices = officesOf(await loadConfig(nodeIo(), defaultsPath, path.join(claudeDir, "isoplan", "config.json")));
 	const [pairing, who] = await Promise.all([readPairing(pairingPath(claudeDir)), account()]);
 	process.stdout.write(statusSentence(offices.map((o) => ({
@@ -7612,28 +7961,23 @@ if (mode === "--status") {
 	startDetached(link);
 	process.stdout.write(`A window is opening on this computer to connect Claude Code to Isoplan: answer it there. Run this only once. What happens is written to ${logFile}.\n`);
 } else if (!link) {
-	process.stderr.write("usage: node connect.js [--wait] <isoplan://connect?...>, or node connect.js --status\n");
+	process.stderr.write("usage: node connect.js [--wait] <isoplan://connect?...>, node connect.js isoplan://start-runner, or node connect.js --status\n");
 	process.exitCode = 2;
-} else {
-	const log = (text) => {
-		fs.mkdir(path.dirname(logFile), { recursive: true }).then(() => fs.appendFile(logFile, `${(/* @__PURE__ */ new Date()).toISOString()} ${run ? `${runTag(run)} ` : ""}${text}\n`)).catch(() => {});
-	};
-	try {
-		await connect(link, {
-			claudeDir,
-			defaultsPath,
-			account,
-			machine: os.hostname(),
-			ask: (title, text) => ask(process.platform, title, text),
-			tell: (title, text, problem) => tell(process.platform, title, text, problem),
-			restart: () => stopReporting(claudeDir),
-			log
-		});
-	} catch (err) {
-		log(`couldn't connect: ${String(err?.stack ?? err)}`);
-		await tell(process.platform, "Connect Claude Code to Isoplan", `Claude Code wasn't connected: ${String(err?.message ?? err)}`, true).catch(() => {});
-		process.exitCode = 1;
-	}
+} else try {
+	await connect(link, {
+		claudeDir,
+		defaultsPath,
+		account,
+		machine: os.hostname(),
+		ask: (title, text) => ask(process.platform, title, text),
+		tell: (title, text, problem) => tell(process.platform, title, text, problem),
+		restart: () => stopReporting(claudeDir),
+		log
+	});
+} catch (err) {
+	log(`couldn't connect: ${String(err?.stack ?? err)}`);
+	await tell(process.platform, "Connect Claude Code to Isoplan", `Claude Code wasn't connected: ${String(err?.message ?? err)}`, true).catch(() => {});
+	process.exitCode = 1;
 }
 //#endregion
 export {};

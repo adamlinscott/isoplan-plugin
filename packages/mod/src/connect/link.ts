@@ -52,6 +52,17 @@ export function parseLink(text: string): ConnectLink | string {
   return { office: at.origin, server: `${at.origin.replace(/^http/, "ws")}/data-layer`, host: at.host, code, name };
 }
 
+/**
+ * Whether `text` is the link that starts this computer's runner, isoplan://start-runner, as the web
+ * app's "Restart Isoplan on this machine" opens it: exactly that, with nothing after it, since any
+ * web page can open one.
+ */
+export function isStartRunnerLink(text: string): boolean {
+  if (!URL.canParse(text)) return false;
+  const url = new URL(text);
+  return url.protocol === "isoplan:" && url.host === "start-runner" && ["", "/"].includes(url.pathname) && !url.search && !url.hash && !url.username && !url.password && !/[?#]/.test(text);
+}
+
 /** The office's label in config.json: its name, lower case, letters, digits and dashes. */
 export const labelOf = (name: string) =>
   name

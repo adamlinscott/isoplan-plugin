@@ -2,8 +2,14 @@
 // only and without admin rights, and takes it out again. Install does it with the wake hook
 // (install.ts), so it follows the plugin's own copy of the handler, which outlives plugin updates.
 //
-// - Windows: HKCU\Software\Classes\isoplan, a URL protocol whose open command runs node on the
-//   handler with the link ("%1").
+// - Windows: HKCU\Software\Classes\isoplan, a URL protocol whose open command runs wscript on a
+//   launcher, <claude dir>/isoplan/open-link.js, which hands the link to node on the handler, hidden
+//   and in the environment (hidden-launch.ts), so a link opens no console window. Its open verb's
+//   FriendlyAppName is Isoplan, which is what the browser's "open this link?" prompt names
+//   (AssocQueryString's friendly app name, probed on Windows 11: without it, "Microsoft Windows
+//   Based Script Host"). Where Windows Script Host is turned off, the command runs node on the
+//   handler with the link ("%1") instead, which shows a console window for a moment. A registration
+//   of that older form is redone through the launcher once Script Host is on.
 // - macOS: a small AppleScript app, <claude dir>/isoplan/Isoplan Connect.app, made with osacompile,
 //   claiming the isoplan scheme in its Info.plist (CFBundleURLTypes), signed again ad hoc once that
 //   is changed, and registered with LaunchServices (lsregister). It hands the link to node in the
@@ -23,6 +29,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { exec, type Exec } from "../connect/dialog.js";
 import { alive, releaseLock, takeLock } from "../wake/lock.js";
+import { hiddenLauncher, launchCommand, launcherOf, launcherPaths, scriptHostOff } from "./hidden-launch.js";
 
 export interface LinkHandler {
   platform: NodeJS.Platform;
@@ -37,7 +44,8 @@ export interface LinkHandler {
 }
 
 const KEY = "HKCU\\Software\\Classes\\isoplan";
-const COMMAND_KEY = `${KEY}\\shell\\open\\command`;
+const OPEN_KEY = `${KEY}\\shell\\open`;
+const COMMAND_KEY = `${OPEN_KEY}\\command`;
 const LSREGISTER = "/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister";
 const DESKTOP = "isoplan-connect.desktop";
 
@@ -45,11 +53,15 @@ export const macAppPath = (claudeDir: string) => path.join(claudeDir, "isoplan",
 const macMarker = (app: string) => path.join(app, "Contents", "Resources", "isoplan-handler.json");
 const desktopPath = (h: Pick<LinkHandler, "home" | "dataHome">) => path.join(h.dataHome || path.join(h.home, ".local", "share"), "applications", DESKTOP);
 
-/** The Windows open command: node and the handler, quoted, and the link. */
-export const windowsCommand = (node: string, script: string) => `"${node}" "${script}" "%1"`;
+/** The Windows launcher the open command runs. */
+export const linkLauncherPath = (claudeDir: string) => path.join(claudeDir, "isoplan", "open-link.js");
+/** The Windows open command: wscript on the launcher, and the link. */
+export const windowsCommand = (launcher: string) => launchCommand(launcher, '"%1"');
+/** The open command where Windows Script Host is off: node and the handler, quoted, and the link. */
+export const directCommand = (node: string, script: string) => `"${node}" "${script}" "%1"`;
 
-// The value `reg query` prints for a key's default, whatever the language of its "(Default)" label.
-const regValue = (stdout: string) => /REG_SZ[ \t]+(.*?)\s*$/m.exec(stdout)?.[1] ?? null;
+/** The value `reg query` prints for a key's default or a named value, whatever the language of its "(Default)" label. */
+export const regValue = (stdout: string) => /REG_SZ[ \t]+(.*?)\s*$/m.exec(stdout)?.[1] ?? null;
 // A path as Windows compares it.
 const norm = (p: string) => p.replace(/\\/g, "/").toLowerCase();
 
@@ -66,16 +78,16 @@ export const macScript = (node: string, script: string) =>
 
 const exists = (file: string) => fs.stat(file).then(() => true, () => false);
 /** Whether a registration naming this node and this handler still works: both are there. */
-const works = async (paths: { node?: unknown; script?: unknown } | null) =>
+export const works = async (paths: { node?: unknown; script?: unknown } | null) =>
   !!paths && typeof paths.node === "string" && typeof paths.script === "string" && (await exists(paths.node)) && (await exists(paths.script));
-/** The node and handler a Windows open command names, as windowsCommand writes it. */
-const windowsPaths = (command: string | null) => {
+/** The node and handler a direct Windows open command names, as directCommand writes it. */
+const directPaths = (command: string | null) => {
   const m = command ? /^"([^"]+)" "([^"]+)" "%1"$/.exec(command) : null;
   return m ? { node: m[1], script: m[2] } : null;
 };
 
-// A desktop entry's Exec argument, quoted as the Desktop Entry spec asks, then escaped as its strings are.
-const execArg = (value: string) => `"${value.replace(/(["`$\\])/g, "\\$1")}"`.replace(/\\/g, "\\\\");
+/** A desktop entry's Exec argument, quoted as the Desktop Entry spec asks, then escaped as its strings are. */
+export const execArg = (value: string) => `"${value.replace(/(["`$\\])/g, "\\$1")}"`.replace(/\\/g, "\\\\");
 /** The Linux desktop entry. */
 export const desktopEntry = (node: string, script: string) =>
   [
@@ -120,12 +132,23 @@ async function register(given: LinkHandler): Promise<string[]> {
     if (r.code !== 0) throw new Error(`${path.basename(file)} ${args[0] ?? ""} failed${r.code === null ? " to start" : ` (${r.code})`}`);
   };
   if (h.platform === "win32") {
-    const want = windowsCommand(h.node, h.script);
-    if (await works(windowsPaths(regValue((await run("reg", ["query", COMMAND_KEY, "/ve"])).stdout)))) return [];
+    const current = regValue((await run("reg", ["query", COMMAND_KEY, "/ve"])).stdout);
+    // Through a launcher, this config folder's or another's: kept while the node and handler it names are there.
+    const launcher = launcherOf(current);
+    if (launcher && (await works(launcherPaths(await fs.readFile(launcher, "utf8").catch(() => null))))) return [];
+    // Script Host is checked only here, as it registers: one turned off later leaves the links to its message.
+    const off = await scriptHostOff(run);
+    if (off && (await works(directPaths(current)))) return [];
+    const file = linkLauncherPath(h.claudeDir);
+    if (!off) {
+      await fs.mkdir(path.dirname(file), { recursive: true });
+      await fs.writeFile(file, hiddenLauncher(h.node, h.script, { link: true }));
+    }
     await must("reg", ["add", KEY, "/ve", "/d", "URL:Isoplan", "/f"]);
     await must("reg", ["add", KEY, "/v", "URL Protocol", "/d", "", "/f"]);
-    await must("reg", ["add", COMMAND_KEY, "/ve", "/d", want, "/f"]);
-    return [`registered isoplan:// links to open ${h.script}`];
+    await must("reg", ["add", OPEN_KEY, "/v", "FriendlyAppName", "/d", "Isoplan", "/f"]);
+    await must("reg", ["add", COMMAND_KEY, "/ve", "/d", off ? directCommand(h.node, h.script) : windowsCommand(file), "/f"]);
+    return [off ? `registered isoplan:// links to open ${h.script}; Windows Script Host is turned off, so a link shows a console window for a moment` : `registered isoplan:// links to open ${h.script}, through ${file}`];
   }
   if (h.platform === "darwin") {
     const app = macAppPath(h.claudeDir);
@@ -168,7 +191,10 @@ export async function unregisterLinkHandler(h: Omit<LinkHandler, "node">): Promi
   const run = h.run ?? exec;
   if (h.platform === "win32") {
     const value = regValue((await run("reg", ["query", COMMAND_KEY, "/ve"])).stdout);
-    if (!value || !norm(value).includes(norm(h.script))) return [];
+    const launcher = linkLauncherPath(h.claudeDir);
+    // This config folder's launcher goes whoever holds the scheme now; nothing else runs it.
+    await fs.rm(launcher, { force: true });
+    if (!value || ![h.script, launcher].some((p) => norm(value).includes(norm(p)))) return [];
     await run("reg", ["delete", KEY, "/f"]);
     return ["removed the isoplan:// link handler"];
   }
