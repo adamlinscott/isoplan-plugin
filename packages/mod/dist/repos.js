@@ -6489,6 +6489,8 @@ const MAX_OUTPUT_LENGTH = 2e5;
 const MAX_PROMPT_LENGTH = 2e3;
 /** The longest error text or refusal detail. */
 const MAX_DETAIL_LENGTH = 1e3;
+/** The longest folder a `handed-back` names. */
+const MAX_FOLDER_LENGTH = 4096;
 /** A drive request's, an instruction's, a prompt's or a withheld text's id. */
 const DriveId = string().min(1).max(100);
 /** A driven session, by its id as its facts name it (`claude-code:<uuid>`). */
@@ -6702,8 +6704,6 @@ const AskedAckMessageSchema = object({
 	v: Version,
 	question: RequestId
 });
-/** The most driven sessions a `holding` message lists. */
-const MAX_HOLDING = 200;
 const driven = {
 	type: literal("driven"),
 	v: Version
@@ -6711,15 +6711,15 @@ const driven = {
 /**
 * Why a runner won't do what a `drive` request asked, sent in place of its answer (protocol 0.5.0).
 * `not-owner`: the acting person isn't the session's owner, this runner's person. `not-found`: this
-* machine has no driven session by that id that it would act on. `bypass-off`: the start asked for
+* machine has no driven session by that id that it would act on, or, for a release, holds nothing
+* withheld under that id (it was dropped, or the runner restarted since). `bypass-off`: the start asked for
 * `bypassPermissions` in a project whose office doesn't allow it (`drive-policy`). `no-folder`: this
 * machine has no folder for the room's project. `no-claude`: it has no claude binary. `busy`: the
 * session can't take this now, such as while a turn runs. `no-prompt`: an answer names a prompt the
 * session isn't waiting on (never raised by this runner, answered already, timed out or cancelled).
-* `offline` is never sent by a runner: it is the server's own, for a request it refused at once
-* because the owner's runner isn't linked (nothing is queued), so the server and the floor read one
-* list of reasons. `cap-reached`: the project already has `limit` driven sessions running on this
-* machine. `unavailable` is anything else, saying what in `detail`.
+* `cap-reached`: the project already has `limit` driven sessions running on this machine.
+* `unavailable` is anything else, saying what in `detail`. A runner never refuses `offline`: that is
+* the server's own (FloorDriveRefusalReason).
 */
 const DrivenRefusedSchema = discriminatedUnion("reason", [
 	object({
@@ -6733,8 +6733,7 @@ const DrivenRefusedSchema = discriminatedUnion("reason", [
 			"no-folder",
 			"no-claude",
 			"busy",
-			"no-prompt",
-			"offline"
+			"no-prompt"
 		]),
 		detail: Detail.optional()
 	}),
@@ -6791,6 +6790,12 @@ discriminatedUnion("type", [
 			tool: ToolName,
 			summary: string().min(1).max(500).optional(),
 			withheld: literal(true).optional()
+		}).superRefine((message, context) => {
+			if (message.withheld && message.summary !== void 0) context.addIssue({
+				code: "custom",
+				path: ["summary"],
+				message: "no summary when the secret scan withheld it"
+			});
 		}),
 		object({
 			...driven,
@@ -6825,7 +6830,7 @@ discriminatedUnion("type", [
 			id: DriveId,
 			session: DrivenSessionId,
 			turn: DriveId.optional(),
-			text: string().min(1).max(MAX_OUTPUT_LENGTH),
+			text: string().max(MAX_OUTPUT_LENGTH),
 			cut: Cut,
 			withheld: Withheld
 		}),
@@ -6883,7 +6888,7 @@ discriminatedUnion("type", [
 			id: DriveId,
 			session: DrivenSessionId,
 			command: string().min(1).max(500),
-			folder: string().min(1).max(4096)
+			folder: string().min(1).max(MAX_FOLDER_LENGTH)
 		}),
 		DrivenRefusedSchema,
 		object({
@@ -6895,7 +6900,7 @@ discriminatedUnion("type", [
 				held: boolean(),
 				permissions: DrivePermissionsSchema,
 				turn: DriveId.optional()
-			})).max(MAX_HOLDING)
+			})).max(200)
 		})
 	])
 ]);
@@ -7153,7 +7158,7 @@ discriminatedUnion("type", [
 	object({
 		type: literal("drive-policy"),
 		v: Version,
-		bypassAllowed: array(string().min(1).max(300)).max(1e3)
+		bypassAllowed: array(string().min(1)).max(1e3)
 	})
 ]);
 //#endregion

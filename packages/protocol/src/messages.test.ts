@@ -1,13 +1,21 @@
 import { describe, expect, test } from "vitest";
 import {
+  MAX_DETAIL_LENGTH,
+  MAX_DRIVE_ID_LENGTH,
+  MAX_HOLDING,
   MAX_INSTRUCTION_LENGTH,
   MAX_OUTPUT_LENGTH,
+  MAX_PROMPT_LENGTH,
   MAX_REPLY_LENGTH,
+  MAX_ROOM_SESSIONS,
+  MAX_SUMMARY_LENGTH,
+  MAX_TOOL_NAME_LENGTH,
   parseDataLayerMessage,
   parseOfficeServerMessage,
   PROTOCOL_VERSION,
   type AgentFact,
   type Facts,
+  type FloorDriveRefusalReason,
   type Handoff,
   type ParseResult,
 } from "./index.js";
@@ -339,8 +347,8 @@ const broken: Record<keyof typeof valid, [unknown, string]> = {
   "drive release": [{ ...valid["drive release"], withheld: "" }, "withheld"],
   "drive-policy": [{ ...valid["drive-policy"], bypassAllowed: [""] }, "bypassAllowed[0]"],
   "driven started": [{ ...valid["driven started"], room: undefined }, "room"],
-  "driven turn-started": [{ ...valid["driven turn-started"], turn: "x".repeat(101) }, "turn"],
-  "driven tool": [{ ...valid["driven tool"], summary: "x".repeat(501) }, "summary"],
+  "driven turn-started": [{ ...valid["driven turn-started"], turn: "x".repeat(MAX_DRIVE_ID_LENGTH + 1) }, "turn"],
+  "driven tool": [{ ...valid["driven tool"], summary: "x".repeat(MAX_SUMMARY_LENGTH + 1) }, "summary"],
   "driven reply": [{ ...valid["driven reply"], text: "x".repeat(MAX_REPLY_LENGTH + 1) }, "text"],
   "driven turn-ended": [{ ...valid["driven turn-ended"], outcome: "cancelled" }, "outcome"],
   "driven error": [{ ...valid["driven error"], text: "" }, "text"],
@@ -539,13 +547,33 @@ describe("changes", () => {
 });
 
 describe("driven sessions", () => {
-  test("a reply or output at its limit parses, cut or withheld, and one past it doesn't", () => {
-    const reply = { ...valid["driven reply"], text: "x".repeat(MAX_REPLY_LENGTH), cut: true };
-    const output = { ...valid["driven output"], text: "x".repeat(MAX_OUTPUT_LENGTH), cut: true };
+  const long = (length: number) => "x".repeat(length);
+  const sessions = (count: number) => Array.from({ length: count }, (_, i) => `claude-code:s${i}`);
+  test.each([
+    ["a cut reply", parseDataLayerMessage, (n: number) => ({ ...valid["driven reply"], text: long(n), cut: true }), MAX_REPLY_LENGTH, "text"],
+    ["a cut output", parseDataLayerMessage, (n: number) => ({ ...valid["driven output"], text: long(n), cut: true }), MAX_OUTPUT_LENGTH, "text"],
+    ["a prompt's description", parseDataLayerMessage, (n: number) => ({ ...valid["driven prompt"], description: long(n) }), MAX_PROMPT_LENGTH, "description"],
+    ["a refusal's detail", parseDataLayerMessage, (n: number) => ({ ...valid["driven refused"], detail: long(n) }), MAX_DETAIL_LENGTH, "detail"],
+    ["a tool's name", parseDataLayerMessage, (n: number) => ({ ...valid["driven tool"], tool: `mcp__${long(n - 5)}` }), MAX_TOOL_NAME_LENGTH, "tool"],
+    ["a start's room sessions", parseOfficeServerMessage, (n: number) => ({ ...valid["drive start"], roomSessions: sessions(n) }), MAX_ROOM_SESSIONS, "roomSessions"],
+    ["the sessions a runner holds", parseDataLayerMessage, (n: number) => ({ ...valid["driven holding"], sessions: sessions(n).map((session) => ({ ...valid["driven holding"].sessions[0], session })) }), MAX_HOLDING, "sessions"],
+  ] as const)("%s at its limit parses, and one past it doesn't", (_, parse, make, limit, path) => {
+    expect(parse(make(limit))).toEqual({ ok: true, message: make(limit) });
+    const result = parse(make(limit + 1));
+    expect(result).toMatchObject({ ok: false, kind: "invalid" });
+    expect(!result.ok && result.error).toContain(path);
+  });
+
+  test("a withheld reply carries the id to release it by, and not an empty one", () => {
     const withheld = { ...valid["driven reply"], text: "Withheld here: it matches a secret pattern.", withheld: { id: "w1" } };
-    for (const message of [reply, output, withheld]) expect(parseDataLayerMessage(message)).toEqual({ ok: true, message });
-    expect(parseDataLayerMessage({ ...output, text: "x".repeat(MAX_OUTPUT_LENGTH + 1) })).toMatchObject({ ok: false, kind: "invalid" });
+    expect(parseDataLayerMessage(withheld)).toEqual({ ok: true, message: withheld });
     expect(parseDataLayerMessage({ ...withheld, withheld: { id: "" } })).toMatchObject({ ok: false, kind: "invalid" });
+  });
+
+  test("an output with nothing in it parses, and an empty reply doesn't", () => {
+    const output = { ...valid["driven output"], text: "" };
+    expect(parseDataLayerMessage(output)).toEqual({ ok: true, message: output });
+    expect(parseDataLayerMessage({ ...valid["driven reply"], text: "" })).toMatchObject({ ok: false, kind: "invalid" });
   });
 
   test("a tool summary or prompt the scan matched is marked withheld, and not with false", () => {
@@ -553,6 +581,12 @@ describe("driven sessions", () => {
     const prompt = { ...valid["driven prompt"], description: "Withheld here: it matches a secret pattern.", withheld: true };
     for (const message of [tool, prompt]) expect(parseDataLayerMessage(message)).toEqual({ ok: true, message });
     expect(parseDataLayerMessage({ ...prompt, withheld: false })).toMatchObject({ ok: false, kind: "invalid" });
+  });
+
+  test("a tool use the scan matched carries no summary", () => {
+    const result = parseDataLayerMessage({ ...valid["driven tool"], withheld: true });
+    expect(result).toMatchObject({ ok: false, kind: "invalid" });
+    expect(!result.ok && result.error).toContain("summary");
   });
 
   test("an instruction is trimmed, and one of only spaces is invalid", () => {
@@ -568,9 +602,16 @@ describe("driven sessions", () => {
     expect(!result.ok && result.error).toContain(key);
   });
 
-  test.each(["not-owner", "not-found", "bypass-off", "no-folder", "no-claude", "busy", "no-prompt", "offline"])("a drive request can be refused %s", (reason) => {
+  test.each(["not-owner", "not-found", "bypass-off", "no-folder", "no-claude", "busy", "no-prompt"])("a drive request can be refused %s", (reason) => {
     const message = { ...valid["driven refused"], reason, detail: "In plain words." };
     expect(parseDataLayerMessage(message)).toEqual({ ok: true, message });
+  });
+
+  test("a runner can't refuse offline, which only the server says", () => {
+    const offline: FloorDriveRefusalReason = "offline";
+    const result = parseDataLayerMessage({ ...valid["driven refused"], reason: offline });
+    expect(result).toMatchObject({ ok: false, kind: "invalid" });
+    expect(!result.ok && result.error).toContain("reason");
   });
 
   test("only a refusal at the cap names its limit, and it must", () => {
@@ -584,6 +625,11 @@ describe("driven sessions", () => {
       [{ ...valid["driven holding"], sessions: [] }, parseDataLayerMessage],
     ] as const)
       expect(parse(message)).toEqual({ ok: true, message });
+  });
+
+  test("a policy lists a project whatever the length of its id", () => {
+    const message = { ...valid["drive-policy"], bypassAllowed: [`local:sevengill/c:/users/sam/${long(5000)}`] };
+    expect(parseOfficeServerMessage(message)).toEqual({ ok: true, message });
   });
 
   test("a drive or driven message of a kind the channel doesn't have is invalid, naming the kind", () => {
