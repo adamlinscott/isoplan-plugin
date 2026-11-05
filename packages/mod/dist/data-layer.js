@@ -7685,7 +7685,7 @@ async function register(given) {
 			RUN_KEY,
 			"/v",
 			runValueName(h.claudeDir)
-		])).stdout) === want && await works(launcherPaths(await read(launcher)))) return [];
+		])).stdout)?.toLowerCase() === want.toLowerCase() && await works(launcherPaths(await read(launcher)))) return [];
 		if (await scriptHostOff(run)) throw new Error("Windows Script Host is turned off on this computer, and without it the runner can't start with no window");
 		await fs.mkdir(path.dirname(launcher), { recursive: true });
 		await fs.writeFile(launcher, hiddenLauncher(h.node, h.script, { args: LOGIN_ARG }));

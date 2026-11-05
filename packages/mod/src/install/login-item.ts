@@ -154,7 +154,8 @@ async function register(given: LoginItem): Promise<string[]> {
     const launcher = loginLauncherPath(h.claudeDir);
     const want = windowsLoginCommand(h.claudeDir);
     const current = regValue((await run("reg", ["query", RUN_KEY, "/v", runValueName(h.claudeDir)])).stdout);
-    if (current === want && (await works(launcherPaths(await read(launcher))))) return [];
+    // In any letter case, as Windows reads paths: %SystemRoot% may be C:\WINDOWS or C:\Windows.
+    if (current?.toLowerCase() === want.toLowerCase() && (await works(launcherPaths(await read(launcher))))) return [];
     if (await scriptHostOff(run)) throw new Error("Windows Script Host is turned off on this computer, and without it the runner can't start with no window");
     await fs.mkdir(path.dirname(launcher), { recursive: true });
     await fs.writeFile(launcher, hiddenLauncher(h.node, h.script, { args: LOGIN_ARG }));
