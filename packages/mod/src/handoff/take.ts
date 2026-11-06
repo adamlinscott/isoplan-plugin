@@ -73,8 +73,9 @@
 //      The worktree and setup are as for a terminal, and the worktree is trusted as for headless;
 //      then the driver checks its cap and readies the session, which it opens once `taken` has been
 //      handed to the link (which sends it now, or after the next hello), under the take's session id,
-//      with the take's prompt as its first instruction. A take the server has dropped (cancelled, or
-//      timed out) by then isn't trusted or readied.
+//      with the take's prompt as its first instruction, and the permission mode the person asked for
+//      (`permissions`), which the driver runs only where the office allows it. A take the server has
+//      dropped (cancelled, or timed out) by then isn't trusted or readied.
 //
 // After Orca (for a take into Orca), the claude binary is looked for, in every mode, before anything
 // is made: without it nothing is.
@@ -564,7 +565,7 @@ let emptyHooks: Promise<string> | null = null;
 const noHooks = async () => ["-c", `core.hooksPath=${await (emptyHooks ??= fs.mkdtemp(path.join(os.tmpdir(), "isoplan-no-hooks-")))}`];
 
 /** Takes the handoff on this machine; never throws. */
-export async function takeHandoff(message: Pick<HandoffMessage, "handoff" | "mode" | "session" | "by" | "room">, o: TakeOptions): Promise<TakenMessage> {
+export async function takeHandoff(message: Pick<HandoffMessage, "handoff" | "mode" | "session" | "by" | "room" | "permissions">, o: TakeOptions): Promise<TakenMessage> {
   const { handoff } = message;
   const headless = message.mode === "headless";
   const driven = message.mode === "driven";
@@ -713,7 +714,7 @@ export async function takeHandoff(message: Pick<HandoffMessage, "handoff" | "mod
         await fail("open", dropped);
         return done();
       }
-      const problem = await o.driven!.prepare({ session: id, folder: dir, prompt: takePrompt(handoff.id, briefFile, setupLog, failedRepos), name, addDir: folder, room: message.room!, by: message.by! });
+      const problem = await o.driven!.prepare({ session: id, folder: dir, prompt: takePrompt(handoff.id, briefFile, setupLog, failedRepos), name, addDir: folder, room: message.room!, by: message.by!, permissions: message.permissions ?? "auto" });
       if (problem) {
         await fail("open", `${problem} The worktree is ${dir}.`);
         return done();

@@ -215,12 +215,13 @@ test("link: a runner's link passes the server's requests on, and a reply sent wh
   expect(s.got[2]).toMatchObject({ id: "q1", answer: "Because." });
 });
 
-test("link: a runner's link passes drive requests and drive-policy to onDrive, tells onOpen after every hello, and sends a driven message only while up", async () => {
+test("link: a runner's link passes drive requests and drive-policy to onDrive, tells onOpen after every hello and onClose at every drop, and sends a driven message only while up", async () => {
   const s = await server();
   const runnerHello: RunnerHelloMessage = { type: "runner", v: PROTOCOL_VERSION, account: hello.account, machine: hello.machine, drive: true };
   const drives: unknown[] = [];
   let opened = 0;
-  const { link: l, lines } = link(s.url, { hello: runnerHello, onDrive: (m) => drives.push(m), onOpen: () => void opened++ });
+  let closed = 0;
+  const { link: l, lines } = link(s.url, { hello: runnerHello, onDrive: (m) => drives.push(m), onOpen: () => void opened++, onClose: () => void closed++ });
   await until(() => opened === 1);
   expect(s.got).toHaveLength(1);
   const policy = { type: "drive-policy", v: PROTOCOL_VERSION, bypassAllowed: ["github.com/ada/app"] };
@@ -232,10 +233,13 @@ test("link: a runner's link passes drive requests and drive-policy to onDrive, t
   const released = { type: "driven", v: PROTOCOL_VERSION, kind: "released", session: "claude-code:s", why: "stopped", id: "d1" } as const;
   expect(l.sendLive(released)).toBe(true);
   await until(() => s.got.length === 2);
+  expect(closed).toBe(0);
   s.sockets[0]!.terminate();
   await until(() => lines.some((x) => x.type === "status" && x.state === "disconnected"));
+  expect(closed).toBe(1);
   expect(l.sendLive(released)).toBe(false);
   await until(() => opened === 2);
+  expect(closed).toBe(1);
   await new Promise((r) => setTimeout(r, 50));
   // The one sent while it was down is gone, not sent after the next hello.
   expect(types(s.got)).toEqual(["runner", "driven", "runner"]);

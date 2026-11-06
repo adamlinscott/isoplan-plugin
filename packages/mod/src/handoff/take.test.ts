@@ -113,17 +113,17 @@ test("headless: a session claude agents doesn't list is reported, not taken", as
   expect(taken.failures).toEqual([{ step: "open", output: expect.stringContaining("doesn't list session") }]);
 });
 
-test("driven: the same worktree and setup, the worktree alone trusted, then the driver readies the session under the server's session id, with the take's prompt and the brief's folder; nothing opens", async () => {
+test("driven: the same worktree and setup, the worktree alone trusted, then the driver readies the session under the server's session id, with the take's prompt, the brief's folder and the permission mode asked for; nothing opens", async () => {
   const t = await handedOver("h2d", { command: "node -e \"require('fs').writeFileSync('setup-ran.txt', 'yes')\"" });
   const prepared: PreparedTake[] = [];
   const by = { id: "claude:sam", name: "Sam" };
-  const taken = await takeHandoff({ handoff: t.handoff, mode: "driven", session: SESSION, by, room: "room-1" }, { ...t.options, driven: { problem: () => null, prepare: async (p) => (prepared.push(p), null) } });
+  const taken = await takeHandoff({ handoff: t.handoff, mode: "driven", session: SESSION, by, room: "room-1", permissions: "bypassPermissions" }, { ...t.options, driven: { problem: () => null, prepare: async (p) => (prepared.push(p), null) } });
   expect(taken).toEqual({ type: "taken", v: 1, handoff: "h2d", session: `claude-code:${SESSION}`, failures: [] });
   expect([t.opened, t.started]).toEqual([[], []]);
   const dir = `${t.receiver.clone}-handoff-h2d`;
   expect(fs.readFileSync(path.join(dir, "setup-ran.txt"), "utf8")).toBe("yes");
   const folder = path.join(t.claudeDir, "isoplan", "handoffs", "h2d");
-  expect(prepared).toEqual([{ session: SESSION, folder: dir, prompt: expect.stringMatching(/^Isoplan handoff h2d: you are taking this work over\. Read its brief in /), name: "Isoplan handoff h2d", addDir: folder, room: "room-1", by }]);
+  expect(prepared).toEqual([{ session: SESSION, folder: dir, prompt: expect.stringMatching(/^Isoplan handoff h2d: you are taking this work over\. Read its brief in /), name: "Isoplan handoff h2d", addDir: folder, room: "room-1", by, permissions: "bypassPermissions" }]);
   expect(JSON.parse(fs.readFileSync(t.claudeJson, "utf8")).projects[trustKey(dir, "win32")]).toEqual({ hasTrustDialogAccepted: true });
 });
 

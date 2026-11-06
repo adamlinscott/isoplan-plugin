@@ -25,5 +25,6 @@
   "drivenIdleMinutes": 30,
   "drivenPerProject": 4,
   "drivenCloseSeconds": 30,
-  "drivenStartSeconds": 120
+  "drivenStartSeconds": 120,
+  "drivenPromptMinutes": 10
 }

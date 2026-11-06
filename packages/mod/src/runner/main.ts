@@ -356,8 +356,9 @@ async function worker(): Promise<number> {
         pairing,
         onMessage: (message) => runner.take(message),
         onDrive: (message) => drive.take(office.server, message),
-        // After every hello, where this office's driven sessions stand.
+        // After every hello, where this office's driven sessions stand; at every drop, its drive-policy no longer holds.
         onOpen: () => drive.linked(office.server),
+        onClose: () => drive.unlinked(office.server),
         onNotWanted: said.notWanted,
         // A revoked or lapsed pairing closes this link: its data layers pair the machine again.
         onPairingEnded: said.unpaired,

@@ -29,7 +29,8 @@
 // OUTBOX_MAX and OUTBOX_MAX_AGE_MS. Driving sessions from the floor (protocol 0.5.0), the server's
 // `drive` requests and `drive-policy` go to `onDrive`, and the runner's `driven` messages go out
 // through `sendLive`, only while the link is up: they never wait in the outbox. `onOpen` is told
-// after every hello, so the runner can say where its driven sessions stand.
+// after every hello, so the runner can say where its driven sessions stand, and `onClose` at every
+// drop, so it stops trusting that connection's drive-policy.
 
 import {
   parseOfficeServerMessage,
@@ -85,6 +86,8 @@ export interface LinkOptions {
   onDrive?: (message: DriveMessage | DrivePolicyMessage) => void;
   /** Told after every hello, once what waited in the outbox has gone. */
   onOpen?: () => void;
+  /** Told each time the connection drops or is closed, before any reconnect. */
+  onClose?: () => void;
   /**
    * What of the facts may go on this connection, given the projects its welcome named (null before
    * one): applied at every send, so a reconnect's full goes by the new connection's welcome (#74).
@@ -134,6 +137,7 @@ export function createLink({
   onMessage,
   onDrive,
   onOpen,
+  onClose,
   filter = (facts) => facts,
   answered,
   pairing,
@@ -239,6 +243,7 @@ export function createLink({
   function dropped() {
     socket = null;
     isOpen = false;
+    onClose?.();
     projects = null;
     sent = null;
     if (pacing) clearTimeout(pacing);
