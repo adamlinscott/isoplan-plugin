@@ -10,12 +10,13 @@
 // Ids are source-scoped: the session is claude-code:<session id>, its lead claude-code:<session
 // id>:lead, and a subagent claude-code:<agent id>.
 
-import type { AgentFact, Facts, FileFact, Project, QuestionFact } from "@isoplan/protocol";
+import type { AgentFact, Facts, FileFact, Project, QuestionFact, WorkflowFact } from "@isoplan/protocol";
 import { attributionCache, createAttribution, type Attribution, type Placed } from "./attribution.js";
 import type { Config } from "./config.js";
 import { join, normalize, pathKey, relativeTo, type MaybePromise, type Stat, type Where } from "./git.js";
 import type { DirEntry } from "./io.js";
 import { shellFiles } from "./shell-writes.js";
+import { agentsInView, createWorkflowReader, listWorkflows, viewWorkflow, workflowLaunch, type RunState, type WorkflowAgentView, type WorkflowFiles, type WorkflowLaunch } from "./workflows.js";
 
 const SOURCE = "claude-code";
 
@@ -111,10 +112,12 @@ export function createClaudeCode(io: SourceIo) {
   const workspaces = new Map<string, { at: number; is: boolean }>(); // folder → whether it is a workspace
   const places = attributionCache(); // which folders exist and where links lead, across passes
   const searched = new Map<string, number>(); // session id → when every project folder was last searched
+  const runs = createWorkflowReader(io); // the session's workflow runs (workflows.ts)
   let used = new Set<string>(); // the cache keys this pass has used
 
   async function read({ sessionId, cwd, now, config, resolve, projectOf }: ReadInput): Promise<SourceRead> {
     used = new Set();
+    runs.begin();
     const errors = { count: 0, first: null as string | null };
     const fail = (err: unknown) => {
       errors.count++;
@@ -162,6 +165,7 @@ export function createClaudeCode(io: SourceIo) {
       for (const cache of [transcripts, metas]) {
         for (const key of cache.keys()) if (!used.has(key)) cache.delete(key);
       }
+      runs.prune(c.workflows.map((w) => w.id));
     }
   }
 
@@ -218,6 +222,7 @@ export function createClaudeCode(io: SourceIo) {
     const keepMs = Math.max(idleMs, config.lightsOffHours * 3600000);
     const agentWindowMs = Math.max(idleMs, config.touchedWindowMinutes * 60000);
     const all: AgentFile[] = [];
+    let workflows: WorkflowFiles[] = [];
     if (now - st.mtimeMs <= Math.max(SUBAGENT_LOOKBACK_MS, keepMs)) {
       // Subagents of subagents sit in the same folder; meta.json says who started them.
       const subDir = join(path.slice(0, -".jsonl".length), "subagents");
@@ -227,13 +232,18 @@ export function createClaudeCode(io: SourceIo) {
         const ast = await io.stat(join(subDir, f.name));
         if (ast) all.push({ id: m[1]!, path: join(subDir, f.name), metaPath: join(subDir, `agent-${m[1]}.meta.json`), ...ast });
       }
+      // A workflow's agents sit one folder down, in subagents/workflows/<run id>/ (workflows.ts).
+      workflows = await listWorkflows(io, path.slice(0, -".jsonl".length), now, keepMs);
     }
-    const lastActive = Math.max(st.mtimeMs, ...all.map((a) => a.mtimeMs));
+    const lastActive = Math.max(st.mtimeMs, ...all.map((a) => a.mtimeMs), ...workflows.map((w) => w.lastActive));
     if (now - lastActive > keepMs) return null;
     const lit = now - lastActive <= idleMs;
     const from = lit ? now : lastActive;
     const agents = all.filter((a) => from - a.mtimeMs <= agentWindowMs);
-    return { id: sessionId, path, size: st.size, ownMtime: st.mtimeMs, lastActive, lights: lit ? "on" : "off", agents, subagents: all.length };
+    // A workflow in view brings all its agents, so its graph is whole.
+    const inView = workflows.filter((w) => from - w.lastActive <= agentWindowMs);
+    const subagents = all.length + workflows.reduce((n, w) => n + w.agents.length, 0);
+    return { id: sessionId, path, size: st.size, ownMtime: st.mtimeMs, lastActive, lights: lit ? "on" : "off", agents, workflows: inView, subagents };
   }
 
   // A folder with a repo directly in it.
@@ -268,7 +278,21 @@ export function createClaudeCode(io: SourceIo) {
     const session = `${SOURCE}:${c.id}`;
     const lead = `${session}:lead`;
     const agentFiles: (AgentFile & { t: TranscriptState; meta: Meta })[] = [];
-    for (const a of c.agents) {
+    // Each workflow run in view, read off disk, and its agents, read as any subagent's are.
+    const sessionDir = c.path.slice(0, -".jsonl".length);
+    const runStates = new Map<string, { files: WorkflowFiles; run: RunState; more: number }>();
+    const workflowAgents: AgentFile[] = [];
+    for (const w of c.workflows) {
+      try {
+        const run = await runs.read(w, sessionDir, main.workflows.get(w.id)?.script ?? null);
+        const { kept, more } = agentsInView(w, run);
+        runStates.set(w.id, { files: w, run, more });
+        workflowAgents.push(...kept);
+      } catch (err) {
+        fail(err);
+      }
+    }
+    for (const a of [...c.agents, ...workflowAgents]) {
       try {
         agentFiles.push({ ...a, t: await readTranscript(a.path, a.size, config.tailBytes), meta: await readMeta(a.metaPath) });
       } catch (err) {
@@ -314,6 +338,31 @@ export function createClaudeCode(io: SourceIo) {
     // Each transcript's newest write, by the agent that writes it.
     const mtimes = new Map<string, number>([[lead, c.ownMtime], ...agentFiles.map((a): [string, number] => [agentId(a.id), a.mtimeMs])]);
 
+    // Each run's fact and its agents' places: started by whichever transcript's Workflow call
+    // launched it, or the lead when that call isn't in view. An ended run's fact stays as first built.
+    const launches = new Map<string, WorkflowLaunch & { at: number; by: string }>();
+    for (const [runId, l] of main.workflows) launches.set(runId, { ...l, by: lead });
+    for (const a of agentFiles) for (const [runId, l] of a.t.workflows) launches.set(runId, { ...l, by: agentId(a.id) });
+    const workflowViews = new Map<string, Map<string, WorkflowAgentView>>();
+    const workflowFacts: WorkflowFact[] = [];
+    for (const [runId, { files, run, more }] of runStates) {
+      const view = viewWorkflow({
+        files,
+        run,
+        launch: launches.get(runId) ?? null,
+        agents: agentFiles.filter((a) => a.run === runId).map((a) => ({ file: { ...a, run: runId }, firstAt: a.t.firstAt, lastAt: a.t.lastAt, tokens: tokensOf(a.t), meta: a.meta })),
+        more,
+        session,
+        lead,
+        now,
+        config,
+        frozen: runs.frozen.get(runId),
+      });
+      if (run.record) runs.frozen.set(runId, view.fact);
+      workflowViews.set(runId, view.agents);
+      workflowFacts.push(view.fact);
+    }
+
     const branch = main.branch || where.branch;
     const facts: Facts = {
       session: {
@@ -335,6 +384,7 @@ export function createClaudeCode(io: SourceIo) {
       waits: [],
       reports: [],
       questions: [],
+      ...(workflowFacts.length ? { workflows: workflowFacts } : {}),
     };
 
     // The lead works while its turn is open: from a prompt (or a notification it takes up) until
@@ -363,6 +413,8 @@ export function createClaudeCode(io: SourceIo) {
 
     for (const a of agentFiles) {
       const id = agentId(a.id);
+      // One of a workflow's agents: its place and state come from its run (workflows.ts).
+      const wf = a.run ? workflowViews.get(a.run)?.get(a.id) : undefined;
       const type = typeof a.meta.agentType === "string" && a.meta.agentType ? a.meta.agentType : null;
       const at = a.t.cwd ? await resolve(a.t.cwd) : null;
       // The worktree trap: a worktree-isolated agent's lines carry the PARENT's gitBranch, so the
@@ -380,10 +432,16 @@ export function createClaudeCode(io: SourceIo) {
       // Started by whichever transcript made the Agent call, else the parent meta.json names, else
       // the lead. One not in view (aged out, or never seen) falls back to the lead too.
       const spawn = typeof a.meta.toolUseId === "string" ? spawns.get(a.meta.toolUseId) : undefined;
-      let startedBy = spawn ? spawn.by : typeof a.meta.parentAgentId === "string" ? agentId(a.meta.parentAgentId) : lead;
+      let startedBy = wf
+        ? (workflowFacts.find((w) => w.id === a.run)?.startedBy ?? lead)
+        : spawn
+          ? spawn.by
+          : typeof a.meta.parentAgentId === "string"
+            ? agentId(a.meta.parentAgentId)
+            : lead;
       if (!mtimes.has(startedBy)) startedBy = lead;
 
-      const s = agentStatus(a, results, notes, spawn, now, mtimes.get(startedBy)!, config);
+      const s: AgentStatus = wf ? { status: wf.status, since: wf.since, ...(wf.endState ? { endState: wf.endState } : {}) } : agentStatus(a, results, notes, spawn, now, mtimes.get(startedBy)!, config);
       const working = s.status === "working";
       // A stalled agent keeps its last action, to show where it stopped.
       const live = working || s.status === "stalled";
@@ -401,13 +459,18 @@ export function createClaudeCode(io: SourceIo) {
         ...checkInsOf(id, a.t, a.mtimeMs),
         usage: usageOf(a.t, a.mtimeMs),
         ...(worktree ? { checkout: worktree, branch: agentBranch } : {}),
+        ...(wf ? { workflow: wf.workflow } : {}),
         extra: { description: a.meta.description ?? null, ...(s.endState ? { endState: s.endState } : {}) },
       });
-      if (live) {
+      // Nobody waits on a workflow's agents: the Workflow tool returns as it launches them.
+      if (live && !wf) {
         facts.waits.push({ waiter: startedBy, on: id, since: iso(spawn ? spawn.at : a.t.firstAt, a.mtimeMs) });
       }
       if (live) addQuestions(facts.questions!, id, a.t, results, a.mtimeMs);
-      if ((s.status === "done" || s.status === "failed") && a.t.lastText !== null) {
+      // A workflow agent's report is its result in the run's journal.
+      if (wf) {
+        if (wf.status === "done" && wf.report !== null) facts.reports.push({ agent: id, at: iso(wf.since, a.mtimeMs), text: wf.report });
+      } else if ((s.status === "done" || s.status === "failed") && a.t.lastText !== null) {
         facts.reports.push({ agent: id, at: iso(a.t.lastTextAt, a.mtimeMs), text: a.t.lastText });
       }
       a.t.touches = await addFiles(facts.edits, id, a.t.touches, [...config.touchedTools, ...config.shellTools], now, config, place);
@@ -508,6 +571,8 @@ interface AgentFile extends Stat {
   id: string;
   path: string;
   metaPath: string;
+  /** The workflow run it is an agent of, if any. */
+  run?: string;
 }
 
 interface Candidate {
@@ -518,6 +583,8 @@ interface Candidate {
   lastActive: number;
   lights: "on" | "off";
   agents: AgentFile[];
+  /** The workflow runs in view, whose agents are read with the subagents. */
+  workflows: WorkflowFiles[];
   subagents: number;
 }
 
@@ -594,6 +661,7 @@ interface TranscriptState {
   firstPrompt: string | null; // the first prompt's opening, for leftOut only: it is never sent
   compacted: boolean; // the session was compacted at least once
   asks: Map<string, { at: number; input: unknown }>; // id of each AskUserQuestion tool_use since the last prompt → its time and input
+  workflows: Map<string, WorkflowLaunch & { at: number }>; // run id of each workflow this file launched → its launch
 }
 
 const agentId = (id: string) => `${SOURCE}:${id}`;
@@ -693,6 +761,7 @@ function newTranscriptState(): TranscriptState {
     firstPrompt: null,
     compacted: false,
     asks: new Map(),
+    workflows: new Map(),
   };
 }
 
@@ -787,6 +856,8 @@ function foldLine(st: TranscriptState, line: string, home: string | null, isDir?
         if (c.type === "tool_result" && typeof c.tool_use_id === "string") {
           toolResults = true;
           st.results.set(c.tool_use_id, { ...toolResult(ev.toolUseResult, c.is_error), at });
+          const launch = workflowLaunch(ev.toolUseResult);
+          if (launch) st.workflows.set(launch.runId, { ...launch, at });
         }
       }
     }
@@ -849,6 +920,9 @@ function foldUsage(st: TranscriptState, line: string): void {
 
 // Claude Code marks a compaction with a compact_boundary system line, then the summary as a user line.
 const isCompaction = (ev: Line): boolean => !!ev && typeof ev === "object" && ((ev.type === "system" && ev.subtype === "compact_boundary") || ev.isCompactSummary === true);
+
+// An agent's tokens as Claude Code counts them for a workflow's total: its newest reply's prompt and output.
+const tokensOf = (st: TranscriptState) => (st.usage?.context ?? 0) + (st.reply?.counts.output ?? 0);
 
 // An agent's usage: null until a reply with usage has been read.
 function usageOf(st: TranscriptState, fallbackMs: number): AgentFact["usage"] {
@@ -967,9 +1041,10 @@ const MAX_CHECKS = 20;
 const MAX_REPORTED = 5;
 
 // A background agent's output file (<tasks folder>/<agent id>.output) or its transcript
-// (subagents/agent-<agent id>.jsonl), anywhere in a path or command, in any case. Background
-// shells' output files match too: only ids of the session's agents are kept at read time.
-const AGENT_FILES = /[\\/](?:tasks[\\/]([a-z0-9_-]+)\.output|subagents[\\/]agent-([a-z0-9_-]+)\.jsonl)(?![\w.-])/gi;
+// (subagents/agent-<agent id>.jsonl, or subagents/workflows/<run id>/agent-<agent id>.jsonl for a
+// workflow's agent), anywhere in a path or command, in any case. Background shells' output files
+// match too: only ids of the session's agents are kept at read time.
+const AGENT_FILES = /[\\/](?:tasks[\\/]([a-z0-9_-]+)\.output|subagents[\\/](?:workflows[\\/][a-z0-9_-]+[\\/])?agent-([a-z0-9_-]+)\.jsonl)(?![\w.-])/gi;
 const agentsIn = (text: string) => [...text.matchAll(AGENT_FILES)].map((m) => (m[1] ?? m[2])!.toLowerCase());
 
 // The check-ins a tool call makes on other agents, by id or name as it wrote them: SendMessage to

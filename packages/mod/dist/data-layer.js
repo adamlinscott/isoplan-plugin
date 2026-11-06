@@ -5466,7 +5466,7 @@ const ZodLiteral = /*@__PURE__*/ $constructor("ZodLiteral", (inst, def) => {
 		return def.values[0];
 	} });
 });
-function literal(value, params) {
+function literal$1(value, params) {
 	return new ZodLiteral({
 		type: "literal",
 		values: Array.isArray(value) ? value : [value],
@@ -5681,6 +5681,8 @@ const SessionFactSchema = object({
 	extra: Extra
 });
 const TokenCount = number().int().nonnegative();
+/** The longest workflow description. */
+const MAX_WORKFLOW_DESCRIPTION_LENGTH = 1e3;
 const TokenCounts = object({
 	input: TokenCount,
 	cacheWrite: TokenCount,
@@ -5730,6 +5732,44 @@ const AgentFactSchema = object({
 		kind: _enum(["talk", "read"]),
 		since: Time
 	})).max(20).optional(),
+	workflow: object({
+		id: string().min(1),
+		phase: string().max(100),
+		label: string().max(200)
+	}).optional(),
+	extra: Extra
+});
+/**
+* A Claude Code workflow run (the Workflow tool, also used by ultracode): `id` is its run id, so a
+* new run is a new workflow and an ended one doesn't change again. `startedBy` is the agent whose
+* Workflow call started it. Its agents are AgentFacts with `workflow.id` naming it; at most
+* MAX_WORKFLOW_AGENTS of them are sent, and `moreAgents` counts the rest. `status`: running while
+* it writes, stalled once it has been quiet a while and idle after longer, with no end record;
+* done, stopped or failed once it ended. `usage.tokens`: its tokens, counted by Claude Code when it
+* ended, summed over its agents before. A data layer cuts each text to its MAX_* limit.
+*/
+const WorkflowFactSchema = object({
+	id: string().min(1),
+	session: string().min(1),
+	startedBy: string().min(1),
+	name: string().min(1).max(200),
+	description: string().max(MAX_WORKFLOW_DESCRIPTION_LENGTH).optional(),
+	phases: array(object({
+		title: string().max(100),
+		detail: string().max(500).optional()
+	})).max(30),
+	status: _enum([
+		"running",
+		"stalled",
+		"idle",
+		"done",
+		"stopped",
+		"failed"
+	]),
+	startedAt: Time,
+	endedAt: Time.optional(),
+	usage: object({ tokens: TokenCount }).optional(),
+	moreAgents: number().int().positive().optional(),
 	extra: Extra
 });
 /**
@@ -5783,8 +5823,8 @@ const QuestionFactSchema = object({
 		})),
 		multiSelect: boolean()
 	})).min(1),
-	answerable: literal(true).optional(),
-	withheld: literal(true).optional(),
+	answerable: literal$1(true).optional(),
+	withheld: literal$1(true).optional(),
 	extra: Extra
 });
 const FactsSchema = object({
@@ -5795,7 +5835,9 @@ const FactsSchema = object({
 	waits: array(WaitFactSchema),
 	reports: array(ReportFactSchema),
 	/** Absent from a data layer that doesn't report questions, which is the same as none. */
-	questions: array(QuestionFactSchema).optional()
+	questions: array(QuestionFactSchema).optional(),
+	/** Absent from a data layer that doesn't report workflows, which is the same as none. */
+	workflows: array(WorkflowFactSchema).optional()
 });
 /** The records that changed, each replacing the one with the same key. */
 const FactUpsertSchema = object({
@@ -5805,7 +5847,8 @@ const FactUpsertSchema = object({
 	reads: array(FileFactSchema).optional(),
 	waits: array(WaitFactSchema).optional(),
 	reports: array(ReportFactSchema).optional(),
-	questions: array(QuestionFactSchema).optional()
+	questions: array(QuestionFactSchema).optional(),
+	workflows: array(WorkflowFactSchema).optional()
 });
 const FileKey = FileFactSchema.pick({
 	agent: true,
@@ -5815,7 +5858,7 @@ const FileKey = FileFactSchema.pick({
 /**
 * The keys of records that went away: an agent by its id, an edit or read by agent, file and
 * project (absent for the session's own), a
-* wait by waiter and on, a report by its agent, a question by its id. The session itself goes with
+* wait by waiter and on, a report by its agent, a question or a workflow by its id. The session itself goes with
 * the connection. `questionOutcomes`: how each question in `questions` ended, by its id: `answered`,
 * in the terminal or from the floor, or `abandoned`, with no answer (interrupted, or a new prompt
 * came first). Absent, or without a question's id, from a peer that doesn't say (protocol 0.3.5 on).
@@ -5830,9 +5873,10 @@ const FactRemoveSchema = object({
 	})).optional(),
 	reports: array(string().min(1)).optional(),
 	questions: array(string().min(1)).optional(),
-	questionOutcomes: record(string().min(1), _enum(["answered", "abandoned"])).optional()
+	questionOutcomes: record(string().min(1), _enum(["answered", "abandoned"])).optional(),
+	workflows: array(string().min(1)).optional()
 });
-const Version = literal(1);
+const Version = literal$1(1);
 const Seq = number().int().nonnegative();
 const Account = object({
 	id: string().min(1),
@@ -5916,7 +5960,7 @@ const Instruction = string().trim().min(1).max(MAX_INSTRUCTION_LENGTH);
 const ToolName = string().min(1).max(100);
 const Detail = string().min(1).max(MAX_DETAIL_LENGTH);
 /** The text was longer than its field's limit, so the runner cut it to fit. */
-const Cut = literal(true).optional();
+const Cut = literal$1(true).optional();
 /** The secret scan matched the text: it only says so, and its owner can release it by this id (drive `release`). */
 const Withheld = object({ id: DriveId }).optional();
 /**
@@ -5927,7 +5971,7 @@ const Withheld = object({ id: DriveId }).optional();
 const DrivePermissionsSchema = _enum(["auto", "bypassPermissions"]);
 /** The first message on a connection: who is reporting, from where, about which session. */
 const HelloMessageSchema = object({
-	type: literal("hello"),
+	type: literal$1("hello"),
 	v: Version,
 	source: SourceSchema,
 	account: Account,
@@ -5947,7 +5991,7 @@ const HelloMessageSchema = object({
 * it, and refuses each start `no-claude`.
 */
 const RunnerHelloMessageSchema = object({
-	type: literal("runner"),
+	type: literal$1("runner"),
 	v: Version,
 	account: Account,
 	machine: Machine,
@@ -5958,14 +6002,14 @@ const RunnerHelloMessageSchema = object({
 });
 /** All of the session's facts. Sent on connect and on repair. */
 const FullMessageSchema = object({
-	type: literal("full"),
+	type: literal$1("full"),
 	v: Version,
 	seq: Seq,
 	facts: FactsSchema
 });
 /** What changed since the last message. `seq` goes up by one per message, so a gap shows. */
 const ChangesMessageSchema = object({
-	type: literal("changes"),
+	type: literal$1("changes"),
 	v: Version,
 	seq: Seq,
 	upsert: FactUpsertSchema,
@@ -5980,35 +6024,35 @@ const CapSchema = _enum([
 /** The answer to a request, carrying the request's id and kind. */
 const ReplyMessageSchema = discriminatedUnion("kind", [
 	object({
-		type: literal("reply"),
+		type: literal$1("reply"),
 		v: Version,
 		id: RequestId,
-		kind: literal("answer-question"),
+		kind: literal$1("answer-question"),
 		answer: string().min(1)
 	}),
 	object({
-		type: literal("reply"),
+		type: literal$1("reply"),
 		v: Version,
 		id: RequestId,
-		kind: literal("write-brief"),
+		kind: literal$1("write-brief"),
 		handoff: HandoffSchema,
-		fallback: literal(true).optional(),
+		fallback: literal$1(true).optional(),
 		cap: CapSchema.optional(),
-		noClaude: literal(true).optional()
+		noClaude: literal$1(true).optional()
 	}),
 	object({
-		type: literal("reply"),
+		type: literal$1("reply"),
 		v: Version,
 		id: RequestId,
-		kind: literal("owner-answer"),
-		closed: literal(true).optional(),
-		late: literal(true).optional()
+		kind: literal$1("owner-answer"),
+		closed: literal$1(true).optional(),
+		late: literal$1(true).optional()
 	}),
 	object({
-		type: literal("reply"),
+		type: literal$1("reply"),
 		v: Version,
 		id: RequestId,
-		kind: literal("focus")
+		kind: literal$1("focus")
 	})
 ]);
 /**
@@ -6019,26 +6063,26 @@ const ReplyMessageSchema = discriminatedUnion("kind", [
 */
 const RefusalMessageSchema = discriminatedUnion("reason", [
 	object({
-		type: literal("refusal"),
+		type: literal$1("refusal"),
 		v: Version,
 		id: RequestId,
-		reason: literal("over-cap"),
+		reason: literal$1("over-cap"),
 		cap: CapSchema
 	}),
 	object({
-		type: literal("refusal"),
+		type: literal$1("refusal"),
 		v: Version,
 		id: RequestId,
-		reason: literal("withheld"),
+		reason: literal$1("withheld"),
 		file: string().min(1).optional(),
 		held: number().int().positive().optional(),
 		unchecked: array(string().min(1)).optional()
 	}),
 	object({
-		type: literal("refusal"),
+		type: literal$1("refusal"),
 		v: Version,
 		id: RequestId,
-		reason: literal("unavailable"),
+		reason: literal$1("unavailable"),
 		detail: string().min(1)
 	})
 ]);
@@ -6047,7 +6091,7 @@ const RefusalMessageSchema = discriminatedUnion("reason", [
 * `to` is the receiver as the sender named them, for the server to find in the office.
 */
 const HandOverMessageSchema = object({
-	type: literal("hand-over"),
+	type: literal$1("hand-over"),
 	v: Version,
 	to: string().min(1),
 	handoff: HandoffSchema
@@ -6057,14 +6101,14 @@ const HandOverMessageSchema = object({
 * taken: the server answers hand-over-ready, or an error saying why not.
 */
 const HandOverCheckMessageSchema = object({
-	type: literal("hand-over-check"),
+	type: literal$1("hand-over-check"),
 	v: Version,
 	to: string().min(1),
 	handoff: HandoffId
 });
 /** The receiver's session asks for the handoff a take code stands for. */
 const TakeMessageSchema = object({
-	type: literal("take"),
+	type: literal$1("take"),
 	v: Version,
 	code: string().min(1)
 });
@@ -6076,7 +6120,7 @@ const TakeMessageSchema = object({
 * `clone` is a missing repo under the folder whose git clone failed.
 */
 const TakenMessageSchema = object({
-	type: literal("taken"),
+	type: literal$1("taken"),
 	v: Version,
 	handoff: HandoffId,
 	session: string().min(1).optional(),
@@ -6099,14 +6143,14 @@ const TakenMessageSchema = object({
 * for this ask, makes a retry of it the same question rather than a second one.
 */
 const AskRoomMessageSchema = object({
-	type: literal("ask-room"),
+	type: literal$1("ask-room"),
 	v: Version,
 	question: string().trim().min(1).max(4e3),
 	key: string().min(1).max(100).optional()
 });
 /** The asking session polls a question it asked: the server answers `asked`. */
 const AskCheckMessageSchema = object({
-	type: literal("ask-check"),
+	type: literal$1("ask-check"),
 	v: Version,
 	question: RequestId
 });
@@ -6115,12 +6159,12 @@ const AskCheckMessageSchema = object({
 * sending it again.
 */
 const AskedAckMessageSchema = object({
-	type: literal("asked-ack"),
+	type: literal$1("asked-ack"),
 	v: Version,
 	question: RequestId
 });
 const driven = {
-	type: literal("driven"),
+	type: literal$1("driven"),
 	v: Version
 };
 /**
@@ -6139,7 +6183,7 @@ const driven = {
 const DrivenRefusedSchema = discriminatedUnion("reason", [
 	object({
 		...driven,
-		kind: literal("refused"),
+		kind: literal$1("refused"),
 		id: DriveId,
 		reason: _enum([
 			"not-owner",
@@ -6154,17 +6198,17 @@ const DrivenRefusedSchema = discriminatedUnion("reason", [
 	}),
 	object({
 		...driven,
-		kind: literal("refused"),
+		kind: literal$1("refused"),
 		id: DriveId,
-		reason: literal("cap-reached"),
+		reason: literal$1("cap-reached"),
 		limit: number().int().positive(),
 		detail: Detail.optional()
 	}),
 	object({
 		...driven,
-		kind: literal("refused"),
+		kind: literal$1("refused"),
 		id: DriveId,
-		reason: literal("unavailable"),
+		reason: literal$1("unavailable"),
 		detail: Detail
 	})
 ]);
@@ -6185,7 +6229,7 @@ discriminatedUnion("type", [
 	discriminatedUnion("kind", [
 		object({
 			...driven,
-			kind: literal("started"),
+			kind: literal$1("started"),
 			id: DriveId,
 			session: DrivenSessionId,
 			room: Room,
@@ -6193,18 +6237,18 @@ discriminatedUnion("type", [
 		}),
 		object({
 			...driven,
-			kind: literal("turn-started"),
+			kind: literal$1("turn-started"),
 			session: DrivenSessionId,
 			turn: DriveId
 		}),
 		object({
 			...driven,
-			kind: literal("tool"),
+			kind: literal$1("tool"),
 			session: DrivenSessionId,
 			turn: DriveId,
 			tool: ToolName,
 			summary: string().min(1).max(500).optional(),
-			withheld: literal(true).optional()
+			withheld: literal$1(true).optional()
 		}).superRefine((message, context) => {
 			if (message.withheld && message.summary !== void 0) context.addIssue({
 				code: "custom",
@@ -6214,7 +6258,7 @@ discriminatedUnion("type", [
 		}),
 		object({
 			...driven,
-			kind: literal("reply"),
+			kind: literal$1("reply"),
 			session: DrivenSessionId,
 			turn: DriveId,
 			text: string().min(1).max(MAX_REPLY_LENGTH),
@@ -6223,7 +6267,7 @@ discriminatedUnion("type", [
 		}),
 		object({
 			...driven,
-			kind: literal("turn-ended"),
+			kind: literal$1("turn-ended"),
 			session: DrivenSessionId,
 			turn: DriveId,
 			outcome: _enum([
@@ -6234,14 +6278,14 @@ discriminatedUnion("type", [
 		}),
 		object({
 			...driven,
-			kind: literal("error"),
+			kind: literal$1("error"),
 			session: DrivenSessionId,
 			turn: DriveId.optional(),
 			text: Detail
 		}),
 		object({
 			...driven,
-			kind: literal("output"),
+			kind: literal$1("output"),
 			id: DriveId,
 			session: DrivenSessionId,
 			turn: DriveId.optional(),
@@ -6251,18 +6295,18 @@ discriminatedUnion("type", [
 		}),
 		object({
 			...driven,
-			kind: literal("prompt"),
+			kind: literal$1("prompt"),
 			session: DrivenSessionId,
 			turn: DriveId.optional(),
 			prompt: DriveId,
 			tool: ToolName,
 			description: string().min(1).max(MAX_PROMPT_LENGTH),
-			withheld: literal(true).optional(),
+			withheld: literal$1(true).optional(),
 			expires: datetime({ offset: true })
 		}),
 		object({
 			...driven,
-			kind: literal("prompt-ended"),
+			kind: literal$1("prompt-ended"),
 			session: DrivenSessionId,
 			prompt: DriveId,
 			outcome: _enum([
@@ -6275,7 +6319,7 @@ discriminatedUnion("type", [
 		}),
 		object({
 			...driven,
-			kind: literal("held"),
+			kind: literal$1("held"),
 			session: DrivenSessionId,
 			room: Room,
 			why: _enum([
@@ -6287,7 +6331,7 @@ discriminatedUnion("type", [
 		}),
 		object({
 			...driven,
-			kind: literal("released"),
+			kind: literal$1("released"),
 			session: DrivenSessionId,
 			why: _enum([
 				"stopped",
@@ -6299,7 +6343,7 @@ discriminatedUnion("type", [
 		}),
 		object({
 			...driven,
-			kind: literal("handed-back"),
+			kind: literal$1("handed-back"),
 			id: DriveId,
 			session: DrivenSessionId,
 			command: string().min(1).max(500),
@@ -6308,7 +6352,7 @@ discriminatedUnion("type", [
 		DrivenRefusedSchema,
 		object({
 			...driven,
-			kind: literal("holding"),
+			kind: literal$1("holding"),
 			sessions: array(object({
 				session: DrivenSessionId,
 				room: Room,
@@ -6321,13 +6365,13 @@ discriminatedUnion("type", [
 ]);
 /** Asks the data layer to send its facts in full. */
 const RepairMessageSchema = object({
-	type: literal("repair"),
+	type: literal$1("repair"),
 	v: Version,
 	reason: string().optional()
 });
 /** A note for the later editor of `file`, which the data layer adds to `agent`'s next tool result. */
 const ConflictMessageSchema = object({
-	type: literal("conflict"),
+	type: literal$1("conflict"),
 	v: Version,
 	agent: string().min(1),
 	file: string().min(1),
@@ -6342,13 +6386,13 @@ const ConflictMessageSchema = object({
 * the session's own.
 */
 const WelcomeMessageSchema = object({
-	type: literal("welcome"),
+	type: literal$1("welcome"),
 	v: Version,
 	projects: array(string().min(1))
 });
 /** Something the data layer should show. */
 const ErrorMessageSchema = object({
-	type: literal("error"),
+	type: literal$1("error"),
 	v: Version,
 	code: string().min(1),
 	message: string()
@@ -6360,39 +6404,39 @@ const ErrorMessageSchema = object({
 */
 const RequestMessageSchema = discriminatedUnion("kind", [
 	object({
-		type: literal("request"),
+		type: literal$1("request"),
 		v: Version,
 		id: RequestId,
-		kind: literal("answer-question"),
+		kind: literal$1("answer-question"),
 		session: string().min(1),
 		room: string().min(1),
 		from: Account,
 		question: string().min(1)
 	}),
 	object({
-		type: literal("request"),
+		type: literal$1("request"),
 		v: Version,
 		id: RequestId,
-		kind: literal("write-brief"),
+		kind: literal$1("write-brief"),
 		session: string().min(1),
 		room: string().min(1),
 		handoff: HandoffId,
 		to: Account
 	}),
 	object({
-		type: literal("request"),
+		type: literal$1("request"),
 		v: Version,
 		id: RequestId,
-		kind: literal("owner-answer"),
+		kind: literal$1("owner-answer"),
 		session: string().min(1),
 		question: string().min(1),
 		answers: record(string(), string())
 	}),
 	object({
-		type: literal("request"),
+		type: literal$1("request"),
 		v: Version,
 		id: RequestId,
-		kind: literal("focus"),
+		kind: literal$1("focus"),
 		handoff: HandoffId
 	})
 ]);
@@ -6403,7 +6447,7 @@ const RequestMessageSchema = discriminatedUnion("kind", [
 * the take opens nothing more (a take into the Claude app doesn't open the app).
 */
 const DropMessageSchema = object({
-	type: literal("drop"),
+	type: literal$1("drop"),
 	v: Version,
 	id: RequestId
 });
@@ -6413,7 +6457,7 @@ const DropMessageSchema = object({
 * report's `withheld.id`, and only that exact report is released.
 */
 const ReleaseMessageSchema = object({
-	type: literal("release"),
+	type: literal$1("release"),
 	v: Version,
 	id: RequestId
 });
@@ -6422,7 +6466,7 @@ const ReleaseMessageSchema = object({
 * their session in answer to a take code.
 */
 const HandoffMessageSchema = object({
-	type: literal("handoff"),
+	type: literal$1("handoff"),
 	v: Version,
 	handoff: HandoffSchema,
 	mode: _enum([
@@ -6451,14 +6495,14 @@ const HandoffMessageSchema = object({
 });
 /** A hand-over-check passed: `to` is the receiver the server found for the name given. */
 const HandOverReadyMessageSchema = object({
-	type: literal("hand-over-ready"),
+	type: literal$1("hand-over-ready"),
 	v: Version,
 	handoff: HandoffId,
 	to: Account
 });
 /** The sender's hand-over reached the room: `to` is the receiver the server found for the name given. */
 const HandedOverMessageSchema = object({
-	type: literal("handed-over"),
+	type: literal$1("handed-over"),
 	v: Version,
 	handoff: HandoffId,
 	to: Account
@@ -6476,7 +6520,7 @@ const HandedOverMessageSchema = object({
 * An answered or dropped question is sent again down the session's own link until it is acked.
 */
 const AskedMessageSchema = object({
-	type: literal("asked"),
+	type: literal$1("asked"),
 	v: Version,
 	question: RequestId,
 	text: string().min(1),
@@ -6499,14 +6543,14 @@ const AskedMessageSchema = object({
 * turn it off and on again.
 */
 const AskRightsMessageSchema = object({
-	type: literal("ask-rights"),
+	type: literal$1("ask-rights"),
 	v: Version,
 	room: string().min(1),
 	owner: Account,
 	granted: boolean()
 });
 const drive = {
-	type: literal("drive"),
+	type: literal$1("drive"),
 	v: Version,
 	id: DriveId,
 	by: Account
@@ -6527,7 +6571,7 @@ const OfficeServerMessageSchema = discriminatedUnion("type", [
 	discriminatedUnion("kind", [
 		object({
 			...drive,
-			kind: literal("start"),
+			kind: literal$1("start"),
 			room: Room,
 			project: ProjectSchema,
 			roomSessions: array(DrivenSessionId).max(20).optional(),
@@ -6536,42 +6580,42 @@ const OfficeServerMessageSchema = discriminatedUnion("type", [
 		}),
 		object({
 			...drive,
-			kind: literal("instruct"),
+			kind: literal$1("instruct"),
 			session: DrivenSessionId,
 			text: Instruction
 		}),
 		object({
 			...drive,
-			kind: literal("stop"),
+			kind: literal$1("stop"),
 			session: DrivenSessionId
 		}),
 		object({
 			...drive,
-			kind: literal("hand-back"),
+			kind: literal$1("hand-back"),
 			session: DrivenSessionId
 		}),
 		object({
 			...drive,
-			kind: literal("output"),
+			kind: literal$1("output"),
 			session: DrivenSessionId,
 			turn: DriveId.optional()
 		}),
 		object({
 			...drive,
-			kind: literal("answer"),
+			kind: literal$1("answer"),
 			session: DrivenSessionId,
 			prompt: DriveId,
 			answer: _enum(["allow", "deny"])
 		}),
 		object({
 			...drive,
-			kind: literal("release"),
+			kind: literal$1("release"),
 			session: DrivenSessionId,
 			withheld: DriveId
 		})
 	]),
 	object({
-		type: literal("drive-policy"),
+		type: literal$1("drive-policy"),
 		v: Version,
 		bypassAllowed: array(string().min(1)).max(1e3)
 	})
@@ -9017,6 +9061,458 @@ function skipHeredocs(src, i, heredocs) {
 	return i;
 }
 //#endregion
+//#region src/data-layer/workflows.ts
+const RUN_ID = /^wf_[A-Za-z0-9_-]+$/;
+const SCRIPT_NAME = /^[A-Za-z0-9_.-]+\.js$/;
+const encoder$1 = new TextEncoder();
+/** The run a Workflow tool result launched, or null when it isn't one. */
+function workflowLaunch(toolUseResult) {
+	if (!toolUseResult || typeof toolUseResult !== "object") return null;
+	const r = toolUseResult;
+	if (r.taskType !== "local_workflow" || typeof r.runId !== "string" || !RUN_ID.test(r.runId)) return null;
+	const base = typeof r.scriptPath === "string" ? r.scriptPath.split(/[\\/]/).pop() : "";
+	return {
+		runId: r.runId,
+		name: text(r.workflowName),
+		description: text(r.summary),
+		script: SCRIPT_NAME.test(base) ? base : null
+	};
+}
+/**
+* The runs under a session's folder (its transcript's path without .jsonl): each folder in
+* subagents/workflows with its journal, end record and agents. A run whose end record is older than
+* `keepMs` is left out without listing its folder.
+*/
+async function listWorkflows(io, sessionDir, now, keepMs) {
+	const root = join(sessionDir, "subagents/workflows");
+	const out = [];
+	for (const d of await io.listDir(root)) {
+		if (!d.isDir || !RUN_ID.test(d.name)) continue;
+		const recordPath = join(sessionDir, `workflows/${d.name}.json`);
+		const rst = await io.stat(recordPath);
+		if (rst && now - rst.mtimeMs > keepMs) continue;
+		const dir = join(root, d.name);
+		const jpath = join(dir, "journal.jsonl");
+		const jst = await io.stat(jpath);
+		const agents = [];
+		for (const f of await io.listDir(dir)) {
+			const m = /^agent-(.+)\.jsonl$/.exec(f.name);
+			if (f.isDir || !m) continue;
+			const ast = await io.stat(join(dir, f.name));
+			if (ast) agents.push({
+				id: m[1],
+				path: join(dir, f.name),
+				metaPath: join(dir, `agent-${m[1]}.meta.json`),
+				run: d.name,
+				...ast
+			});
+		}
+		if (!jst && !agents.length) continue;
+		const lastActive = Math.max(jst?.mtimeMs ?? -Infinity, rst?.mtimeMs ?? -Infinity, ...agents.map((a) => a.mtimeMs));
+		out.push({
+			id: d.name,
+			journal: jst && {
+				...jst,
+				path: jpath
+			},
+			record: rst && {
+				...rst,
+				path: recordPath
+			},
+			agents,
+			lastActive
+		});
+	}
+	return out;
+}
+/**
+* Keep it for the life of the data layer: it reads each journal incrementally and each end record
+* and script once per change. `prune` drops what the latest pass didn't use; `frozen` keeps an
+* ended run's fact, which never changes again.
+*/
+function createWorkflowReader(io) {
+	const journals = /* @__PURE__ */ new Map();
+	const files = /* @__PURE__ */ new Map();
+	const frozen = /* @__PURE__ */ new Map();
+	let used = /* @__PURE__ */ new Set();
+	async function readJournal(f) {
+		used.add(f.path);
+		let st = journals.get(f.path);
+		if (!st || f.size < st.offset) journals.set(f.path, st = {
+			offset: 0,
+			started: /* @__PURE__ */ new Map(),
+			results: /* @__PURE__ */ new Map()
+		});
+		if (f.size <= st.offset) return st;
+		const chunk = await io.read(f.path, st.offset, f.size);
+		const lastNl = chunk.lastIndexOf("\n");
+		if (lastNl < 0) return st;
+		st.offset = f.size - encoder$1.encode(chunk.slice(lastNl + 1)).length;
+		for (const line of chunk.slice(0, lastNl).split("\n")) {
+			let ev;
+			try {
+				ev = JSON.parse(line);
+			} catch {
+				continue;
+			}
+			if (!ev || typeof ev !== "object" || typeof ev.agentId !== "string" || !ev.agentId) continue;
+			if (ev.type === "started") st.started.set(ev.agentId, {
+				label: text(ev.label) ?? "",
+				phase: text(ev.phase) ?? ""
+			});
+			if (ev.type === "result") st.results.set(ev.agentId, resultText(ev.result));
+		}
+		return st;
+	}
+	async function readFile(path, parse) {
+		used.add(path);
+		const st = await io.stat(path);
+		if (!st) return null;
+		const hit = files.get(path);
+		if (hit && hit.mtimeMs === st.mtimeMs) return hit.value;
+		let value = null;
+		try {
+			value = parse(await io.read(path));
+		} catch {}
+		files.set(path, {
+			mtimeMs: st.mtimeMs,
+			value
+		});
+		return value;
+	}
+	return {
+		frozen,
+		begin() {
+			used = /* @__PURE__ */ new Set();
+		},
+		prune(runs) {
+			for (const cache of [journals, files]) for (const key of cache.keys()) if (!used.has(key)) cache.delete(key);
+			const live = new Set(runs);
+			for (const id of frozen.keys()) if (!live.has(id)) frozen.delete(id);
+		},
+		/** The run's journal, end record and script meta; `script` is the script's file name, from its launch. */
+		async read(f, sessionDir, script) {
+			const j = f.journal ? await readJournal(f.journal) : null;
+			const record = f.record ? await readFile(f.record.path, parseRecord) : null;
+			let meta = null;
+			if (!record?.phases) {
+				const scripts = join(sessionDir, "workflows/scripts");
+				const name = script ?? (await io.listDir(scripts)).find((e) => !e.isDir && e.name.endsWith(`-${f.id}.js`))?.name ?? null;
+				if (name) meta = await readFile(join(scripts, name), parseScriptMeta);
+			}
+			return {
+				started: j?.started ?? /* @__PURE__ */ new Map(),
+				results: j?.results ?? /* @__PURE__ */ new Map(),
+				record,
+				meta
+			};
+		}
+	};
+}
+/**
+* The run's agents in the order they started, then any whose start isn't in the journal yet, at
+* most MAX_WORKFLOW_AGENTS; `more` counts the rest.
+*/
+function agentsInView(f, run) {
+	const order = [...run.started.keys()];
+	const rank = (id) => {
+		const i = order.indexOf(id);
+		return i < 0 ? order.length : i;
+	};
+	const all = [...f.agents].sort((a, b) => rank(a.id) - rank(b.id) || a.mtimeMs - b.mtimeMs);
+	return {
+		kept: all.slice(0, 100),
+		more: Math.max(0, all.length - 100)
+	};
+}
+/** The run's fact, and each of its agents' place and state. */
+function viewWorkflow(input) {
+	const { files, run, launch, now, config } = input;
+	const record = run.record;
+	const stalledMs = config.stalledMinutes * 6e4;
+	const journalAt = files.journal?.mtimeMs ?? -Infinity;
+	const ended = record ? endOf(record.status) : null;
+	const agents = /* @__PURE__ */ new Map();
+	for (const a of input.agents) {
+		const started = run.started.get(a.file.id);
+		const label = cut(started?.label || text(a.meta.description) || "", 200);
+		const phase = cut(started?.phase || text(a.meta.workflowPhase) || "", 100);
+		const workflow = {
+			id: files.id,
+			phase,
+			label
+		};
+		const lastAt = Number.isFinite(a.lastAt) ? a.lastAt : a.file.mtimeMs;
+		if (run.results.has(a.file.id)) agents.set(a.file.id, {
+			workflow,
+			status: "done",
+			since: lastAt,
+			endState: "completed",
+			report: run.results.get(a.file.id)
+		});
+		else if (record && ended) agents.set(a.file.id, {
+			workflow,
+			status: ended,
+			since: record.endedAt,
+			endState: record.status,
+			report: null
+		});
+		else {
+			const quietSince = Math.max(a.file.mtimeMs, journalAt);
+			const working = now - quietSince <= stalledMs;
+			agents.set(a.file.id, {
+				workflow,
+				status: working ? "working" : "stalled",
+				since: working ? Number.isFinite(a.firstAt) ? a.firstAt : a.file.mtimeMs : quietSince + stalledMs,
+				report: null
+			});
+		}
+	}
+	if (input.frozen) return {
+		fact: input.frozen,
+		agents
+	};
+	const meta = run.meta;
+	const firsts = input.agents.map((a) => a.firstAt).filter(Number.isFinite);
+	const startedAt = record?.startedAt ?? launch?.at ?? (firsts.length ? Math.min(...firsts) : files.lastActive);
+	const name = launch?.name ?? record?.name ?? meta?.name ?? files.id;
+	const description = launch?.description ?? record?.description ?? meta?.description;
+	const phases = record?.phases ?? meta?.phases ?? [...new Set([...run.started.values()].map((s) => s.phase).filter(Boolean))].map((title) => ({ title }));
+	const quiet = now - files.lastActive;
+	const status = ended ?? (quiet <= stalledMs ? "running" : quiet <= config.idleMinutes * 6e4 ? "stalled" : "idle");
+	const tokens = record?.tokens ?? input.agents.reduce((n, a) => n + a.tokens, 0);
+	return {
+		fact: {
+			id: files.id,
+			session: input.session,
+			startedBy: launch?.by ?? input.lead,
+			name: cut(name, 200),
+			...description ? { description: cut(description, MAX_WORKFLOW_DESCRIPTION_LENGTH) } : {},
+			phases: phases.slice(0, 30).map((p) => ({
+				title: cut(p.title, 100),
+				...p.detail ? { detail: cut(p.detail, 500) } : {}
+			})),
+			status,
+			startedAt: iso$1(startedAt, files.lastActive),
+			...record ? { endedAt: iso$1(record.endedAt, files.record.mtimeMs) } : {},
+			...tokens > 0 ? { usage: { tokens } } : {},
+			...input.more ? { moreAgents: input.more } : {}
+		},
+		agents
+	};
+}
+/** What withheld workflow text says in its place. */
+const WORKFLOW_WITHHELD = "Hidden by the secret check";
+/**
+* The facts with each workflow's name, description, phase titles and details, and its agents'
+* labels and phases, secret-checked: a text the scan matches, and every one while `patterns` is
+* null, goes out as WORKFLOW_WITHHELD. A withheld label hides the agent's task too, which is the
+* same text.
+*/
+function prepareWorkflows(facts, patterns, log) {
+	if (!facts.workflows?.length) return facts;
+	const check = (value, what) => {
+		if (!value) return value;
+		const matched = scan(value, patterns);
+		if (!matched) return value;
+		log(`withheld ${what}: ${patterns ? `it matches the secret pattern "${matched}"` : "the secret patterns couldn't be read"}`);
+		return WORKFLOW_WITHHELD;
+	};
+	const workflows = facts.workflows.map((w) => {
+		const { description, ...rest } = w;
+		const said = description === void 0 ? void 0 : check(description, `the description of workflow ${w.id}`);
+		return {
+			...rest,
+			name: check(w.name, `the name of workflow ${w.id}`),
+			...said === void 0 ? {} : { description: said },
+			phases: w.phases.map((p, i) => ({
+				title: check(p.title, `phase ${i + 1}'s title in workflow ${w.id}`),
+				...p.detail === void 0 ? {} : { detail: check(p.detail, `phase ${i + 1}'s detail in workflow ${w.id}`) }
+			}))
+		};
+	});
+	const agents = facts.agents.map((a) => {
+		if (!a.workflow) return a;
+		const label = check(a.workflow.label, `the label of ${a.id}`);
+		const phase = check(a.workflow.phase, `the phase of ${a.id}`);
+		if (label === a.workflow.label && phase === a.workflow.phase) return a;
+		const hidden = label !== a.workflow.label;
+		return {
+			...a,
+			workflow: {
+				...a.workflow,
+				label,
+				phase
+			},
+			...hidden ? {
+				task: WORKFLOW_WITHHELD,
+				extra: {
+					...a.extra,
+					description: WORKFLOW_WITHHELD
+				}
+			} : {}
+		};
+	});
+	return {
+		...facts,
+		agents,
+		workflows
+	};
+}
+function endOf(status) {
+	return status === "completed" ? "done" : status === "killed" || status === "stopped" ? "stopped" : "failed";
+}
+function parseRecord(textIn) {
+	const r = JSON.parse(textIn);
+	if (!r || typeof r !== "object") return null;
+	const num = (v) => typeof v === "number" && Number.isFinite(v) ? v : null;
+	const start = num(r.startTime);
+	const duration = num(r.durationMs);
+	const stamp = typeof r.timestamp === "string" ? Date.parse(r.timestamp) : NaN;
+	const endedAt = start !== null && duration !== null ? start + duration : stamp;
+	const tokens = num(r.totalTokens);
+	return {
+		status: text(r.status) ?? "failed",
+		startedAt: start ?? NaN,
+		endedAt,
+		tokens: tokens !== null && tokens >= 0 ? Math.round(tokens) : null,
+		name: text(r.workflowName),
+		description: text(r.summary),
+		phases: phasesOf(r.phases)
+	};
+}
+/** The script's `export const meta = {...}`, read as a plain object literal: nothing in it runs. */
+function parseScriptMeta(src) {
+	const m = /export\s+const\s+meta\s*=\s*/.exec(src);
+	if (!m) return null;
+	const value = literal(src, m.index + m[0].length);
+	if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+	const o = value;
+	return {
+		name: text(o.name),
+		description: text(o.description),
+		phases: phasesOf(o.phases)
+	};
+}
+function phasesOf(v) {
+	if (!Array.isArray(v)) return null;
+	const out = [];
+	for (const p of v) {
+		const title = p && typeof p === "object" ? text(p.title) : null;
+		if (!title) continue;
+		const detail = text(p.detail);
+		out.push({
+			title,
+			...detail ? { detail } : {}
+		});
+	}
+	return out;
+}
+function literal(src, start) {
+	let i = start;
+	const fail = () => {
+		throw new Error("not a literal");
+	};
+	const space = () => {
+		for (;;) {
+			while (i < src.length && /\s/.test(src[i])) i++;
+			if (src.startsWith("//", i)) {
+				const end = src.indexOf("\n", i);
+				i = end < 0 ? src.length : end;
+			} else if (src.startsWith("/*", i)) {
+				const end = src.indexOf("*/", i + 2);
+				i = end < 0 ? fail() : end + 2;
+			} else return;
+		}
+	};
+	const str = () => {
+		const q = src[i++];
+		let out = "";
+		while (i < src.length && src[i] !== q) {
+			if (q === "`" && src.startsWith("${", i)) fail();
+			if (src[i] === "\\") {
+				const c = src[i + 1];
+				out += c === "n" ? "\n" : c === "t" ? "	" : c === "\n" ? "" : c;
+				i += 2;
+			} else out += src[i++];
+		}
+		if (src[i] !== q) fail();
+		i++;
+		return out;
+	};
+	const value = (depth) => {
+		if (depth > 20) fail();
+		space();
+		const c = src[i];
+		if (c === "{") {
+			i++;
+			const o = {};
+			for (;;) {
+				space();
+				if (src[i] === "}") return i++, o;
+				let key;
+				if (src[i] === "'" || src[i] === "\"") key = str();
+				else {
+					key = /^[A-Za-z_$][\w$]*/.exec(src.slice(i, i + 200))?.[0] ?? fail();
+					i += key.length;
+				}
+				space();
+				if (src[i++] !== ":") fail();
+				Object.defineProperty(o, key, {
+					value: value(depth + 1),
+					enumerable: true,
+					writable: true,
+					configurable: true
+				});
+				space();
+				if (src[i] === ",") i++;
+				else if (src[i] !== "}") fail();
+			}
+		}
+		if (c === "[") {
+			i++;
+			const a = [];
+			for (;;) {
+				space();
+				if (src[i] === "]") return i++, a;
+				a.push(value(depth + 1));
+				space();
+				if (src[i] === ",") i++;
+				else if (src[i] !== "]") fail();
+			}
+		}
+		if (c === "'" || c === "\"" || c === "`") return str();
+		const word = /^(?:-?\d+(?:\.\d+)?|true|false|null)(?![\w$])/.exec(src.slice(i, i + 50))?.[0] ?? fail();
+		i += word.length;
+		return word === "true" ? true : word === "false" ? false : word === "null" ? null : Number(word);
+	};
+	try {
+		return value(0);
+	} catch {
+		return null;
+	}
+}
+function resultText(v) {
+	if (v === void 0 || v === null) return null;
+	if (typeof v === "string") return v.trim() ? v : null;
+	try {
+		return JSON.stringify(v, null, 2);
+	} catch {
+		return null;
+	}
+}
+const text = (v) => typeof v === "string" && v.trim() ? v.trim() : null;
+function cut(s, max) {
+	if (s.length <= max) return s;
+	let end = max;
+	const code = s.charCodeAt(end - 1);
+	if (code >= 55296 && code <= 56319) end--;
+	return s.slice(0, end);
+}
+function iso$1(ms, fallback) {
+	return new Date(Number.isFinite(ms) ? ms : fallback).toISOString();
+}
+//#endregion
 //#region src/data-layer/claude-code.ts
 const SOURCE = "claude-code";
 const SUBAGENT_LOOKBACK_MS = 864e5;
@@ -9051,9 +9547,11 @@ function createClaudeCode(io) {
 	const workspaces = /* @__PURE__ */ new Map();
 	const places = attributionCache();
 	const searched = /* @__PURE__ */ new Map();
+	const runs = createWorkflowReader(io);
 	let used = /* @__PURE__ */ new Set();
 	async function read({ sessionId, cwd, now, config, resolve, projectOf }) {
 		used = /* @__PURE__ */ new Set();
+		runs.begin();
 		const errors = {
 			count: 0,
 			first: null
@@ -9109,6 +9607,7 @@ function createClaudeCode(io) {
 			};
 		} finally {
 			for (const cache of [transcripts, metas]) for (const key of cache.keys()) if (!used.has(key)) cache.delete(key);
+			runs.prune(c.workflows.map((w) => w.id));
 		}
 	}
 	async function lead(sessionId, now, config) {
@@ -9150,6 +9649,7 @@ function createClaudeCode(io) {
 		const keepMs = Math.max(idleMs, config.lightsOffHours * 36e5);
 		const agentWindowMs = Math.max(idleMs, config.touchedWindowMinutes * 6e4);
 		const all = [];
+		let workflows = [];
 		if (now - st.mtimeMs <= Math.max(SUBAGENT_LOOKBACK_MS, keepMs)) {
 			const subDir = join(path.slice(0, -6), "subagents");
 			for (const f of await io.listDir(subDir)) {
@@ -9163,12 +9663,15 @@ function createClaudeCode(io) {
 					...ast
 				});
 			}
+			workflows = await listWorkflows(io, path.slice(0, -6), now, keepMs);
 		}
-		const lastActive = Math.max(st.mtimeMs, ...all.map((a) => a.mtimeMs));
+		const lastActive = Math.max(st.mtimeMs, ...all.map((a) => a.mtimeMs), ...workflows.map((w) => w.lastActive));
 		if (now - lastActive > keepMs) return null;
 		const lit = now - lastActive <= idleMs;
 		const from = lit ? now : lastActive;
 		const agents = all.filter((a) => from - a.mtimeMs <= agentWindowMs);
+		const inView = workflows.filter((w) => from - w.lastActive <= agentWindowMs);
+		const subagents = all.length + workflows.reduce((n, w) => n + w.agents.length, 0);
 		return {
 			id: sessionId,
 			path,
@@ -9177,7 +9680,8 @@ function createClaudeCode(io) {
 			lastActive,
 			lights: lit ? "on" : "off",
 			agents,
-			subagents: all.length
+			workflows: inView,
+			subagents
 		};
 	}
 	async function isWorkspace(dir, now, config) {
@@ -9201,7 +9705,22 @@ function createClaudeCode(io) {
 		const session = `${SOURCE}:${c.id}`;
 		const lead = `${session}:lead`;
 		const agentFiles = [];
-		for (const a of c.agents) try {
+		const sessionDir = c.path.slice(0, -6);
+		const runStates = /* @__PURE__ */ new Map();
+		const workflowAgents = [];
+		for (const w of c.workflows) try {
+			const run = await runs.read(w, sessionDir, main.workflows.get(w.id)?.script ?? null);
+			const { kept, more } = agentsInView(w, run);
+			runStates.set(w.id, {
+				files: w,
+				run,
+				more
+			});
+			workflowAgents.push(...kept);
+		} catch (err) {
+			fail(err);
+		}
+		for (const a of [...c.agents, ...workflowAgents]) try {
 			agentFiles.push({
 				...a,
 				t: await readTranscript(a.path, a.size, config.tailBytes),
@@ -9249,6 +9768,43 @@ function createClaudeCode(io) {
 			});
 		}
 		const mtimes = new Map([[lead, c.ownMtime], ...agentFiles.map((a) => [agentId(a.id), a.mtimeMs])]);
+		const launches = /* @__PURE__ */ new Map();
+		for (const [runId, l] of main.workflows) launches.set(runId, {
+			...l,
+			by: lead
+		});
+		for (const a of agentFiles) for (const [runId, l] of a.t.workflows) launches.set(runId, {
+			...l,
+			by: agentId(a.id)
+		});
+		const workflowViews = /* @__PURE__ */ new Map();
+		const workflowFacts = [];
+		for (const [runId, { files, run, more }] of runStates) {
+			const view = viewWorkflow({
+				files,
+				run,
+				launch: launches.get(runId) ?? null,
+				agents: agentFiles.filter((a) => a.run === runId).map((a) => ({
+					file: {
+						...a,
+						run: runId
+					},
+					firstAt: a.t.firstAt,
+					lastAt: a.t.lastAt,
+					tokens: tokensOf(a.t),
+					meta: a.meta
+				})),
+				more,
+				session,
+				lead,
+				now,
+				config,
+				frozen: runs.frozen.get(runId)
+			});
+			if (run.record) runs.frozen.set(runId, view.fact);
+			workflowViews.set(runId, view.agents);
+			workflowFacts.push(view.fact);
+		}
 		const branch = main.branch || where.branch;
 		const facts = {
 			session: {
@@ -9268,7 +9824,8 @@ function createClaudeCode(io) {
 			reads: [],
 			waits: [],
 			reports: [],
-			questions: []
+			questions: [],
+			...workflowFacts.length ? { workflows: workflowFacts } : {}
 		};
 		const leadWorking = main.turnOpen && now - c.ownMtime <= config.stalledMinutes * 6e4;
 		facts.agents.push({
@@ -9290,6 +9847,7 @@ function createClaudeCode(io) {
 		if (main.turnOpen) addQuestions(facts.questions, lead, main, results, c.ownMtime);
 		for (const a of agentFiles) {
 			const id = agentId(a.id);
+			const wf = a.run ? workflowViews.get(a.run)?.get(a.id) : void 0;
 			const type = typeof a.meta.agentType === "string" && a.meta.agentType ? a.meta.agentType : null;
 			const at = a.t.cwd ? await resolve(a.t.cwd) : null;
 			let worktree = typeof a.meta.worktreePath === "string" ? normalize(a.meta.worktreePath) : null;
@@ -9298,9 +9856,13 @@ function createClaudeCode(io) {
 			if (elsewhere?.project) checkouts[id] = elsewhere.project.id;
 			const agentBranch = worktree ? typeof a.meta.worktreeBranch === "string" && a.meta.worktreeBranch || (at && pathKey(at.toplevel) === pathKey(worktree) ? at.branch : null) : null;
 			const spawn = typeof a.meta.toolUseId === "string" ? spawns.get(a.meta.toolUseId) : void 0;
-			let startedBy = spawn ? spawn.by : typeof a.meta.parentAgentId === "string" ? agentId(a.meta.parentAgentId) : lead;
+			let startedBy = wf ? workflowFacts.find((w) => w.id === a.run)?.startedBy ?? lead : spawn ? spawn.by : typeof a.meta.parentAgentId === "string" ? agentId(a.meta.parentAgentId) : lead;
 			if (!mtimes.has(startedBy)) startedBy = lead;
-			const s = agentStatus(a, results, notes, spawn, now, mtimes.get(startedBy), config);
+			const s = wf ? {
+				status: wf.status,
+				since: wf.since,
+				...wf.endState ? { endState: wf.endState } : {}
+			} : agentStatus(a, results, notes, spawn, now, mtimes.get(startedBy), config);
 			const live = s.status === "working" || s.status === "stalled";
 			facts.agents.push({
 				id,
@@ -9319,18 +9881,25 @@ function createClaudeCode(io) {
 					checkout: worktree,
 					branch: agentBranch
 				} : {},
+				...wf ? { workflow: wf.workflow } : {},
 				extra: {
 					description: a.meta.description ?? null,
 					...s.endState ? { endState: s.endState } : {}
 				}
 			});
-			if (live) facts.waits.push({
+			if (live && !wf) facts.waits.push({
 				waiter: startedBy,
 				on: id,
 				since: iso(spawn ? spawn.at : a.t.firstAt, a.mtimeMs)
 			});
 			if (live) addQuestions(facts.questions, id, a.t, results, a.mtimeMs);
-			if ((s.status === "done" || s.status === "failed") && a.t.lastText !== null) facts.reports.push({
+			if (wf) {
+				if (wf.status === "done" && wf.report !== null) facts.reports.push({
+					agent: id,
+					at: iso(wf.since, a.mtimeMs),
+					text: wf.report
+				});
+			} else if ((s.status === "done" || s.status === "failed") && a.t.lastText !== null) facts.reports.push({
 				agent: id,
 				at: iso(a.t.lastTextAt, a.mtimeMs),
 				text: a.t.lastText
@@ -9510,7 +10079,8 @@ function newTranscriptState() {
 		tools: 0,
 		firstPrompt: null,
 		compacted: false,
-		asks: /* @__PURE__ */ new Map()
+		asks: /* @__PURE__ */ new Map(),
+		workflows: /* @__PURE__ */ new Map()
 	};
 }
 const MESSAGE_TYPES = /* @__PURE__ */ new Set([
@@ -9628,6 +10198,11 @@ function foldLine(st, line, home, isDir) {
 					...toolResult(ev.toolUseResult, c.is_error),
 					at
 				});
+				const launch = workflowLaunch(ev.toolUseResult);
+				if (launch) st.workflows.set(launch.runId, {
+					...launch,
+					at
+				});
 			}
 		}
 		const turn = userTurn(ev, content);
@@ -9683,6 +10258,7 @@ function foldUsage(st, line) {
 	if (ev && ev.type === "assistant" && ev.message && typeof ev.message === "object") readUsage(st, ev.message, Date.parse(ev.timestamp));
 }
 const isCompaction = (ev) => !!ev && typeof ev === "object" && (ev.type === "system" && ev.subtype === "compact_boundary" || ev.isCompactSummary === true);
+const tokensOf = (st) => (st.usage?.context ?? 0) + (st.reply?.counts.output ?? 0);
 function usageOf(st, fallbackMs) {
 	return st.usage && {
 		model: st.usage.model,
@@ -9777,7 +10353,7 @@ const READ_LIKE = /* @__PURE__ */ new Set([
 ]);
 const MAX_CHECKS = 20;
 const MAX_REPORTED = 5;
-const AGENT_FILES = /[\\/](?:tasks[\\/]([a-z0-9_-]+)\.output|subagents[\\/]agent-([a-z0-9_-]+)\.jsonl)(?![\w.-])/gi;
+const AGENT_FILES = /[\\/](?:tasks[\\/]([a-z0-9_-]+)\.output|subagents[\\/](?:workflows[\\/][a-z0-9_-]+[\\/])?agent-([a-z0-9_-]+)\.jsonl)(?![\w.-])/gi;
 const agentsIn = (text) => [...text.matchAll(AGENT_FILES)].map((m) => (m[1] ?? m[2]).toLowerCase());
 function checkIns(name, input, writes) {
 	if (name === "SendMessage") return typeof input.to === "string" && input.to.trim() ? [{
@@ -10816,6 +11392,9 @@ function diffFacts(before, after, answered) {
 		remove.questions = questions.remove.map((q) => q.id);
 		if (answered) remove.questionOutcomes = Object.fromEntries(remove.questions.map((id) => [id, answered(id) ? "answered" : "abandoned"]));
 	}
+	const workflows = diff(before.workflows ?? [], after.workflows ?? [], (w) => w.id);
+	if (workflows.upsert.length) upsert.workflows = workflows.upsert;
+	if (workflows.remove.length) remove.workflows = workflows.remove.map((w) => w.id);
 	return Object.keys(upsert).length || Object.keys(remove).length ? {
 		upsert,
 		remove
@@ -11838,7 +12417,7 @@ async function main(argv) {
 		});
 		said.add(text);
 	};
-	const outgoing = (run, facts, patterns) => prepareQuestions(run.hold.apply(facts, patterns), patterns, waiting, patternLog);
+	const outgoing = (run, facts, patterns) => prepareWorkflows(prepareQuestions(run.hold.apply(facts, patterns), patterns, waiting, patternLog), patterns, patternLog);
 	let checkouts = {};
 	let answered = (_id) => false;
 	let contextWindow = null;

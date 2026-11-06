@@ -2,7 +2,7 @@
 // records that are new or differ, and the keys of those that went away. Records are keyed as the
 // protocol keys them: an agent by its id, an edit or read by agent, file and project (absent for
 // the session's own, as an older peer sends it), a wait by waiter and
-// on, a report by its agent, a question by its id. The session is one record, sent whole when it
+// on, a report by its agent, a question or a workflow by its id. The session is one record, sent whole when it
 // changed. Facts without questions have none. Given `answered`, each removed question says how it
 // ended: answered, or abandoned with no answer.
 
@@ -38,6 +38,10 @@ export function diffFacts(before: Facts, after: Facts, answered?: (question: str
     remove.questions = questions.remove.map((q) => q.id);
     if (answered) remove.questionOutcomes = Object.fromEntries(remove.questions.map((id) => [id, answered(id) ? "answered" : "abandoned"]));
   }
+
+  const workflows = diff(before.workflows ?? [], after.workflows ?? [], (w) => w.id);
+  if (workflows.upsert.length) upsert.workflows = workflows.upsert;
+  if (workflows.remove.length) remove.workflows = workflows.remove.map((w) => w.id);
 
   return Object.keys(upsert).length || Object.keys(remove).length ? { upsert, remove } : null;
 }

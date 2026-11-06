@@ -25,7 +25,9 @@
 // answerable from the floor while this data layer's hooks module marks that it waits for it
 // (src/data-layer/owner-answers.ts); a detached one's are read-only. The session fact carries the
 // session's context window once its hooks module has written the size to the file the `window`
-// line names; a detached one has no hooks module, so sends none.
+// line names; a detached one has no hooks module, so sends none. A Claude Code workflow's name,
+// description, phases and agents' labels are secret-checked too, and one that matches goes out as a
+// placeholder (src/data-layer/workflows.ts); its agents' results are reports like any other.
 //
 //   node dist/data-layer.js --session <session id> --cwd <the session's folder> --detached
 //
@@ -90,6 +92,7 @@ import { createPairing, pairingLockPath, pairingPath, pairingWriteLockPath, type
 import { askingRemoteNames } from "./remote-names.js";
 import { openReportHold, releasedPath, type ReportHold } from "./reports.js";
 import { cleanTitle, nextTitle, TITLE_SYSTEM, type TitleCache } from "./titles.js";
+import { prepareWorkflows } from "./workflows.js";
 
 // A detached data layer's log starts over once it is this big.
 const LOG_CAP_BYTES = 64 * 1024;
@@ -338,8 +341,10 @@ async function main(argv: string[]): Promise<number> {
     if (!said.has(text)) emit({ type: "log", text });
     said.add(text);
   };
-  // What goes to an office's link: the reports its hold keeps held, and the questions checked and marked.
-  const outgoing = (run: OfficeRun, facts: Facts, patterns: Pattern[] | null) => prepareQuestions(run.hold.apply(facts, patterns), patterns, waiting, patternLog);
+  // What goes to an office's link: the reports its hold keeps held, the questions checked and
+  // marked, and the workflows' names, phases and labels checked (workflows.ts).
+  const outgoing = (run: OfficeRun, facts: Facts, patterns: Pattern[] | null) =>
+    prepareWorkflows(prepareQuestions(run.hold.apply(facts, patterns), patterns, waiting, patternLog), patterns, patternLog);
   // The project of each subagent working in a worktree of another repo, from the latest read.
   let checkouts: Record<string, string> = {};
   // Whether a question got an answer, from the latest read, so one that closed says how.
