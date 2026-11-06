@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 import fs from "node:fs/promises";
 import { promisify } from "node:util";
 import { statSync } from "node:fs";
+import { createHash } from "node:crypto";
 //#region src/data-layer/config.ts
 async function loadConfig(io, defaultsPath, userPath) {
 	const config = await loadSettings(io, defaultsPath, userPath);
@@ -692,13 +693,17 @@ const exec = (file, args, env) => new Promise((resolve) => {
 //#endregion
 //#region src/install/link-handler.ts
 const KEY = "HKCU\\Software\\Classes\\isoplan";
-const COMMAND_KEY = `${KEY}\\shell\\open\\command`;
+const COMMAND_KEY = `${`${KEY}\\shell\\open`}\\command`;
 const LSREGISTER = "/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister";
 const DESKTOP = "isoplan-connect.desktop";
 const macAppPath = (claudeDir) => path.join(claudeDir, "isoplan", "Isoplan Connect.app");
 const desktopPath = (h) => path.join(h.dataHome || path.join(h.home, ".local", "share"), "applications", DESKTOP);
+/** The Windows launcher the open command runs. */
+const linkLauncherPath = (claudeDir) => path.join(claudeDir, "isoplan", "open-link.js");
+/** The value `reg query` prints for a key's default or a named value, whatever the language of its "(Default)" label. */
 const regValue = (stdout) => /REG_SZ[ \t]+(.*?)\s*$/m.exec(stdout)?.[1] ?? null;
 const norm = (p) => p.replace(/\\/g, "/").toLowerCase();
+/** A desktop entry's Exec argument, quoted as the Desktop Entry spec asks, then escaped as its strings are. */
 const execArg = (value) => `"${value.replace(/(["`$\\])/g, "\\$1")}"`.replace(/\\/g, "\\\\");
 /** Takes the handler out when it is this config folder's; says what it changed. */
 async function unregisterLinkHandler(h) {
@@ -709,7 +714,9 @@ async function unregisterLinkHandler(h) {
 			COMMAND_KEY,
 			"/ve"
 		])).stdout);
-		if (!value || !norm(value).includes(norm(h.script))) return [];
+		const launcher = linkLauncherPath(h.claudeDir);
+		await fs.rm(launcher, { force: true });
+		if (!value || ![h.script, launcher].some((p) => norm(value).includes(norm(p)))) return [];
 		await run("reg", [
 			"delete",
 			KEY,
@@ -733,6 +740,59 @@ async function unregisterLinkHandler(h) {
 		await fs.rm(file, { force: true });
 		await run("update-desktop-database", [path.dirname(file)]);
 		return [`removed the isoplan:// link handler, ${file}`];
+	}
+	return [];
+}
+//#endregion
+//#region src/install/login-item.ts
+const RUN_KEY = "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+/** A short id of the config folder, so each folder's item has its own name. */
+const loginItemId = (claudeDir, platform) => createHash("sha256").update(normalPath(claudeDir, platform)).digest("hex").slice(0, 8);
+const runValueName = (claudeDir) => `Isoplan runner ${loginItemId(claudeDir, "win32")}`;
+const loginLauncherPath = (claudeDir) => path.join(claudeDir, "isoplan", "start-at-login.js");
+const launchAgentLabel = (claudeDir) => `dev.isoplan.runner.${loginItemId(claudeDir, "darwin")}`;
+const launchAgentPath = (home, claudeDir) => path.join(home, "Library", "LaunchAgents", `${launchAgentLabel(claudeDir)}.plist`);
+const autostartPath = (h) => path.join(h.configHome || path.join(h.home, ".config"), "autostart", `isoplan-runner-${loginItemId(h.claudeDir, "linux")}.desktop`);
+/** Whether runner.json (`defaultsPath`, overridden by the person's `userPath`) has the runner start at login; on unless it says false. */
+async function startsAtLogin(defaultsPath, userPath) {
+	return (await loadSettings(nodeIo(), defaultsPath, userPath).catch(() => null))?.startAtLogin !== false;
+}
+/** Takes this config folder's login item out; says what it changed. */
+async function unregisterLoginItem(h) {
+	const run = h.run ?? exec;
+	const removed = (where) => [`took out the runner's start at login (${where})`];
+	if (h.platform === "win32") {
+		const name = runValueName(h.claudeDir);
+		const had = (await run("reg", [
+			"query",
+			RUN_KEY,
+			"/v",
+			name
+		])).code === 0;
+		if (had) await run("reg", [
+			"delete",
+			RUN_KEY,
+			"/v",
+			name,
+			"/f"
+		]);
+		const launcher = loginLauncherPath(h.claudeDir);
+		const hadLauncher = !!await fs.stat(launcher).catch(() => null);
+		await fs.rm(launcher, { force: true });
+		return had || hadLauncher ? removed(`${RUN_KEY}\\${name}`) : [];
+	}
+	if (h.platform === "darwin") {
+		const file = launchAgentPath(h.home, h.claudeDir);
+		if (!await fs.stat(file).catch(() => null)) return [];
+		await fs.rm(file, { force: true });
+		await run("launchctl", ["bootout", `gui/${h.uid}/${launchAgentLabel(h.claudeDir)}`]);
+		return removed(file);
+	}
+	if (h.platform === "linux") {
+		const file = autostartPath(h);
+		if (!await fs.stat(file).catch(() => null)) return [];
+		await fs.rm(file, { force: true });
+		return removed(file);
 	}
 	return [];
 }
@@ -814,7 +874,7 @@ const SESSION_TRACES = [
 * person writes, is kept, and the folder goes once it is empty. Throws when settings.json can't be
 * merged, with the hooks and wake.mjs still in place and settings.json not written.
 */
-async function uninstall(paths, { optOut = false, settleMs = 0, confirm, runner = {}, linkHandler } = {}) {
+async function uninstall(paths, { optOut = false, settleMs = 0, confirm, runner = {}, linkHandler, loginItem } = {}) {
 	const changes = [];
 	const dir = path.dirname(wakeScriptPath(paths.claudeDir));
 	const remove = async (file) => {
@@ -843,6 +903,14 @@ async function uninstall(paths, { optOut = false, settleMs = 0, confirm, runner 
 			script: connectScriptPath(paths.claudeDir)
 		});
 		changes.push(...await unregistered.catch((err) => [`couldn't take out the isoplan:// link handler: ${String(err?.message ?? err)}`]));
+	}
+	if (loginItem) {
+		const unregistered = unregisterLoginItem({
+			...loginItem,
+			claudeDir: paths.claudeDir,
+			script: wakeScriptPath(paths.claudeDir)
+		});
+		changes.push(...await unregistered.catch((err) => [`couldn't take out the runner's start at login: ${String(err?.message ?? err)}`]));
 	}
 	await remove(path.join(dir, "live"));
 	if (settleMs) await new Promise((r) => setTimeout(r, settleMs));
@@ -903,7 +971,7 @@ const UNINSTALL_RETRY_MS = 864e5;
 * uninstalled `recheckMs` after the reading that started it, so a record rewritten during an
 * update never counts.
 */
-async function uninstallInBackground(paths, { settleMs = 0, runner = {}, linkHandler, now = Date.now, recheckMs = UNINSTALL_RECHECK_MS } = {}) {
+async function uninstallInBackground(paths, { settleMs = 0, runner = {}, linkHandler, loginItem, now = Date.now, recheckMs = UNINSTALL_RECHECK_MS } = {}) {
 	const lock = uninstallLockPath(paths.claudeDir);
 	if (!await takeLock(lock, process.pid, alive, false, now())) return;
 	await new Promise((r) => setTimeout(r, recheckMs));
@@ -914,6 +982,7 @@ async function uninstallInBackground(paths, { settleMs = 0, runner = {}, linkHan
 			settleMs,
 			runner,
 			linkHandler,
+			loginItem,
 			confirm: async () => await recordedState(paths) === "uninstalled"
 		});
 		if (isDone) return;
@@ -1082,6 +1151,30 @@ async function writeWhole(file, text) {
 	}
 }
 //#endregion
+//#region src/wake/outside.ts
+async function startFromOutside({ paths, spawn, login, isAlive }) {
+	const { claudeDir } = paths;
+	const state = await recordedState(paths).catch(() => "enabled");
+	if (state === "uninstalled") {
+		if (!await isUninstalling(claudeDir)) spawn([wakeScriptPath(claudeDir), "--uninstall"], claudeDir);
+		return "uninstalling";
+	}
+	if (state === "disabled") return "disabled";
+	if (login && !await startsAtLogin(path.join(runnerAppDir(claudeDir), "runner.json"), path.join(claudeDir, "isoplan", "runner.json"))) {
+		await unregisterLoginItem({
+			...login,
+			claudeDir,
+			script: wakeScriptPath(claudeDir)
+		}).catch(() => []);
+		return "off";
+	}
+	return startRunner({
+		claudeDir,
+		spawn,
+		...isAlive && { isAlive }
+	});
+}
+//#endregion
 //#region src/wake/main.ts
 const STDIN_MS = 500;
 const RUNNER_EXIT_MS = 1e4;
@@ -1121,6 +1214,12 @@ const start = (args, cwd, env) => spawn(process.execPath, args, {
 	stdio: "ignore",
 	windowsHide: true
 }).on("error", () => {}).unref();
+const loginItem = {
+	platform: process.platform,
+	home: os.homedir(),
+	configHome: process.env.XDG_CONFIG_HOME,
+	uid: process.getuid?.()
+};
 if (process.argv.includes("--uninstall")) {
 	const settle = await settleMs(claudeDir, path.join(runnerAppDir(claudeDir), "config.json"));
 	const linkHandler = {
@@ -1134,7 +1233,16 @@ if (process.argv.includes("--uninstall")) {
 			commandOf: processCommand,
 			waitMs: RUNNER_EXIT_MS
 		},
-		linkHandler
+		linkHandler,
+		loginItem
+	}).catch(() => {});
+	process.exit(0);
+}
+if (process.argv.includes("--login")) {
+	await startFromOutside({
+		paths,
+		spawn: start,
+		login: loginItem
 	}).catch(() => {});
 	process.exit(0);
 }

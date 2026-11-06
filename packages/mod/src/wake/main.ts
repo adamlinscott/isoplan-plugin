@@ -26,6 +26,12 @@
 //   prompt starts them again.
 //
 //   node <claude dir>/isoplan/wake.mjs --uninstall
+//
+// The login item (src/install/login-item.ts) runs it as this person logs in, with no hook and no
+// session, to do the same for the machine (outside.ts): start the runner, unless the plugin is
+// disabled, uninstalled (then the uninstall), or `startAtLogin` is off (then it takes itself out).
+//
+//   node <claude dir>/isoplan/wake.mjs --login
 
 import { spawn } from "node:child_process";
 import os from "node:os";
@@ -34,6 +40,7 @@ import { fileURLToPath } from "node:url";
 import { isUninstalling, processCommand, recordedState, runnerAppDir, settleMs, stopOurRunner, uninstallInBackground } from "../install/install.js";
 import { managedDir, pluginDirsOf, pluginsDir } from "../install/state.js";
 import { startRunner } from "../runner/start.js";
+import { startFromOutside } from "./outside.js";
 import { wake } from "./wake.js";
 
 const STDIN_MS = 500;
@@ -68,10 +75,15 @@ const self = fileURLToPath(import.meta.url);
 const claudeDir = path.dirname(path.dirname(self));
 const paths = { claudeDir, settings: path.join(claudeDir, "settings.json"), plugins: pluginsDir(claudeDir, process.env), managed: managedDir(process.platform), pluginDirs: pluginDirsOf(process.env) };
 const start = (args: string[], cwd: string, env?: Record<string, string>) => spawn(process.execPath, args, { cwd, env, detached: true, stdio: "ignore", windowsHide: true }).on("error", () => {}).unref();
+const loginItem = { platform: process.platform, home: os.homedir(), configHome: process.env.XDG_CONFIG_HOME, uid: process.getuid?.() };
 if (process.argv.includes("--uninstall")) {
   const settle = await settleMs(claudeDir, path.join(runnerAppDir(claudeDir), "config.json"));
   const linkHandler = { platform: process.platform, home: os.homedir(), dataHome: process.env.XDG_DATA_HOME };
-  await uninstallInBackground(paths, { settleMs: settle, runner: { commandOf: processCommand, waitMs: RUNNER_EXIT_MS }, linkHandler }).catch(() => {});
+  await uninstallInBackground(paths, { settleMs: settle, runner: { commandOf: processCommand, waitMs: RUNNER_EXIT_MS }, linkHandler, loginItem }).catch(() => {});
+  process.exit(0);
+}
+if (process.argv.includes("--login")) {
+  await startFromOutside({ paths, spawn: start, login: loginItem }).catch(() => {});
   process.exit(0);
 }
 const input = await readStdin();

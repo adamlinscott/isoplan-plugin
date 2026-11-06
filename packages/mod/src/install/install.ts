@@ -12,7 +12,12 @@
 //
 // The isoplan:// link handler (src/connect), which the floor's Connect Claude Code opens, is copied
 // beside the runner, reading the same defaults, and registered with the operating system
-// (link-handler.ts) by an install given `linkHandler`: the install script's and the plugin's.
+// (link-handler.ts) by an install given `linkHandler`: the install script's and the plugin's. The
+// same installs, given `loginItem`, add the login item that starts the runner when this person logs
+// in (login-item.ts), or take it out while `startAtLogin` in runner.json is off. Since the plugin's
+// data layer installs as each session starts, a plugin update and a change to runner.json reach it
+// at the next session; the item itself also takes itself out at login once the setting is off
+// (src/wake/outside.ts), for a person who no longer opens Claude Code.
 //
 // settings.json gets one command hook on UserPromptSubmit and one on Stop. They are found again by
 // this config folder's wake.mjs path in their command, not by a field of their own, which Claude
@@ -47,6 +52,7 @@ import { RUNNER_FRESH_MS, runnerLockPath } from "../runner/start.js";
 import { alive, holdOff, isHeld, readLock, releaseLock, takeLock } from "../wake/lock.js";
 import { wakeRecordPath, type WakeRecord } from "../wake/wake.js";
 import { registerLinkHandler, unregisterLinkHandler, type LinkHandler } from "./link-handler.js";
+import { registerLoginItem, startsAtLogin, unregisterLoginItem, type LoginItemPlace } from "./login-item.js";
 import { normalPath, pluginState, type Place, type PluginState } from "./state.js";
 
 export const WAKE_EVENTS = ["UserPromptSubmit", "Stop"] as const;
@@ -148,7 +154,8 @@ export async function installWake(
     findClaude,
     waitMs = INSTALL_WAIT_MS,
     linkHandler,
-  }: { auto?: boolean; runnerFrom?: string; findClaude?: () => Promise<string | null>; waitMs?: number; linkHandler?: LinkHandlerPlace } = {},
+    loginItem,
+  }: { auto?: boolean; runnerFrom?: string; findClaude?: () => Promise<string | null>; waitMs?: number; linkHandler?: LinkHandlerPlace; loginItem?: LoginItemPlace } = {},
 ): Promise<string[]> {
   const { claudeDir, settings } = paths;
   if (auto && (await isOptedOut(claudeDir))) return finishOptOut(paths);
@@ -218,6 +225,12 @@ export async function installWake(
   if (runnerFrom && linkHandler) {
     changes.push(...(await registerLinkHandler({ ...linkHandler, claudeDir, script: connectScriptPath(claudeDir) }).catch((err: unknown) => [`couldn't register isoplan:// links: ${String((err as Error)?.message ?? err)}`])));
   }
+  // It runs wake.mjs, which is in place by now. One that can't be added leaves the runner to start as before.
+  if (runnerFrom && loginItem) {
+    const item = { ...loginItem, claudeDir, script };
+    const on = await startsAtLogin(path.join(runnerFrom, "runner.json"), path.join(claudeDir, "isoplan", "runner.json"));
+    changes.push(...(await (on ? registerLoginItem(item) : unregisterLoginItem(item)).catch((err: unknown) => [`couldn't ${on ? "set the runner to start" : "take out the runner's start"} at login: ${String((err as Error)?.message ?? err)}`])));
+  }
   if (done.length) await writeSettings(settings, current);
   return [...changes, ...done];
 }
@@ -273,6 +286,8 @@ export interface UninstallOptions {
   runner?: StopOptions;
   /** Where the operating system keeps the link handler, to take it out. */
   linkHandler?: Omit<LinkHandlerPlace, "node">;
+  /** Where the operating system keeps the login item, to take it out. */
+  loginItem?: Omit<LoginItemPlace, "node">;
 }
 
 /** What uninstall changed, and whether it got to the end; one that stopped says why last. */
@@ -291,7 +306,7 @@ export interface Uninstalled {
  * person writes, is kept, and the folder goes once it is empty. Throws when settings.json can't be
  * merged, with the hooks and wake.mjs still in place and settings.json not written.
  */
-export async function uninstall(paths: Paths, { optOut = false, settleMs = 0, confirm, runner = {}, linkHandler }: UninstallOptions = {}): Promise<Uninstalled> {
+export async function uninstall(paths: Paths, { optOut = false, settleMs = 0, confirm, runner = {}, linkHandler, loginItem }: UninstallOptions = {}): Promise<Uninstalled> {
   const changes: string[] = [];
   const dir = path.dirname(wakeScriptPath(paths.claudeDir));
   const remove = async (file: string) => {
@@ -313,6 +328,11 @@ export async function uninstall(paths: Paths, { optOut = false, settleMs = 0, co
   if (linkHandler) {
     const unregistered = unregisterLinkHandler({ ...linkHandler, claudeDir: paths.claudeDir, script: connectScriptPath(paths.claudeDir) });
     changes.push(...(await unregistered.catch((err: unknown) => [`couldn't take out the isoplan:// link handler: ${String((err as Error)?.message ?? err)}`])));
+  }
+  // The login item runs wake.mjs, which goes last; one that can't be taken out runs nothing once it has gone.
+  if (loginItem) {
+    const unregistered = unregisterLoginItem({ ...loginItem, claudeDir: paths.claudeDir, script: wakeScriptPath(paths.claudeDir) });
+    changes.push(...(await unregistered.catch((err: unknown) => [`couldn't take out the runner's start at login: ${String((err as Error)?.message ?? err)}`])));
   }
   await remove(path.join(dir, "live"));
   if (settleMs) await new Promise((r) => setTimeout(r, settleMs));
@@ -384,7 +404,7 @@ export const UNINSTALL_RETRY_MS = 24 * 3600000;
  */
 export async function uninstallInBackground(
   paths: Paths,
-  { settleMs = 0, runner = {}, linkHandler, now = Date.now, recheckMs = UNINSTALL_RECHECK_MS }: Pick<UninstallOptions, "settleMs" | "runner" | "linkHandler"> & { now?: () => number; recheckMs?: number } = {},
+  { settleMs = 0, runner = {}, linkHandler, loginItem, now = Date.now, recheckMs = UNINSTALL_RECHECK_MS }: Pick<UninstallOptions, "settleMs" | "runner" | "linkHandler" | "loginItem"> & { now?: () => number; recheckMs?: number } = {},
 ): Promise<void> {
   const lock = uninstallLockPath(paths.claudeDir);
   if (!(await takeLock(lock, process.pid, alive, false, now()))) return;
@@ -392,7 +412,7 @@ export async function uninstallInBackground(
   if ((await recordedState(paths)) !== "uninstalled") return releaseLock(lock, process.pid);
   const log = (text: string) => fs.appendFile(uninstallLogPath(paths.claudeDir), `${new Date(now()).toISOString()} ${text}\n`).catch(() => {});
   try {
-    const { changes, isDone } = await uninstall(paths, { settleMs, runner, linkHandler, confirm: async () => (await recordedState(paths)) === "uninstalled" });
+    const { changes, isDone } = await uninstall(paths, { settleMs, runner, linkHandler, loginItem, confirm: async () => (await recordedState(paths)) === "uninstalled" });
     if (isDone) return;
     const why = changes[changes.length - 1]!;
     if (!why.includes("installed again")) await log(why);

@@ -6,11 +6,16 @@
 // Install runs it from its copy beside the runner's (<claude dir>/isoplan/runner/app/dist/connect.mjs),
 // which outlives plugin updates, with the mod's config.json one folder up as here. Given the link
 // as an argument, it starts itself again, hidden and detached, with the link in its environment,
-// says so in one line, and returns at once: on Windows the link starts node in a console window of
-// its own, which then closes at once, and the floor's set-up message has Claude run it from a shell
-// whose command would otherwise wait for the dialog's answer, up to five minutes. (The Mac handler
-// passes the link in the environment, already in the background.) What it did, and why it didn't,
-// goes to <claude dir>/isoplan/logs/connect.log as well as the dialog.
+// says so in one line, and returns at once: the floor's set-up message has Claude run it from a shell
+// whose command would otherwise wait for the dialog's answer, up to five minutes, and on Windows
+// where Script Host is off the link starts node in a console window of its own, which then closes at
+// once. (The Mac handler and the Windows launcher pass the link in the environment, already in the
+// background.) What it did, and why it didn't, goes to <claude dir>/isoplan/logs/connect.log as well
+// as the dialog.
+//
+// isoplan://start-runner, which the web app's "Restart Isoplan on this machine" opens, starts this
+// computer's runner instead, as the login item does (src/wake/outside.ts), with no dialog and no
+// window, and says in connect.log what it did. A runner already running is left as it is.
 //
 // /isoplan:connect (commands/connect.md), and the floor's set-up message, run it two more ways, and
 // what they print is status.ts's one plain sentence:
@@ -31,9 +36,11 @@ import { loadConfig, officesOf } from "../data-layer/config.js";
 import { accountOf, claudePaths } from "../data-layer/identity.js";
 import { nodeIo } from "../data-layer/io.js";
 import { pairingEntry, pairingPath, readPairing } from "../data-layer/pairing.js";
+import { managedDir, pluginDirsOf, pluginsDir } from "../install/state.js";
+import { startFromOutside, type FromOutside } from "../wake/outside.js";
 import { connect, stopReporting } from "./connect.js";
 import { ask, tell } from "./dialog.js";
-import { parseLink } from "./link.js";
+import { isStartRunnerLink, parseLink } from "./link.js";
 import { resultSentence, runTag, statusSentence, waitForResult } from "./status.js";
 
 const ENV = "ISOPLAN_CONNECT_URL";
@@ -53,8 +60,30 @@ const startDetached = (link: string, run?: string) => {
   child.on("exit", () => (running = false)).on("error", () => (running = false));
   return () => running;
 };
+const log = (text: string) => {
+  void fs
+    .mkdir(path.dirname(logFile), { recursive: true })
+    .then(() => fs.appendFile(logFile, `${new Date().toISOString()} ${run ? `${runTag(run)} ` : ""}${text}\n`))
+    .catch(() => {});
+};
+// What isoplan://start-runner did, in a sentence.
+const STARTED: Record<FromOutside, string> = {
+  started: "Started Isoplan on this computer.",
+  running: "Isoplan was already running on this computer.",
+  "held-off": "Isoplan is holding off on this computer for up to an hour (the office didn't want it, or it kept stopping); see runner.log beside this log.",
+  "not-installed": "Isoplan isn't set up on this computer yet: start Claude Code once, so the plugin sets itself up.",
+  disabled: "Isoplan's plugin is turned off on this computer, so nothing was started.",
+  uninstalling: "Isoplan's plugin was uninstalled, so it is being taken off this computer.",
+  off: "Isoplan no longer starts when you log in on this computer.",
+};
 
-if (mode === "--status") {
+if (link && !mode && isStartRunnerLink(link)) {
+  const hidden = (args: string[], cwd: string, env?: Record<string, string>) => spawn(process.execPath, args, { cwd, env, detached: true, stdio: "ignore", windowsHide: true }).on("error", () => {}).unref();
+  const paths = { claudeDir, settings: path.join(claudeDir, "settings.json"), plugins: pluginsDir(claudeDir, process.env), managed: managedDir(process.platform), pluginDirs: pluginDirsOf(process.env) };
+  const said = STARTED[await startFromOutside({ paths, spawn: hidden })];
+  log(`isoplan://start-runner: ${said}`);
+  process.stdout.write(said + "\n");
+} else if (mode === "--status") {
   const offices = officesOf(await loadConfig(nodeIo(), defaultsPath, path.join(claudeDir, "isoplan", "config.json")));
   const [pairing, who] = await Promise.all([readPairing(pairingPath(claudeDir)), account()]);
   process.stdout.write(statusSentence(offices.map((o) => ({ label: o.label, server: o.server, connected: !!pairingEntry(pairing, o.server, who.id)?.credential }))) + "\n");
@@ -74,15 +103,9 @@ if (mode === "--status") {
   startDetached(link);
   process.stdout.write(`A window is opening on this computer to connect Claude Code to Isoplan: answer it there. Run this only once. What happens is written to ${logFile}.\n`);
 } else if (!link) {
-  process.stderr.write("usage: node connect.js [--wait] <isoplan://connect?...>, or node connect.js --status\n");
+  process.stderr.write("usage: node connect.js [--wait] <isoplan://connect?...>, node connect.js isoplan://start-runner, or node connect.js --status\n");
   process.exitCode = 2;
 } else {
-  const log = (text: string) => {
-    void fs
-      .mkdir(path.dirname(logFile), { recursive: true })
-      .then(() => fs.appendFile(logFile, `${new Date().toISOString()} ${run ? `${runTag(run)} ` : ""}${text}\n`))
-      .catch(() => {});
-  };
   try {
     await connect(link, {
       claudeDir,
