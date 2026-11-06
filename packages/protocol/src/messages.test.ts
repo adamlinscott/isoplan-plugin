@@ -2,11 +2,14 @@ import { describe, expect, test } from "vitest";
 import {
   MAX_DETAIL_LENGTH,
   MAX_DRIVE_ID_LENGTH,
+  MAX_FOLDER_LENGTH,
+  MAX_FOLDER_REPOS,
   MAX_HOLDING,
   MAX_INSTRUCTION_LENGTH,
   MAX_OUTPUT_LENGTH,
   MAX_PROMPT_LENGTH,
   MAX_REPLY_LENGTH,
+  MAX_REPO_FOLDERS,
   MAX_ROOM_SESSIONS,
   MAX_SUMMARY_LENGTH,
   MAX_TOOL_NAME_LENGTH,
@@ -195,6 +198,7 @@ const valid = {
   "runner that drives sessions": { type: "runner", v, account: adam, machine: { name: "sevengill" }, drive: true },
   "handoff as a driven session": { type: "handoff", v, handoff, mode: "driven", session: "0b5c4d3e-0000-4000-8000-000000000001", by: sam, room, permissions: "auto" },
   "drive start": { type: "drive", v, kind: "start", id: "d1", by: adam, room, project: isoplan, roomSessions: ["claude-code:s1"], instruction: "Fix the failing test in src/a.ts.", permissions: "auto" },
+  "drive start in a folder": { type: "drive", v, kind: "start", id: "d8", by: adam, folder: "C:\Users\adam\isoplan", project: isoplan, instruction: "Add a dark mode.", permissions: "auto" },
   "drive instruct": { type: "drive", v, kind: "instruct", id: "i2", by: adam, session: driving, text: "Now run the whole suite." },
   "drive stop": { type: "drive", v, kind: "stop", id: "d3", by: adam, session: driving },
   "drive hand-back": { type: "drive", v, kind: "hand-back", id: "d4", by: adam, session: driving },
@@ -217,6 +221,7 @@ const valid = {
   "driven refused": { type: "driven", v, kind: "refused", id: "d1", reason: "no-folder" },
   "driven refused at the cap": { type: "driven", v, kind: "refused", id: "d1", reason: "cap-reached", limit: 4 },
   "driven refused unavailable": { type: "driven", v, kind: "refused", id: "d1", reason: "unavailable", detail: "Claude Code isn't signed in on this machine." },
+  "driven folders": { type: "driven", v, kind: "folders", repos: [{ project: isoplan.id, folders: ["/Users/sam/code/isoplan", "/Users/sam/code/isoplan-wt"] }] },
   "driven holding": { type: "driven", v, kind: "holding", sessions: [{ session: driving, room, held: true, permissions: "auto", turn: "i2" }] },
 };
 
@@ -270,6 +275,7 @@ const parsers = {
   "runner that drives sessions": parseDataLayerMessage,
   "handoff as a driven session": parseOfficeServerMessage,
   "drive start": parseOfficeServerMessage,
+  "drive start in a folder": parseOfficeServerMessage,
   "drive instruct": parseOfficeServerMessage,
   "drive stop": parseOfficeServerMessage,
   "drive hand-back": parseOfficeServerMessage,
@@ -293,6 +299,7 @@ const parsers = {
   "driven refused at the cap": parseDataLayerMessage,
   "driven refused unavailable": parseDataLayerMessage,
   "driven holding": parseDataLayerMessage,
+  "driven folders": parseDataLayerMessage,
 } satisfies Record<keyof typeof valid, (value: unknown) => ParseResult<unknown>>;
 
 // Each message with one field made wrong, and the path the error should name.
@@ -346,6 +353,7 @@ const broken: Record<keyof typeof valid, [unknown, string]> = {
   "runner that drives sessions": [{ ...valid["runner that drives sessions"], drive: "yes" }, "drive"],
   "handoff as a driven session": [{ ...valid["handoff as a driven session"], room: undefined }, "room"],
   "drive start": [{ ...valid["drive start"], permissions: "default" }, "permissions"],
+  "drive start in a folder": [{ ...valid["drive start in a folder"], folder: "" }, "folder"],
   "drive instruct": [{ ...valid["drive instruct"], text: "x".repeat(MAX_INSTRUCTION_LENGTH + 1) }, "text"],
   "drive stop": [{ ...valid["drive stop"], by: undefined }, "by"],
   "drive hand-back": [{ ...valid["drive hand-back"], session: "" }, "session"],
@@ -369,6 +377,7 @@ const broken: Record<keyof typeof valid, [unknown, string]> = {
   "driven refused at the cap": [{ ...valid["driven refused at the cap"], limit: 0 }, "limit"],
   "driven refused unavailable": [{ ...valid["driven refused unavailable"], detail: undefined }, "detail"],
   "driven holding": [{ ...valid["driven holding"], sessions: [{ ...valid["driven holding"].sessions[0], held: "yes" }] }, "sessions[0].held"],
+  "driven folders": [{ ...valid["driven folders"], repos: [{ project: isoplan.id, folders: [] }] }, "repos[0].folders"],
 };
 
 describe.each(Object.keys(valid) as (keyof typeof valid)[])("%s", (type) => {
@@ -613,6 +622,10 @@ describe("driven sessions", () => {
     ["a refusal's detail", parseDataLayerMessage, (n: number) => ({ ...valid["driven refused"], detail: long(n) }), MAX_DETAIL_LENGTH, "detail"],
     ["a tool's name", parseDataLayerMessage, (n: number) => ({ ...valid["driven tool"], tool: `mcp__${long(n - 5)}` }), MAX_TOOL_NAME_LENGTH, "tool"],
     ["a start's room sessions", parseOfficeServerMessage, (n: number) => ({ ...valid["drive start"], roomSessions: sessions(n) }), MAX_ROOM_SESSIONS, "roomSessions"],
+    ["a start's folder", parseOfficeServerMessage, (n: number) => ({ ...valid["drive start in a folder"], folder: long(n) }), MAX_FOLDER_LENGTH, "folder"],
+    ["the folders listed for a repo", parseDataLayerMessage, (n: number) => ({ ...valid["driven folders"], repos: [{ project: isoplan.id, folders: Array.from({ length: n }, (_, i) => `/Users/sam/code/isoplan-${i}`) }] }), MAX_REPO_FOLDERS, "folders"],
+    ["a folder listed", parseDataLayerMessage, (n: number) => ({ ...valid["driven folders"], repos: [{ project: isoplan.id, folders: [long(n)] }] }), MAX_FOLDER_LENGTH, "folders"],
+    ["the repos folders are listed for", parseDataLayerMessage, (n: number) => ({ ...valid["driven folders"], repos: Array.from({ length: n }, (_, i) => ({ project: `github.com/sam/repo-${i}`, folders: ["/Users/sam/code/x"] })) }), MAX_FOLDER_REPOS, "repos"],
     ["the sessions a runner holds", parseDataLayerMessage, (n: number) => ({ ...valid["driven holding"], sessions: sessions(n).map((session) => ({ ...valid["driven holding"].sessions[0], session })) }), MAX_HOLDING, "sessions"],
   ] as const)("%s at its limit parses, and one past it doesn't", (_, parse, make, limit, path) => {
     expect(parse(make(limit))).toEqual({ ok: true, message: make(limit) });
@@ -674,6 +687,24 @@ describe("driven sessions", () => {
   test("only a refusal at the cap names its limit, and it must", () => {
     expect(parseDataLayerMessage({ ...valid["driven refused at the cap"], limit: undefined })).toMatchObject({ ok: false, kind: "invalid" });
     expect(parseDataLayerMessage({ ...valid["driven refused"], limit: 4 })).toEqual({ ok: true, message: valid["driven refused"] });
+  });
+
+  test("a start names a room or a folder, and a start in a folder names no room or room sessions", () => {
+    const { room: _, ...noRoom } = valid["drive start"];
+    for (const [message, path] of [
+      [noRoom, "room"],
+      [{ ...valid["drive start in a folder"], room }, "room"],
+      [{ ...valid["drive start in a folder"], roomSessions: ["claude-code:s1"] }, "roomSessions"],
+    ] as const) {
+      const result = parseOfficeServerMessage(message);
+      expect(result).toMatchObject({ ok: false, kind: "invalid" });
+      expect(!result.ok && result.error).toContain(path);
+    }
+  });
+
+  test("a runner with no folder for any repo says so with an empty list", () => {
+    const message = { ...valid["driven folders"], repos: [] };
+    expect(parseDataLayerMessage(message)).toEqual({ ok: true, message });
   });
 
   test("a policy that allows skipping nowhere, and a runner holding no sessions, parse", () => {
