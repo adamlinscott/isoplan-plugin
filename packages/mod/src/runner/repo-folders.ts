@@ -30,12 +30,15 @@ export interface RepoFoldersOptions {
   /** The name of the secret pattern `text` matches, or null. */
   scan: (text: string) => Promise<string | null>;
   log: (text: string) => void;
+  /** The pathKeys of the folders the scan left out last time, kept by the caller across checks: only a folder newly left out is logged. Updated in place. */
+  leftOut: Set<string>;
 }
 
 /** The folders `seen` holds, by repo, the most recently used first: each folder once, at most MAX_REPO_FOLDERS a repo and MAX_FOLDER_REPOS repos. */
 export async function repoFolders(seen: FolderSeen[], o: RepoFoldersOptions): Promise<RepoFolders[]> {
   const byRepo = new Map<string, string[]>();
   const tried = new Set<string>();
+  const leftOut = new Set<string>();
   for (const { folder } of [...seen].sort((a, b) => b.at - a.at)) {
     const key = pathKey(folder);
     if (tried.has(key)) continue;
@@ -47,11 +50,14 @@ export async function repoFolders(seen: FolderSeen[], o: RepoFoldersOptions): Pr
     if (folders.length >= MAX_REPO_FOLDERS || (!byRepo.has(project) && byRepo.size >= MAX_FOLDER_REPOS)) continue;
     const matched = await o.scan(folder);
     if (matched) {
-      o.log(`a folder of ${project} wasn't listed for starting sessions from the floor: its path matches the secret pattern "${matched}"`);
+      leftOut.add(key);
+      if (!o.leftOut.has(key)) o.log(`a folder of ${project} wasn't listed for starting sessions from the floor: its path matches the secret pattern "${matched}"`);
       continue;
     }
     folders.push(folder);
     byRepo.set(project, folders);
   }
+  o.leftOut.clear();
+  for (const key of leftOut) o.leftOut.add(key);
   return [...byRepo].map(([project, folders]) => ({ project, folders }));
 }

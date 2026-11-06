@@ -6131,7 +6131,7 @@ const driven$1 = {
 * machine has no driven session by that id that it would act on, or, for a release, holds nothing
 * withheld under that id (it was dropped, or the runner restarted since). `bypass-off`: the start asked for
 * `bypassPermissions` in a project whose office doesn't allow it (`drive-policy`). `no-folder`: this
-* machine has no folder for the room's project, or a start named a folder it didn't list in `folders`. `no-claude`: it has no claude binary. `busy`: the
+* machine has no folder for the room's project, or a start named a folder it didn't list in `folders` for that project, or that is no longer in it. `no-claude`: it has no claude binary. `busy`: the
 * session can't take this now, such as while a turn runs. `no-prompt`: an answer names a prompt the
 * session isn't waiting on (never raised by this runner, answered already, timed out or cancelled).
 * `cap-reached`: the project already has `limit` driven sessions running on this machine.
@@ -10992,7 +10992,7 @@ async function recentFolders(io, projectsDir, since) {
 /**
 * The folders the machine's Claude Code sessions since `since` ran in, still there, the most recent
 * first, each once, with when each was last used. `cwds` keeps what each transcript says its folder
-* is between calls, so a transcript is read once.
+* is between calls, so a transcript that names its folder is read once.
 */
 async function sessionFolders(io, projectsDir, since, cwds) {
 	const transcripts = [];
@@ -12955,6 +12955,7 @@ function createRegistry({ file, log, pid = process.pid, isAlive = alive, info = 
 async function repoFolders(seen, o) {
 	const byRepo = /* @__PURE__ */ new Map();
 	const tried = /* @__PURE__ */ new Set();
+	const leftOut = /* @__PURE__ */ new Set();
 	for (const { folder } of [...seen].sort((a, b) => b.at - a.at)) {
 		const key = pathKey(folder);
 		if (tried.has(key)) continue;
@@ -12966,12 +12967,15 @@ async function repoFolders(seen, o) {
 		if (folders.length >= 5 || !byRepo.has(project) && byRepo.size >= 100) continue;
 		const matched = await o.scan(folder);
 		if (matched) {
-			o.log(`a folder of ${project} wasn't listed for starting sessions from the floor: its path matches the secret pattern "${matched}"`);
+			leftOut.add(key);
+			if (!o.leftOut.has(key)) o.log(`a folder of ${project} wasn't listed for starting sessions from the floor: its path matches the secret pattern "${matched}"`);
 			continue;
 		}
 		folders.push(folder);
 		byRepo.set(project, folders);
 	}
+	o.leftOut.clear();
+	for (const key of leftOut) o.leftOut.add(key);
 	return [...byRepo].map(([project, folders]) => ({
 		project,
 		folders
@@ -13760,7 +13764,8 @@ function createDriver(o) {
 		const office = offices.get(server);
 		let folder;
 		if (m.folder !== void 0) {
-			folder = listed.get(server)?.folders.get(project)?.has(pathKey(m.folder)) === true && await office.home(m.folder).catch(() => null) === project ? m.folder : null;
+			const own = listed.get(server)?.folders.get(project)?.get(pathKey(m.folder));
+			folder = own !== void 0 && await office.home(own).catch(() => null) === project ? own : null;
 			if (!folder) return refuse(server, m.id, "no-folder", { detail: NOT_LISTED });
 		} else {
 			folder = await office.folder(m.roomSessions ?? []);
@@ -14046,7 +14051,7 @@ function createDriver(o) {
 			if (!again && listed.get(server)?.said === said) return;
 			listed.set(server, {
 				said,
-				folders: new Map(repos.map((r) => [r.project, new Set(r.folders.map(pathKey))]))
+				folders: new Map(repos.map((r) => [r.project, new Map(r.folders.map((f) => [pathKey(f), f]))]))
 			});
 			sendTo(server, {
 				...driven,
@@ -14063,7 +14068,9 @@ function createDriver(o) {
 			foldersCheck = setTimeout(() => {
 				foldersCheck = null;
 				for (const server of policies.keys()) sayFolders(server, false);
-				if (policies.size) checkFoldersLater();
+				foldersOut.then(() => {
+					if (policies.size) checkFoldersLater();
+				});
 			}, st.repoFoldersCheckMinutes * 6e4);
 			foldersCheck.unref?.();
 		}, () => foldersCheck = null);
@@ -14403,6 +14410,7 @@ async function worker() {
 			await approved.refresh();
 			return (await approvedHome(folder, homeIo, approved.repos()))?.id.toLowerCase() ?? null;
 		};
+		const foldersLeftOut = /* @__PURE__ */ new Set();
 		drives[index] = {
 			server,
 			send: (message) => live(index)(message),
@@ -14425,7 +14433,8 @@ async function worker() {
 				return repoFolders(seen, {
 					home,
 					scan: scanText,
-					log
+					log,
+					leftOut: foldersLeftOut
 				});
 			},
 			home

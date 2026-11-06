@@ -257,6 +257,7 @@ async function worker(): Promise<number> {
     // A session driven from the floor opens in the folder Claude Code's own transcript of a room
     // session on this machine names, still there and in a repo the office takes; or in one of the
     // folders the runner listed for a new room (#67): never a path the server sent unchecked.
+    const foldersLeftOut = new Set<string>();
     drives[index] = {
       server,
       send: (message) => live(index)(message),
@@ -274,7 +275,7 @@ async function worker(): Promise<number> {
         const since = Date.now() - (await settings()).cloneSearchDays * 86400000;
         const seen = await sessionFolders(io, path.join(claudeDir, "projects"), since, transcriptFolders);
         for (const r of registry.list()) if (r.kind === "driven" && r.folder) seen.push({ folder: r.folder, at: Date.parse(r.lastActivity) || 0 });
-        return repoFolders(seen, { home, scan: scanText, log });
+        return repoFolders(seen, { home, scan: scanText, log, leftOut: foldersLeftOut });
       },
       home,
     };

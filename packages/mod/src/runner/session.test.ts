@@ -185,8 +185,9 @@ async function setUp({ settings = {}, linger = false, records = [] as ProcessRec
   // The `folders` messages, kept out of `sent`, and every message in the order it went.
   const folders: Of<"folders">[] = [];
   const all: DrivenMessage[] = [];
-  // What the office's repoFolders lists, and the folders its home says are no longer in their repo.
-  const listing = { repos: [] as RepoFolders[], gone: new Set<string>() };
+  // What the office's repoFolders lists, and the folders its home says are no longer in their repo;
+  // how long each listing takes, and when each began and ended.
+  const listing = { repos: [] as RepoFolders[], gone: new Set<string>(), ms: 0, calls: [] as [number, number][] };
   // What the driver sent while the office's link was down, which the link drops.
   const dropped: DrivenMessage[] = [];
   const link = { up: true };
@@ -200,7 +201,12 @@ async function setUp({ settings = {}, linger = false, records = [] as ProcessRec
         server: SERVER,
         send: (m) => (link.up ? (all.push(m), m.kind === "folders" ? folders.push(m) : sent.push(m), true) : (dropped.push(m), false)),
         folder: async (sessions) => (sessions.includes("claude-code:room-1") ? folder : null),
-        repoFolders: async () => listing.repos,
+        repoFolders: async () => {
+          const began = Date.now();
+          if (listing.ms) await new Promise((r) => setTimeout(r, listing.ms));
+          listing.calls.push([began, Date.now()]);
+          return listing.repos;
+        },
         home: async (f) => (listing.gone.has(f) ? null : (listing.repos.find((r) => r.folders.includes(f))?.project ?? null)),
       },
     ],
@@ -263,6 +269,15 @@ test("folders: with the connection's first drive-policy they go right after hold
   await t.until(() => t.folders.length === 3);
 });
 
+test("folders: a listing slower than the check waits for the next check, so checks never pile up", async () => {
+  const t = await setUp({ settings: { repoFoldersCheckMinutes: 0.002 }, policy: null });
+  t.listing.ms = 200;
+  t.policy([]);
+  await t.until(() => t.listing.calls.length >= 5);
+  // The first check may wait on the drive-policy's own listing; each one after begins a whole check (120 ms) after the one before ended.
+  for (let i = 2; i < t.listing.calls.length; i++) expect(t.listing.calls[i]![0] - t.listing.calls[i - 1]![1]).toBeGreaterThanOrEqual(100);
+});
+
 test("start in a folder: a fresh session in a folder the office was told of, in a room of its own with no room sessions; one it wasn't told of, or no longer in the repo, is no-folder", async () => {
   const t = await setUp({ policy: null });
   const other = path.join(t.root, "other");
@@ -293,6 +308,11 @@ test("start in a folder: a fresh session in a folder the office was told of, in 
   ]);
   for (const m of t.of("refused")) expect(m.detail).toContain("isn't one this computer offers for this repo");
   expect(t.fakeLog().filter((l) => l.argv)).toHaveLength(1);
+  // The server's spelling of a listed folder opens it, but the session runs in and records the folder as listed.
+  t.drive({ id: "d5", kind: "start", folder: `${t.folder}${path.sep}`, project: PROJECT, permissions: "auto", instruction: "second" });
+  await t.until(() => t.of("turn-ended").length === 2);
+  const session = `claude-code:${UUIDS[1]}`;
+  expect(t.registry.list().find((r) => r.session === session)!.folder).toBe(t.folder);
 });
 
 test("start: a new session in the folder the room's session ran in, its turn's tool, reply and end going out in order, and the registry recording its process", async () => {

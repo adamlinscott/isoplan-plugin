@@ -14,6 +14,7 @@ const options = (byFolder: Record<string, string>, logs: string[] = []) => ({
   home: homes(Object.fromEntries(Object.entries(byFolder).map(([f, p]) => [pathKey(f), p]))),
   scan: async (text: string) => (text.includes(AWS_KEY) ? "aws-access-key" : null),
   log: (t: string) => void logs.push(t),
+  leftOut: new Set<string>(),
 });
 
 test.each([
@@ -53,4 +54,18 @@ test("a folder the secret scan matches, or one too long to send, is left out, ne
   expect(listed).toHaveLength(MAX_FOLDER_REPOS);
   expect(listed.at(-1)!.project).toBe(`github.com/ada/repo-${MAX_FOLDER_REPOS - 2}`);
   expect(logs).toEqual([`a folder of ${APP} wasn't listed for starting sessions from the floor: its path matches the secret pattern "aws-access-key"`]);
+});
+
+test("a folder the secret scan leaves out is logged when it is first left out, not on every check after", async () => {
+  const logs: string[] = [];
+  const secret = `/Users/ada/${AWS_KEY}/app`;
+  const o = options({ [secret]: APP, "/Users/ada/app": APP }, logs);
+  const seen = [{ folder: secret, at: 2 }];
+  await repoFolders(seen, o);
+  await repoFolders(seen, o);
+  expect(logs).toHaveLength(1);
+  // Gone for a check, then back: logged again.
+  await repoFolders([], o);
+  await repoFolders(seen, o);
+  expect(logs).toHaveLength(2);
 });

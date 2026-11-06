@@ -198,7 +198,7 @@ const valid = {
   "runner that drives sessions": { type: "runner", v, account: adam, machine: { name: "sevengill" }, drive: true },
   "handoff as a driven session": { type: "handoff", v, handoff, mode: "driven", session: "0b5c4d3e-0000-4000-8000-000000000001", by: sam, room, permissions: "auto" },
   "drive start": { type: "drive", v, kind: "start", id: "d1", by: adam, room, project: isoplan, roomSessions: ["claude-code:s1"], instruction: "Fix the failing test in src/a.ts.", permissions: "auto" },
-  "drive start in a folder": { type: "drive", v, kind: "start", id: "d8", by: adam, folder: "C:\Users\adam\isoplan", project: isoplan, instruction: "Add a dark mode.", permissions: "auto" },
+  "drive start in a folder": { type: "drive", v, kind: "start", id: "d8", by: adam, folder: "C:\\Users\\adam\\isoplan", project: isoplan, instruction: "Add a dark mode.", permissions: "auto" },
   "drive instruct": { type: "drive", v, kind: "instruct", id: "i2", by: adam, session: driving, text: "Now run the whole suite." },
   "drive stop": { type: "drive", v, kind: "stop", id: "d3", by: adam, session: driving },
   "drive hand-back": { type: "drive", v, kind: "hand-back", id: "d4", by: adam, session: driving },
@@ -700,6 +700,11 @@ describe("driven sessions", () => {
       expect(result).toMatchObject({ ok: false, kind: "invalid" });
       expect(!result.ok && result.error).toContain(path);
     }
+  });
+
+  test("a start in a Windows folder keeps its backslashes", () => {
+    const result = parseOfficeServerMessage(valid["drive start in a folder"]);
+    expect(result.ok && result.message.type === "drive" && result.message.kind === "start" && result.message.folder).toBe(String.raw`C:\Users\adam\isoplan`);
   });
 
   test("a runner with no folder for any repo says so with an empty list", () => {

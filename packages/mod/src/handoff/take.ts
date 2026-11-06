@@ -245,7 +245,7 @@ async function recentFolders(io: NodeIo, projectsDir: string, since: number): Pr
 /**
  * The folders the machine's Claude Code sessions since `since` ran in, still there, the most recent
  * first, each once, with when each was last used. `cwds` keeps what each transcript says its folder
- * is between calls, so a transcript is read once.
+ * is between calls, so a transcript that names its folder is read once.
  */
 export async function sessionFolders(io: Pick<NodeIo, "listDir" | "stat" | "read">, projectsDir: string, since: number, cwds?: Map<string, string>): Promise<{ folder: string; at: number }[]> {
   const transcripts: { cwd: string; at: number }[] = [];

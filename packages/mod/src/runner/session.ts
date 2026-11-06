@@ -52,7 +52,7 @@
 //   room's sessions this machine has its own record of: Claude Code's transcript of that session
 //   says the folder it ran in (`office.folder`, which also needs the folder to be there and in a
 //   repo the office takes). Never a path from the server. None: refused `no-folder`.
-// - Where a new session can start (#67): with each connection's first drive-policy, right after
+// - Where a new session can start (#67): with each connection's first drive-policy, after
 //   `holding`, and again whenever a check every `repoFoldersCheckMinutes` finds it changed, the
 //   office is sent `folders`, the folders sessions on this machine ran in for each repo it takes
 //   (`office.repoFolders`, repo-folders.ts). A start with `folder` and no room opens a fresh session
@@ -523,8 +523,8 @@ export function createDriver(o: DriverOptions): Driver {
   const policies = new Map<string, Set<string>>();
   const takes = new Map<string, PreparedTake & { server: string; project: string }>();
   const starts = new Set<string>();
-  // Office -> what its last `folders` said: the message as sent, and each project's folders by pathKey.
-  const listed = new Map<string, { said: string; folders: Map<string, Set<string>> }>();
+  // Office -> what its last `folders` said: the message as sent, and each project's folders, pathKey -> the folder as listed.
+  const listed = new Map<string, { said: string; folders: Map<string, Map<string, string>> }>();
   let foldersOut = Promise.resolve();
   let foldersCheck: ReturnType<typeof setTimeout> | "arming" | null = null;
   let closed = false;
@@ -955,9 +955,9 @@ export function createDriver(o: DriverOptions): Driver {
     const office = offices.get(server)!;
     let folder: string | null;
     if (m.folder !== undefined) {
-      // Only a folder this runner listed for the project, still in its repo: never the server's path unchecked.
-      const wasListed = listed.get(server)?.folders.get(project)?.has(pathKey(m.folder)) === true;
-      folder = wasListed && (await office.home(m.folder).catch(() => null)) === project ? m.folder : null;
+      // Only a folder this runner listed for the project, still in its repo, spelled as listed: never the server's path unchecked.
+      const own = listed.get(server)?.folders.get(project)?.get(pathKey(m.folder));
+      folder = own !== undefined && (await office.home(own).catch(() => null)) === project ? own : null;
       if (!folder) return refuse(server, m.id, "no-folder", { detail: NOT_LISTED });
     } else {
       folder = await office.folder(m.roomSessions ?? []);
@@ -1140,7 +1140,7 @@ export function createDriver(o: DriverOptions): Driver {
           if (!policies.has(server)) return;
           const said = JSON.stringify(repos);
           if (!again && listed.get(server)?.said === said) return;
-          listed.set(server, { said, folders: new Map(repos.map((r) => [r.project, new Set(r.folders.map(pathKey))])) });
+          listed.set(server, { said, folders: new Map(repos.map((r) => [r.project, new Map(r.folders.map((f) => [pathKey(f), f]))])) });
           sendTo(server, { ...driven, kind: "folders", repos });
         })
         .catch((err: Error) => o.log(`couldn't list the folders new sessions can start in for ${server}: ${err?.stack ?? String(err)}`)),
@@ -1157,7 +1157,10 @@ export function createDriver(o: DriverOptions): Driver {
         foldersCheck = setTimeout(() => {
           foldersCheck = null;
           for (const server of policies.keys()) sayFolders(server, false);
-          if (policies.size) checkFoldersLater();
+          // Armed again only once this round's listings are done, so a slow one never piles up checks.
+          void foldersOut.then(() => {
+            if (policies.size) checkFoldersLater();
+          });
         }, st.repoFoldersCheckMinutes * 60000);
         foldersCheck.unref?.();
       },
