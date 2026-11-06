@@ -9,7 +9,7 @@ import { fakeClaude, fakeOrca, git, remoteAndClone, workspace } from "./fixture.
 import { orcaRunner } from "./orca.js";
 import type { PreparedTake } from "../runner/session.js";
 import { remoteNames, remoteNamesPath } from "../data-layer/remote-names.js";
-import { checkoutHere, findClone, findWorkspace, launch, onTheWire, parseSetup, sessionArgv, takeHandoff, trustFolder, trustKey, type Background, type Launch, type TakeOptions } from "./take.js";
+import { checkoutHere, findClone, findWorkspace, launch, onTheWire, parseSetup, sessionArgv, sessionFolders, takeHandoff, trustFolder, trustKey, type Background, type Launch, type TakeOptions } from "./take.js";
 
 // Every test here drives real git, a few dozen spawns each, which is slow on Windows under load.
 vi.setConfig({ testTimeout: 30000 });
@@ -398,6 +398,35 @@ test("with no clone of the repo on the machine, no session opens and the failure
   expect(taken.session).toBe(undefined);
   expect(taken.failures).toEqual([{ step: "worktree", output: expect.stringMatching(/^No clone of .* was found on sam-laptop.*copy its prompt/s) }]);
   expect(t.opened).toEqual([]);
+});
+
+test("sessionFolders: the folders sessions since then ran in, still there, the most recent first, each once, with when; each transcript read once", async () => {
+  const root = tempRoot();
+  const [app, api, gone] = ["app", "api", "gone"].map((n) => path.join(root, n));
+  for (const dir of [app, api]) fs.mkdirSync(dir!);
+  const projects = path.join(root, "projects");
+  const ages: [string, string, number][] = [["a1", app!, 50], ["a2", app!, 5], ["b", api!, 20], ["c", gone!, 1], ["old", api!, 90000]];
+  for (const [name, cwd, age] of ages) {
+    fs.mkdirSync(path.join(projects, name), { recursive: true });
+    const file = path.join(projects, name, "s.jsonl");
+    fs.writeFileSync(file, JSON.stringify({ type: "user", cwd }) + "\n");
+    const at = new Date(Date.now() - age * 1000);
+    fs.utimesSync(file, at, at);
+  }
+  const io = nodeIo();
+  const read = vi.spyOn(io, "read");
+  const cwds = new Map<string, string>();
+  const since = Date.now() - 86400000;
+  const found = await sessionFolders(io, projects, since, cwds);
+  expect(found.map((f) => f.folder)).toEqual([app, api]);
+  expect(found[0]!.at).toBe(fs.statSync(path.join(projects, "a2", "s.jsonl")).mtimeMs);
+  const reads = read.mock.calls.length;
+  expect(await sessionFolders(io, projects, since, cwds)).toEqual(found);
+  expect(read.mock.calls.length).toBe(reads);
+  // A transcript that has gone is forgotten.
+  fs.rmSync(path.join(projects, "b"), { recursive: true });
+  await sessionFolders(io, projects, since, cwds);
+  expect([...cwds.values()].sort()).toEqual([app, app, gone].sort());
 });
 
 test("findClone: the most recently used clone, with a remote whose path has spaces", async () => {

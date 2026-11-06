@@ -13,7 +13,8 @@ import { alive } from "../wake/lock.js";
 import type { Spawn } from "./claude.js";
 import { createRegistry, registryPath, type ProcessRecord } from "./registry.js";
 import { loadPatterns, scan } from "./scan.js";
-import { createDriver, drivenArgs, promptDescription, type DriveSettings } from "./session.js";
+import type { RepoFolders } from "./repo-folders.js";
+import { createDriver, drivenArgs, promptDescription, type DriveOffice, type DriveSettings } from "./session.js";
 
 // Each test starts real (fake) claude processes, which is slow on Windows under load.
 vi.setConfig({ testTimeout: 30000 });
@@ -24,7 +25,7 @@ const SERVER = "wss://office.example";
 const ADA = { id: "claude:ada", name: "Ada" };
 const PROJECT = { id: "github.com/ada/app", name: "app" };
 const UUIDS = ["11111111-1111-4111-8111-111111111111", "22222222-2222-4222-8222-222222222222", "33333333-3333-4333-8333-333333333333"];
-const SETTINGS: DriveSettings = { drivenIdleMinutes: 30, drivenPerProject: 4, drivenCloseSeconds: 5, drivenStartSeconds: 20, drivenPromptMinutes: 10 };
+const SETTINGS: DriveSettings = { drivenIdleMinutes: 30, drivenPerProject: 4, drivenCloseSeconds: 5, drivenStartSeconds: 20, drivenPromptMinutes: 10, repoFoldersCheckMinutes: 5 };
 
 // A stand-in for `claude -p --input-format stream-json --output-format stream-json`, shaped as the
 // probe in session.ts found it: it logs its argv and folder, then answers each user line with a
@@ -142,6 +143,15 @@ process.stdin.setEncoding("utf8").on("data", (d) => {
 });
 `;
 
+// An office of a driver's that lists no folders a new session can start in, and keeps its `folders` out of what `send` gets.
+const listsNone = (server: string, send: (m: DrivenMessage) => boolean, folder: DriveOffice["folder"] = async () => null): DriveOffice => ({
+  server,
+  send: (m) => m.kind === "folders" || send(m),
+  folder,
+  repoFolders: async () => [],
+  home: async () => null,
+});
+
 const cleanups: (() => void)[] = [];
 afterEach(() => {
   for (const c of cleanups.splice(0)) c();
@@ -172,6 +182,11 @@ async function setUp({ settings = {}, linger = false, records = [] as ProcessRec
   await registry.restore();
   const patterns = await loadPatterns(path.join(modDir, "secret-patterns.json"), path.join(root, "none.json"), log);
   const sent: DrivenMessage[] = [];
+  // The `folders` messages, kept out of `sent`, and every message in the order it went.
+  const folders: Of<"folders">[] = [];
+  const all: DrivenMessage[] = [];
+  // What the office's repoFolders lists, and the folders its home says are no longer in their repo.
+  const listing = { repos: [] as RepoFolders[], gone: new Set<string>() };
   // What the driver sent while the office's link was down, which the link drops.
   const dropped: DrivenMessage[] = [];
   const link = { up: true };
@@ -180,7 +195,15 @@ async function setUp({ settings = {}, linger = false, records = [] as ProcessRec
   const driver = createDriver({
     claudeDir,
     account: { id: ADA.id },
-    offices: [{ server: SERVER, send: (m) => (link.up ? (sent.push(m), true) : (dropped.push(m), false)), folder: async (sessions) => (sessions.includes("claude-code:room-1") ? folder : null) }],
+    offices: [
+      {
+        server: SERVER,
+        send: (m) => (link.up ? (all.push(m), m.kind === "folders" ? folders.push(m) : sent.push(m), true) : (dropped.push(m), false)),
+        folder: async (sessions) => (sessions.includes("claude-code:room-1") ? folder : null),
+        repoFolders: async () => listing.repos,
+        home: async (f) => (listing.gone.has(f) ? null : (listing.repos.find((r) => r.folders.includes(f))?.project ?? null)),
+      },
+    ],
     registry,
     binary: async () => bin,
     settings: async () => current,
@@ -212,11 +235,65 @@ async function setUp({ settings = {}, linger = false, records = [] as ProcessRec
   driver.linked(SERVER);
   if (first) policy(first);
   sent.splice(0);
-  return { root, claudeDir, state, bin, folder, file, driver, registry, sent, dropped, link, logs, current, drive, policy, until, of, fakeLog, saved };
+  return { root, claudeDir, state, bin, folder, file, driver, registry, sent, folders, all, listing, dropped, link, logs, current, drive, policy, until, of, fakeLog, saved };
 }
 
 const start = (id: string, extra: Record<string, unknown> = {}) => ({ id, kind: "start", room: "room-1", project: PROJECT, roomSessions: ["claude-code:gone", "claude-code:room-1"], permissions: "auto", ...extra });
 const S1 = `claude-code:${UUIDS[0]}`;
+
+test("folders: with the connection's first drive-policy they go right after holding; a check sends them again only when they changed; a new connection gets them again", async () => {
+  const t = await setUp({ settings: { repoFoldersCheckMinutes: 0.002 }, policy: null });
+  t.listing.repos = [{ project: PROJECT.id, folders: [t.folder] }];
+  t.policy([]);
+  await t.until(() => t.folders.length === 1);
+  expect(t.all.map((m) => m.kind)).toEqual(["holding", "folders"]);
+  expect(t.folders[0]).toEqual({ type: "driven", v: 1, kind: "folders", repos: [{ project: PROJECT.id, folders: [t.folder] }] });
+  // Unchanged across several checks: nothing more goes.
+  await new Promise((r) => setTimeout(r, 500));
+  expect(t.folders).toHaveLength(1);
+  t.listing.repos = [];
+  await t.until(() => t.folders.length === 2);
+  expect(t.folders[1]!.repos).toEqual([]);
+  // A later drive-policy on the same connection sends nothing; a new connection's first one does.
+  t.policy([PROJECT.id]);
+  await t.driver.settled();
+  expect(t.folders).toHaveLength(2);
+  t.driver.linked(SERVER);
+  t.policy([]);
+  await t.until(() => t.folders.length === 3);
+});
+
+test("start in a folder: a fresh session in a folder the office was told of, in a room of its own with no room sessions; one it wasn't told of, or no longer in the repo, is no-folder", async () => {
+  const t = await setUp({ policy: null });
+  const other = path.join(t.root, "other");
+  fs.mkdirSync(other);
+  t.listing.repos = [{ project: PROJECT.id, folders: [t.folder, other] }];
+  t.policy([]);
+  await t.until(() => t.folders.length === 1);
+  t.drive({ id: "d1", kind: "start", folder: t.folder, project: PROJECT, permissions: "auto", instruction: "first" });
+  await t.until(() => t.of("turn-ended").length === 1);
+  expect([...t.of("started"), ...t.of("held")]).toEqual([
+    { type: "driven", v: 1, kind: "started", id: "d1", session: S1, room: `room:${S1}`, permissions: "auto" },
+    { type: "driven", v: 1, kind: "held", session: S1, room: `room:${S1}`, why: "started", permissions: "auto" },
+  ]);
+  const [first] = t.fakeLog();
+  expect(first.argv).toEqual(drivenArgs({ uuid: UUIDS[0]!, resume: false, permissions: "auto" }));
+  expect(fs.realpathSync(first.cwd)).toBe(fs.realpathSync(t.folder));
+  expect(t.registry.list()[0]!.driven).toMatchObject({ room: `room:${S1}`, project: PROJECT.id });
+  // Not listed; listed for another repo; listed, but no longer in the repo.
+  t.listing.gone.add(other);
+  t.drive({ id: "d2", kind: "start", folder: path.join(t.root, "elsewhere"), project: PROJECT, permissions: "auto" });
+  t.drive({ id: "d3", kind: "start", folder: t.folder, project: { id: "github.com/ada/other", name: "other" }, permissions: "auto" });
+  t.drive({ id: "d4", kind: "start", folder: other, project: PROJECT, permissions: "auto" });
+  await t.until(() => t.of("refused").length === 3);
+  expect(t.of("refused").map((m) => [m.id, m.reason]).sort()).toEqual([
+    ["d2", "no-folder"],
+    ["d3", "no-folder"],
+    ["d4", "no-folder"],
+  ]);
+  for (const m of t.of("refused")) expect(m.detail).toContain("isn't one this computer offers for this repo");
+  expect(t.fakeLog().filter((l) => l.argv)).toHaveLength(1);
+});
 
 test("start: a new session in the folder the room's session ran in, its turn's tool, reply and end going out in order, and the registry recording its process", async () => {
   const t = await setUp();
@@ -588,7 +665,7 @@ test("restart: a recorded process still Isoplan's is ended and its session opene
   const again = createDriver({
     claudeDir: t.claudeDir,
     account: { id: ADA.id },
-    offices: [{ server: SERVER, send: (m) => (t.sent.push(m), true), folder: async () => null }],
+    offices: [listsNone(SERVER, (m) => (t.sent.push(m), true))],
     registry: t.registry,
     binary: async () => t.bin,
     settings: async () => SETTINGS,
@@ -618,7 +695,7 @@ test("restart: a session whose saved conversation is gone fails to reopen and is
   const again = createDriver({
     claudeDir: t.claudeDir,
     account: { id: ADA.id },
-    offices: [{ server: SERVER, send: (m) => (sent.push(m), true), folder: async () => null }],
+    offices: [listsNone(SERVER, (m) => (sent.push(m), true))],
     registry: t.registry,
     binary: async () => t.bin,
     settings: async () => SETTINGS,
@@ -731,7 +808,7 @@ test("live: an office on a server from before driven sessions is sent no driven 
   // The runner's link to the office, wired to a driver as runner/main.ts wires them.
   const runnerLink = (url: string) => {
     let link: Link | null = null;
-    const driver = createDriver({ claudeDir: t.claudeDir, account: { id: ADA.id }, offices: [{ server: url, send: (m) => link!.sendLive(m), folder: async () => null }], registry: t.registry, binary: async () => t.bin, settings: async () => SETTINGS, scan: async () => null, log: () => {}, projectOf: async () => PROJECT.id });
+    const driver = createDriver({ claudeDir: t.claudeDir, account: { id: ADA.id }, offices: [{ ...listsNone(url, () => false), send: (m) => link!.sendLive(m) }], registry: t.registry, binary: async () => t.bin, settings: async () => SETTINGS, scan: async () => null, log: () => {}, projectOf: async () => PROJECT.id });
     const asks: ServerAsk[] = [];
     const hello: RunnerHelloMessage = { type: "runner", v: PROTOCOL_VERSION, account: ADA, machine: { name: "sevengill" }, drive: true };
     link = createLink({ url, hello, emit: () => {}, onMessage: (m) => asks.push(m), onDrive: (m) => driver.take(url, m), onOpen: () => driver.linked(url), onClose: () => driver.unlinked(url), retryBaseMs: 20, retryCapMs: 100 });
@@ -753,11 +830,14 @@ test("live: an office on a server from before driven sessions is sent no driven 
 
   const current = await office(true);
   runnerLink(current.url);
-  await t.until(() => current.got.length === 2);
-  expect(current.got[1]).toEqual({ type: "driven", v: PROTOCOL_VERSION, kind: "holding", sessions: [] });
+  await t.until(() => current.got.length === 3);
+  expect(current.got.slice(1)).toEqual([
+    { type: "driven", v: PROTOCOL_VERSION, kind: "holding", sessions: [] },
+    { type: "driven", v: PROTOCOL_VERSION, kind: "folders", repos: [] },
+  ]);
   current.sockets[0]!.terminate();
-  await t.until(() => current.got.length === 4);
-  expect(current.got.map((m) => m.type)).toEqual(["runner", "driven", "runner", "driven"]);
+  await t.until(() => current.got.length === 6);
+  expect(current.got.map((m) => m.type)).toEqual(["runner", "driven", "driven", "runner", "driven", "driven"]);
 });
 
 test("a driven take: only for the runner's own person; past the cap it isn't readied; readied, it opens once its taken went, its first turn named by its uuid; one that won't open frees its place", async () => {
@@ -883,7 +963,7 @@ test("bypass: a session restored after the runner's restart skips prompts again 
   const again = createDriver({
     claudeDir: t.claudeDir,
     account: { id: ADA.id },
-    offices: [{ server: SERVER, send: (m) => (sent.push(m), true), folder: async () => null }],
+    offices: [listsNone(SERVER, (m) => (sent.push(m), true))],
     registry: t.registry,
     binary: async () => t.bin,
     settings: async () => SETTINGS,
