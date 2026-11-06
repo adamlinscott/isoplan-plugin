@@ -1,3 +1,4 @@
+import path from "node:path";
 import { beforeEach, expect, test, vi } from "vitest";
 import { PROTOCOL_VERSION } from "@isoplan/protocol";
 import type { DataLayerLine } from "../lines.js";
@@ -18,10 +19,16 @@ interface HostOptions {
   later?: Promise<DataLayerLine[]>;
   /** $.session.usage; none, as in a Claude Code build without it, unless given. */
   usage?: Host["session"]["usage"];
+  /** What $.session.version answers; none, as in an older build, unless given. */
+  version?: { version: string; base?: string };
+  /** $.prompt.submit; none, as in an older build, unless given. */
+  submit?: NonNullable<Host["prompt"]>["submit"];
+  /** $.clock.after keeps its callbacks in `timers` rather than run them at once. */
+  heldTimers?: boolean;
 }
 
 // A host whose data layer writes `lines` and then exits (or stays up).
-function host(lines: DataLayerLine[], { wakes = 0, runMs = 0, stays = false, noNode = false, later, usage }: HostOptions = {}) {
+function host(lines: DataLayerLine[], { wakes = 0, runMs = 0, stays = false, noNode = false, later, usage, version, submit, heldTimers = false }: HostOptions = {}) {
   const status: (string | undefined)[] = [];
   const written: [string, string][] = [];
   const spawned: (readonly string[])[] = [];
@@ -32,12 +39,14 @@ function host(lines: DataLayerLine[], { wakes = 0, runMs = 0, stays = false, noN
   const tools: string[] = [];
   // The session's agents, as $.agent.list answers.
   const agents: { id: string; status: string }[] = [];
+  const timers: (() => void)[] = [];
   const session = { id: "s1" };
   const folder = { gone: false }; // this copy's folder, which Claude Code may clean up
   let now = 0;
   const $: Host = {
     plugin: { root: "C:\\plugins\\isoplan" },
-    session: { id: async () => session.id, cwd: async () => "C:/w/repo", ...(usage ? { usage } : {}) },
+    session: { id: async () => session.id, cwd: async () => "C:/w/repo", ...(usage ? { usage } : {}), ...(version ? { version: async () => version } : {}) },
+    ...(submit ? { prompt: { submit } } : {}),
     process: {
       spawn: ({ argv, cwd }) => {
         spawned.push(argv);
@@ -67,10 +76,14 @@ function host(lines: DataLayerLine[], { wakes = 0, runMs = 0, stays = false, noN
     clock: {
       now: async () => now,
       sleep: (ms) => (slept.push(ms), slept.length <= wakes ? Promise.resolve() : new Promise(() => {})),
-      after: (_ms, fn) => (fn(), { cancel: () => {} }),
+      after: (_ms, fn) => {
+        if (!heldTimers) return fn(), { cancel: () => {} };
+        timers.push(fn);
+        return { cancel: () => void timers.splice(timers.indexOf(fn) >>> 0, 1) };
+      },
     },
   };
-  return { $, status, written, spawned, spawnedIn, slept, session, logged, ran, tools, agents, folder };
+  return { $, status, written, spawned, spawnedIn, slept, session, logged, ran, tools, agents, folder, timers };
 }
 
 let hooks: Hooks;
@@ -498,4 +511,70 @@ test("hooks: without $.session.usage, or without a size, nothing is written", as
     await new Promise((r) => setTimeout(r, 10));
     expect(h.written).toEqual([]);
   }
+});
+
+test("hooks: the data layer is started saying it takes messages only on Claude Code 2.1.312 on, going by the version", async () => {
+  const argv = async (version?: { version: string; base?: string }) => {
+    vi.resetModules();
+    const { register } = await import("./register.js");
+    register(((event: keyof Hooks, hook: Function) => ((hooks[event] = hook), { catch: () => {} })) as unknown as On);
+    const h = await start([], { stays: true, version });
+    await vi.waitFor(() => expect(h.spawned).toHaveLength(1));
+    return h.spawned[0]!.includes("--messages");
+  };
+  expect(await argv()).toBe(false);
+  expect(await argv({ version: "2.1.303" })).toBe(false);
+  expect(await argv({ version: "2.0.999" })).toBe(false);
+  expect(await argv({ version: "2.1.312", base: "2.1.312" })).toBe(true);
+  expect(await argv({ version: "2.1.320-dev.20261101.t101500.sha1a2b3c4", base: "2.1.320-dev" })).toBe(true);
+  expect(await argv({ version: "2.2.0" })).toBe(true);
+  expect(await argv({ version: "a build from source" })).toBe(false);
+});
+
+test.each([
+  ["Windows", path.win32, String.raw`C:\Users\ada\.claude\isoplan\messages\s1`],
+  ["macOS", path.posix, "/Users/ada/.claude/isoplan/messages/s1"],
+])("hooks: on %s the floor's messages are submitted as the owner's words, one after another; one not in after two seconds waits its turn", async (_os, paths, dir) => {
+  const submitted: { text: string; asUser?: true }[] = [];
+  const pending: (() => void)[] = [];
+  const submit = (input: { text: string; asUser?: true }) => (submitted.push(input), new Promise<{ drop?: string }>((resolve) => pending.push(() => resolve({}))));
+  const line = (n: number): DataLayerLine => ({ type: "owner-message", session: "s1", text: `message ${n}`, file: paths.join(dir, `${n}.json`) });
+  const h = await start([line(1), line(2)], { stays: true, submit, heldTimers: true, version: { version: "2.1.318" } });
+  await vi.waitFor(() => expect(submitted).toEqual([{ text: "message 1", asUser: true }]));
+  // The session is mid-turn: the first hasn't gone in, and the second waits behind it.
+  expect(h.written).toEqual([]);
+  for (const fire of h.timers.splice(0)) fire();
+  await vi.waitFor(() => expect(h.written).toHaveLength(2));
+  expect(h.written).toEqual([[paths.join(dir, "1.json"), JSON.stringify({ taken: true, queued: true })], [paths.join(dir, "2.json"), JSON.stringify({ taken: true, queued: true })]]);
+  expect(submitted).toHaveLength(1);
+  pending.shift()!();
+  await vi.waitFor(() => expect(submitted.map((s) => s.text)).toEqual(["message 1", "message 2"]));
+  pending.shift()!();
+  await new Promise((r) => setTimeout(r, 10));
+  expect(h.written).toHaveLength(2);
+});
+
+test("hooks: a message goes in and says so at once on an idle session; it isn't submitted for a session the process has left, and says why it couldn't go in", async () => {
+  const file = "/Users/ada/.claude/isoplan/messages/s1/1.json";
+  const message: DataLayerLine = { type: "owner-message", session: "s1", text: "Now run the tests.", file };
+  const said = async (opts: HostOptions, session = "s1") => {
+    vi.resetModules();
+    const { register } = await import("./register.js");
+    register(((event: keyof Hooks, hook: Function) => ((hooks[event] = hook), { catch: () => {} })) as unknown as On);
+    const h = host([message], { stays: true, heldTimers: true, ...opts });
+    h.session.id = session;
+    await hooks["session.start"]!(h.$, { cwd: "C:/w/repo" }, async () => ({}));
+    await vi.waitFor(() => expect(h.written).toHaveLength(1));
+    return JSON.parse(h.written[0]![1]);
+  };
+  const submit = vi.fn(async () => ({}));
+  expect(await said({ submit })).toEqual({ taken: true });
+  expect(submit).toHaveBeenCalledWith({ text: "Now run the tests.", asUser: true });
+  submit.mockClear();
+  // A /clear: the data layer runs for the old id until it is started again; the new conversation never gets it.
+  expect(await said({ submit }, "s2")).toEqual({ taken: false, reason: "ended" });
+  expect(submit).not.toHaveBeenCalled();
+  expect(await said({})).toEqual({ taken: false, reason: "no-submit" });
+  expect(await said({ submit: async () => ({ drop: "a hook said no" }) })).toEqual({ taken: false, reason: "dropped" });
+  expect(await said({ submit: async () => Promise.reject(new Error("busy")) })).toEqual({ taken: false, reason: "dropped" });
 });

@@ -27,7 +27,7 @@ afterEach(async () => {
  * `hangs`), and every data-layer socket is kept; with `notWanted` a hello is told the project isn't wanted.
  */
 async function office() {
-  const state = { repos: [] as string[], version: 1, status: 200, hangs: false, notWanted: false, connections: [] as { messages: { type: string }[]; closed: boolean; close(): void }[] };
+  const state = { repos: [] as string[], version: 1, status: 200, hangs: false, notWanted: false, connections: [] as { messages: { type: string }[]; closed: boolean; close(): void; send(message: unknown): void }[] };
   const server = http.createServer((request, response) => {
     if (!request.url?.startsWith("/data-layer/repos")) return void response.writeHead(404).end();
     if (state.hangs) return;
@@ -36,7 +36,7 @@ async function office() {
   });
   const wss = new WebSocketServer({ server });
   wss.on("connection", (ws) => {
-    const c = { messages: [] as { type: string }[], closed: false, close: () => ws.close() };
+    const c = { messages: [] as { type: string }[], closed: false, close: () => ws.close(), send: (message: unknown) => ws.send(JSON.stringify(message)) };
     state.connections.push(c);
     ws.on("message", (data) => {
       const message = JSON.parse(String(data)) as { type: string };
@@ -326,6 +326,8 @@ test("the session's context window reaches the office only once the hooks module
   await until(() => sent().some((m) => m.type === "full"));
   await wait(1500);
   expect(sent().find((m) => m.type === "full")!.facts!.session).not.toHaveProperty("contextWindow");
+  // Started without --messages, the session doesn't say it takes messages from the floor.
+  expect(sent().find((m) => m.type === "full")!.facts!.session).not.toHaveProperty("takesMessages");
   expect(sent().some((m) => m.upsert?.session && "contextWindow" in m.upsert.session)).toBe(false);
 
   fs.writeFileSync(file, JSON.stringify({ contextWindow: 1000000 }));
@@ -341,4 +343,59 @@ test("the session's context window reaches the office only once the hooks module
   expect(upserts()).toBe(before);
   fs.writeFileSync(file, JSON.stringify({ contextWindow: 200000 }));
   await until(() => sent().some((m) => m.upsert?.session?.contextWindow === 200000));
+});
+
+test("a session whose hooks module can submit says it takes messages; its owner's message goes to the hooks module and the reply to the office, and anyone else's is refused", async () => {
+  const o = await office();
+  o.state.repos = ["github.com/team/app"];
+  const v = versions(o.url);
+  const r = v.run("0.2.0", "--messages");
+  type Sent = { type: string; id?: string; code?: string; account?: { id: string }; facts?: { session: Record<string, unknown> } };
+  const sent = () => (o.state.connections[0]?.messages ?? []) as Sent[];
+  await until(() => sent().some((m) => m.type === "full"));
+  expect(sent().find((m) => m.type === "full")!.facts!.session.takesMessages).toBe(true);
+  const owner = sent().find((m) => m.type === "hello")!.account!;
+  const request = (id: string, from: { id: string; name: string }) => ({ type: "request", v: 1, id, kind: "owner-message", session: "claude-code:s1", from, text: "Now run the tests." });
+
+  o.state.connections[0]!.send(request("m1", { id: "claude:someone-else", name: "Sam" }));
+  await until(() => sent().some((m) => m.id === "m1"));
+  expect(sent().find((m) => m.id === "m1")).toMatchObject({ type: "refusal", reason: "unavailable", code: "not-owner" });
+  expect(r.lines().some((l) => l.type === "owner-message")).toBe(false);
+
+  o.state.connections[0]!.send(request("m2", { id: owner.id, name: "Ada" }));
+  await until(() => r.lines().some((l) => l.type === "owner-message"));
+  const line = r.lines().find((l) => l.type === "owner-message") as unknown as { session: string; text: string; file: string };
+  expect(line).toMatchObject({ session: "s1", text: "Now run the tests." });
+  expect(path.dirname(line.file)).toBe(path.join(v.claudeDir, "isoplan", "messages", "s1"));
+  fs.writeFileSync(line.file, JSON.stringify({ taken: true, queued: true }));
+  await until(() => sent().some((m) => m.id === "m2"));
+  expect(sent().find((m) => m.id === "m2")).toEqual({ type: "reply", v: 1, id: "m2", kind: "owner-message", queued: true });
+});
+
+test("several messages the owner sends back to back reach the hooks module in the order they were sent", async () => {
+  const o = await office();
+  o.state.repos = ["github.com/team/app"];
+  const r = versions(o.url).run("0.2.0", "--messages");
+  const sent = () => (o.state.connections[0]?.messages ?? []) as { type: string; account?: { id: string } }[];
+  await until(() => sent().some((m) => m.type === "full"));
+  const owner = sent().find((m) => m.type === "hello")!.account!;
+  const texts = Array.from({ length: 8 }, (_, i) => `message ${i}`);
+  for (const [i, text] of texts.entries()) o.state.connections[0]!.send({ type: "request", v: 1, id: `m${i}`, kind: "owner-message", session: "claude-code:s1", from: { id: owner.id, name: "Ada" }, text });
+  const lines = () => r.lines().filter((l) => l.type === "owner-message");
+  await until(() => lines().length === texts.length);
+  expect(lines().map((l) => l.text)).toEqual(texts);
+});
+
+test("a detached data layer refuses its owner's message and leaves no messages folder behind", async () => {
+  const o = await office();
+  o.state.repos = ["github.com/team/app"];
+  const { claudeDir } = start(o.url);
+  type Sent = { type: string; id?: string; account?: { id: string } };
+  const sent = () => (o.state.connections[0]?.messages ?? []) as Sent[];
+  await until(() => sent().some((m) => m.type === "full"));
+  const owner = sent().find((m) => m.type === "hello")!.account!;
+  o.state.connections[0]!.send({ type: "request", v: 1, id: "m1", kind: "owner-message", session: "claude-code:s1", from: { id: owner.id, name: "Ada" }, text: "hi" });
+  await until(() => sent().some((m) => m.id === "m1"));
+  expect(sent().find((m) => m.id === "m1")).toMatchObject({ type: "refusal", code: "detached" });
+  expect(fs.existsSync(path.join(claudeDir, "isoplan", "messages"))).toBe(false);
 });

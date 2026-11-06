@@ -6,6 +6,7 @@ import {
   MAX_FOLDER_REPOS,
   MAX_HOLDING,
   MAX_INSTRUCTION_LENGTH,
+  MAX_OWNER_MESSAGE_LENGTH,
   MAX_OUTPUT_LENGTH,
   MAX_PROMPT_LENGTH,
   MAX_REPLY_LENGTH,
@@ -146,10 +147,12 @@ const valid = {
   "reply write-brief fallback without claude": { type: "reply", v, id: "r2", kind: "write-brief", handoff, fallback: true, noClaude: true },
   "reply owner-answer": { type: "reply", v, id: "r3", kind: "owner-answer" },
   "reply focus": { type: "reply", v, id: "f1", kind: "focus" },
+  "reply owner-message": { type: "reply", v, id: "m1", kind: "owner-message", queued: true },
   "refusal over-cap": { type: "refusal", v, id: "r1", reason: "over-cap", cap: "owner-tokens" },
   "refusal withheld": { type: "refusal", v, id: "r1", reason: "withheld" },
   "refusal withheld commit": { type: "refusal", v, id: "r2", reason: "withheld", file: "config/dev.ts", unchecked: ["assets/logo.png"] },
   "refusal unavailable": { type: "refusal", v, id: "r2", reason: "unavailable", detail: "The session's folder is gone." },
+  "refusal of an owner-message": { type: "refusal", v, id: "m1", reason: "unavailable", detail: "This session has ended.", code: "ended" },
   "hand-over": { type: "hand-over", v, to: "sam@example.com", handoff },
   "hand-over-check": { type: "hand-over-check", v, to: "Sam", handoff: "h7k2" },
   take: { type: "take", v, code: "K4P9-2QX" },
@@ -180,6 +183,7 @@ const valid = {
     question: "toolu_01",
     answers: { "Which branch should the fix go on?": "A new branch" },
   },
+  "request owner-message": { type: "request", v, id: "m1", kind: "owner-message", session: "claude-code:s1", from: adam, text: "Now run the tests." },
   release: { type: "release", v, id: "r1" },
   handoff: { type: "handoff", v, handoff },
   "handed-over": { type: "handed-over", v, handoff: "h7k2", to: sam },
@@ -246,6 +250,8 @@ const parsers = {
   "reply write-brief fallback without claude": parseDataLayerMessage,
   "reply owner-answer": parseDataLayerMessage,
   "reply focus": parseDataLayerMessage,
+  "reply owner-message": parseDataLayerMessage,
+  "refusal of an owner-message": parseDataLayerMessage,
   "refusal over-cap": parseDataLayerMessage,
   "refusal withheld": parseDataLayerMessage,
   "refusal withheld commit": parseDataLayerMessage,
@@ -263,6 +269,7 @@ const parsers = {
   "request write-brief": parseOfficeServerMessage,
   "request owner-answer": parseOfficeServerMessage,
   "request focus": parseOfficeServerMessage,
+  "request owner-message": parseOfficeServerMessage,
   release: parseOfficeServerMessage,
   handoff: parseOfficeServerMessage,
   "handed-over": parseOfficeServerMessage,
@@ -330,10 +337,12 @@ const broken: Record<keyof typeof valid, [unknown, string]> = {
   "reply write-brief fallback without claude": [{ ...valid["reply write-brief fallback without claude"], noClaude: false }, "noClaude"],
   "reply owner-answer": [{ ...valid["reply owner-answer"], id: "" }, "id"],
   "reply focus": [{ ...valid["reply focus"], id: "" }, "id"],
+  "reply owner-message": [{ ...valid["reply owner-message"], queued: "yes" }, "queued"],
   "refusal over-cap": [{ ...valid["refusal over-cap"], cap: "per-week" }, "cap"],
   "refusal withheld": [{ ...valid["refusal withheld"], reason: "secret" }, "reason"],
   "refusal withheld commit": [{ ...valid["refusal withheld commit"], file: "" }, "file"],
   "refusal unavailable": [{ ...valid["refusal unavailable"], detail: undefined }, "detail"],
+  "refusal of an owner-message": [{ ...valid["refusal of an owner-message"], code: "gone" }, "code"],
   "hand-over": [{ ...valid["hand-over"], handoff: { ...handoff, id: "H 7" } }, "handoff.id"],
   "hand-over-check": [{ ...valid["hand-over-check"], handoff: "H 7" }, "handoff"],
   take: [{ ...valid.take, code: "" }, "code"],
@@ -347,6 +356,7 @@ const broken: Record<keyof typeof valid, [unknown, string]> = {
   "request write-brief": [{ ...valid["request write-brief"], to: { name: "Sam" } }, "to.id"],
   "request owner-answer": [{ ...valid["request owner-answer"], answers: { q: 1 } }, "answers.q"],
   "request focus": [{ ...valid["request focus"], handoff: "H7K2" }, "handoff"],
+  "request owner-message": [{ ...valid["request owner-message"], from: { name: "Adam" } }, "from.id"],
   release: [{ ...valid.release, id: 3 }, "id"],
   handoff: [{ ...valid.handoff, handoff: { ...handoff, repos: [{ ...handoff.repos[0], commit: "0123abc" }] } }, "handoff.repos[0].commit"],
   "handed-over": [{ ...valid["handed-over"], to: { id: "", name: "Sam" } }, "to.id"],
@@ -453,6 +463,20 @@ test("a session's context window parses as a whole number of tokens, and not as 
   const sized = { ...facts, session: { ...facts.session, contextWindow: 1000000 } };
   expect(parseDataLayerMessage({ ...valid.full, facts: sized })).toEqual({ ok: true, message: { ...valid.full, facts: sized } });
   for (const contextWindow of [0, 200000.5]) expect(parseDataLayerMessage({ ...valid.full, facts: { ...facts, session: { ...facts.session, contextWindow } } })).toMatchObject({ ok: false, kind: "invalid" });
+});
+
+test("a session that takes messages from the floor says so with true, and never with false", () => {
+  const takes = { ...facts, session: { ...facts.session, takesMessages: true } };
+  expect(parseDataLayerMessage({ ...valid.full, facts: takes })).toEqual({ ok: true, message: { ...valid.full, facts: takes } });
+  expect(parseDataLayerMessage({ ...valid.full, facts: { ...facts, session: { ...facts.session, takesMessages: false } } })).toMatchObject({ ok: false, kind: "invalid" });
+});
+
+test("an owner-message has a text of 1 to MAX_OWNER_MESSAGE_LENGTH characters once trimmed; its refusal names only a known code", () => {
+  const request = valid["request owner-message"];
+  expect(parseOfficeServerMessage({ ...request, text: "x".repeat(MAX_OWNER_MESSAGE_LENGTH) })).toMatchObject({ ok: true });
+  for (const text of ["   ", "x".repeat(MAX_OWNER_MESSAGE_LENGTH + 1)]) expect(parseOfficeServerMessage({ ...request, text })).toMatchObject({ ok: false, kind: "invalid" });
+  expect(parseDataLayerMessage({ ...valid["reply owner-message"], queued: false })).toMatchObject({ ok: false, kind: "invalid" });
+  expect(parseDataLayerMessage({ ...valid["refusal of an owner-message"], code: "busy" })).toMatchObject({ ok: false, kind: "invalid" });
 });
 
 test("a withheld report parses with its hold id, and not without one", () => {

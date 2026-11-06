@@ -42,10 +42,18 @@
 // The session's context window, the size Claude Code gives the status line (`context_window_size`,
 // through $.session.usage), goes to the data layer through the file its `window` line names, as it
 // starts and on each tool call once it has changed (a /model switch), for the session's facts.
+//
+// A message the owner sends the session from the floor (#77) comes as an `owner-message` line, and
+// is submitted with $.prompt.submit as a turn of its own, read as the owner's own words: once the
+// session is idle, after any message before it, never touching the draft in the prompt box. Only a
+// Claude Code build that has $.prompt.submit (SUBMIT_SINCE on, by $.session.version) starts the data
+// layer with `--messages`, so only its session says on the floor that it takes messages. Whether each
+// went in, or waits its turn (it hasn't gone in after SUBMIT_WAIT_MS), or why not, goes back through
+// the file the line names. One for a session id the process has left (a /clear) is not submitted.
 
 import type { AskedMessage, ConflictMessage } from "@isoplan/protocol";
 import { endText, MAX_WAIT_MS } from "../ask/text.js";
-import type { AnswerTaken, ContextWindow, DataLayerLine, FromOffice, OwnerAnswerLine, PairLine, StatusLine, TitleAskLine, WaitMark } from "../lines.js";
+import type { AnswerTaken, ContextWindow, DataLayerLine, FromOffice, MessageTaken, OwnerAnswerLine, OwnerMessageLine, PairLine, StatusLine, TitleAskLine, WaitMark } from "../lines.js";
 import type { Host, On, ToolCallInput, ToolCallResult } from "./host.js";
 
 const RETRY_CAP_MS = 30000;
@@ -68,6 +76,10 @@ const RUNNING = new Set(["pending", "running", "waiting"]);
 const ASK_TOOL = "AskUserQuestion";
 // A call id that is safe as a file name; a question with any other id is never marked, so never answerable.
 const SAFE_ID = /^[A-Za-z0-9_-]{1,200}$/;
+// The first Claude Code release known to have $.prompt.submit.
+const SUBMIT_SINCE = [2, 1, 312];
+// A message not in after this long waits for the running turn, or an earlier message, to end.
+const SUBMIT_WAIT_MS = 2000;
 
 let running: string | null = null; // the session id the data layer runs for
 let lead: string | null = null; // that session's lead, as the facts name it
@@ -101,6 +113,7 @@ let superseded: "newer" | "window" | null = null; // the data layer said another
 let marking: Promise<unknown> = Promise.resolve(); // the marks, written in order
 let windowFile: string | null = null; // where the context window goes, as the data layer said
 let windowSent: number | null = null; // the size last written there
+let submitting: Promise<unknown> = Promise.resolve(); // the floor's messages, submitted in order
 
 export function register(on: On): void {
   on("session.start", async ($, e, next) => {
@@ -187,6 +200,61 @@ function ownerAnswer($: Host, line: OwnerAnswerLine): void {
   $.fs.write(line.file, JSON.stringify(taken)).catch((err) => $.ui.log("isoplan: could not say whether the floor's answer was taken: " + message(err), { to: "debug" }));
 }
 
+// The owner's message from the floor: submitted after those before it, if the process still runs
+// the session it was sent to. The data layer is told once it went in, once it has waited
+// SUBMIT_WAIT_MS (it waits its turn), or why it didn't, whichever comes first.
+function ownerMessage($: Host, line: OwnerMessageLine): void {
+  let said = false;
+  const say = (taken: MessageTaken) => {
+    if (said) return;
+    said = true;
+    $.fs.write(line.file, JSON.stringify(taken)).catch((err) => $.ui.log("isoplan: could not say whether the floor's message was taken: " + message(err), { to: "debug" }));
+  };
+  const waiting = $.clock.after(SUBMIT_WAIT_MS, () => say({ taken: true, queued: true }));
+  const end = (taken: MessageTaken) => {
+    waiting.cancel();
+    if (said && !taken.taken) $.ui.log(`isoplan: a message from the floor that was waiting its turn wasn't sent (${taken.reason})`, { to: "debug" });
+    say(taken);
+  };
+  submitting = submitting.then(async () => {
+    if ((await $.session.id().catch(() => null)) !== line.session) return end({ taken: false, reason: "ended" });
+    let submitted: Promise<{ drop?: string }>;
+    try {
+      submitted = $.prompt!.submit!({ text: line.text, asUser: true }); // throws when the host has no submit
+    } catch {
+      return end({ taken: false, reason: "no-submit" });
+    }
+    try {
+      const r = await submitted;
+      if (r && typeof r.drop === "string") {
+        $.ui.log("isoplan: Claude Code didn't let a message from the floor in: " + r.drop, { to: "debug" });
+        return end({ taken: false, reason: "dropped" });
+      }
+      end({ taken: true });
+    } catch (err) {
+      $.ui.log("isoplan: a message from the floor couldn't be submitted: " + message(err), { to: "debug" });
+      end({ taken: false, reason: "dropped" });
+    }
+  }).catch(() => {}); // one that failed never holds up the next
+}
+
+// Whether this Claude Code build can submit a prompt for a plugin, by its version: false when it
+// can't say. Called, never read as a value, like $.fs.exists.
+async function submits($: Host): Promise<boolean> {
+  try {
+    const { version, base } = await $.session.version!();
+    const parts = /^(\d+)\.(\d+)\.(\d+)/.exec(base ?? version);
+    if (!parts) return false;
+    for (let i = 0; i < SUBMIT_SINCE.length; i++) {
+      const n = Number(parts[i + 1]);
+      if (n !== SUBMIT_SINCE[i]) return n > SUBMIT_SINCE[i]!;
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 // Writes the session's context window where the data layer said, once it is known and has changed;
 // a host without $.session.usage, or without a size, writes nothing.
 async function sendWindow($: Host): Promise<void> {
@@ -218,6 +286,7 @@ async function run($: Host): Promise<void> {
   const script = $.plugin.root.replace(/\\/g, "/") + "/dist/data-layer.js";
   let failures = 0;
   const since = await $.clock.now();
+  const messages = (await submits($)) ? ["--messages"] : [];
   for (;;) {
     if (!(await isThere($, script))) {
       updated = true;
@@ -249,7 +318,7 @@ async function run($: Host): Promise<void> {
     let code: number | null = null;
     const startedAt = await $.clock.now();
     try {
-      const child = $.process.spawn({ argv: ["node", script, "--session", session, "--cwd", cwd, "--since", String(since)], cwd });
+      const child = $.process.spawn({ argv: ["node", script, "--session", session, "--cwd", cwd, "--since", String(since), ...messages], cwd });
       let buffer = "";
       for (;;) {
         const piece = await Promise.race([child.next(), switching]);
@@ -354,6 +423,9 @@ function handle($: Host, text: string): void {
       break;
     case "owner-answer":
       ownerAnswer($, line);
+      break;
+    case "owner-message":
+      ownerMessage($, line);
       break;
     case "window":
       // A data layer that started again has none yet.

@@ -375,8 +375,8 @@ export function createRunner({ answerer, ledger, settings, prompts, scan, send, 
         }
         return;
       }
-      if (message.kind === "owner-answer") {
-        send(unavailable(message.id, "an owner's answer goes to the live session, not the runner"));
+      if (message.kind === "owner-answer" || message.kind === "owner-message") {
+        send(unavailable(message.id, `an owner's ${message.kind === "owner-answer" ? "answer" : "message"} goes to the live session, not the runner`));
         return;
       }
       if (message.kind === "focus") {

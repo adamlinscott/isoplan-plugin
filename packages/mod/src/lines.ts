@@ -67,6 +67,27 @@ export interface OwnerAnswerLine {
 }
 
 /**
+ * The owner sent this session a message from the floor (#77): the hooks module submits `text` as a
+ * turn of its own, after any it was given before, if the process still runs `session` (the data
+ * layer's own id; another means a /clear or a resume moved it on), and writes a MessageTaken as JSON
+ * to `file`.
+ */
+export interface OwnerMessageLine {
+  type: "owner-message";
+  session: string;
+  text: string;
+  file: string;
+}
+
+/**
+ * What an owner-message's file holds: whether the message entered the session, `queued` when it
+ * waits for the running turn (or an earlier message) to end, or why it didn't: `no-submit`, this
+ * Claude Code build can't take one from a plugin; `ended`, the session has moved on; `dropped`,
+ * Claude Code didn't let it in.
+ */
+export type MessageTaken = { taken: true; queued?: true } | { taken: false; reason: "no-submit" | "ended" | "dropped" };
+
+/**
  * Where the hooks module marks the questions it waits on: `<dir>/<call id>.json`, a WaitMark, written
  * as it starts to wait for a floor answer and again when it stops. The data layer marks a question
  * answerable only while its mark says it waits. Sent once each time the data layer starts.
@@ -138,7 +159,7 @@ export interface TitleReply {
  * waiting, and `ask-rights` whether the session may ask its room (#49), each with the office server
  * it came from (#105), which the room is asked through.
  */
-export type DataLayerLine = StatusLine | TitleAskLine | PairLine | WaitsLine | WindowLine | OwnerAnswerLine | UpdatedLine | SupersededLine | LogLine | ConflictMessage | ErrorMessage | FromOffice<AskedMessage> | FromOffice<AskRightsMessage>;
+export type DataLayerLine = StatusLine | TitleAskLine | PairLine | WaitsLine | WindowLine | OwnerAnswerLine | UpdatedLine | SupersededLine | OwnerMessageLine | LogLine | ConflictMessage | ErrorMessage | FromOffice<AskedMessage> | FromOffice<AskRightsMessage>;
 
 /** A server's message, with the data-layer address of the office server that sent it; none from a data layer before #105. */
 export type FromOffice<M> = M & { server?: string };

@@ -28,6 +28,9 @@
 // line names; a detached one has no hooks module, so sends none. A Claude Code workflow's name,
 // description, phases and agents' labels are secret-checked too, and one that matches goes out as a
 // placeholder (src/data-layer/workflows.ts); its agents' results are reports like any other.
+// Started by a hooks module that can submit a prompt (`--messages`), the session fact says
+// `takesMessages`, and a message its owner sends from the floor goes to that hooks module, which
+// submits it as the session's next turn (src/data-layer/owner-messages.ts).
 //
 //   node dist/data-layer.js --session <session id> --cwd <the session's folder> --detached
 //
@@ -88,6 +91,7 @@ import { accountOf, claudePaths, projectOf } from "./identity.js";
 import { nodeIo } from "./io.js";
 import { createLink, type Link } from "./link.js";
 import { lateTake, prepareQuestions, relayOwnerAnswer } from "./owner-answers.js";
+import { relayOwnerMessage } from "./owner-messages.js";
 import { createPairing, pairingLockPath, pairingPath, pairingWriteLockPath, type Pairing } from "./pairing.js";
 import { askingRemoteNames } from "./remote-names.js";
 import { openReportHold, releasedPath, type ReportHold } from "./reports.js";
@@ -135,8 +139,10 @@ async function main(argv: string[]): Promise<number> {
   const sessionId = value(argv, "--session");
   const cwd = value(argv, "--cwd");
   const detached = argv.includes("--detached");
+  // Only the plugin's own hooks module passes it, and only when its Claude Code can submit a prompt.
+  const takesMessages = !detached && argv.includes("--messages");
   if (!sessionId || !cwd) {
-    process.stderr.write("usage: node data-layer.js --session <id> --cwd <dir> [--detached]\n");
+    process.stderr.write("usage: node data-layer.js --session <id> --cwd <dir> [--detached] [--messages]\n");
     return 2;
   }
 
@@ -152,6 +158,8 @@ async function main(argv: string[]): Promise<number> {
   // Where the hooks module says whether it took an owner's answer, one file per request, and where it
   // marks the questions it waits on: this session's own folders, cleared as the data layer starts.
   const answersDir = path.join(claudeDir, "isoplan", "answers", sessionId);
+  // Where the hooks module says whether it took an owner's message, one file per request.
+  const messagesDir = path.join(claudeDir, "isoplan", "messages", sessionId);
   const waitsDir = path.join(claudeDir, "isoplan", "waits", sessionId);
   // Where the hooks module writes the session's context window (a window line names it).
   const windowFile = path.join(claudeDir, "isoplan", "windows", `${sessionId}.json`);
@@ -313,8 +321,10 @@ async function main(argv: string[]): Promise<number> {
   const offices = officesOf(config);
   for (const { server } of offices.filter((o) => o.plainRefused)) emit({ type: "log", text: `not reporting to ${server}: it is plain ws:// to another machine; use wss://, or set "allowPlainWs": true in config.json` });
   if (!detached) {
-    for (const dir of [answersDir, waitsDir]) await fs.rm(dir, { recursive: true, force: true }).catch(() => {});
+    for (const dir of [answersDir, waitsDir, messagesDir]) await fs.rm(dir, { recursive: true, force: true }).catch(() => {});
     if (await fs.mkdir(waitsDir, { recursive: true }).then(() => true, () => false)) emit({ type: "waits", dir: waitsDir });
+    // Made once here, not per message, so each message's line goes out in the order it came.
+    await fs.mkdir(messagesDir, { recursive: true }).catch(() => {});
     // The hooks module writes the size again for this run, so one from an earlier run is never sent.
     await fs.rm(windowFile, { force: true }).catch(() => {});
     if (await fs.mkdir(path.dirname(windowFile), { recursive: true }).then(() => true, () => false)) emit({ type: "window", file: windowFile });
@@ -368,8 +378,8 @@ async function main(argv: string[]): Promise<number> {
       filter: (f, projects) => forOffice(candidates?.workspace ? inRepos(f) : f, projects, checkouts),
       answered: (id) => answered(id),
       // The owner released a withheld report on this office's floor: it goes to this office alone, now, not on the next pass.
-      // The owner answered a question from the floor: it goes to the hooks module, and the reply to
-      // the office it came from.
+      // The owner answered a question, or sent the session a message, from the floor: it goes to the
+      // hooks module, and the reply to the office it came from.
       onMessage: (message) => {
         if (message.type === "request" && message.kind === "owner-answer") {
           const file = path.join(answersDir, `${randomUUID()}.json`);
@@ -388,6 +398,15 @@ async function main(argv: string[]): Promise<number> {
             // A word that came later still, or not at all, is left over: it goes.
             .finally(() => fs.rm(file, { force: true }).catch(() => {}))
             .catch((err: unknown) => emit({ type: "log", text: `couldn't pass the owner's answer on: ${String((err as Error)?.message ?? err)}` }));
+          return;
+        }
+        if (message.type === "request" && message.kind === "owner-message") {
+          const file = path.join(messagesDir, `${randomUUID()}.json`);
+          // relayOwnerMessage emits its line before its first await: lines go out in arrival order.
+          void relayOwnerMessage(message, { detached, takes: takesMessages, owner: account.id, session: sessionId, file, emit, take: takeFile })
+            .then((answer) => run.gate.current()?.send(answer))
+            .finally(() => fs.rm(file, { force: true }).catch(() => {}))
+            .catch((err: unknown) => emit({ type: "log", text: `couldn't pass the owner's message on: ${String((err as Error)?.message ?? err)}` }));
           return;
         }
         if (message.type !== "release") return emit({ type: "log", text: `the office server sent a ${message.type} message, which this data layer doesn't handle yet` });
@@ -604,7 +623,8 @@ async function main(argv: string[]): Promise<number> {
     // The size stays as last read while the file is missing or half written; there is none until it is written.
     if (!detached) contextWindow = (await windowOf(windowFile)) ?? contextWindow;
     const titled = read.facts.session.titleFrom === "branch" && title?.title ? { ...read.facts, session: { ...read.facts.session, title: title.title } } : read.facts;
-    const facts: Facts = contextWindow ? { ...titled, session: { ...titled.session, contextWindow } } : titled;
+    const sized: Facts = contextWindow ? { ...titled, session: { ...titled.session, contextWindow } } : titled;
+    const facts: Facts = takesMessages ? { ...sized, session: { ...sized.session, takesMessages: true } } : sized;
 
     checkouts = read.checkouts ?? {};
     answered = read.answered ?? answered;
