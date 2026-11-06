@@ -52,6 +52,14 @@
 //   room's sessions this machine has its own record of: Claude Code's transcript of that session
 //   says the folder it ran in (`office.folder`, which also needs the folder to be there and in a
 //   repo the office takes). Never a path from the server. None: refused `no-folder`.
+// - Where a new session can start (#67): with each connection's first drive-policy, after
+//   `holding`, and again whenever a check every `repoFoldersCheckMinutes` finds it changed, the
+//   office is sent `folders`, the folders sessions on this machine ran in for each repo it takes
+//   (`office.repoFolders`, repo-folders.ts). A start with `folder` and no room opens a fresh session
+//   there, in a room of its own (`room:<session>`), with nothing from any room passed in, only when
+//   the folder is one the office was last told of for the start's project and is still in that repo
+//   (`office.home`); otherwise it is refused `no-folder`. The server's path is checked against
+//   what this runner listed, never used unchecked.
 // - A turn is named by the instruction that started it; one at a time (`busy`). Each tool use is
 //   sent as `tool` with a short summary of what for; the turn's `result` text as `reply`; then
 //   `turn-ended`. The turn's full output (instruction, the agent's words, tools and their results) is
@@ -141,9 +149,11 @@ import {
   type DrivenMessage,
   type DriveRefusalReason,
 } from "@isoplan/protocol";
+import { pathKey } from "../data-layer/git.js";
 import { claudeCommand } from "./claude-binary.js";
 import { forkEnv, hiddenSpawn, killTree, userTurn, type Spawn } from "./claude.js";
 import type { DrivenFields, ProcessRecord, Registry } from "./registry.js";
+import type { RepoFolders } from "./repo-folders.js";
 import { MAX_HELD } from "./runner.js";
 
 /** What runner.json says of driven sessions. */
@@ -158,6 +168,8 @@ export interface DriveSettings {
   drivenStartSeconds: number;
   /** How long a permission prompt waits for its owner's answer from the floor before it is denied. */
   drivenPromptMinutes: number;
+  /** How often the folders a new session can start in are checked again, and sent when they changed. */
+  repoFoldersCheckMinutes: number;
 }
 
 /** One office server's side of the driver. */
@@ -168,6 +180,10 @@ export interface DriveOffice {
   send(message: DrivenMessage): boolean;
   /** The folder of the first of these sessions this machine has its own record of, still there and in a repo the office takes; null with none. */
   folder(roomSessions: string[]): Promise<string | null>;
+  /** For each repo the office takes, the folders on this machine a new session can start in, as `folders` lists them. */
+  repoFolders(): Promise<RepoFolders[]>;
+  /** The project id, lower-cased, of the repo the office takes that `folder` is in; null when it is gone or the office takes none. */
+  home(folder: string): Promise<string | null>;
 }
 
 /** A handoff taken as a driven session, once its worktree is ready. */
@@ -271,6 +287,7 @@ const KILL_WAIT_MS = 10000;
 
 const NO_CLAUDE = "Claude Code for the terminal isn't installed on this computer, so no session can run here.";
 const NO_FOLDER = "This computer has no folder for this room: open Claude Code once in the room's repo here, then try again.";
+const NOT_LISTED = "That folder isn't one this computer offers for this repo any more, so nothing was started. Pick one of the folders it offers now.";
 const NOT_STARTED = "Claude Code couldn't be started on this computer. Its runner log says why.";
 const BUSY = "The agent is still working on the last instruction. Wait for it to finish, or stop it.";
 const NOT_CLOSED = "Claude Code couldn't be closed for this session on this computer, so it is still running there. Try again in a moment.";
@@ -506,6 +523,11 @@ export function createDriver(o: DriverOptions): Driver {
   const policies = new Map<string, Set<string>>();
   const takes = new Map<string, PreparedTake & { server: string; project: string }>();
   const starts = new Set<string>();
+  // Office -> what its last `folders` said: the message as sent, and each project's folders, pathKey -> the folder as listed.
+  const listed = new Map<string, { said: string; folders: Map<string, Map<string, string>> }>();
+  let foldersOut = Promise.resolve();
+  let foldersCheck: ReturnType<typeof setTimeout> | "arming" | null = null;
+  let closed = false;
 
   function newSession(record: ProcessRecord & { driven: DrivenFields }, fromBefore: boolean): Session {
     return { record, child: null, opening: false, closed: Promise.resolve(), turn: null, output: "", cut: false, outputs: new Map(), ending: null, failure: null, fromBefore, stderr: "", idle: null, idleToken: 0, starting: null, prompts: new Map(), work: Promise.resolve(), out: Promise.resolve() };
@@ -930,15 +952,27 @@ export function createDriver(o: DriverOptions): Driver {
     if (m.permissions === "bypassPermissions" && !bypassAllowed(server, project)) return refuse(server, m.id, "bypass-off", { detail: BYPASS_OFF });
     const bin = await o.binary();
     if (!bin) return refuse(server, m.id, "no-claude", { detail: NO_CLAUDE });
-    const folder = await offices.get(server)!.folder(m.roomSessions ?? []);
-    if (!folder) return refuse(server, m.id, "no-folder", { detail: NO_FOLDER });
+    const office = offices.get(server)!;
+    let folder: string | null;
+    if (m.folder !== undefined) {
+      // Only a folder this runner listed for the project, still in its repo, spelled as listed: never the server's path unchecked.
+      const own = listed.get(server)?.folders.get(project)?.get(pathKey(m.folder));
+      folder = own !== undefined && (await office.home(own).catch(() => null)) === project ? own : null;
+      if (!folder) return refuse(server, m.id, "no-folder", { detail: NOT_LISTED });
+    } else {
+      folder = await office.folder(m.roomSessions ?? []);
+      if (!folder) return refuse(server, m.id, "no-folder", { detail: NO_FOLDER });
+    }
     const st = await o.settings();
     const cap = capOf(st);
     // Checked and taken with no await between, so two starts can't both take the last place.
     if (heldIn(project) >= cap) return refuse(server, m.id, "cap-reached", { limit: cap, detail: capReached(cap) });
     const at = iso(now());
+    const session = `claude-code:${newId()}`;
+    // A start in a folder opens a new room: the session's own, as the server gives a session that says hello alone.
+    const room = m.room ?? `room:${session}`;
     const s = newSession(
-      { kind: "driven", pid: null, spawned: null, session: `claude-code:${newId()}`, folder, started: at, lastActivity: at, state: "closed", driven: { room: m.room, project, office: server, owner: m.by.id, permissions: DRIVEN_PERMISSIONS, asked: m.permissions, transcript: false } },
+      { kind: "driven", pid: null, spawned: null, session, folder, started: at, lastActivity: at, state: "closed", driven: { room, project, office: server, owner: m.by.id, permissions: DRIVEN_PERMISSIONS, asked: m.permissions, transcript: false } },
       false,
     );
     s.opening = true;
@@ -951,8 +985,8 @@ export function createDriver(o: DriverOptions): Driver {
       }
       prune();
       const { permissions } = s.record.driven;
-      emit(s, () => ({ ...driven, kind: "started", id: m.id, session: s.record.session, room: m.room, permissions }));
-      emit(s, () => ({ ...driven, kind: "held", session: s.record.session, room: m.room, why: "started", permissions }));
+      emit(s, () => ({ ...driven, kind: "started", id: m.id, session: s.record.session, room, permissions }));
+      emit(s, () => ({ ...driven, kind: "held", session: s.record.session, room, why: "started", permissions }));
       // A drive-policy that came after the check above.
       sayPromptsOn(s);
       if (m.instruction) await beginTurn(s, m.id, m.instruction);
@@ -1094,6 +1128,46 @@ export function createDriver(o: DriverOptions): Driver {
     for (const s of ofOffice) for (const w of s.prompts.values()) if (w.message) sendTo(server, w.message);
   }
 
+  // The folders a new session can start in, to the office: on a connection's first drive-policy
+  // (`again`), and otherwise only when they changed. One at a time, so they go in order.
+  function sayFolders(server: string, again: boolean): void {
+    foldersOut = count(
+      foldersOut
+        .then(async () => {
+          const office = offices.get(server);
+          if (!office || !policies.has(server)) return;
+          const repos = await office.repoFolders();
+          if (!policies.has(server)) return;
+          const said = JSON.stringify(repos);
+          if (!again && listed.get(server)?.said === said) return;
+          listed.set(server, { said, folders: new Map(repos.map((r) => [r.project, new Map(r.folders.map((f) => [pathKey(f), f]))])) });
+          sendTo(server, { ...driven, kind: "folders", repos });
+        })
+        .catch((err: Error) => o.log(`couldn't list the folders new sessions can start in for ${server}: ${err?.stack ?? String(err)}`)),
+    );
+  }
+
+  // Checks the folders again every repoFoldersCheckMinutes while any office's connection has had its first drive-policy.
+  function checkFoldersLater(): void {
+    if (foldersCheck || closed) return;
+    foldersCheck = "arming";
+    void o.settings().then(
+      (st) => {
+        if (closed) return;
+        foldersCheck = setTimeout(() => {
+          foldersCheck = null;
+          for (const server of policies.keys()) sayFolders(server, false);
+          // Armed again only once this round's listings are done, so a slow one never piles up checks.
+          void foldersOut.then(() => {
+            if (policies.size) checkFoldersLater();
+          });
+        }, st.repoFoldersCheckMinutes * 60000);
+        foldersCheck.unref?.();
+      },
+      () => (foldersCheck = null),
+    );
+  }
+
   // The driven sessions an earlier run left, with no process now (registry.restore ended theirs).
   for (const r of o.registry.list()) if (r.kind === "driven" && r.driven) sessions.set(r.session, newSession(r as Session["record"], true));
   prune();
@@ -1105,7 +1179,11 @@ export function createDriver(o: DriverOptions): Driver {
         const allowed = new Set(m.bypassAllowed.map((p) => p.toLowerCase()));
         const first = !policies.has(server);
         policies.set(server, allowed);
-        if (first) sayHolding(server);
+        if (first) {
+          sayHolding(server);
+          sayFolders(server, true);
+          checkFoldersLater();
+        }
         for (const s of sessions.values()) {
           const d = s.record.driven;
           if (d.office === server && s.child && d.permissions === "bypassPermissions" && !allowed.has(d.project)) queue(s, () => closeForPolicy(s));
@@ -1185,6 +1263,8 @@ export function createDriver(o: DriverOptions): Driver {
       });
     },
     close() {
+      closed = true;
+      if (foldersCheck && foldersCheck !== "arming") clearTimeout(foldersCheck);
       for (const s of sessions.values()) {
         if (!s.child) continue;
         s.ending = "stopped";

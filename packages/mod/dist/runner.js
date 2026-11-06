@@ -5949,7 +5949,7 @@ const MAX_OUTPUT_LENGTH = 2e5;
 const MAX_PROMPT_LENGTH = 2e3;
 /** The longest error text or refusal detail. */
 const MAX_DETAIL_LENGTH = 1e3;
-/** The longest folder a `handed-back` names. */
+/** The longest folder a `handed-back`, a `folders` or a start names. */
 const MAX_FOLDER_LENGTH = 4096;
 /** A drive request's, an instruction's, a prompt's or a withheld text's id. */
 const DriveId = string().min(1).max(100);
@@ -5960,6 +5960,8 @@ const Room = string().min(1).max(200);
 const Instruction = string().trim().min(1).max(MAX_INSTRUCTION_LENGTH);
 const ToolName = string().min(1).max(100);
 const Detail = string().min(1).max(MAX_DETAIL_LENGTH);
+/** A folder on the runner's machine, as the runner names it. */
+const Folder = string().min(1).max(MAX_FOLDER_LENGTH);
 /** The text was longer than its field's limit, so the runner cut it to fit. */
 const Cut = literal$1(true).optional();
 /** The secret scan matched the text: it only says so, and its owner can release it by this id (drive `release`). */
@@ -6174,7 +6176,7 @@ const driven$1 = {
 * machine has no driven session by that id that it would act on, or, for a release, holds nothing
 * withheld under that id (it was dropped, or the runner restarted since). `bypass-off`: the start asked for
 * `bypassPermissions` in a project whose office doesn't allow it (`drive-policy`). `no-folder`: this
-* machine has no folder for the room's project. `no-claude`: it has no claude binary. `busy`: the
+* machine has no folder for the room's project, or a start named a folder it didn't list in `folders` for that project, or that is no longer in it. `no-claude`: it has no claude binary. `busy`: the
 * session can't take this now, such as while a turn runs. `no-prompt`: an answer names a prompt the
 * session isn't waiting on (never raised by this runner, answered already, timed out or cancelled).
 * `cap-reached`: the project already has `limit` driven sessions running on this machine.
@@ -6362,7 +6364,7 @@ const DrivenMessageSchema = discriminatedUnion("kind", [
 		id: DriveId,
 		session: DrivenSessionId,
 		command: string().min(1).max(500),
-		folder: string().min(1).max(MAX_FOLDER_LENGTH)
+		folder: Folder
 	}),
 	DrivenRefusedSchema,
 	object({
@@ -6375,6 +6377,14 @@ const DrivenMessageSchema = discriminatedUnion("kind", [
 			permissions: DrivePermissionsSchema,
 			turn: DriveId.optional()
 		})).max(200)
+	}),
+	object({
+		...driven$1,
+		kind: literal$1("folders"),
+		repos: array(object({
+			project: string().min(1),
+			folders: array(Folder).min(1).max(5)
+		})).max(100)
 	})
 ]);
 discriminatedUnion("type", [
@@ -6602,11 +6612,26 @@ const OfficeServerMessageSchema = discriminatedUnion("type", [
 		object({
 			...drive$1,
 			kind: literal$1("start"),
-			room: Room,
+			room: Room.optional(),
+			folder: Folder.optional(),
 			project: ProjectSchema,
 			roomSessions: array(DrivenSessionId).max(20).optional(),
 			instruction: Instruction.optional(),
 			permissions: DrivePermissionsSchema
+		}).superRefine((message, context) => {
+			if (message.folder === void 0) {
+				if (message.room === void 0) context.addIssue({
+					code: "custom",
+					path: ["room"],
+					message: "a start names a room, or a folder"
+				});
+				return;
+			}
+			for (const key of ["room", "roomSessions"]) if (message[key] !== void 0) context.addIssue({
+				code: "custom",
+				path: [key],
+				message: "a start in a folder opens a new room, with nothing from another"
+			});
 		}),
 		object({
 			...drive$1,
@@ -11578,7 +11603,16 @@ async function findWorkspace(io, run, projectsDir, repos, since, timeoutMs, name
 	return null;
 }
 async function recentFolders(io, projectsDir, since) {
+	return (await sessionFolders(io, projectsDir, since)).map((f) => f.folder);
+}
+/**
+* The folders the machine's Claude Code sessions since `since` ran in, still there, the most recent
+* first, each once, with when each was last used. `cwds` keeps what each transcript says its folder
+* is between calls, so a transcript that names its folder is read once.
+*/
+async function sessionFolders(io, projectsDir, since, cwds) {
 	const transcripts = [];
+	const used = /* @__PURE__ */ new Set();
 	for (const dir of await io.listDir(projectsDir)) {
 		if (!dir.isDir) continue;
 		for (const entry of await io.listDir(path.join(projectsDir, dir.name))) {
@@ -11586,20 +11620,30 @@ async function recentFolders(io, projectsDir, since) {
 			const file = path.join(projectsDir, dir.name, entry.name);
 			const st = await io.stat(file);
 			if (!st || st.mtimeMs < since) continue;
-			const cwd = await cwdOf(io, file, st.size);
-			if (cwd) transcripts.push({
-				cwd,
-				at: st.mtimeMs
-			});
+			const cwd = cwds?.get(file) ?? await cwdOf(io, file, st.size);
+			if (cwd) {
+				used.add(file);
+				cwds?.set(file, cwd);
+				transcripts.push({
+					cwd,
+					at: st.mtimeMs
+				});
+			}
 		}
+	}
+	if (cwds) {
+		for (const file of cwds.keys()) if (!used.has(file)) cwds.delete(file);
 	}
 	transcripts.sort((a, b) => b.at - a.at);
 	const out = [];
 	const seen = /* @__PURE__ */ new Set();
-	for (const { cwd } of transcripts) {
+	for (const { cwd, at } of transcripts) {
 		if (seen.has(pathKey(cwd))) continue;
 		seen.add(pathKey(cwd));
-		if ((await io.stat(cwd))?.isDir) out.push(cwd);
+		if ((await io.stat(cwd))?.isDir) out.push({
+			folder: cwd,
+			at
+		});
 	}
 	return out;
 }
@@ -13473,6 +13517,38 @@ function createRegistry({ file, log, pid = process.pid, isAlive = alive, info = 
 	};
 }
 //#endregion
+//#region src/runner/repo-folders.ts
+/** The folders `seen` holds, by repo, the most recently used first: each folder once, at most MAX_REPO_FOLDERS a repo and MAX_FOLDER_REPOS repos. */
+async function repoFolders(seen, o) {
+	const byRepo = /* @__PURE__ */ new Map();
+	const tried = /* @__PURE__ */ new Set();
+	const leftOut = /* @__PURE__ */ new Set();
+	for (const { folder } of [...seen].sort((a, b) => b.at - a.at)) {
+		const key = pathKey(folder);
+		if (tried.has(key)) continue;
+		tried.add(key);
+		if (folder.length > 4096) continue;
+		const project = await o.home(folder).catch(() => null);
+		if (!project) continue;
+		const folders = byRepo.get(project) ?? [];
+		if (folders.length >= 5 || !byRepo.has(project) && byRepo.size >= 100) continue;
+		const matched = await o.scan(folder);
+		if (matched) {
+			leftOut.add(key);
+			if (!o.leftOut.has(key)) o.log(`a folder of ${project} wasn't listed for starting sessions from the floor: its path matches the secret pattern "${matched}"`);
+			continue;
+		}
+		folders.push(folder);
+		byRepo.set(project, folders);
+	}
+	o.leftOut.clear();
+	for (const key of leftOut) o.leftOut.add(key);
+	return [...byRepo].map(([project, folders]) => ({
+		project,
+		folders
+	}));
+}
+//#endregion
 //#region src/runner/session.ts
 /** The permission mode a driven session runs in, unless its person asked for bypassPermissions where its office allows it. */
 const DRIVEN_PERMISSIONS = "auto";
@@ -13513,6 +13589,7 @@ const TAKES_KEPT = 20;
 const KILL_WAIT_MS = 1e4;
 const NO_CLAUDE = "Claude Code for the terminal isn't installed on this computer, so no session can run here.";
 const NO_FOLDER = "This computer has no folder for this room: open Claude Code once in the room's repo here, then try again.";
+const NOT_LISTED = "That folder isn't one this computer offers for this repo any more, so nothing was started. Pick one of the folders it offers now.";
 const NOT_STARTED = "Claude Code couldn't be started on this computer. Its runner log says why.";
 const BUSY = "The agent is still working on the last instruction. Wait for it to finish, or stop it.";
 const NOT_CLOSED = "Claude Code couldn't be closed for this session on this computer, so it is still running there. Try again in a moment.";
@@ -13702,6 +13779,10 @@ function createDriver(o) {
 	const policies = /* @__PURE__ */ new Map();
 	const takes = /* @__PURE__ */ new Map();
 	const starts = /* @__PURE__ */ new Set();
+	const listed = /* @__PURE__ */ new Map();
+	let foldersOut = Promise.resolve();
+	let foldersCheck = null;
+	let closed = false;
 	function newSession(record, fromBefore) {
 		return {
 			record,
@@ -14247,8 +14328,16 @@ function createDriver(o) {
 		if (m.permissions === "bypassPermissions" && !bypassAllowed(server, project)) return refuse(server, m.id, "bypass-off", { detail: BYPASS_OFF });
 		const bin = await o.binary();
 		if (!bin) return refuse(server, m.id, "no-claude", { detail: NO_CLAUDE });
-		const folder = await offices.get(server).folder(m.roomSessions ?? []);
-		if (!folder) return refuse(server, m.id, "no-folder", { detail: NO_FOLDER });
+		const office = offices.get(server);
+		let folder;
+		if (m.folder !== void 0) {
+			const own = listed.get(server)?.folders.get(project)?.get(pathKey(m.folder));
+			folder = own !== void 0 && await office.home(own).catch(() => null) === project ? own : null;
+			if (!folder) return refuse(server, m.id, "no-folder", { detail: NOT_LISTED });
+		} else {
+			folder = await office.folder(m.roomSessions ?? []);
+			if (!folder) return refuse(server, m.id, "no-folder", { detail: NO_FOLDER });
+		}
 		const st = await o.settings();
 		const cap = capOf(st);
 		if (heldIn(project) >= cap) return refuse(server, m.id, "cap-reached", {
@@ -14256,17 +14345,19 @@ function createDriver(o) {
 			detail: capReached(cap)
 		});
 		const at = iso(now());
+		const session = `claude-code:${newId()}`;
+		const room = m.room ?? `room:${session}`;
 		const s = newSession({
 			kind: "driven",
 			pid: null,
 			spawned: null,
-			session: `claude-code:${newId()}`,
+			session,
 			folder,
 			started: at,
 			lastActivity: at,
 			state: "closed",
 			driven: {
-				room: m.room,
+				room,
 				project,
 				office: server,
 				owner: m.by.id,
@@ -14290,14 +14381,14 @@ function createDriver(o) {
 				kind: "started",
 				id: m.id,
 				session: s.record.session,
-				room: m.room,
+				room,
 				permissions
 			}));
 			emit(s, () => ({
 				...driven,
 				kind: "held",
 				session: s.record.session,
-				room: m.room,
+				room,
 				why: "started",
 				permissions
 			}));
@@ -14517,6 +14608,40 @@ function createDriver(o) {
 		});
 		for (const s of ofOffice) for (const w of s.prompts.values()) if (w.message) sendTo(server, w.message);
 	}
+	function sayFolders(server, again) {
+		foldersOut = count(foldersOut.then(async () => {
+			const office = offices.get(server);
+			if (!office || !policies.has(server)) return;
+			const repos = await office.repoFolders();
+			if (!policies.has(server)) return;
+			const said = JSON.stringify(repos);
+			if (!again && listed.get(server)?.said === said) return;
+			listed.set(server, {
+				said,
+				folders: new Map(repos.map((r) => [r.project, new Map(r.folders.map((f) => [pathKey(f), f]))]))
+			});
+			sendTo(server, {
+				...driven,
+				kind: "folders",
+				repos
+			});
+		}).catch((err) => o.log(`couldn't list the folders new sessions can start in for ${server}: ${err?.stack ?? String(err)}`)));
+	}
+	function checkFoldersLater() {
+		if (foldersCheck || closed) return;
+		foldersCheck = "arming";
+		o.settings().then((st) => {
+			if (closed) return;
+			foldersCheck = setTimeout(() => {
+				foldersCheck = null;
+				for (const server of policies.keys()) sayFolders(server, false);
+				foldersOut.then(() => {
+					if (policies.size) checkFoldersLater();
+				});
+			}, st.repoFoldersCheckMinutes * 6e4);
+			foldersCheck.unref?.();
+		}, () => foldersCheck = null);
+	}
 	for (const r of o.registry.list()) if (r.kind === "driven" && r.driven) sessions.set(r.session, newSession(r, true));
 	prune();
 	return {
@@ -14526,7 +14651,11 @@ function createDriver(o) {
 				const allowed = new Set(m.bypassAllowed.map((p) => p.toLowerCase()));
 				const first = !policies.has(server);
 				policies.set(server, allowed);
-				if (first) sayHolding(server);
+				if (first) {
+					sayHolding(server);
+					sayFolders(server, true);
+					checkFoldersLater();
+				}
 				for (const s of sessions.values()) {
 					const d = s.record.driven;
 					if (d.office === server && s.child && d.permissions === "bypassPermissions" && !allowed.has(d.project)) queue(s, () => closeForPolicy(s));
@@ -14633,6 +14762,8 @@ function createDriver(o) {
 			});
 		},
 		close() {
+			closed = true;
+			if (foldersCheck && foldersCheck !== "arming") clearTimeout(foldersCheck);
 			for (const s of sessions.values()) {
 				if (!s.child) continue;
 				s.ending = "stopped";
@@ -14815,6 +14946,7 @@ async function worker() {
 	let live = (_index) => (_message) => false;
 	const isDir = (p) => fs.stat(p).then((s) => s.isDirectory(), () => false);
 	const drives = [];
+	const transcriptFolders = /* @__PURE__ */ new Map();
 	const runnerFor = (office, index) => {
 		const { server } = office;
 		const pairing = createPairing({
@@ -14840,6 +14972,12 @@ async function worker() {
 			await approved.refresh();
 			return takesFrom(homeIo, approved.repos());
 		};
+		const home = async (folder) => {
+			if (!await isDir(folder)) return null;
+			await approved.refresh();
+			return (await approvedHome(folder, homeIo, approved.repos()))?.id.toLowerCase() ?? null;
+		};
+		const foldersLeftOut = /* @__PURE__ */ new Set();
 		drives[index] = {
 			server,
 			send: (message) => live(index)(message),
@@ -14851,7 +14989,22 @@ async function worker() {
 					if (await approvedHome(lead.cwd, homeIo, approved.repos()) !== null) return lead.cwd;
 				}
 				return null;
-			}
+			},
+			repoFolders: async () => {
+				const since = Date.now() - (await settings()).cloneSearchDays * 864e5;
+				const seen = await sessionFolders(io, path.join(claudeDir, "projects"), since, transcriptFolders);
+				for (const r of registry.list()) if (r.kind === "driven" && r.folder) seen.push({
+					folder: r.folder,
+					at: Date.parse(r.lastActivity) || 0
+				});
+				return repoFolders(seen, {
+					home,
+					scan: scanText,
+					log,
+					leftOut: foldersLeftOut
+				});
+			},
+			home
 		};
 		return {
 			pairing,

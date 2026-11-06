@@ -239,7 +239,17 @@ export async function findWorkspace(io: NodeIo, run: RunGit, projectsDir: string
 
 // The folders the machine's Claude Code sessions since `since` ran in, the most recent first, each once.
 async function recentFolders(io: NodeIo, projectsDir: string, since: number): Promise<string[]> {
+  return (await sessionFolders(io, projectsDir, since)).map((f) => f.folder);
+}
+
+/**
+ * The folders the machine's Claude Code sessions since `since` ran in, still there, the most recent
+ * first, each once, with when each was last used. `cwds` keeps what each transcript says its folder
+ * is between calls, so a transcript that names its folder is read once.
+ */
+export async function sessionFolders(io: Pick<NodeIo, "listDir" | "stat" | "read">, projectsDir: string, since: number, cwds?: Map<string, string>): Promise<{ folder: string; at: number }[]> {
   const transcripts: { cwd: string; at: number }[] = [];
+  const used = new Set<string>();
   for (const dir of await io.listDir(projectsDir)) {
     if (!dir.isDir) continue;
     for (const entry of await io.listDir(path.join(projectsDir, dir.name))) {
@@ -247,23 +257,28 @@ async function recentFolders(io: NodeIo, projectsDir: string, since: number): Pr
       const file = path.join(projectsDir, dir.name, entry.name);
       const st = await io.stat(file);
       if (!st || st.mtimeMs < since) continue;
-      const cwd = await cwdOf(io, file, st.size);
-      if (cwd) transcripts.push({ cwd, at: st.mtimeMs });
+      const cwd = cwds?.get(file) ?? (await cwdOf(io, file, st.size));
+      if (cwd) {
+        used.add(file);
+        cwds?.set(file, cwd);
+        transcripts.push({ cwd, at: st.mtimeMs });
+      }
     }
   }
+  if (cwds) for (const file of cwds.keys()) if (!used.has(file)) cwds.delete(file);
   transcripts.sort((a, b) => b.at - a.at);
-  const out: string[] = [];
+  const out: { folder: string; at: number }[] = [];
   const seen = new Set<string>();
-  for (const { cwd } of transcripts) {
+  for (const { cwd, at } of transcripts) {
     if (seen.has(pathKey(cwd))) continue;
     seen.add(pathKey(cwd));
-    if ((await io.stat(cwd))?.isDir) out.push(cwd);
+    if ((await io.stat(cwd))?.isDir) out.push({ folder: cwd, at });
   }
   return out;
 }
 
 // The folder a transcript's first lines name.
-async function cwdOf(io: NodeIo, file: string, size: number): Promise<string | null> {
+async function cwdOf(io: Pick<NodeIo, "read">, file: string, size: number): Promise<string | null> {
   for (const text of (await io.read(file, 0, Math.min(size, 65536)).catch(() => "")).split("\n")) {
     if (!text.includes('"cwd"')) continue;
     try {

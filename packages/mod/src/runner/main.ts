@@ -63,12 +63,13 @@ import { loadPrompts } from "./prompts.js";
 import { createRunGit, gitFailed, handoffBranch, handoffNote, HandoffGitError, prepare, pushHandoff, type Prepared } from "../handoff/git.js";
 import { focusHandoff } from "../handoff/focus.js";
 import { findOrca, orcaRunner } from "../handoff/orca.js";
-import { desktopProblem, takeHandoff, type TakeSettings } from "../handoff/take.js";
+import { desktopProblem, sessionFolders, takeHandoff, type TakeSettings } from "../handoff/take.js";
 import { recordTakenOffice } from "../handoff/taken-office.js";
 import { answerOffices } from "./offices.js";
 import { createForkSlots, createRunner, PushFailed, type RunnerSettings } from "./runner.js";
 import { loadPatterns, scan } from "./scan.js";
 import { createRegistry, registryPath } from "./registry.js";
+import { repoFolders } from "./repo-folders.js";
 import { createDriver, type DriveOffice, type Driver, type DriveSettings } from "./session.js";
 import { runnerEnvPath } from "./environment.js";
 import { applyClaudeDir, LOCK_REFRESH_MS, RUNNER_FRESH_MS, runnerCode, runnerLockPath } from "./start.js";
@@ -223,6 +224,8 @@ async function worker(): Promise<number> {
   let live = (_index: number) => (_message: DrivenMessage): boolean => false;
   const isDir = (p: string) => fs.stat(p).then((s) => s.isDirectory(), () => false);
   const drives: DriveOffice[] = [];
+  // What each transcript says its folder is, read once, for every office's list of folders.
+  const transcriptFolders = new Map<string, string>();
 
   // The runner answering what one office asks, for that office alone; it outlives its office's link.
   const runnerFor = (office: Office, index: number) => {
@@ -245,9 +248,16 @@ async function worker(): Promise<number> {
       await approved.refresh();
       return takesFrom(homeIo, approved.repos());
     };
+    // The repo the office takes that a folder still there is in, as a session there would report it.
+    const home = async (folder: string) => {
+      if (!(await isDir(folder))) return null;
+      await approved.refresh();
+      return (await approvedHome(folder, homeIo, approved.repos()))?.id.toLowerCase() ?? null;
+    };
     // A session driven from the floor opens in the folder Claude Code's own transcript of a room
-    // session on this machine names, still there and in a repo the office takes: never a path the
-    // server sent.
+    // session on this machine names, still there and in a repo the office takes; or in one of the
+    // folders the runner listed for a new room (#67): never a path the server sent unchecked.
+    const foldersLeftOut = new Set<string>();
     drives[index] = {
       server,
       send: (message) => live(index)(message),
@@ -260,6 +270,14 @@ async function worker(): Promise<number> {
         }
         return null;
       },
+      // The folders Claude Code sessions here ran in, within cloneSearchDays, and those of the sessions driven from here.
+      repoFolders: async () => {
+        const since = Date.now() - (await settings()).cloneSearchDays * 86400000;
+        const seen = await sessionFolders(io, path.join(claudeDir, "projects"), since, transcriptFolders);
+        for (const r of registry.list()) if (r.kind === "driven" && r.folder) seen.push({ folder: r.folder, at: Date.parse(r.lastActivity) || 0 });
+        return repoFolders(seen, { home, scan: scanText, log, leftOut: foldersLeftOut });
+      },
+      home,
     };
     const runner = createRunner({
       answerer,

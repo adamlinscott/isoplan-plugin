@@ -114,8 +114,12 @@ export const MAX_ROOM_ID_LENGTH = 200;
 export const MAX_TOOL_NAME_LENGTH = 100;
 /** The longest command a `handed-back` gives to continue the session in a terminal. */
 export const MAX_COMMAND_LENGTH = 500;
-/** The longest folder a `handed-back` names. */
+/** The longest folder a `handed-back`, a `folders` or a start names. */
 export const MAX_FOLDER_LENGTH = 4096;
+/** The most folders a `folders` message lists for one repo. */
+export const MAX_REPO_FOLDERS = 5;
+/** The most repos a `folders` message lists. */
+export const MAX_FOLDER_REPOS = 100;
 /** The most room sessions a start names. */
 export const MAX_ROOM_SESSIONS = 20;
 /** The most driven sessions a `holding` message lists. */
@@ -130,6 +134,8 @@ const Room = z.string().min(1).max(MAX_ROOM_ID_LENGTH);
 const Instruction = z.string().trim().min(1).max(MAX_INSTRUCTION_LENGTH);
 const ToolName = z.string().min(1).max(MAX_TOOL_NAME_LENGTH);
 const Detail = z.string().min(1).max(MAX_DETAIL_LENGTH);
+/** A folder on the runner's machine, as the runner names it. */
+const Folder = z.string().min(1).max(MAX_FOLDER_LENGTH);
 /** The text was longer than its field's limit, so the runner cut it to fit. */
 const Cut = z.literal(true).optional();
 /** The secret scan matched the text: it only says so, and its owner can release it by this id (drive `release`). */
@@ -336,7 +342,7 @@ const driven = { type: z.literal("driven"), v: Version };
  * machine has no driven session by that id that it would act on, or, for a release, holds nothing
  * withheld under that id (it was dropped, or the runner restarted since). `bypass-off`: the start asked for
  * `bypassPermissions` in a project whose office doesn't allow it (`drive-policy`). `no-folder`: this
- * machine has no folder for the room's project. `no-claude`: it has no claude binary. `busy`: the
+ * machine has no folder for the room's project, or a start named a folder it didn't list in `folders` for that project, or that is no longer in it. `no-claude`: it has no claude binary. `busy`: the
  * session can't take this now, such as while a turn runs. `no-prompt`: an answer names a prompt the
  * session isn't waiting on (never raised by this runner, answered already, timed out or cancelled).
  * `cap-reached`: the project already has `limit` driven sessions running on this machine.
@@ -420,7 +426,7 @@ export const DrivenMessageSchema = z.discriminatedUnion("kind", [
   z.object({ ...driven, kind: z.literal("released"), session: DrivenSessionId, why: z.enum(["stopped", "handed-back", "idle-closed", "crashed"]), id: DriveId.optional() }),
   // The session is back in its person's hands: `command` (`claude --resume <id>`) continues it in a
   // terminal opened in `folder`, a path on the runner's machine.
-  z.object({ ...driven, kind: z.literal("handed-back"), id: DriveId, session: DrivenSessionId, command: z.string().min(1).max(MAX_COMMAND_LENGTH), folder: z.string().min(1).max(MAX_FOLDER_LENGTH) }),
+  z.object({ ...driven, kind: z.literal("handed-back"), id: DriveId, session: DrivenSessionId, command: z.string().min(1).max(MAX_COMMAND_LENGTH), folder: Folder }),
   DrivenRefusedSchema,
   // Sent once per connection, after its first drive-policy: the driven sessions the runner holds, or
   // would reopen for an instruction, at most MAX_HOLDING of them, held ones first, then the most
@@ -434,6 +440,21 @@ export const DrivenMessageSchema = z.discriminatedUnion("kind", [
     sessions: z
       .array(z.object({ session: DrivenSessionId, room: Room, held: z.boolean(), permissions: DrivePermissionsSchema, turn: DriveId.optional() }))
       .max(MAX_HOLDING),
+  }),
+  // Where on this machine a new session can start, for a start with a `folder` (#67): for each repo
+  // the office takes, by its project id, lower-cased, the folders a Claude Code session here ran in
+  // that a session there reports as that repo (its checkout, or a folder above several repos, under
+  // the first the office takes), still there, the most recently used first, at most MAX_REPO_FOLDERS of them,
+  // for at most MAX_FOLDER_REPOS repos. A repo with none isn't listed. Sent with each connection's
+  // first drive-policy, after `holding`, and again whenever it changes; each one replaces the
+  // last. Every folder has passed the secret scan: one it matched, or one too long to send, is left
+  // out. Only these are folders a start may name.
+  z.object({
+    ...driven,
+    kind: z.literal("folders"),
+    repos: z
+      .array(z.object({ project: z.string().min(1), folders: z.array(Folder).min(1).max(MAX_REPO_FOLDERS) }))
+      .max(MAX_FOLDER_REPOS),
   }),
 ]);
 
@@ -664,15 +685,30 @@ export const DriveMessageSchema = z.discriminatedUnion("kind", [
   // reports, by its own record of that folder, or else in a checkout of `project` it finds, as a take
   // does. `instruction`, the first, is the turn named by this request's id. `permissions` is the mode
   // the person asked for; the runner runs `bypassPermissions` only where `drive-policy` allows it.
-  z.object({
-    ...drive,
-    kind: z.literal("start"),
-    room: Room,
-    project: ProjectSchema,
-    roomSessions: z.array(DrivenSessionId).max(MAX_ROOM_SESSIONS).optional(),
-    instruction: Instruction.optional(),
-    permissions: DrivePermissionsSchema,
-  }),
+  // Or, with `folder` and no `room` or `roomSessions` (#67): a fresh session in a new room, in one of
+  // the folders the runner's last `folders` listed for `project`, with nothing from any room passed
+  // in. Its room is its own, `room:<session>`, the one a session that says hello alone is given,
+  // which `started`, `held` and `holding` name. A folder it didn't list for that project, or that is no longer in it, is refused `no-folder`.
+  z
+    .object({
+      ...drive,
+      kind: z.literal("start"),
+      room: Room.optional(),
+      folder: Folder.optional(),
+      project: ProjectSchema,
+      roomSessions: z.array(DrivenSessionId).max(MAX_ROOM_SESSIONS).optional(),
+      instruction: Instruction.optional(),
+      permissions: DrivePermissionsSchema,
+    })
+    .superRefine((message, context) => {
+      if (message.folder === undefined) {
+        if (message.room === undefined) context.addIssue({ code: "custom", path: ["room"], message: "a start names a room, or a folder" });
+        return;
+      }
+      for (const key of ["room", "roomSessions"] as const) {
+        if (message[key] !== undefined) context.addIssue({ code: "custom", path: [key], message: "a start in a folder opens a new room, with nothing from another" });
+      }
+    }),
   // The next instruction, `text`; this request's id names the turn it starts.
   z.object({ ...drive, kind: z.literal("instruct"), session: DrivenSessionId, text: Instruction }),
   // End the session's process, mid-turn or not.

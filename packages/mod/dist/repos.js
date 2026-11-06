@@ -6534,7 +6534,7 @@ const MAX_OUTPUT_LENGTH = 2e5;
 const MAX_PROMPT_LENGTH = 2e3;
 /** The longest error text or refusal detail. */
 const MAX_DETAIL_LENGTH = 1e3;
-/** The longest folder a `handed-back` names. */
+/** The longest folder a `handed-back`, a `folders` or a start names. */
 const MAX_FOLDER_LENGTH = 4096;
 /** A drive request's, an instruction's, a prompt's or a withheld text's id. */
 const DriveId = string().min(1).max(100);
@@ -6545,6 +6545,8 @@ const Room = string().min(1).max(200);
 const Instruction = string().trim().min(1).max(MAX_INSTRUCTION_LENGTH);
 const ToolName = string().min(1).max(100);
 const Detail = string().min(1).max(MAX_DETAIL_LENGTH);
+/** A folder on the runner's machine, as the runner names it. */
+const Folder = string().min(1).max(MAX_FOLDER_LENGTH);
 /** The text was longer than its field's limit, so the runner cut it to fit. */
 const Cut = literal(true).optional();
 /** The secret scan matched the text: it only says so, and its owner can release it by this id (drive `release`). */
@@ -6759,7 +6761,7 @@ const driven = {
 * machine has no driven session by that id that it would act on, or, for a release, holds nothing
 * withheld under that id (it was dropped, or the runner restarted since). `bypass-off`: the start asked for
 * `bypassPermissions` in a project whose office doesn't allow it (`drive-policy`). `no-folder`: this
-* machine has no folder for the room's project. `no-claude`: it has no claude binary. `busy`: the
+* machine has no folder for the room's project, or a start named a folder it didn't list in `folders` for that project, or that is no longer in it. `no-claude`: it has no claude binary. `busy`: the
 * session can't take this now, such as while a turn runs. `no-prompt`: an answer names a prompt the
 * session isn't waiting on (never raised by this runner, answered already, timed out or cancelled).
 * `cap-reached`: the project already has `limit` driven sessions running on this machine.
@@ -6933,7 +6935,7 @@ discriminatedUnion("type", [
 			id: DriveId,
 			session: DrivenSessionId,
 			command: string().min(1).max(500),
-			folder: string().min(1).max(MAX_FOLDER_LENGTH)
+			folder: Folder
 		}),
 		DrivenRefusedSchema,
 		object({
@@ -6946,6 +6948,14 @@ discriminatedUnion("type", [
 				permissions: DrivePermissionsSchema,
 				turn: DriveId.optional()
 			})).max(200)
+		}),
+		object({
+			...driven,
+			kind: literal("folders"),
+			repos: array(object({
+				project: string().min(1),
+				folders: array(Folder).min(1).max(5)
+			})).max(100)
 		})
 	])
 ]);
@@ -7158,11 +7168,26 @@ discriminatedUnion("type", [
 		object({
 			...drive,
 			kind: literal("start"),
-			room: Room,
+			room: Room.optional(),
+			folder: Folder.optional(),
 			project: ProjectSchema,
 			roomSessions: array(DrivenSessionId).max(20).optional(),
 			instruction: Instruction.optional(),
 			permissions: DrivePermissionsSchema
+		}).superRefine((message, context) => {
+			if (message.folder === void 0) {
+				if (message.room === void 0) context.addIssue({
+					code: "custom",
+					path: ["room"],
+					message: "a start names a room, or a folder"
+				});
+				return;
+			}
+			for (const key of ["room", "roomSessions"]) if (message[key] !== void 0) context.addIssue({
+				code: "custom",
+				path: [key],
+				message: "a start in a folder opens a new room, with nothing from another"
+			});
 		}),
 		object({
 			...drive,
