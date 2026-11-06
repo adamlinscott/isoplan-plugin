@@ -371,3 +371,31 @@ test("a session whose hooks module can submit says it takes messages; its owner'
   await until(() => sent().some((m) => m.id === "m2"));
   expect(sent().find((m) => m.id === "m2")).toEqual({ type: "reply", v: 1, id: "m2", kind: "owner-message", queued: true });
 });
+
+test("several messages the owner sends back to back reach the hooks module in the order they were sent", async () => {
+  const o = await office();
+  o.state.repos = ["github.com/team/app"];
+  const r = versions(o.url).run("0.2.0", "--messages");
+  const sent = () => (o.state.connections[0]?.messages ?? []) as { type: string; account?: { id: string } }[];
+  await until(() => sent().some((m) => m.type === "full"));
+  const owner = sent().find((m) => m.type === "hello")!.account!;
+  const texts = Array.from({ length: 8 }, (_, i) => `message ${i}`);
+  for (const [i, text] of texts.entries()) o.state.connections[0]!.send({ type: "request", v: 1, id: `m${i}`, kind: "owner-message", session: "claude-code:s1", from: { id: owner.id, name: "Ada" }, text });
+  const lines = () => r.lines().filter((l) => l.type === "owner-message");
+  await until(() => lines().length === texts.length);
+  expect(lines().map((l) => l.text)).toEqual(texts);
+});
+
+test("a detached data layer refuses its owner's message and leaves no messages folder behind", async () => {
+  const o = await office();
+  o.state.repos = ["github.com/team/app"];
+  const { claudeDir } = start(o.url);
+  type Sent = { type: string; id?: string; account?: { id: string } };
+  const sent = () => (o.state.connections[0]?.messages ?? []) as Sent[];
+  await until(() => sent().some((m) => m.type === "full"));
+  const owner = sent().find((m) => m.type === "hello")!.account!;
+  o.state.connections[0]!.send({ type: "request", v: 1, id: "m1", kind: "owner-message", session: "claude-code:s1", from: { id: owner.id, name: "Ada" }, text: "hi" });
+  await until(() => sent().some((m) => m.id === "m1"));
+  expect(sent().find((m) => m.id === "m1")).toMatchObject({ type: "refusal", code: "detached" });
+  expect(fs.existsSync(path.join(claudeDir, "isoplan", "messages"))).toBe(false);
+});

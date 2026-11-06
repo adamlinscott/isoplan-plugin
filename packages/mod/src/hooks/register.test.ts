@@ -1,3 +1,4 @@
+import path from "node:path";
 import { beforeEach, expect, test, vi } from "vitest";
 import { PROTOCOL_VERSION } from "@isoplan/protocol";
 import type { DataLayerLine } from "../lines.js";
@@ -512,7 +513,7 @@ test("hooks: without $.session.usage, or without a size, nothing is written", as
   }
 });
 
-test("hooks: only a Claude Code build with $.prompt.submit (2.1.312 on) starts the data layer saying it takes messages", async () => {
+test("hooks: the data layer is started saying it takes messages only on Claude Code 2.1.312 on, going by the version", async () => {
   const argv = async (version?: { version: string; base?: string }) => {
     vi.resetModules();
     const { register } = await import("./register.js");
@@ -531,20 +532,20 @@ test("hooks: only a Claude Code build with $.prompt.submit (2.1.312 on) starts t
 });
 
 test.each([
-  ["Windows", "C:\Users\ada\.claude\isoplan\messages\s1"],
-  ["macOS", "/Users/ada/.claude/isoplan/messages/s1"],
-])("hooks: on %s the floor's messages are submitted as the owner's words, one after another; one not in after two seconds waits its turn", async (_os, dir) => {
+  ["Windows", path.win32, String.raw`C:\Users\ada\.claude\isoplan\messages\s1`],
+  ["macOS", path.posix, "/Users/ada/.claude/isoplan/messages/s1"],
+])("hooks: on %s the floor's messages are submitted as the owner's words, one after another; one not in after two seconds waits its turn", async (_os, paths, dir) => {
   const submitted: { text: string; asUser?: true }[] = [];
   const pending: (() => void)[] = [];
   const submit = (input: { text: string; asUser?: true }) => (submitted.push(input), new Promise<{ drop?: string }>((resolve) => pending.push(() => resolve({}))));
-  const line = (n: number): DataLayerLine => ({ type: "owner-message", session: "s1", text: `message ${n}`, file: `${dir}/${n}.json` });
+  const line = (n: number): DataLayerLine => ({ type: "owner-message", session: "s1", text: `message ${n}`, file: paths.join(dir, `${n}.json`) });
   const h = await start([line(1), line(2)], { stays: true, submit, heldTimers: true, version: { version: "2.1.318" } });
   await vi.waitFor(() => expect(submitted).toEqual([{ text: "message 1", asUser: true }]));
   // The session is mid-turn: the first hasn't gone in, and the second waits behind it.
   expect(h.written).toEqual([]);
   for (const fire of h.timers.splice(0)) fire();
   await vi.waitFor(() => expect(h.written).toHaveLength(2));
-  expect(h.written).toEqual([[`${dir}/1.json`, JSON.stringify({ taken: true, queued: true })], [`${dir}/2.json`, JSON.stringify({ taken: true, queued: true })]]);
+  expect(h.written).toEqual([[paths.join(dir, "1.json"), JSON.stringify({ taken: true, queued: true })], [paths.join(dir, "2.json"), JSON.stringify({ taken: true, queued: true })]]);
   expect(submitted).toHaveLength(1);
   pending.shift()!();
   await vi.waitFor(() => expect(submitted.map((s) => s.text)).toEqual(["message 1", "message 2"]));

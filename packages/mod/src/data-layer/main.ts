@@ -323,6 +323,8 @@ async function main(argv: string[]): Promise<number> {
   if (!detached) {
     for (const dir of [answersDir, waitsDir, messagesDir]) await fs.rm(dir, { recursive: true, force: true }).catch(() => {});
     if (await fs.mkdir(waitsDir, { recursive: true }).then(() => true, () => false)) emit({ type: "waits", dir: waitsDir });
+    // Made once here, not per message, so each message's line goes out in the order it came.
+    await fs.mkdir(messagesDir, { recursive: true }).catch(() => {});
     // The hooks module writes the size again for this run, so one from an earlier run is never sent.
     await fs.rm(windowFile, { force: true }).catch(() => {});
     if (await fs.mkdir(path.dirname(windowFile), { recursive: true }).then(() => true, () => false)) emit({ type: "window", file: windowFile });
@@ -400,9 +402,9 @@ async function main(argv: string[]): Promise<number> {
         }
         if (message.type === "request" && message.kind === "owner-message") {
           const file = path.join(messagesDir, `${randomUUID()}.json`);
-          void fs
-            .mkdir(messagesDir, { recursive: true })
-            .then(async () => run.gate.current()?.send(await relayOwnerMessage(message, { detached, takes: takesMessages, owner: account.id, session: sessionId, file, emit, take: takeFile })))
+          // relayOwnerMessage emits its line before its first await: lines go out in arrival order.
+          void relayOwnerMessage(message, { detached, takes: takesMessages, owner: account.id, session: sessionId, file, emit, take: takeFile })
+            .then((answer) => run.gate.current()?.send(answer))
             .finally(() => fs.rm(file, { force: true }).catch(() => {}))
             .catch((err: unknown) => emit({ type: "log", text: `couldn't pass the owner's message on: ${String((err as Error)?.message ?? err)}` }));
           return;

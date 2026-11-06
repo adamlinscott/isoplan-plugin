@@ -12604,6 +12604,7 @@ async function main(argv) {
 			type: "waits",
 			dir: waitsDir
 		});
+		await fs.mkdir(messagesDir, { recursive: true }).catch(() => {});
 		await fs.rm(windowFile, { force: true }).catch(() => {});
 		if (await fs.mkdir(path.dirname(windowFile), { recursive: true }).then(() => true, () => false)) emit({
 			type: "window",
@@ -12687,7 +12688,7 @@ async function main(argv) {
 			}
 			if (message.type === "request" && message.kind === "owner-message") {
 				const file = path.join(messagesDir, `${randomUUID()}.json`);
-				fs.mkdir(messagesDir, { recursive: true }).then(async () => run.gate.current()?.send(await relayOwnerMessage(message, {
+				relayOwnerMessage(message, {
 					detached,
 					takes: takesMessages,
 					owner: account.id,
@@ -12695,7 +12696,7 @@ async function main(argv) {
 					file,
 					emit,
 					take: takeFile
-				}))).finally(() => fs.rm(file, { force: true }).catch(() => {})).catch((err) => emit({
+				}).then((answer) => run.gate.current()?.send(answer)).finally(() => fs.rm(file, { force: true }).catch(() => {})).catch((err) => emit({
 					type: "log",
 					text: `couldn't pass the owner's message on: ${String(err?.message ?? err)}`
 				}));

@@ -245,8 +245,8 @@ export const ReplyMessageSchema = z.discriminatedUnion("kind", [
   // it took the answer after this request was refused for taking too long, so this reply follows that
   // refusal, with the same id.
   z.object({ type: z.literal("reply"), v: Version, id: RequestId, kind: z.literal("owner-answer"), closed: z.literal(true).optional(), late: z.literal(true).optional() }),
-  // The owner's message entered their session as a turn of its own (protocol 0.7.0 on). `queued`: the
-  // session was busy, so the message waits and runs once the running turn ends.
+  // The owner's message went into their session as a turn of its own (protocol 0.7.0 on). With
+  // `queued`, it hasn't gone in yet: the session accepted it to run after the running turn.
   z.object({ type: z.literal("reply"), v: Version, id: RequestId, kind: z.literal("owner-message"), queued: z.literal(true).optional() }),
   // The handoff's session is in front in Orca now (protocol 0.3.8); one that couldn't be is refused `unavailable`.
   z.object({ type: z.literal("reply"), v: Version, id: RequestId, kind: z.literal("focus") }),
