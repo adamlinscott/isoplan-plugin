@@ -72,3 +72,12 @@ test("changes: the same path at home and in another repo is two records, kept ap
   expect(diffFacts(both, { ...both, edits: [both.edits[0]!] })).toEqual({ upsert: {}, remove: { edits: [{ agent: lead, file: "a.md", project: web }] } });
   expect(diffFacts(both, { ...both, edits: [both.edits[1]!] })).toEqual({ upsert: {}, remove: { edits: [{ agent: lead, file: "a.md" }] } });
 });
+
+test("changes: a workflow upserts when it differs and is removed by its id", () => {
+  const workflow = { id: "wf_1", session: "claude-code:s", startedBy: lead, name: "build-review-merge", phases: [{ title: "Build" }], status: "running" as const, startedAt: at };
+  const withOne: Facts = { ...base, workflows: [workflow] };
+  expect(diffFacts(base, withOne)).toEqual({ upsert: { workflows: [workflow] }, remove: {} });
+  const ended = { ...workflow, status: "done" as const, endedAt: later };
+  expect(diffFacts(withOne, { ...base, workflows: [ended] })).toEqual({ upsert: { workflows: [ended] }, remove: {} });
+  expect(diffFacts(withOne, base)).toEqual({ upsert: {}, remove: { workflows: ["wf_1"] } });
+});

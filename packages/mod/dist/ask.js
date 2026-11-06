@@ -5681,6 +5681,8 @@ const SessionFactSchema = object({
 	extra: Extra
 });
 const TokenCount = number().int().nonnegative();
+/** The longest workflow description. */
+const MAX_WORKFLOW_DESCRIPTION_LENGTH = 1e3;
 const TokenCounts = object({
 	input: TokenCount,
 	cacheWrite: TokenCount,
@@ -5730,6 +5732,44 @@ const AgentFactSchema = object({
 		kind: _enum(["talk", "read"]),
 		since: Time
 	})).max(20).optional(),
+	workflow: object({
+		id: string().min(1),
+		phase: string().max(100),
+		label: string().max(200)
+	}).optional(),
+	extra: Extra
+});
+/**
+* A Claude Code workflow run (the Workflow tool, also used by ultracode): `id` is its run id, so a
+* new run is a new workflow and an ended one doesn't change again. `startedBy` is the agent whose
+* Workflow call started it. Its agents are AgentFacts with `workflow.id` naming it; at most
+* MAX_WORKFLOW_AGENTS of them are sent, and `moreAgents` counts the rest. `status`: running while
+* it writes, stalled once it has been quiet a while and idle after longer, with no end record;
+* done, stopped or failed once it ended. `usage.tokens`: its tokens, counted by Claude Code when it
+* ended, summed over its agents before. A data layer cuts each text to its MAX_* limit.
+*/
+const WorkflowFactSchema = object({
+	id: string().min(1),
+	session: string().min(1),
+	startedBy: string().min(1),
+	name: string().min(1).max(200),
+	description: string().max(MAX_WORKFLOW_DESCRIPTION_LENGTH).optional(),
+	phases: array(object({
+		title: string().max(100),
+		detail: string().max(500).optional()
+	})).max(30),
+	status: _enum([
+		"running",
+		"stalled",
+		"idle",
+		"done",
+		"stopped",
+		"failed"
+	]),
+	startedAt: Time,
+	endedAt: Time.optional(),
+	usage: object({ tokens: TokenCount }).optional(),
+	moreAgents: number().int().positive().optional(),
 	extra: Extra
 });
 /**
@@ -5795,7 +5835,9 @@ const FactsSchema = object({
 	waits: array(WaitFactSchema),
 	reports: array(ReportFactSchema),
 	/** Absent from a data layer that doesn't report questions, which is the same as none. */
-	questions: array(QuestionFactSchema).optional()
+	questions: array(QuestionFactSchema).optional(),
+	/** Absent from a data layer that doesn't report workflows, which is the same as none. */
+	workflows: array(WorkflowFactSchema).optional()
 });
 /** The records that changed, each replacing the one with the same key. */
 const FactUpsertSchema = object({
@@ -5805,7 +5847,8 @@ const FactUpsertSchema = object({
 	reads: array(FileFactSchema).optional(),
 	waits: array(WaitFactSchema).optional(),
 	reports: array(ReportFactSchema).optional(),
-	questions: array(QuestionFactSchema).optional()
+	questions: array(QuestionFactSchema).optional(),
+	workflows: array(WorkflowFactSchema).optional()
 });
 const FileKey = FileFactSchema.pick({
 	agent: true,
@@ -5815,7 +5858,7 @@ const FileKey = FileFactSchema.pick({
 /**
 * The keys of records that went away: an agent by its id, an edit or read by agent, file and
 * project (absent for the session's own), a
-* wait by waiter and on, a report by its agent, a question by its id. The session itself goes with
+* wait by waiter and on, a report by its agent, a question or a workflow by its id. The session itself goes with
 * the connection. `questionOutcomes`: how each question in `questions` ended, by its id: `answered`,
 * in the terminal or from the floor, or `abandoned`, with no answer (interrupted, or a new prompt
 * came first). Absent, or without a question's id, from a peer that doesn't say (protocol 0.3.5 on).
@@ -5830,7 +5873,8 @@ const FactRemoveSchema = object({
 	})).optional(),
 	reports: array(string().min(1)).optional(),
 	questions: array(string().min(1)).optional(),
-	questionOutcomes: record(string().min(1), _enum(["answered", "abandoned"])).optional()
+	questionOutcomes: record(string().min(1), _enum(["answered", "abandoned"])).optional(),
+	workflows: array(string().min(1)).optional()
 });
 const Version = literal(1);
 const Seq = number().int().nonnegative();

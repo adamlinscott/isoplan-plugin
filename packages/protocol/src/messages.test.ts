@@ -10,6 +10,12 @@ import {
   MAX_ROOM_SESSIONS,
   MAX_SUMMARY_LENGTH,
   MAX_TOOL_NAME_LENGTH,
+  MAX_WORKFLOW_DESCRIPTION_LENGTH,
+  MAX_WORKFLOW_LABEL_LENGTH,
+  MAX_WORKFLOW_NAME_LENGTH,
+  MAX_WORKFLOW_PHASE_DETAIL_LENGTH,
+  MAX_WORKFLOW_PHASE_TITLE_LENGTH,
+  MAX_WORKFLOW_PHASES,
   parseDataLayerMessage,
   parseOfficeServerMessage,
   PROTOCOL_VERSION,
@@ -18,6 +24,7 @@ import {
   type FloorDriveRefusalReason,
   type Handoff,
   type ParseResult,
+  type WorkflowFact,
 } from "./index.js";
 
 const at = "2026-10-20T09:00:00.000Z";
@@ -466,6 +473,50 @@ test("an edit, a read or a command in another repo carries that repo, and whethe
   const away = { ...facts, agents: [lead, { ...worker, doing }], edits: [edit], reads: [{ ...edit, away: undefined }] };
   expect(parseDataLayerMessage({ ...valid.full, facts: away })).toEqual({ ok: true, message: { ...valid.full, facts: away } });
   expect(parseDataLayerMessage({ ...valid.full, facts: { ...facts, edits: [{ ...edit, project: { id: "", name: "x" } }] } })).toMatchObject({ ok: false, kind: "invalid" });
+});
+
+describe("workflows", () => {
+  const workflow: WorkflowFact = {
+    id: "wf_66acbd07-57e",
+    session: "claude-code:s1",
+    startedBy: lead.id,
+    name: "build-review-merge",
+    description: "Build, review and merge each ticket",
+    phases: [{ title: "Build", detail: "one worktree per ticket" }, { title: "Review" }],
+    status: "done",
+    startedAt: at,
+    endedAt: at,
+    usage: { tokens: 1599101 },
+  };
+  const agent = { ...worker, id: "claude-code:a22a39ec5a8fa4a41", workflow: { id: workflow.id, phase: "Build", label: "build app-172" } };
+  const withWorkflow = (w: unknown, a: unknown = agent) => ({ ...valid.full, facts: { ...facts, agents: [lead, a], workflows: [w] } });
+
+  test("a workflow and its agents parse, and a running one needs no end or usage", () => {
+    expect(parseDataLayerMessage(withWorkflow(workflow))).toEqual({ ok: true, message: withWorkflow(workflow) });
+    const { endedAt: _e, usage: _u, description: _d, ...running } = workflow;
+    expect(parseDataLayerMessage(withWorkflow({ ...running, status: "running", moreAgents: 3 }))).toMatchObject({ ok: true });
+    expect(parseDataLayerMessage(withWorkflow({ ...workflow, status: "paused" }))).toMatchObject({ ok: false, kind: "invalid" });
+    expect(parseDataLayerMessage(withWorkflow({ ...workflow, moreAgents: 0 }))).toMatchObject({ ok: false, kind: "invalid" });
+  });
+
+  test("changes carry workflows, and remove them by id", () => {
+    const message = { ...valid.changes, upsert: { workflows: [workflow] }, remove: { workflows: ["wf_0"] } };
+    expect(parseDataLayerMessage(message)).toEqual({ ok: true, message });
+  });
+
+  const long = (length: number) => "x".repeat(length);
+  test.each([
+    ["a name", (n: number) => withWorkflow({ ...workflow, name: long(n) }), MAX_WORKFLOW_NAME_LENGTH],
+    ["a description", (n: number) => withWorkflow({ ...workflow, description: long(n) }), MAX_WORKFLOW_DESCRIPTION_LENGTH],
+    ["the phases", (n: number) => withWorkflow({ ...workflow, phases: Array.from({ length: n }, () => ({ title: "P" })) }), MAX_WORKFLOW_PHASES],
+    ["a phase title", (n: number) => withWorkflow({ ...workflow, phases: [{ title: long(n) }] }), MAX_WORKFLOW_PHASE_TITLE_LENGTH],
+    ["a phase detail", (n: number) => withWorkflow({ ...workflow, phases: [{ title: "P", detail: long(n) }] }), MAX_WORKFLOW_PHASE_DETAIL_LENGTH],
+    ["an agent's label", (n: number) => withWorkflow(workflow, { ...agent, workflow: { ...agent.workflow, label: long(n) } }), MAX_WORKFLOW_LABEL_LENGTH],
+    ["an agent's phase", (n: number) => withWorkflow(workflow, { ...agent, workflow: { ...agent.workflow, phase: long(n) } }), MAX_WORKFLOW_PHASE_TITLE_LENGTH],
+  ] as const)("%s at its limit parses, and one past it doesn't", (_, make, limit) => {
+    expect(parseDataLayerMessage(make(limit))).toMatchObject({ ok: true });
+    expect(parseDataLayerMessage(make(limit + 1))).toMatchObject({ ok: false, kind: "invalid" });
+  });
 });
 
 describe("handoff", () => {
