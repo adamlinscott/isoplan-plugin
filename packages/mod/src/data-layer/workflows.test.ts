@@ -1,9 +1,9 @@
 import fs from "node:fs";
 import path from "node:path";
-import { FactsSchema } from "@isoplan/protocol";
+import { FactsSchema, MAX_WORKFLOW_AGENTS, MAX_WORKFLOW_LABEL_LENGTH } from "@isoplan/protocol";
 import { expect, test } from "vitest";
 import { loadPatterns } from "../runner/scan.js";
-import { at, byId, cc, factsOf, gitRepo, line, modDir, NOW, session, sourceIn, tempRoot, touch } from "./fixture.js";
+import { agent, at, byId, cc, factsOf, gitRepo, line, modDir, NOW, session, sourceIn, tempRoot, touch } from "./fixture.js";
 import { openReportHold, WITHHELD_TEXT } from "./reports.js";
 import { parseScriptMeta, prepareWorkflows, WORKFLOW_WITHHELD } from "./workflows.js";
 
@@ -210,6 +210,119 @@ test("a planted secret: labels, phases, name and description are hidden, and a r
   expect(byId(hold.apply(facts, patterns).reports.map((r) => ({ ...r, id: r.agent }))).a0000000000000004!.text).toBe(`the key is ${secret}`);
   // With the patterns unreadable, every workflow text is hidden.
   expect(prepareWorkflows(facts, null, () => {}).workflows![0]!.phases[1]!.title).toBe(WORKFLOW_WITHHELD);
+});
+
+test("an agent's task and description are checked on their own: a secret past the label's cut, or in a description the journal's label differs from", async () => {
+  const root = tempRoot();
+  const home = path.join(root, "home");
+  const repo = gitRepo(path.join(root, "repo"));
+  const secret = "AKIAABCDEFGHIJKLMNOP";
+  session(home, "s", [line.user(repo, "run it", 200), launch(repo, "wf_ffffffff-666", {}, 190)], { age: 10 });
+  const long = `${"x".repeat(MAX_WORKFLOW_LABEL_LENGTH)} ${secret}`;
+  const sessionDir = run(home, "s", "wf_ffffffff-666", [
+    { id: "a0000000000000006", label: long, phase: "Build", type: "workflow-subagent" },
+    { id: "a0000000000000007", label: "plain label", phase: "Build", type: "workflow-subagent" },
+  ], { age: 20 });
+  const meta = path.join(sessionDir, "subagents", "workflows", "wf_ffffffff-666", "agent-a0000000000000007.meta.json");
+  fs.writeFileSync(meta, JSON.stringify({ agentType: "workflow-subagent", description: `push ${secret}`, workflowPhase: "Build" }));
+  const facts = await factsOf(home, "s");
+  const patterns = await loadPatterns(path.join(modDir, "secret-patterns.json"), path.join(root, "none.json"), () => {});
+  const out = prepareWorkflows(facts, patterns, () => {});
+
+  expect(JSON.stringify(out)).not.toContain(secret);
+  const agents = byId(out.agents);
+  expect(agents.a0000000000000006!.workflow!.label).toBe("x".repeat(MAX_WORKFLOW_LABEL_LENGTH));
+  expect(agents.a0000000000000007!.workflow!.label).toBe("plain label");
+  for (const id of ["a0000000000000006", "a0000000000000007"]) {
+    expect([agents[id]!.task, agents[id]!.extra?.description]).toEqual([WORKFLOW_WITHHELD, WORKFLOW_WITHHELD]);
+  }
+});
+
+test("a run record with no start time starts the workflow at its launch", async () => {
+  const root = tempRoot();
+  const home = path.join(root, "home");
+  const repo = gitRepo(path.join(root, "repo"));
+  session(home, "s", [line.user(repo, "run it", 200), launch(repo, "wf_99999999-777", {}, 190)], { age: 10 });
+  run(home, "s", "wf_99999999-777", FINISHED.slice(0, 1), { record: { status: "completed", timestamp: at(30), phases: PHASES }, age: 30 });
+  const [w] = (await factsOf(home, "s")).workflows!;
+  expect([w!.startedAt, w!.endedAt]).toEqual([at(190), at(30)]);
+});
+
+test("an ended run that leaves the view and comes back when the lights go off is the same fact", async () => {
+  const root = tempRoot();
+  const home = path.join(root, "home");
+  const repo = gitRepo(path.join(root, "repo"));
+  // The run's newest write 29 minutes before the session's: in view while the session is lit and
+  // fresh, out of view later in that lit half hour, back in view once the lights go off.
+  const age = 10 + 29 * 60;
+  session(home, "s", [line.user(repo, "run it", age + 100), line.reply(repo, "r1", { output_tokens: 1 }, age + 95), launch(repo, "wf_12121212-888", {}, age + 90)], { age: 10 });
+  const sessionDir = run(home, "s", "wf_12121212-888", [{ ...FINISHED[0]!, age }], { record: { status: "completed", startTime: NOW - (age + 90) * 1000, durationMs: 1000, phases: PHASES }, age });
+  let clock = NOW;
+  const read = sourceIn(home, { now: () => clock });
+  const first = (await read("s")).facts!.workflows![0]!;
+
+  clock = NOW + 29 * 60_000 + 30_000;
+  expect((await read("s")).facts!.workflows).toBeUndefined();
+  const rpath = path.join(sessionDir, "workflows", "wf_12121212-888.json");
+  fs.writeFileSync(rpath, JSON.stringify({ status: "failed", workflowName: "renamed" }));
+  touch(rpath, age);
+
+  clock = NOW + 31 * 60_000;
+  const back = (await read("s")).facts!;
+  expect(back.session.lights).toBe("off");
+  expect(back.workflows![0]).toEqual(first);
+});
+
+test("a run a subagent launched: its phases come from the script that launch names", async () => {
+  const root = tempRoot();
+  const home = path.join(root, "home");
+  const repo = gitRepo(path.join(root, "repo"));
+  session(home, "s", [line.user(repo, "go", 200)], { age: 10 });
+  // A later run of a reused script: the file is named for the script's first run, not this one.
+  const sessionDir = path.join(home, ".claude", "projects", "proj", "s");
+  agent(home, "s", "a00000000000000aa", { agentType: "general-purpose", description: "runs a workflow" }, [line.user(repo, "run it", 150), launch(repo, "wf_34343434-999", { scriptPath: "/x/workflows/scripts/reused-wf_10101010-000.js" }, 140)], { age: 30 });
+  run(home, "s", "wf_34343434-999", [{ id: "a0000000000000008", label: "one", phase: "Journal phase", type: "workflow-subagent", age: 20 }], { age: 20 });
+  const script = path.join(sessionDir, "workflows", "scripts", "reused-wf_10101010-000.js");
+  fs.mkdirSync(path.dirname(script), { recursive: true });
+  fs.writeFileSync(script, `export const meta = { name: "reused", phases: [{ title: "Script phase" }] };\n`);
+  const [w] = (await factsOf(home, "s")).workflows!;
+  expect([w!.startedBy, w!.phases]).toEqual([cc("a00000000000000aa"), [{ title: "Script phase" }]]);
+});
+
+test("an ended run whose starter has left the view names the lead, as its agents do", async () => {
+  const root = tempRoot();
+  const home = path.join(root, "home");
+  const repo = gitRepo(path.join(root, "repo"));
+  session(home, "s", [line.user(repo, "go", 2000)], { age: 10 });
+  agent(home, "s", "a00000000000000bb", { agentType: "general-purpose", description: "runs a workflow" }, [line.user(repo, "run it", 1600), launch(repo, "wf_56565656-aaa", {}, 1550)], { age: 25 * 60 });
+  run(home, "s", "wf_56565656-aaa", [{ ...FINISHED[0]!, age: 5 * 60 }], { record: { status: "completed", startTime: NOW - 1550_000, durationMs: 1000, phases: PHASES }, age: 5 * 60 });
+  let clock = NOW;
+  const read = sourceIn(home, { now: () => clock });
+  expect((await read("s")).facts!.workflows![0]!.startedBy).toBe(cc("a00000000000000bb"));
+  clock = NOW + 10 * 60_000; // the subagent 35 minutes quiet, out of view; the run 15, in view
+  const later = (await read("s")).facts!;
+  expect(byId(later.agents).a00000000000000bb).toBeUndefined();
+  expect([later.workflows![0]!.startedBy, byId(later.agents)[FINISHED[0]!.id]!.startedBy]).toEqual([cc("s:lead"), cc("s:lead")]);
+});
+
+test("a run with more agents than are sent: the first MAX_WORKFLOW_AGENTS go, and moreAgents counts the rest", async () => {
+  const root = tempRoot();
+  const home = path.join(root, "home");
+  const repo = gitRepo(path.join(root, "repo"));
+  session(home, "s", [line.user(repo, "run it", 200), launch(repo, "wf_78787878-bbb", {}, 190)], { age: 10 });
+  const many = Array.from({ length: MAX_WORKFLOW_AGENTS + 2 }, (_, i) => ({ id: `c${String(i).padStart(16, "0")}`, label: `agent ${i}`, phase: "Build", type: "workflow-subagent" }));
+  run(home, "s", "wf_78787878-bbb", many, { age: 20 });
+  const facts = await factsOf(home, "s");
+  expect(facts.agents.filter((a) => a.workflow).length).toBe(MAX_WORKFLOW_AGENTS);
+  expect(facts.workflows![0]!.moreAgents).toBe(2);
+  expect(FactsSchema.safeParse(facts).success).toBe(true);
+});
+
+test("a script's meta decodes escapes as JavaScript does, and reads numbers with exponents", () => {
+  const bs = String.fromCharCode(92); // a backslash, so the escapes reach the parser as written
+  const src = `export const meta = { name: "caf${bs}u00e9 ${bs}x41${bs}u{1F600}${bs}r!", description: 'a${bs}\nb', version: 1e3, size: -2.5E-1, phases: [{ title: "P${bs}t${bs}"Q${bs}"" }] }`;
+  expect(parseScriptMeta(src)).toEqual({ name: `caf${String.fromCharCode(0xe9)} A${String.fromCodePoint(0x1f600)}\r!`, description: "ab", phases: [{ title: 'P\t"Q"' }] });
+  expect(parseScriptMeta(`export const meta = { name: "${bs}u00g1" }`)).toBe(null);
 });
 
 test("a script's meta is read only as a literal: anything that would have to run makes it unreadable", () => {

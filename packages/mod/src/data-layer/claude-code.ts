@@ -16,7 +16,7 @@ import type { Config } from "./config.js";
 import { join, normalize, pathKey, relativeTo, type MaybePromise, type Stat, type Where } from "./git.js";
 import type { DirEntry } from "./io.js";
 import { shellFiles } from "./shell-writes.js";
-import { agentsInView, createWorkflowReader, listWorkflows, viewWorkflow, workflowLaunch, type RunState, type WorkflowAgentView, type WorkflowFiles, type WorkflowLaunch } from "./workflows.js";
+import { agentsInView, createWorkflowReader, endStatus, listWorkflows, viewWorkflow, workflowLaunch, type RunState, type WorkflowAgentView, type WorkflowFiles, type WorkflowLaunch } from "./workflows.js";
 
 const SOURCE = "claude-code";
 
@@ -52,9 +52,6 @@ const ASK_TOOL = "AskUserQuestion";
 // The tools whose file path counts as a read. A shell tool (`shellTools`) counts the files its
 // command reads.
 const READ_TOOLS = ["Read"];
-
-// End states that mean someone ended the agent early. It never answers, so it leaves no report.
-const STOPPED = new Set(["killed", "stopped"]);
 
 const encoder = new TextEncoder();
 
@@ -165,7 +162,9 @@ export function createClaudeCode(io: SourceIo) {
       for (const cache of [transcripts, metas]) {
         for (const key of cache.keys()) if (!used.has(key)) cache.delete(key);
       }
-      runs.prune(c.workflows.map((w) => w.id));
+      // An ended run's fact is kept while the run is listed at all, so one that leaves the view
+      // and comes back (the lights going off move the view) is the same fact.
+      runs.prune(c.listed);
     }
   }
 
@@ -243,7 +242,7 @@ export function createClaudeCode(io: SourceIo) {
     // A workflow in view brings all its agents, so its graph is whole.
     const inView = workflows.filter((w) => from - w.lastActive <= agentWindowMs);
     const subagents = all.length + workflows.reduce((n, w) => n + w.agents.length, 0);
-    return { id: sessionId, path, size: st.size, ownMtime: st.mtimeMs, lastActive, lights: lit ? "on" : "off", agents, workflows: inView, subagents };
+    return { id: sessionId, path, size: st.size, ownMtime: st.mtimeMs, lastActive, lights: lit ? "on" : "off", agents, workflows: inView, listed: workflows.map((w) => w.id), subagents };
   }
 
   // A folder with a repo directly in it.
@@ -278,13 +277,27 @@ export function createClaudeCode(io: SourceIo) {
     const session = `${SOURCE}:${c.id}`;
     const lead = `${session}:lead`;
     const agentFiles: (AgentFile & { t: TranscriptState; meta: Meta })[] = [];
+    const readAgents = async (list: AgentFile[]) => {
+      for (const a of list) {
+        try {
+          agentFiles.push({ ...a, t: await readTranscript(a.path, a.size, config.tailBytes), meta: await readMeta(a.metaPath) });
+        } catch (err) {
+          // An unreadable subagent transcript (deleted mid-read, locked) costs that agent, counted.
+          fail(err);
+        }
+      }
+    };
+    // The subagents first, so a run one of them launched is read with its launch's script.
+    await readAgents(c.agents);
+    const scripts = new Map<string, string | null>();
+    for (const t of [main, ...agentFiles.map((a) => a.t)]) for (const [runId, l] of t.workflows) scripts.set(runId, l.script);
     // Each workflow run in view, read off disk, and its agents, read as any subagent's are.
     const sessionDir = c.path.slice(0, -".jsonl".length);
     const runStates = new Map<string, { files: WorkflowFiles; run: RunState; more: number }>();
     const workflowAgents: AgentFile[] = [];
     for (const w of c.workflows) {
       try {
-        const run = await runs.read(w, sessionDir, main.workflows.get(w.id)?.script ?? null);
+        const run = await runs.read(w, sessionDir, scripts.get(w.id) ?? null);
         const { kept, more } = agentsInView(w, run);
         runStates.set(w.id, { files: w, run, more });
         workflowAgents.push(...kept);
@@ -292,14 +305,7 @@ export function createClaudeCode(io: SourceIo) {
         fail(err);
       }
     }
-    for (const a of [...c.agents, ...workflowAgents]) {
-      try {
-        agentFiles.push({ ...a, t: await readTranscript(a.path, a.size, config.tailBytes), meta: await readMeta(a.metaPath) });
-      } catch (err) {
-        // An unreadable subagent transcript (deleted mid-read, locked) costs that agent, counted.
-        fail(err);
-      }
-    }
+    await readAgents(workflowAgents);
     // The session's agents, by file id (any case), and by the names their spawning calls gave
     // them: what a check-in may name. A name two agents share names neither.
     const known = new Map(agentFiles.map((a) => [a.id.toLowerCase(), a.id]));
@@ -360,7 +366,8 @@ export function createClaudeCode(io: SourceIo) {
       });
       if (run.record) runs.frozen.set(runId, view.fact);
       workflowViews.set(runId, view.agents);
-      workflowFacts.push(view.fact);
+      // A starter no longer in view reads as the lead, as for its agents; the frozen fact keeps it.
+      workflowFacts.push(mtimes.has(view.fact.startedBy) ? view.fact : { ...view.fact, startedBy: lead });
     }
 
     const branch = main.branch || where.branch;
@@ -585,6 +592,8 @@ interface Candidate {
   agents: AgentFile[];
   /** The workflow runs in view, whose agents are read with the subagents. */
   workflows: WorkflowFiles[];
+  /** Every run listed, in view or not: an ended one's fact is kept while it is. */
+  listed: string[];
   subagents: number;
 }
 
@@ -1030,7 +1039,7 @@ function agentStatus(
 }
 
 function ended(state: string, at: number): AgentStatus {
-  return { status: state === "completed" ? "done" : STOPPED.has(state) ? "stopped" : "failed", since: at, endState: state };
+  return { status: endStatus(state), since: at, endState: state };
 }
 
 // The tools that start an agent, whose input names it; the tools that only read a file or folder,

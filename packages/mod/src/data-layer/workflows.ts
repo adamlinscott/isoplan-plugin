@@ -82,7 +82,7 @@ export interface RunState {
 
 interface RunRecord {
   status: string;
-  startedAt: number;
+  startedAt: number | null;
   endedAt: number;
   tokens: number | null;
   name: string | null;
@@ -263,7 +263,7 @@ export function viewWorkflow(input: ViewInput): { fact: WorkflowFact; agents: Ma
   const record = run.record;
   const stalledMs = config.stalledMinutes * 60000;
   const journalAt = files.journal?.mtimeMs ?? -Infinity;
-  const ended = record ? endOf(record.status) : null;
+  const ended = record ? endStatus(record.status) : null;
 
   const agents = new Map<string, WorkflowAgentView>();
   for (const a of input.agents) {
@@ -316,9 +316,9 @@ export const WORKFLOW_WITHHELD = "Hidden by the secret check";
 
 /**
  * The facts with each workflow's name, description, phase titles and details, and its agents'
- * labels and phases, secret-checked: a text the scan matches, and every one while `patterns` is
- * null, goes out as WORKFLOW_WITHHELD. A withheld label hides the agent's task too, which is the
- * same text.
+ * labels, phases, tasks and descriptions, secret-checked: a text the scan matches, and every one
+ * while `patterns` is null, goes out as WORKFLOW_WITHHELD. The task and description are checked on
+ * their own: they come uncut from meta.json, while the label is cut and may come from the journal.
  */
 export function prepareWorkflows(facts: Facts, patterns: Pattern[] | null, log: (text: string) => void): Facts {
   if (!facts.workflows?.length) return facts;
@@ -346,20 +346,26 @@ export function prepareWorkflows(facts: Facts, patterns: Pattern[] | null, log: 
     if (!a.workflow) return a;
     const label = check(a.workflow.label, `the label of ${a.id}`);
     const phase = check(a.workflow.phase, `the phase of ${a.id}`);
-    if (label === a.workflow.label && phase === a.workflow.phase) return a;
-    const hidden = label !== a.workflow.label;
+    const task = a.task === null ? null : check(a.task, `the task of ${a.id}`);
+    const said = a.extra?.description;
+    const description = typeof said === "string" ? check(said, `the description of ${a.id}`) : said;
+    if (label === a.workflow.label && phase === a.workflow.phase && task === a.task && description === said) return a;
     return {
       ...a,
       workflow: { ...a.workflow, label, phase },
-      ...(hidden ? { task: WORKFLOW_WITHHELD, extra: { ...a.extra, description: WORKFLOW_WITHHELD } } : {}),
+      task,
+      ...(description === said ? {} : { extra: { ...a.extra, description } }),
     };
   });
   return { ...facts, agents, workflows };
 }
 
-// The agent state an ended run leaves an agent that gave no result in.
-function endOf(status: string): "done" | "stopped" | "failed" {
-  return status === "completed" ? "done" : status === "killed" || status === "stopped" ? "stopped" : "failed";
+/**
+ * The agent state an end state means, for any subagent and for an agent an ended run leaves with no
+ * result. Killed and stopped mean someone ended it early: it never answers, so it leaves no report.
+ */
+export function endStatus(state: string): "done" | "stopped" | "failed" {
+  return state === "completed" ? "done" : state === "killed" || state === "stopped" ? "stopped" : "failed";
 }
 
 function parseRecord(textIn: string): RunRecord | null {
@@ -373,7 +379,7 @@ function parseRecord(textIn: string): RunRecord | null {
   const tokens = num(r.totalTokens);
   return {
     status: text(r.status) ?? "failed",
-    startedAt: start ?? NaN,
+    startedAt: start,
     endedAt,
     tokens: tokens !== null && tokens >= 0 ? Math.round(tokens) : null,
     name: text(r.workflowName),
@@ -424,16 +430,40 @@ function literal(src: string, start: number): unknown {
       } else return;
     }
   };
+  // The escape at i, decoded as JavaScript does; i moves past it.
+  const escape = (): string => {
+    const c = src[i + 1] ?? fail();
+    i += 2;
+    const hex = (n: number): number => {
+      const h = src.slice(i, i + n);
+      if (!new RegExp(`^[0-9a-fA-F]{${n}}$`).test(h)) fail();
+      i += n;
+      return parseInt(h, 16);
+    };
+    if (c === "u" && src[i] === "{") {
+      const end = src.indexOf("}", i);
+      const h = end < 0 ? fail() : src.slice(i + 1, end);
+      const code = /^[0-9a-fA-F]{1,6}$/.test(h) ? parseInt(h, 16) : fail();
+      if (code > 0x10ffff) fail();
+      i = end + 1;
+      return String.fromCodePoint(code);
+    }
+    if (c === "u") return String.fromCharCode(hex(4));
+    if (c === "x") return String.fromCharCode(hex(2));
+    // A backslash before a line break continues the line.
+    if (c === "\r") {
+      if (src[i] === "\n") i++;
+      return "";
+    }
+    const simple: Record<string, string> = { n: "\n", t: "\t", r: "\r", b: "\b", f: "\f", v: "\v", "0": "\0", "\n": "", " ": "", " ": "" };
+    return simple[c] ?? c;
+  };
   const str = (): string => {
     const q = src[i++]!;
     let out = "";
     while (i < src.length && src[i] !== q) {
       if (q === "`" && src.startsWith("${", i)) fail();
-      if (src[i] === "\\") {
-        const c = src[i + 1]!;
-        out += c === "n" ? "\n" : c === "t" ? "\t" : c === "\n" ? "" : c;
-        i += 2;
-      } else out += src[i++];
+      out += src[i] === "\\" ? escape() : src[i++];
     }
     if (src[i] !== q) fail();
     i++;
@@ -477,7 +507,7 @@ function literal(src: string, start: number): unknown {
       }
     }
     if (c === "'" || c === '"' || c === "`") return str();
-    const word = /^(?:-?\d+(?:\.\d+)?|true|false|null)(?![\w$])/.exec(src.slice(i, i + 50))?.[0] ?? fail();
+    const word = /^(?:-?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?|true|false|null)(?![\w$])/.exec(src.slice(i, i + 50))?.[0] ?? fail();
     i += word.length;
     return word === "true" ? true : word === "false" ? false : word === "null" ? null : Number(word);
   };
