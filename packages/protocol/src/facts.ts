@@ -49,6 +49,22 @@ export const SessionFactSchema = z.object({
 
 const TokenCount = z.number().int().nonnegative();
 
+// A workflow's bounds (see WorkflowFactSchema).
+/** The longest workflow name. */
+export const MAX_WORKFLOW_NAME_LENGTH = 200;
+/** The longest workflow description. */
+export const MAX_WORKFLOW_DESCRIPTION_LENGTH = 1000;
+/** The most phases a workflow lists. */
+export const MAX_WORKFLOW_PHASES = 30;
+/** The longest phase title, in a workflow's phases and in an agent's `workflow.phase`. */
+export const MAX_WORKFLOW_PHASE_TITLE_LENGTH = 100;
+/** The longest phase detail. */
+export const MAX_WORKFLOW_PHASE_DETAIL_LENGTH = 500;
+/** The longest label of a workflow's agent. */
+export const MAX_WORKFLOW_LABEL_LENGTH = 200;
+/** The most agents of one workflow a data layer sends; the workflow's `moreAgents` counts the rest. */
+export const MAX_WORKFLOW_AGENTS = 100;
+
 const TokenCounts = z.object({
   input: TokenCount,
   cacheWrite: TokenCount,
@@ -90,6 +106,41 @@ export const AgentFactSchema = z.object({
     .array(z.object({ with: z.string().min(1), kind: z.enum(["talk", "read"]), since: Time }))
     .max(20)
     .optional(),
+  // `workflow`: the agent is one of a Claude Code workflow's (its run, by the WorkflowFact's id),
+  // in that phase, under that label. Absent for every other agent.
+  workflow: z
+    .object({
+      id: z.string().min(1),
+      phase: z.string().max(MAX_WORKFLOW_PHASE_TITLE_LENGTH),
+      label: z.string().max(MAX_WORKFLOW_LABEL_LENGTH),
+    })
+    .optional(),
+  extra: Extra,
+});
+
+/**
+ * A Claude Code workflow run (the Workflow tool, also used by ultracode): `id` is its run id, so a
+ * new run is a new workflow and an ended one doesn't change again. `startedBy` is the agent whose
+ * Workflow call started it. Its agents are AgentFacts with `workflow.id` naming it; at most
+ * MAX_WORKFLOW_AGENTS of them are sent, and `moreAgents` counts the rest. `status`: running while
+ * it writes, stalled once it has been quiet a while and idle after longer, with no end record;
+ * done, stopped or failed once it ended. `usage.tokens`: its tokens, counted by Claude Code when it
+ * ended, summed over its agents before. A data layer cuts each text to its MAX_* limit.
+ */
+export const WorkflowFactSchema = z.object({
+  id: z.string().min(1),
+  session: z.string().min(1),
+  startedBy: z.string().min(1),
+  name: z.string().min(1).max(MAX_WORKFLOW_NAME_LENGTH),
+  description: z.string().max(MAX_WORKFLOW_DESCRIPTION_LENGTH).optional(),
+  phases: z
+    .array(z.object({ title: z.string().max(MAX_WORKFLOW_PHASE_TITLE_LENGTH), detail: z.string().max(MAX_WORKFLOW_PHASE_DETAIL_LENGTH).optional() }))
+    .max(MAX_WORKFLOW_PHASES),
+  status: z.enum(["running", "stalled", "idle", "done", "stopped", "failed"]),
+  startedAt: Time,
+  endedAt: Time.optional(),
+  usage: z.object({ tokens: TokenCount }).optional(),
+  moreAgents: z.number().int().positive().optional(),
   extra: Extra,
 });
 
@@ -162,6 +213,8 @@ export const FactsSchema = z.object({
   reports: z.array(ReportFactSchema),
   /** Absent from a data layer that doesn't report questions, which is the same as none. */
   questions: z.array(QuestionFactSchema).optional(),
+  /** Absent from a data layer that doesn't report workflows, which is the same as none. */
+  workflows: z.array(WorkflowFactSchema).optional(),
 });
 
 /** The records that changed, each replacing the one with the same key. */
@@ -173,6 +226,7 @@ export const FactUpsertSchema = z.object({
   waits: z.array(WaitFactSchema).optional(),
   reports: z.array(ReportFactSchema).optional(),
   questions: z.array(QuestionFactSchema).optional(),
+  workflows: z.array(WorkflowFactSchema).optional(),
 });
 
 const FileKey = FileFactSchema.pick({ agent: true, file: true, project: true });
@@ -180,7 +234,7 @@ const FileKey = FileFactSchema.pick({ agent: true, file: true, project: true });
 /**
  * The keys of records that went away: an agent by its id, an edit or read by agent, file and
  * project (absent for the session's own), a
- * wait by waiter and on, a report by its agent, a question by its id. The session itself goes with
+ * wait by waiter and on, a report by its agent, a question or a workflow by its id. The session itself goes with
  * the connection. `questionOutcomes`: how each question in `questions` ended, by its id: `answered`,
  * in the terminal or from the floor, or `abandoned`, with no answer (interrupted, or a new prompt
  * came first). Absent, or without a question's id, from a peer that doesn't say (protocol 0.3.5 on).
@@ -193,6 +247,7 @@ export const FactRemoveSchema = z.object({
   reports: z.array(z.string().min(1)).optional(),
   questions: z.array(z.string().min(1)).optional(),
   questionOutcomes: z.record(z.string().min(1), z.enum(["answered", "abandoned"])).optional(),
+  workflows: z.array(z.string().min(1)).optional(),
 });
 
 export type Source = z.infer<typeof SourceSchema>;
@@ -203,6 +258,7 @@ export type FileFact = z.infer<typeof FileFactSchema>;
 export type WaitFact = z.infer<typeof WaitFactSchema>;
 export type ReportFact = z.infer<typeof ReportFactSchema>;
 export type QuestionFact = z.infer<typeof QuestionFactSchema>;
+export type WorkflowFact = z.infer<typeof WorkflowFactSchema>;
 export type Facts = z.infer<typeof FactsSchema>;
 export type FactUpsert = z.infer<typeof FactUpsertSchema>;
 export type FactRemove = z.infer<typeof FactRemoveSchema>;
