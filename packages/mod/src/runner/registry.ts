@@ -18,7 +18,7 @@
 //         "started": "<ISO time>",     when Isoplan first started a process for it
 //         "lastActivity": "<ISO time>",
 //         "state": "working" | "idle" | "closed",
-//         "driven": { "room", "project", "office", "owner", "permissions", "transcript", "addDir"?, "name"? }   driven only
+//         "driven": { "room", "project", "office", "owner", "permissions", "asked"?, "transcript", "addDir"?, "name"? }   driven only
 //       }
 //     ]
 //   }
@@ -76,7 +76,10 @@ export interface DrivenFields {
   office: string;
   /** The account id of the person who started it. */
   owner: string;
+  /** The permission mode its process runs in, or last ran in. */
   permissions: DrivePermissions;
+  /** The mode its person asked for, which it opens in again only where its office's drive-policy allows it; a record from before has none, and asked for `permissions`. */
+  asked?: DrivePermissions;
   /** Whether a turn has ended in it, so Claude Code has saved its transcript: it opens again with --resume (as it does whenever the transcript is found), not --session-id. */
   transcript: boolean;
   /** A folder outside `folder` the session reads (a driven take's brief), passed as --add-dir. */

@@ -7837,7 +7837,7 @@ const same = (a, b) => a !== void 0 && JSON.stringify(a) === JSON.stringify(b);
 const STABLE_MS$1 = 3e4;
 const OUTBOX_MAX$1 = 100;
 const OUTBOX_MAX_AGE_MS$1 = 36e5;
-function createLink({ url, hello, emit, minIntervalMs = 1e3, retryBaseMs = 1e3, retryCapMs = 3e4, notWantedRetryMs = 36e5, takenRetryMs = 36e5, onNotWanted, onPairingEnded, onMessage, onDrive, onOpen, filter = (facts) => facts, answered, pairing, pairPollMs = 5e3, admit, random = Math.random }) {
+function createLink({ url, hello, emit, minIntervalMs = 1e3, retryBaseMs = 1e3, retryCapMs = 3e4, notWantedRetryMs = 36e5, takenRetryMs = 36e5, onNotWanted, onPairingEnded, onMessage, onDrive, onOpen, onClose, filter = (facts) => facts, answered, pairing, pairPollMs = 5e3, admit, random = Math.random }) {
 	const outbox = [];
 	let latest = null;
 	let socket = null;
@@ -7940,6 +7940,7 @@ function createLink({ url, hello, emit, minIntervalMs = 1e3, retryBaseMs = 1e3, 
 	function dropped() {
 		socket = null;
 		isOpen = false;
+		onClose?.();
 		projects = null;
 		sent = null;
 		if (pacing) clearTimeout(pacing);
@@ -11376,7 +11377,8 @@ async function takeHandoff(message, o) {
 				name,
 				addDir: folder,
 				room: message.room,
-				by: message.by
+				by: message.by,
+				permissions: message.permissions ?? "auto"
 			});
 			if (problem) {
 				await fail("open", `${problem} The worktree is ${dir}.`);
@@ -12697,20 +12699,20 @@ function createRegistry({ file, log, pid = process.pid, isAlive = alive, info = 
 }
 //#endregion
 //#region src/runner/session.ts
-/** The permission mode every driven session runs in until #42. */
+/** The permission mode a driven session runs in, unless its person asked for bypassPermissions where its office allows it. */
 const DRIVEN_PERMISSIONS = "auto";
 /**
-* The permission flags of a driven session's process. Until #42 every session runs in Claude Code's
-* `auto` mode and nobody answers its prompts, so whatever still asks is denied at once. #42 puts
-* `--permission-prompts host` here and relays the prompts, and runs bypassPermissions where the
-* office's drive-policy allows it (the policy is kept by office in the driver).
+* The permission flags of a driven session's process: `mode`, the one it runs in, and what still
+* asks permission handed to the runner, as control requests on its stdout (see the probe above).
 */
-function permissionArgs(_asked) {
+function permissionArgs(mode) {
 	return [
 		"--permission-mode",
-		DRIVEN_PERMISSIONS,
+		mode,
 		"--permission-prompts",
-		"none"
+		"host",
+		"--permission-prompt-tool",
+		"stdio"
 	];
 }
 /** Every flag of a driven session's command line, after the binary. --add-dir takes every argument after it, so it is last. */
@@ -12745,6 +12747,15 @@ const MISSING = "Claude Code can't find this session's saved conversation on thi
 const WITHHELD = "Held back on this computer: it may contain a secret. Release it from the floor to see it.";
 const NOT_YOURS_TAKE = "This handoff was taken from the floor by someone other than this computer's own person, so nothing was opened here.";
 const capReached = (limit) => `This project already has ${limit} sessions running from the floor on this computer, the most allowed. Stop one, then try again.`;
+const BYPASS_OFF = "This office doesn't let sessions in this project skip permission prompts, so nothing was started. Start it again with prompts on.";
+const PROMPTS_ON = "This office doesn't let sessions in this project skip permission prompts, so this one runs with them on: whenever the agent needs your permission, it asks you here first.";
+const BYPASS_TURNED_OFF = "Skipping permission prompts was turned off for this project, so this session was closed. Your next instruction reopens it with prompts on.";
+const BYPASS_STILL_RUNNING = "Skipping permission prompts was turned off for this project, but Claude Code couldn't be closed for this session on this computer yet. Try again in a moment.";
+const NO_PROMPT = "That permission request isn't waiting for an answer any more: it was answered already, ran out of time, or the session stopped.";
+const PROMPT_WITHHELD = "Held back on this computer: what the agent wants to do may contain a secret, so it isn't shown here.";
+const DENIED_TO_CLAUDE = "The user denied this permission request from the Isoplan floor.";
+const TIMED_OUT_TO_CLAUDE = "No answer to this permission request came from the Isoplan floor in time, so it was denied.";
+const UNSUPPORTED_TO_CLAUDE = "Not supported: the Isoplan runner driving this session answers only permission requests.";
 const capOf = (st) => Math.max(1, Math.floor(st.drivenPerProject));
 const uuidOf = (session) => session.slice(session.indexOf(":") + 1);
 const iso = (ms) => new Date(ms).toISOString();
@@ -12788,6 +12799,28 @@ function summaryOf(input) {
 		const value = i[key];
 		if (typeof value === "string" && value.trim()) return cutStart(value.replace(/\s+/g, " ").trim(), 500).text;
 	}
+}
+/**
+* What a permission prompt asks, in plain words, from its tool and the tool's input: the command it
+* would run, the file it would write, change or read, the address it would open, what it would search
+* the web for, or else the tool and its input as they are; then what for, when the agent said.
+*/
+function promptDescription(tool, input) {
+	const i = input && typeof input === "object" ? input : {};
+	const said = (key) => typeof i[key] === "string" && i[key].trim() ? i[key].trim() : void 0;
+	const command = said("command");
+	const file = said("file_path") ?? said("notebook_path");
+	const url = said("url");
+	const query = said("query");
+	const verb = tool === "Write" ? "Write" : [
+		"Edit",
+		"MultiEdit",
+		"NotebookEdit"
+	].includes(tool) ? "Change" : tool === "Read" ? "Read" : null;
+	const json = Object.keys(i).length ? JSON.stringify(i) : "";
+	const what = command ? `Run this command: ${command}` : file && verb ? `${verb} the file ${file}` : url ? `Open the web address ${url}` : query ? `Search the web for: ${query}` : `Use ${tool}${json ? ` with: ${json}` : ""}`;
+	const why = said("description");
+	return why && (command || file && verb || url || query) ? `${what}\nWhat for: ${why}` : what;
 }
 function resultText(block) {
 	const c = block.content;
@@ -12869,6 +12902,7 @@ function fit(m) {
 	limit("command", 500);
 	limit("folder", MAX_FOLDER_LENGTH);
 	limit("detail", MAX_DETAIL_LENGTH);
+	limit("description", MAX_PROMPT_LENGTH);
 	limit("text", m.kind === "reply" ? MAX_REPLY_LENGTH : m.kind === "output" ? MAX_OUTPUT_LENGTH : MAX_DETAIL_LENGTH);
 	if (m.kind === "holding") out.sessions = m.sessions.map((s) => ({
 		...s,
@@ -12910,10 +12944,15 @@ function createDriver(o) {
 			idle: null,
 			idleToken: 0,
 			starting: null,
+			prompts: /* @__PURE__ */ new Map(),
 			work: Promise.resolve(),
 			out: Promise.resolve()
 		};
 	}
+	const bypassAllowed = (server, project) => policies.get(server)?.has(project) === true;
+	const askedOf = (s) => s.record.driven.asked ?? s.record.driven.permissions;
+	/** The mode the session's process opens in now. */
+	const modeFor = (s) => askedOf(s) === "bypassPermissions" && bypassAllowed(s.record.driven.office, s.record.driven.project) ? "bypassPermissions" : DRIVEN_PERMISSIONS;
 	let busy = 0;
 	const waiting = [];
 	function count(p) {
@@ -12996,7 +13035,7 @@ function createDriver(o) {
 		clearIdle(s);
 		const token = s.idleToken;
 		o.settings().then((st) => {
-			if (token !== s.idleToken || !s.child || s.turn) return;
+			if (token !== s.idleToken || !s.child || s.turn || s.prompts.size) return;
 			s.idle = setTimeout(() => queue(s, () => closeIdle(s)), st.drivenIdleMinutes * 6e4);
 			s.idle.unref?.();
 		});
@@ -13028,10 +13067,11 @@ function createDriver(o) {
 			const d = s.record.driven;
 			const uuid = uuidOf(s.record.session);
 			const resume = d.transcript || await transcriptOf(o.claudeDir, s.record.folder, uuid) !== null;
+			const mode = modeFor(s);
 			const argv = [...claudeCommand(bin), ...drivenArgs({
 				uuid,
 				resume,
-				permissions: d.permissions,
+				permissions: mode,
 				...d.name ? { name: d.name } : {},
 				...d.addDir ? { addDir: d.addDir } : {}
 			})];
@@ -13054,9 +13094,13 @@ function createDriver(o) {
 				pid: child.pid ?? null,
 				spawned: at,
 				state: "idle",
-				lastActivity: at
+				lastActivity: at,
+				driven: {
+					...s.record.driven,
+					permissions: mode
+				}
 			});
-			o.log(`opened driven session ${s.record.session} in ${s.record.folder} (process ${child.pid})`);
+			o.log(`opened driven session ${s.record.session} in ${s.record.folder} (process ${child.pid}, permission mode ${mode})`);
 			armIdle(s);
 			return null;
 		} finally {
@@ -13106,6 +13150,12 @@ function createDriver(o) {
 		s.starting = null;
 		s.record.lastActivity = iso(now());
 		o.registry.touch(s.record.session, now());
+		if (e.type === "control_request") return ask(s, child, e);
+		if (e.type === "control_cancel_request") {
+			const w = [...s.prompts.values()].find((p) => p.request === e.request_id);
+			if (w) endPrompt(s, w, "cancelled");
+			return;
+		}
 		const turn = s.turn;
 		if (!turn) {
 			armIdle(s);
@@ -13141,8 +13191,8 @@ function createDriver(o) {
 			}
 		} else if (e.type === "system" && e.subtype === "permission_denied") {
 			const tool = typeof e.tool_name === "string" && e.tool_name ? e.tool_name : "a tool";
-			addOutput(s, `(${tool} wasn't allowed: it needs your permission)`);
-			const said = (name) => `The agent wanted to use ${name}, which needs your permission. Sessions run from the floor can't ask for it yet, so it wasn't allowed.`;
+			addOutput(s, `(${tool} wasn't allowed by Claude Code on this computer)`);
+			const said = (name) => `The agent wanted to use ${name}, but Claude Code on this computer didn't allow it (its permission rules, or its own safety check), so it wasn't used.`;
 			emit(s, async () => ({
 				...driven,
 				kind: "error",
@@ -13151,6 +13201,102 @@ function createDriver(o) {
 				text: await o.scan(said(tool)) ? said("a tool") : said(tool)
 			}));
 		} else if (e.type === "result" && (typeof e.num_turns === "number" && e.num_turns >= 1 || e.is_error === true || typeof e.local_command === "string")) endTurn(s, turn, e);
+	}
+	function ask(s, child, e) {
+		const request = e.request;
+		if (typeof e.request_id !== "string" || child.stdin.writableEnded) return;
+		if (request?.subtype !== "can_use_tool") {
+			const subtype = typeof request?.subtype === "string" ? request.subtype.slice(0, 60) : "(none)";
+			child.stdin.write(JSON.stringify({
+				type: "control_response",
+				response: {
+					subtype: "error",
+					request_id: e.request_id,
+					error: UNSUPPORTED_TO_CLAUDE
+				}
+			}) + "\n");
+			o.log(`answered Claude Code's request of subtype ${subtype} in ${s.record.session} with an error: only permission prompts are answered`);
+			return;
+		}
+		const tool = typeof request.tool_name === "string" && request.tool_name ? request.tool_name : "tool";
+		const w = {
+			id: `p-${randomUUID()}`,
+			request: e.request_id,
+			child,
+			turn: s.turn,
+			input: request.input,
+			message: null,
+			timer: null
+		};
+		s.prompts.set(w.id, w);
+		clearIdle(s);
+		const session = s.record.session;
+		const waiting = () => s.prompts.get(w.id) === w;
+		emit(s, async () => {
+			if (!waiting()) return null;
+			const ms = (await o.settings()).drivenPromptMinutes * 6e4;
+			const expires = now() + ms;
+			w.timer = setTimeout(() => endPrompt(s, w, "timed-out"), ms);
+			w.timer.unref?.();
+			const description = promptDescription(tool, request.input);
+			const toolHeld = await o.scan(tool) !== null;
+			const descriptionHeld = await o.scan(description) !== null;
+			if (!waiting()) return null;
+			if (toolHeld || descriptionHeld) o.log(`withheld what permission prompt ${w.id} of ${session} asks: it matches a secret pattern`);
+			w.message = {
+				...driven,
+				kind: "prompt",
+				session,
+				...w.turn ? { turn: w.turn } : {},
+				prompt: w.id,
+				tool: toolHeld ? "tool" : tool,
+				description: descriptionHeld ? PROMPT_WITHHELD : description,
+				...toolHeld || descriptionHeld ? { withheld: true } : {},
+				expires: iso(expires)
+			};
+			return w.message;
+		});
+	}
+	function endPrompt(s, w, outcome, id) {
+		if (s.prompts.get(w.id) !== w) return;
+		s.prompts.delete(w.id);
+		if (w.timer) clearTimeout(w.timer);
+		if (outcome !== "cancelled" && s.child === w.child && !w.child.stdin.writableEnded) {
+			const response = outcome === "allowed" ? {
+				behavior: "allow",
+				updatedInput: w.input
+			} : {
+				behavior: "deny",
+				message: outcome === "denied" ? DENIED_TO_CLAUDE : TIMED_OUT_TO_CLAUDE
+			};
+			w.child.stdin.write(JSON.stringify({
+				type: "control_response",
+				response: {
+					subtype: "success",
+					request_id: w.request,
+					response
+				}
+			}) + "\n");
+		}
+		o.log(`permission prompt ${w.id} of ${s.record.session} ended: ${outcome}`);
+		const session = s.record.session;
+		emit(s, () => w.message ? {
+			...driven,
+			kind: "prompt-ended",
+			session,
+			prompt: w.id,
+			outcome,
+			...id ? { id } : {}
+		} : null);
+		if (s.child && !s.turn && !s.prompts.size) armIdle(s);
+	}
+	const endPrompts = (s) => {
+		for (const w of [...s.prompts.values()]) endPrompt(s, w, "cancelled");
+	};
+	function answer(s, id, prompt, said) {
+		const w = s.prompts.get(prompt);
+		if (!w) return refuse(s.record.driven.office, id, "no-prompt", { detail: NO_PROMPT });
+		endPrompt(s, w, said === "allow" ? "allowed" : "denied", id);
 	}
 	function endTurn(s, turn, e) {
 		s.turn = null;
@@ -13219,6 +13365,7 @@ function createDriver(o) {
 		clearIdle(s);
 		if (s.starting) clearTimeout(s.starting);
 		s.starting = null;
+		endPrompts(s);
 		const turn = s.turn;
 		s.turn = null;
 		if (turn) keepTurn(s, turn);
@@ -13279,6 +13426,7 @@ function createDriver(o) {
 		const child = s.child;
 		if (!child) return;
 		child.stdin.end();
+		endPrompts(s);
 		if (await within(s.closed, st.drivenCloseSeconds * 1e3)) return;
 		o.log(`driven session ${s.record.session} didn't end within ${st.drivenCloseSeconds} s of being closed, so its process was ended`);
 		if (s.child === child) killTree(child, platform);
@@ -13320,18 +13468,18 @@ function createDriver(o) {
 		}
 		starts.add(m.id);
 		if (starts.size > STARTS_KEPT) starts.delete(starts.values().next().value);
+		const project = m.project.id.toLowerCase();
+		if (m.permissions === "bypassPermissions" && !bypassAllowed(server, project)) return refuse(server, m.id, "bypass-off", { detail: BYPASS_OFF });
 		const bin = await o.binary();
 		if (!bin) return refuse(server, m.id, "no-claude", { detail: NO_CLAUDE });
 		const folder = await offices.get(server).folder(m.roomSessions ?? []);
 		if (!folder) return refuse(server, m.id, "no-folder", { detail: NO_FOLDER });
 		const st = await o.settings();
-		const project = m.project.id.toLowerCase();
 		const cap = capOf(st);
 		if (heldIn(project) >= cap) return refuse(server, m.id, "cap-reached", {
 			limit: cap,
 			detail: capReached(cap)
 		});
-		if (m.permissions !== "auto") o.log(`start ${m.id} asked for ${m.permissions}; it runs in ${DRIVEN_PERMISSIONS}, which is all this runner does yet`);
 		const at = iso(now());
 		const s = newSession({
 			kind: "driven",
@@ -13348,6 +13496,7 @@ function createDriver(o) {
 				office: server,
 				owner: m.by.id,
 				permissions: DRIVEN_PERMISSIONS,
+				asked: m.permissions,
 				transcript: false
 			}
 		}, false);
@@ -13360,13 +13509,14 @@ function createDriver(o) {
 				return refuse(server, m.id, problem.reason, { detail: problem.detail });
 			}
 			prune();
+			const { permissions } = s.record.driven;
 			emit(s, () => ({
 				...driven,
 				kind: "started",
 				id: m.id,
 				session: s.record.session,
 				room: m.room,
-				permissions: DRIVEN_PERMISSIONS
+				permissions
 			}));
 			emit(s, () => ({
 				...driven,
@@ -13374,8 +13524,9 @@ function createDriver(o) {
 				session: s.record.session,
 				room: m.room,
 				why: "started",
-				permissions: DRIVEN_PERMISSIONS
+				permissions
 			}));
+			sayPromptsOn(s);
 			if (m.instruction) await beginTurn(s, m.id, m.instruction);
 		});
 	}
@@ -13383,6 +13534,10 @@ function createDriver(o) {
 		const server = s.record.driven.office;
 		if (!current(s)) return refuse(server, id, "not-found");
 		if (s.turn) return refuse(server, id, "busy", { detail: BUSY });
+		if (s.child && s.record.driven.permissions === "bypassPermissions" && policies.has(server) && modeFor(s) !== "bypassPermissions") {
+			queue(s, () => closeForPolicy(s));
+			return refuse(server, id, "unavailable", { detail: BYPASS_STILL_RUNNING });
+		}
 		if (!s.child) {
 			const cap = capOf(await o.settings());
 			if (heldIn(s.record.driven.project) >= cap) return refuse(server, id, "cap-reached", {
@@ -13393,16 +13548,51 @@ function createDriver(o) {
 			const problem = await open(s);
 			if (problem) return refuse(server, id, problem.reason, { detail: problem.detail });
 			s.fromBefore = false;
+			const { room, permissions } = s.record.driven;
 			emit(s, () => ({
 				...driven,
 				kind: "held",
 				session: s.record.session,
-				room: s.record.driven.room,
+				room,
 				why,
-				permissions: s.record.driven.permissions
+				permissions
 			}));
+			sayPromptsOn(s);
 		}
 		await beginTurn(s, id, text);
+	}
+	function sayPromptsOn(s) {
+		if (askedOf(s) === "bypassPermissions" && s.record.driven.permissions !== "bypassPermissions") emit(s, () => ({
+			...driven,
+			kind: "error",
+			session: s.record.session,
+			text: PROMPTS_ON
+		}));
+	}
+	async function closeForPolicy(s) {
+		const child = s.child;
+		if (!current(s) || !child || s.record.driven.permissions !== "bypassPermissions" || modeFor(s) === "bypassPermissions") return;
+		s.ending = "stopped";
+		killTree(child, platform);
+		await within(s.closed, KILL_WAIT_MS);
+		s.ending = null;
+		if (s.child === child) {
+			o.log(`driven session ${s.record.session}'s process ${child.pid} didn't end when skipping permission prompts was turned off for its project, so it is still held`);
+			return;
+		}
+		o.log(`closed driven session ${s.record.session}: skipping permission prompts was turned off for its project`);
+		emit(s, () => ({
+			...driven,
+			kind: "error",
+			session: s.record.session,
+			text: BYPASS_TURNED_OFF
+		}));
+		emit(s, () => ({
+			...driven,
+			kind: "released",
+			session: s.record.session,
+			why: "stopped"
+		}));
 	}
 	async function stop(s, id) {
 		if (!current(s)) return refuse(s.record.driven.office, id, "not-found");
@@ -13457,7 +13647,7 @@ function createDriver(o) {
 		forget(s);
 	}
 	async function closeIdle(s) {
-		if (!current(s) || !s.child || s.turn || s.ending) return;
+		if (!current(s) || !s.child || s.turn || s.prompts.size || s.ending) return;
 		s.ending = "idle-closed";
 		await closeGently(s);
 		s.ending = null;
@@ -13542,7 +13732,12 @@ function createDriver(o) {
 		take(server, m) {
 			if (!offices.has(server)) return;
 			if (m.type === "drive-policy") {
-				policies.set(server, new Set(m.bypassAllowed.map((p) => p.toLowerCase())));
+				const allowed = new Set(m.bypassAllowed.map((p) => p.toLowerCase()));
+				policies.set(server, allowed);
+				for (const s of sessions.values()) {
+					const d = s.record.driven;
+					if (d.office === server && s.child && d.permissions === "bypassPermissions" && !allowed.has(d.project)) queue(s, () => closeForPolicy(s));
+				}
 				return;
 			}
 			if (m.by.id !== o.account.id) return refuse(server, m.id, "not-owner");
@@ -13558,14 +13753,16 @@ function createDriver(o) {
 			else if (m.kind === "hand-back") queue(s, () => handBack(s, m.id));
 			else if (m.kind === "output") output(s, m.id, m.turn).catch((err) => o.log(`output ${m.id} failed: ${err.message}`));
 			else if (m.kind === "release") release(s, m.id, m.withheld);
-			else refuse(server, m.id, "no-prompt");
+			else answer(s, m.id, m.prompt, m.answer);
 		},
 		linked(server) {
-			const list = [...sessions.values()].filter((s) => s.record.driven.office === server).sort((a, b) => Number(!!b.child) - Number(!!a.child) || Date.parse(b.record.lastActivity) - Date.parse(a.record.lastActivity)).slice(0, 200).map((s) => ({
+			policies.delete(server);
+			const ofOffice = [...sessions.values()].filter((s) => s.record.driven.office === server);
+			const list = ofOffice.sort((a, b) => Number(!!b.child) - Number(!!a.child) || Date.parse(b.record.lastActivity) - Date.parse(a.record.lastActivity)).slice(0, 200).map((s) => ({
 				session: s.record.session,
 				room: s.record.driven.room,
 				held: !!s.child,
-				permissions: s.record.driven.permissions,
+				permissions: s.child ? s.record.driven.permissions : modeFor(s),
 				...s.turn ? { turn: s.turn } : {}
 			}));
 			sendTo(server, {
@@ -13573,6 +13770,10 @@ function createDriver(o) {
 				kind: "holding",
 				sessions: list
 			});
+			for (const s of ofOffice) for (const w of s.prompts.values()) if (w.message) sendTo(server, w.message);
+		},
+		unlinked(server) {
+			policies.delete(server);
 		},
 		held: () => [...sessions.values()].filter((s) => s.child || s.opening).length,
 		takeProblem: (by) => by?.id === o.account.id ? null : NOT_YOURS_TAKE,
@@ -13612,6 +13813,7 @@ function createDriver(o) {
 					office: t.server,
 					owner: t.by.id,
 					permissions: DRIVEN_PERMISSIONS,
+					asked: t.permissions,
 					transcript: false,
 					addDir: t.addDir,
 					name: t.name
@@ -13638,14 +13840,16 @@ function createDriver(o) {
 					return;
 				}
 				prune();
+				const { permissions } = s.record.driven;
 				emit(s, () => ({
 					...driven,
 					kind: "held",
 					session: s.record.session,
 					room: t.room,
 					why: "started",
-					permissions: DRIVEN_PERMISSIONS
+					permissions
 				}));
+				sayPromptsOn(s);
 				await beginTurn(s, uuid, t.prompt);
 			});
 		},
@@ -13979,6 +14183,7 @@ async function worker() {
 				onMessage: (message) => runner.take(message),
 				onDrive: (message) => drive.take(office.server, message),
 				onOpen: () => drive.linked(office.server),
+				onClose: () => drive.unlinked(office.server),
 				onNotWanted: said.notWanted,
 				onPairingEnded: said.unpaired,
 				hello: {

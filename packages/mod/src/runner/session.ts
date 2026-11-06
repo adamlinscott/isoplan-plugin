@@ -3,8 +3,8 @@
 // `drive` requests and `driven` messages, packages/protocol/src/messages.ts).
 //
 //   claude -p (--resume <uuid> | --session-id <uuid>) --input-format stream-json
-//     --output-format stream-json --verbose --permission-mode auto --permission-prompts none
-//     [--name <name>] [--add-dir <folder>]
+//     --output-format stream-json --verbose --permission-mode (auto | bypassPermissions)
+//     --permission-prompts host --permission-prompt-tool stdio [--name <name>] [--add-dir <folder>]
 //
 // - One long-lived process per held session, on the answerer's pattern (claude.ts), but this is the
 //   person's own working session: their settings, tools, MCP servers and plugins load, and it is
@@ -21,6 +21,27 @@
 //   `tool_result` block. Something that needs permission, with nobody answering, is denied at once:
 //   a `system` line, `subtype` "permission_denied", naming `tool_name`, then an error tool result,
 //   whether `--permission-prompts` is the default `host` or `none`.
+// - Probed on Claude Code 2.1.318 (6 Nov 2026, Haiku, a temp folder, --no-session-persistence, no
+//   settings files, `echo hi > probe.txt` through Bash): `--permission-prompts host` alone still
+//   denies at once as above (`permission_decision` source "config"); with `--permission-prompt-tool
+//   stdio` as well, the prompt comes to the runner instead, after the `assistant` line with the
+//   `tool_use`, as one line: `{"type":"control_request","request_id":"<uuid>","request":{"subtype":
+//   "can_use_tool","tool_name":"Bash","display_name":"Bash","input":{"command":"echo hi > probe.txt",
+//   "description":"Write hi into probe.txt"},"description":"Write hi into probe.txt",
+//   "permission_suggestions":[...],"blocked_path":"<the file>","tool_use_id":"toolu_..."}}`. It
+//   waits for as long as it takes (90 s and more, Claude Code sets no limit). The answer is one stdin
+//   line: `{"type":"control_response","response":{"subtype":"success","request_id":"<its id>",
+//   "response":{"behavior":"allow","updatedInput":<its input>}}}` runs the tool (the file was made),
+//   and `"response":{"behavior":"deny","message":"<words>"}` doesn't: the tool's result is an error
+//   whose text is the message, and the turn goes on, with no `permission_denied` line. An interrupt
+//   while one waits makes Claude Code send `{"type":"control_cancel_request","request_id":"<its
+//   id>"}`, then end the turn with an error `result` (`subtype` "error_during_execution"). Closing
+//   stdin while one waits aborts it ("Tool permission stream closed before response received" as the
+//   tool's error result) and the turn goes on to its end. In `auto` mode the same holds: a prompt
+//   comes only for what auto mode would still ask (an `ask` rule in the settings, `decision_reason_
+//   type` "rule"), and a `deny` rule still gives the `permission_denied` line, as Claude Code's own
+//   denial. `--permission-mode bypassPermissions` is taken (`init` says `permissionMode`
+//   "bypassPermissions") and ran the write with no prompt.
 // - Probed on Claude Code 2.1.318 (6 Nov 2026, Haiku, a temp folder, --no-session-persistence): an
 //   instruction that is one of Claude Code's own commands, such as `/cost`, runs no turn of the
 //   model's. It gives a `system` `init` line, an `assistant` line with `local_command_source` and
@@ -57,8 +78,10 @@
 //   wasn't allowed, an output) passes the secret scan first. A matched reply or output is sent as a
 //   note with a `withheld` id, and only the owner's `release` sends it, as the runner's withheld
 //   answers are released (runner.ts); a tool use whose name or summary matched is sent as `tool`,
-//   with no summary, and a tool that wasn't allowed as "a tool". At most MAX_HELD are held, the
-//   oldest dropped, each cut to what its release sends.
+//   with no summary, and a tool that wasn't allowed as "a tool". A prompt whose tool name matched
+//   goes as `tool`, and one whose description matched with a description that only says so, both
+//   `withheld`; neither is released. At most MAX_HELD are held, the oldest dropped, each cut to what
+//   its release sends.
 // - Every message is cut to the protocol's limits and checked against DrivenMessageSchema before it
 //   goes, so one bad message can't make the server close the runner's link, and is sent only while
 //   the office's link is up (`office.send`), never kept in the reply outbox. After every hello
@@ -69,8 +92,26 @@
 //   and the server hadn't dropped the take, nor the runner given it up, that opens it under the
 //   take's uuid with the take's prompt as its first turn, named by that uuid, after `held`
 //   `started`; otherwise it only frees the take's place under the cap.
-// - Permission prompts, bypassPermissions and drive-policy are #42's: every session runs in `auto`
-//   and says so (`permissionArgs`), an `answer` is refused `no-prompt`, and drive-policy is only kept.
+// - Permissions (#42, design R2): a session runs in Claude Code's `auto` mode, or in
+//   `bypassPermissions` when its person asked for that (the start's or the driven take's
+//   `permissions`, kept in the registry as `asked` for a reopen or restore) and the latest
+//   `drive-policy` on the current connection to its office lists its project. Before one arrives on a
+//   connection, and from the link's drop until the next one, nothing opens with bypassPermissions.
+//   A start asking for it where it isn't allowed is refused `bypass-off`; a take, reopen or restore
+//   opens in `auto` all the same, its `held` says so, and an `error` says why. A drive-policy that no
+//   longer lists the project of a session running in bypassPermissions ends its process at once, as
+//   a stop does, with an `error` saying why and `released` `stopped`; the next instruction opens it
+//   in `auto`. A link drop alone ends nothing: it doesn't change the admin's choice.
+// - Whatever the mode, what still asks permission comes to the runner (`--permission-prompts host
+//   --permission-prompt-tool stdio`, see the probe above) and goes to the floor as `prompt`, under
+//   the runner's own id, with a plain description of what it asks (`promptDescription`) and
+//   `expires`, `drivenPromptMinutes` on. Only the owner's `answer` naming a prompt still waiting
+//   allows or denies it; with none by `expires` it is denied, `timed-out`. A stop, a hand-back, the
+//   process ending or Claude Code cancelling it ends it `cancelled`. Each ends once, with
+//   `prompt-ended`, and Claude Code gets an answer for each it still waits on; a `control_request`
+//   that isn't a prompt gets an error at once, so a turn never waits on one. No idle close or
+//   stuck timeout runs while one waits. After every hello the waiting ones go again, right after
+//   `holding`, unchanged; while the link is down they aren't kept anywhere else.
 
 import { randomUUID } from "node:crypto";
 import type { ChildProcessWithoutNullStreams } from "node:child_process";
@@ -84,6 +125,7 @@ import {
   MAX_FOLDER_LENGTH,
   MAX_HOLDING,
   MAX_OUTPUT_LENGTH,
+  MAX_PROMPT_LENGTH,
   MAX_REPLY_LENGTH,
   MAX_ROOM_ID_LENGTH,
   MAX_SUMMARY_LENGTH,
@@ -110,6 +152,8 @@ export interface DriveSettings {
   drivenCloseSeconds: number;
   /** How long a process may take to start on an instruction (its first output) before it is ended as stuck. */
   drivenStartSeconds: number;
+  /** How long a permission prompt waits for its owner's answer from the floor before it is denied. */
+  drivenPromptMinutes: number;
 }
 
 /** One office server's side of the driver. */
@@ -133,6 +177,8 @@ export interface PreparedTake {
   addDir: string;
   room: string;
   by: { id: string };
+  /** The permission mode the person taking it asked for. */
+  permissions: DrivePermissions;
 }
 
 export interface DriverOptions {
@@ -159,8 +205,10 @@ export interface DriverOptions {
 export interface Driver {
   /** A drive request or drive-policy from the office at `server`. */
   take(server: string, message: DriveMessage | DrivePolicyMessage): void;
-  /** The office's link has said hello again: where its sessions stand goes now. */
+  /** The office's link has said hello again: where its sessions stand, and the prompts still waiting, go now. */
   linked(server: string): void;
+  /** The office's link has dropped: its drive-policy no longer holds. */
+  unlinked(server: string): void;
   /** How many sessions a process holds now, or is opening. */
   held(): number;
   /** Why this runner won't take a handoff as a driven session for `by`, or null. */
@@ -175,17 +223,15 @@ export interface Driver {
   settled(): Promise<void>;
 }
 
-/** The permission mode every driven session runs in until #42. */
+/** The permission mode a driven session runs in, unless its person asked for bypassPermissions where its office allows it. */
 export const DRIVEN_PERMISSIONS: DrivePermissions = "auto";
 
 /**
- * The permission flags of a driven session's process. Until #42 every session runs in Claude Code's
- * `auto` mode and nobody answers its prompts, so whatever still asks is denied at once. #42 puts
- * `--permission-prompts host` here and relays the prompts, and runs bypassPermissions where the
- * office's drive-policy allows it (the policy is kept by office in the driver).
+ * The permission flags of a driven session's process: `mode`, the one it runs in, and what still
+ * asks permission handed to the runner, as control requests on its stdout (see the probe above).
  */
-export function permissionArgs(_asked: DrivePermissions): string[] {
-  return ["--permission-mode", DRIVEN_PERMISSIONS, "--permission-prompts", "none"];
+export function permissionArgs(mode: DrivePermissions): string[] {
+  return ["--permission-mode", mode, "--permission-prompts", "host", "--permission-prompt-tool", "stdio"];
 }
 
 /** Every flag of a driven session's command line, after the binary. --add-dir takes every argument after it, so it is last. */
@@ -230,6 +276,16 @@ const MISSING = "Claude Code can't find this session's saved conversation on thi
 const WITHHELD = "Held back on this computer: it may contain a secret. Release it from the floor to see it.";
 const NOT_YOURS_TAKE = "This handoff was taken from the floor by someone other than this computer's own person, so nothing was opened here.";
 const capReached = (limit: number) => `This project already has ${limit} sessions running from the floor on this computer, the most allowed. Stop one, then try again.`;
+const BYPASS_OFF = "This office doesn't let sessions in this project skip permission prompts, so nothing was started. Start it again with prompts on.";
+const PROMPTS_ON = "This office doesn't let sessions in this project skip permission prompts, so this one runs with them on: whenever the agent needs your permission, it asks you here first.";
+const BYPASS_TURNED_OFF = "Skipping permission prompts was turned off for this project, so this session was closed. Your next instruction reopens it with prompts on.";
+const BYPASS_STILL_RUNNING = "Skipping permission prompts was turned off for this project, but Claude Code couldn't be closed for this session on this computer yet. Try again in a moment.";
+const NO_PROMPT = "That permission request isn't waiting for an answer any more: it was answered already, ran out of time, or the session stopped.";
+const PROMPT_WITHHELD = "Held back on this computer: what the agent wants to do may contain a secret, so it isn't shown here.";
+// What Claude Code, and so the agent, is told of a prompt the floor didn't allow.
+const DENIED_TO_CLAUDE = "The user denied this permission request from the Isoplan floor.";
+const TIMED_OUT_TO_CLAUDE = "No answer to this permission request came from the Isoplan floor in time, so it was denied.";
+const UNSUPPORTED_TO_CLAUDE = "Not supported: the Isoplan runner driving this session answers only permission requests.";
 // runner.json may say 2.5, but the cap is a whole number of sessions, and at least one.
 const capOf = (st: DriveSettings) => Math.max(1, Math.floor(st.drivenPerProject));
 
@@ -241,6 +297,23 @@ interface Held {
   turn?: string;
   text: string;
   cut: boolean;
+}
+
+type PromptMessage = Extract<DrivenMessage, { kind: "prompt" }>;
+
+/** A permission prompt Claude Code waits on, under the runner's own id. */
+interface Waiting {
+  id: string;
+  /** Claude Code's id for it, which the answer on stdin names. */
+  request: string;
+  /** The process that asked: only it is answered. */
+  child: ChildProcessWithoutNullStreams;
+  turn: string | null;
+  /** The tool's input, which an allow hands back unchanged. */
+  input: unknown;
+  /** As it was sent, once made: sent again unchanged after every hello. */
+  message: PromptMessage | null;
+  timer: ReturnType<typeof setTimeout> | null;
 }
 
 interface Session {
@@ -264,6 +337,8 @@ interface Session {
   idle: ReturnType<typeof setTimeout> | null;
   idleToken: number;
   starting: ReturnType<typeof setTimeout> | null;
+  /** The permission prompts waiting on the owner, by the runner's id. */
+  prompts: Map<string, Waiting>;
   /** Requests on the session, one at a time. */
   work: Promise<void>;
   /** Its messages, in order. */
@@ -292,6 +367,33 @@ export function summaryOf(input: unknown): string | undefined {
     if (typeof value === "string" && value.trim()) return cutStart(value.replace(/\s+/g, " ").trim(), MAX_SUMMARY_LENGTH).text;
   }
   return undefined;
+}
+
+/**
+ * What a permission prompt asks, in plain words, from its tool and the tool's input: the command it
+ * would run, the file it would write, change or read, the address it would open, what it would search
+ * the web for, or else the tool and its input as they are; then what for, when the agent said.
+ */
+export function promptDescription(tool: string, input: unknown): string {
+  const i = input && typeof input === "object" ? (input as Record<string, unknown>) : {};
+  const said = (key: string) => (typeof i[key] === "string" && (i[key] as string).trim() ? (i[key] as string).trim() : undefined);
+  const command = said("command");
+  const file = said("file_path") ?? said("notebook_path");
+  const url = said("url");
+  const query = said("query");
+  const verb = tool === "Write" ? "Write" : ["Edit", "MultiEdit", "NotebookEdit"].includes(tool) ? "Change" : tool === "Read" ? "Read" : null;
+  const json = Object.keys(i).length ? JSON.stringify(i) : "";
+  const what = command
+    ? `Run this command: ${command}`
+    : file && verb
+      ? `${verb} the file ${file}`
+      : url
+        ? `Open the web address ${url}`
+        : query
+          ? `Search the web for: ${query}`
+          : `Use ${tool}${json ? ` with: ${json}` : ""}`;
+  const why = said("description");
+  return why && (command || (file && verb) || url || query) ? `${what}\nWhat for: ${why}` : what;
 }
 
 function resultText(block: Record<string, unknown>): string {
@@ -378,6 +480,7 @@ function fit(m: DrivenMessage): DrivenMessage {
   limit("command", MAX_COMMAND_LENGTH);
   limit("folder", MAX_FOLDER_LENGTH);
   limit("detail", MAX_DETAIL_LENGTH);
+  limit("description", MAX_PROMPT_LENGTH);
   limit("text", m.kind === "reply" ? MAX_REPLY_LENGTH : m.kind === "output" ? MAX_OUTPUT_LENGTH : MAX_DETAIL_LENGTH);
   if (m.kind === "holding") out.sessions = m.sessions.map((s) => ({ ...s, room: cutStart(s.room, MAX_ROOM_ID_LENGTH).text, session: s.session.slice(0, MAX_DRIVEN_SESSION_ID_LENGTH) }));
   return out as DrivenMessage;
@@ -394,13 +497,21 @@ export function createDriver(o: DriverOptions): Driver {
   const offices = new Map(o.offices.map((office) => [office.server, office]));
   const sessions = new Map<string, Session>();
   const withheld = new Map<string, Held>(); // oldest first
-  const policies = new Map<string, Set<string>>(); // office → projects that allow bypassPermissions (#42)
+  // Office → the projects whose sessions may run in bypassPermissions, from the latest drive-policy on
+  // its current connection; none until one arrives on it.
+  const policies = new Map<string, Set<string>>();
   const takes = new Map<string, PreparedTake & { server: string; project: string }>();
   const starts = new Set<string>();
 
   function newSession(record: ProcessRecord & { driven: DrivenFields }, fromBefore: boolean): Session {
-    return { record, child: null, opening: false, closed: Promise.resolve(), turn: null, output: "", cut: false, outputs: new Map(), ending: null, failure: null, fromBefore, stderr: "", idle: null, idleToken: 0, starting: null, work: Promise.resolve(), out: Promise.resolve() };
+    return { record, child: null, opening: false, closed: Promise.resolve(), turn: null, output: "", cut: false, outputs: new Map(), ending: null, failure: null, fromBefore, stderr: "", idle: null, idleToken: 0, starting: null, prompts: new Map(), work: Promise.resolve(), out: Promise.resolve() };
   }
+
+  const bypassAllowed = (server: string, project: string) => policies.get(server)?.has(project) === true;
+  // A record from before #42 has no `asked`: its person asked for the mode it ran in.
+  const askedOf = (s: Session) => s.record.driven.asked ?? s.record.driven.permissions;
+  /** The mode the session's process opens in now. */
+  const modeFor = (s: Session): DrivePermissions => (askedOf(s) === "bypassPermissions" && bypassAllowed(s.record.driven.office, s.record.driven.project) ? "bypassPermissions" : DRIVEN_PERMISSIONS);
 
   // Work and messages still to finish, for `settled`.
   let busy = 0;
@@ -488,12 +599,12 @@ export function createDriver(o: DriverOptions): Driver {
     s.idle = null;
   }
 
-  // Counts from now: a process with no turn running and nothing from it closes when it runs out.
+  // Counts from now: a process with no turn running, no prompt waiting and nothing from it closes when it runs out.
   function armIdle(s: Session): void {
     clearIdle(s);
     const token = s.idleToken;
     void o.settings().then((st) => {
-      if (token !== s.idleToken || !s.child || s.turn) return;
+      if (token !== s.idleToken || !s.child || s.turn || s.prompts.size) return;
       s.idle = setTimeout(() => queue(s, () => closeIdle(s)), st.drivenIdleMinutes * 60000);
       s.idle.unref?.();
     });
@@ -524,7 +635,9 @@ export function createDriver(o: DriverOptions): Driver {
       // A session that crashed in its first turn has a transcript too. One that had a turn end but
       // whose transcript is gone is resumed all the same, and Claude Code says it can't find it.
       const resume = d.transcript || (await transcriptOf(o.claudeDir, s.record.folder, uuid)) !== null;
-      const argv = [...claudeCommand(bin), ...drivenArgs({ uuid, resume, permissions: d.permissions, ...(d.name ? { name: d.name } : {}), ...(d.addDir ? { addDir: d.addDir } : {}) })];
+      // Decided with no await before the spawn, so a drive-policy can't come between the two.
+      const mode = modeFor(s);
+      const argv = [...claudeCommand(bin), ...drivenArgs({ uuid, resume, permissions: mode, ...(d.name ? { name: d.name } : {}), ...(d.addDir ? { addDir: d.addDir } : {}) })];
       let child: ChildProcessWithoutNullStreams;
       try {
         child = spawn(argv, { cwd: s.record.folder, env: forkEnv(env) });
@@ -534,8 +647,8 @@ export function createDriver(o: DriverOptions): Driver {
       }
       wire(s, child);
       const at = iso(now());
-      save(s, { pid: child.pid ?? null, spawned: at, state: "idle", lastActivity: at });
-      o.log(`opened driven session ${s.record.session} in ${s.record.folder} (process ${child.pid})`);
+      save(s, { pid: child.pid ?? null, spawned: at, state: "idle", lastActivity: at, driven: { ...s.record.driven, permissions: mode } });
+      o.log(`opened driven session ${s.record.session} in ${s.record.folder} (process ${child.pid}, permission mode ${mode})`);
       armIdle(s);
       return null;
     } finally {
@@ -587,6 +700,13 @@ export function createDriver(o: DriverOptions): Driver {
     s.starting = null;
     s.record.lastActivity = iso(now());
     o.registry.touch(s.record.session, now());
+    // A prompt is answered whenever it comes, a subagent's and one outside a turn too, or the turn would hang on it.
+    if (e.type === "control_request") return ask(s, child, e);
+    if (e.type === "control_cancel_request") {
+      const w = [...s.prompts.values()].find((p) => p.request === e.request_id);
+      if (w) endPrompt(s, w, "cancelled");
+      return;
+    }
     const turn = s.turn;
     if (!turn) {
       armIdle(s);
@@ -608,15 +728,90 @@ export function createDriver(o: DriverOptions): Driver {
         });
       }
     } else if (e.type === "system" && e.subtype === "permission_denied") {
+      // Claude Code's own denial, with no prompt for it: a deny rule in the settings (the probe above),
+      // or, not probed, maybe auto mode's own safety check. The words cover both.
       const tool = typeof e.tool_name === "string" && e.tool_name ? e.tool_name : "a tool";
-      addOutput(s, `(${tool} wasn't allowed: it needs your permission)`);
-      const said = (name: string) => `The agent wanted to use ${name}, which needs your permission. Sessions run from the floor can't ask for it yet, so it wasn't allowed.`;
+      addOutput(s, `(${tool} wasn't allowed by Claude Code on this computer)`);
+      const said = (name: string) => `The agent wanted to use ${name}, but Claude Code on this computer didn't allow it (its permission rules, or its own safety check), so it wasn't used.`;
       emit(s, async () => ({ ...driven, kind: "error", session: s.record.session, turn, text: (await o.scan(said(tool))) ? said("a tool") : said(tool) }));
     } else if (e.type === "result" && ((typeof e.num_turns === "number" && e.num_turns >= 1) || e.is_error === true || typeof e.local_command === "string")) {
       // A Claude Code command (`/cost`) is answered with num_turns 0 and `local_command`: see the probe above.
       endTurn(s, turn, e);
     }
     // Any other result, with no turn in it, is a leftover background task replayed (claude.ts): the turn goes on.
+  }
+
+  // A permission prompt from Claude Code: to the floor under the runner's own id, denied when nobody answers in time.
+  function ask(s: Session, child: ChildProcessWithoutNullStreams, e: Record<string, unknown>): void {
+    const request = e.request as Record<string, unknown> | undefined;
+    // With its stdin closed (a hand-back), Claude Code gives it up at once: nobody could answer it.
+    if (typeof e.request_id !== "string" || child.stdin.writableEnded) return;
+    if (request?.subtype !== "can_use_tool") {
+      // None came in the probes (the runner sends no `initialize`), but Claude Code may wait on one as
+      // it does on a prompt, so it gets the error the Agent SDK gives a request it doesn't support.
+      const subtype = typeof request?.subtype === "string" ? request.subtype.slice(0, 60) : "(none)";
+      child.stdin.write(JSON.stringify({ type: "control_response", response: { subtype: "error", request_id: e.request_id, error: UNSUPPORTED_TO_CLAUDE } }) + "\n");
+      o.log(`answered Claude Code's request of subtype ${subtype} in ${s.record.session} with an error: only permission prompts are answered`);
+      return;
+    }
+    const tool = typeof request.tool_name === "string" && request.tool_name ? request.tool_name : "tool";
+    const w: Waiting = { id: `p-${randomUUID()}`, request: e.request_id, child, turn: s.turn, input: request.input, message: null, timer: null };
+    s.prompts.set(w.id, w);
+    clearIdle(s);
+    const session = s.record.session;
+    const waiting = () => s.prompts.get(w.id) === w;
+    // Its time counts from when it goes, in order with the session's other messages.
+    emit(s, async () => {
+      if (!waiting()) return null;
+      const ms = (await o.settings()).drivenPromptMinutes * 60000;
+      const expires = now() + ms;
+      w.timer = setTimeout(() => endPrompt(s, w, "timed-out"), ms);
+      w.timer.unref?.();
+      const description = promptDescription(tool, request.input);
+      // A tool's name can be anyone's words (an MCP server names its own), so it is scanned too.
+      const toolHeld = (await o.scan(tool)) !== null;
+      const descriptionHeld = (await o.scan(description)) !== null;
+      if (!waiting()) return null;
+      if (toolHeld || descriptionHeld) o.log(`withheld what permission prompt ${w.id} of ${session} asks: it matches a secret pattern`);
+      w.message = {
+        ...driven,
+        kind: "prompt",
+        session,
+        ...(w.turn ? { turn: w.turn } : {}),
+        prompt: w.id,
+        tool: toolHeld ? "tool" : tool,
+        description: descriptionHeld ? PROMPT_WITHHELD : description,
+        ...(toolHeld || descriptionHeld ? { withheld: true as const } : {}),
+        expires: iso(expires),
+      };
+      return w.message;
+    });
+  }
+
+  // Ends a waiting prompt once: Claude Code gets the answer (none for a cancel, which it no longer waits on), and the floor `prompt-ended`.
+  function endPrompt(s: Session, w: Waiting, outcome: "allowed" | "denied" | "timed-out" | "cancelled", id?: string): void {
+    if (s.prompts.get(w.id) !== w) return;
+    s.prompts.delete(w.id);
+    if (w.timer) clearTimeout(w.timer);
+    if (outcome !== "cancelled" && s.child === w.child && !w.child.stdin.writableEnded) {
+      const response = outcome === "allowed" ? { behavior: "allow", updatedInput: w.input } : { behavior: "deny", message: outcome === "denied" ? DENIED_TO_CLAUDE : TIMED_OUT_TO_CLAUDE };
+      w.child.stdin.write(JSON.stringify({ type: "control_response", response: { subtype: "success", request_id: w.request, response } }) + "\n");
+    }
+    o.log(`permission prompt ${w.id} of ${s.record.session} ended: ${outcome}`);
+    const session = s.record.session;
+    // One that never went has nothing to end on the floor.
+    emit(s, () => (w.message ? { ...driven, kind: "prompt-ended", session, prompt: w.id, outcome, ...(id ? { id } : {}) } : null));
+    if (s.child && !s.turn && !s.prompts.size) armIdle(s);
+  }
+
+  const endPrompts = (s: Session) => {
+    for (const w of [...s.prompts.values()]) endPrompt(s, w, "cancelled");
+  };
+
+  function answer(s: Session, id: string, prompt: string, said: "allow" | "deny"): void {
+    const w = s.prompts.get(prompt);
+    if (!w) return refuse(s.record.driven.office, id, "no-prompt", { detail: NO_PROMPT });
+    endPrompt(s, w, said === "allow" ? "allowed" : "denied", id);
   }
 
   function endTurn(s: Session, turn: string, e: Record<string, unknown>): void {
@@ -653,6 +848,7 @@ export function createDriver(o: DriverOptions): Driver {
     clearIdle(s);
     if (s.starting) clearTimeout(s.starting);
     s.starting = null;
+    endPrompts(s);
     const turn = s.turn;
     s.turn = null;
     if (turn) keepTurn(s, turn);
@@ -688,6 +884,8 @@ export function createDriver(o: DriverOptions): Driver {
     const child = s.child;
     if (!child) return;
     child.stdin.end();
+    // Claude Code gives up a prompt it waits on as its stdin closes (see the probe above).
+    endPrompts(s);
     if (await within(s.closed, st.drivenCloseSeconds * 1000)) return;
     o.log(`driven session ${s.record.session} didn't end within ${st.drivenCloseSeconds} s of being closed, so its process was ended`);
     if (s.child === child) killTree(child, platform);
@@ -723,19 +921,19 @@ export function createDriver(o: DriverOptions): Driver {
     }
     starts.add(m.id);
     if (starts.size > STARTS_KEPT) starts.delete(starts.values().next().value!);
+    const project = m.project.id.toLowerCase();
+    if (m.permissions === "bypassPermissions" && !bypassAllowed(server, project)) return refuse(server, m.id, "bypass-off", { detail: BYPASS_OFF });
     const bin = await o.binary();
     if (!bin) return refuse(server, m.id, "no-claude", { detail: NO_CLAUDE });
     const folder = await offices.get(server)!.folder(m.roomSessions ?? []);
     if (!folder) return refuse(server, m.id, "no-folder", { detail: NO_FOLDER });
     const st = await o.settings();
-    const project = m.project.id.toLowerCase();
     const cap = capOf(st);
     // Checked and taken with no await between, so two starts can't both take the last place.
     if (heldIn(project) >= cap) return refuse(server, m.id, "cap-reached", { limit: cap, detail: capReached(cap) });
-    if (m.permissions !== DRIVEN_PERMISSIONS) o.log(`start ${m.id} asked for ${m.permissions}; it runs in ${DRIVEN_PERMISSIONS}, which is all this runner does yet`);
     const at = iso(now());
     const s = newSession(
-      { kind: "driven", pid: null, spawned: null, session: `claude-code:${newId()}`, folder, started: at, lastActivity: at, state: "closed", driven: { room: m.room, project, office: server, owner: m.by.id, permissions: DRIVEN_PERMISSIONS, transcript: false } },
+      { kind: "driven", pid: null, spawned: null, session: `claude-code:${newId()}`, folder, started: at, lastActivity: at, state: "closed", driven: { room: m.room, project, office: server, owner: m.by.id, permissions: DRIVEN_PERMISSIONS, asked: m.permissions, transcript: false } },
       false,
     );
     s.opening = true;
@@ -747,8 +945,11 @@ export function createDriver(o: DriverOptions): Driver {
         return refuse(server, m.id, problem.reason, { detail: problem.detail });
       }
       prune();
-      emit(s, () => ({ ...driven, kind: "started", id: m.id, session: s.record.session, room: m.room, permissions: DRIVEN_PERMISSIONS }));
-      emit(s, () => ({ ...driven, kind: "held", session: s.record.session, room: m.room, why: "started", permissions: DRIVEN_PERMISSIONS }));
+      const { permissions } = s.record.driven;
+      emit(s, () => ({ ...driven, kind: "started", id: m.id, session: s.record.session, room: m.room, permissions }));
+      emit(s, () => ({ ...driven, kind: "held", session: s.record.session, room: m.room, why: "started", permissions }));
+      // A drive-policy that came after the check above.
+      sayPromptsOn(s);
       if (m.instruction) await beginTurn(s, m.id, m.instruction);
     });
   }
@@ -757,6 +958,11 @@ export function createDriver(o: DriverOptions): Driver {
     const server = s.record.driven.office;
     if (!current(s)) return refuse(server, id, "not-found");
     if (s.turn) return refuse(server, id, "busy", { detail: BUSY });
+    // Its bypassPermissions was withdrawn, but its process couldn't be ended: it is tried again, and takes nothing meanwhile.
+    if (s.child && s.record.driven.permissions === "bypassPermissions" && policies.has(server) && modeFor(s) !== "bypassPermissions") {
+      queue(s, () => closeForPolicy(s));
+      return refuse(server, id, "unavailable", { detail: BYPASS_STILL_RUNNING });
+    }
     if (!s.child) {
       const cap = capOf(await o.settings());
       if (heldIn(s.record.driven.project) >= cap) return refuse(server, id, "cap-reached", { limit: cap, detail: capReached(cap) });
@@ -764,9 +970,33 @@ export function createDriver(o: DriverOptions): Driver {
       const problem = await open(s);
       if (problem) return refuse(server, id, problem.reason, { detail: problem.detail });
       s.fromBefore = false;
-      emit(s, () => ({ ...driven, kind: "held", session: s.record.session, room: s.record.driven.room, why, permissions: s.record.driven.permissions }));
+      const { room, permissions } = s.record.driven;
+      emit(s, () => ({ ...driven, kind: "held", session: s.record.session, room, why, permissions }));
+      sayPromptsOn(s);
     }
     await beginTurn(s, id, text);
+  }
+
+  // A session asked to skip permission prompts that opened with them on says why.
+  function sayPromptsOn(s: Session): void {
+    if (askedOf(s) === "bypassPermissions" && s.record.driven.permissions !== "bypassPermissions") emit(s, () => ({ ...driven, kind: "error", session: s.record.session, text: PROMPTS_ON }));
+  }
+
+  // Ends a process running in bypassPermissions that its office's drive-policy no longer allows, at once, as a stop does.
+  async function closeForPolicy(s: Session): Promise<void> {
+    const child = s.child;
+    if (!current(s) || !child || s.record.driven.permissions !== "bypassPermissions" || modeFor(s) === "bypassPermissions") return;
+    s.ending = "stopped";
+    killTree(child, platform);
+    await within(s.closed, KILL_WAIT_MS);
+    s.ending = null;
+    if (s.child === child) {
+      o.log(`driven session ${s.record.session}'s process ${child.pid} didn't end when skipping permission prompts was turned off for its project, so it is still held`);
+      return;
+    }
+    o.log(`closed driven session ${s.record.session}: skipping permission prompts was turned off for its project`);
+    emit(s, () => ({ ...driven, kind: "error", session: s.record.session, text: BYPASS_TURNED_OFF }));
+    emit(s, () => ({ ...driven, kind: "released", session: s.record.session, why: "stopped" }));
   }
 
   async function stop(s: Session, id: string): Promise<void> {
@@ -807,7 +1037,7 @@ export function createDriver(o: DriverOptions): Driver {
   }
 
   async function closeIdle(s: Session): Promise<void> {
-    if (!current(s) || !s.child || s.turn || s.ending) return;
+    if (!current(s) || !s.child || s.turn || s.prompts.size || s.ending) return;
     s.ending = "idle-closed";
     await closeGently(s);
     s.ending = null;
@@ -854,8 +1084,12 @@ export function createDriver(o: DriverOptions): Driver {
     take(server, m) {
       if (!offices.has(server)) return;
       if (m.type === "drive-policy") {
-        // Kept for #42, which runs bypassPermissions where it allows; until then nothing skips prompts.
-        policies.set(server, new Set(m.bypassAllowed.map((p) => p.toLowerCase())));
+        const allowed = new Set(m.bypassAllowed.map((p) => p.toLowerCase()));
+        policies.set(server, allowed);
+        for (const s of sessions.values()) {
+          const d = s.record.driven;
+          if (d.office === server && s.child && d.permissions === "bypassPermissions" && !allowed.has(d.project)) queue(s, () => closeForPolicy(s));
+        }
         return;
       }
       if (m.by.id !== o.account.id) return refuse(server, m.id, "not-owner");
@@ -871,16 +1105,23 @@ export function createDriver(o: DriverOptions): Driver {
       else if (m.kind === "hand-back") queue(s, () => handBack(s, m.id));
       else if (m.kind === "output") void output(s, m.id, m.turn).catch((err: Error) => o.log(`output ${m.id} failed: ${err.message}`));
       else if (m.kind === "release") release(s, m.id, m.withheld);
-      // An answer: this runner raises no prompts until #42, so none is waiting.
-      else refuse(server, m.id, "no-prompt");
+      else answer(s, m.id, m.prompt, m.answer);
     },
     linked(server) {
-      const list = [...sessions.values()]
-        .filter((s) => s.record.driven.office === server)
+      // A new connection: its drive-policy is still to come.
+      policies.delete(server);
+      const ofOffice = [...sessions.values()].filter((s) => s.record.driven.office === server);
+      // One with no process says the mode it would open in now.
+      const list = ofOffice
         .sort((a, b) => Number(!!b.child) - Number(!!a.child) || Date.parse(b.record.lastActivity) - Date.parse(a.record.lastActivity))
         .slice(0, MAX_HOLDING)
-        .map((s) => ({ session: s.record.session, room: s.record.driven.room, held: !!s.child, permissions: s.record.driven.permissions, ...(s.turn ? { turn: s.turn } : {}) }));
+        .map((s) => ({ session: s.record.session, room: s.record.driven.room, held: !!s.child, permissions: s.child ? s.record.driven.permissions : modeFor(s), ...(s.turn ? { turn: s.turn } : {}) }));
       sendTo(server, { ...driven, kind: "holding", sessions: list });
+      // Unchanged, so the floor can still answer one raised while the link was down, or before the server restarted.
+      for (const s of ofOffice) for (const w of s.prompts.values()) if (w.message) sendTo(server, w.message);
+    },
+    unlinked(server) {
+      policies.delete(server);
     },
     held: () => [...sessions.values()].filter((s) => s.child || s.opening).length,
     takeProblem: (by) => (by?.id === o.account.id ? null : NOT_YOURS_TAKE),
@@ -911,7 +1152,7 @@ export function createDriver(o: DriverOptions): Driver {
           started: at,
           lastActivity: at,
           state: "closed",
-          driven: { room: t.room, project: t.project, office: t.server, owner: t.by.id, permissions: DRIVEN_PERMISSIONS, transcript: false, addDir: t.addDir, name: t.name },
+          driven: { room: t.room, project: t.project, office: t.server, owner: t.by.id, permissions: DRIVEN_PERMISSIONS, asked: t.permissions, transcript: false, addDir: t.addDir, name: t.name },
         },
         false,
       );
@@ -926,7 +1167,9 @@ export function createDriver(o: DriverOptions): Driver {
           return;
         }
         prune();
-        emit(s, () => ({ ...driven, kind: "held", session: s.record.session, room: t.room, why: "started", permissions: DRIVEN_PERMISSIONS }));
+        const { permissions } = s.record.driven;
+        emit(s, () => ({ ...driven, kind: "held", session: s.record.session, room: t.room, why: "started", permissions }));
+        sayPromptsOn(s);
         await beginTurn(s, uuid, t.prompt);
       });
     },

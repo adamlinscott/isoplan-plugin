@@ -10,7 +10,7 @@ import { alive } from "../wake/lock.js";
 import type { Spawn } from "./claude.js";
 import { createRegistry, registryPath, type ProcessRecord } from "./registry.js";
 import { loadPatterns, scan } from "./scan.js";
-import { createDriver, drivenArgs, type DriveSettings } from "./session.js";
+import { createDriver, drivenArgs, promptDescription, type DriveSettings } from "./session.js";
 
 // Each test starts real (fake) claude processes, which is slow on Windows under load.
 vi.setConfig({ testTimeout: 30000 });
@@ -21,13 +21,16 @@ const SERVER = "wss://office.example";
 const ADA = { id: "claude:ada", name: "Ada" };
 const PROJECT = { id: "github.com/ada/app", name: "app" };
 const UUIDS = ["11111111-1111-4111-8111-111111111111", "22222222-2222-4222-8222-222222222222", "33333333-3333-4333-8333-333333333333"];
-const SETTINGS: DriveSettings = { drivenIdleMinutes: 30, drivenPerProject: 4, drivenCloseSeconds: 5, drivenStartSeconds: 20 };
+const SETTINGS: DriveSettings = { drivenIdleMinutes: 30, drivenPerProject: 4, drivenCloseSeconds: 5, drivenStartSeconds: 20, drivenPromptMinutes: 10 };
 
 // A stand-in for `claude -p --input-format stream-json --output-format stream-json`, shaped as the
 // probe in session.ts found it: it logs its argv and folder, then answers each user line with a
 // `system` init and one `result`. The words of the instruction pick what else it does. A --resume of
 // a session it has no transcript of fails as Claude Code does. Stdin's end ends it, unless
-// FAKE_LINGER is set.
+// FAKE_LINGER is set. An instruction with "ask" uses Bash through a permission prompt, as the probe
+// found it with --permission-prompts host --permission-prompt-tool stdio, waits for its answer on
+// stdin (logged as `answered`), and runs it or not; with "cancel" Claude Code cancels the prompt itself.
+// "ask after" raises one only once its turn has ended, and "elicit" a request that isn't a prompt.
 const FAKE = `
 import fs from "node:fs";
 import path from "node:path";
@@ -41,13 +44,27 @@ const id = flag("--resume") ?? flag("--session-id");
 const transcript = path.join(process.env.CLAUDE_CONFIG_DIR, "projects", "fake", id + ".jsonl");
 const missing = flag("--resume") !== undefined && !fs.existsSync(transcript);
 log({ argv: args, cwd: process.cwd(), pid: process.pid, grandchild: spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" }).pid });
+const finish = (reply) => {
+  out({ type: "assistant", parent_tool_use_id: null, message: { content: [{ type: "text", text: reply }] } });
+  out({ type: "result", subtype: "success", is_error: false, num_turns: 1, result: reply, session_id: id });
+};
+const pending = new Map();
+let asked = 0;
 let buf = "";
 process.stdin.setEncoding("utf8").on("data", (d) => {
   buf += d;
   let i;
   while ((i = buf.indexOf("\\n")) >= 0) {
-    const text = JSON.parse(buf.slice(0, i)).message.content[0].text;
+    const line = JSON.parse(buf.slice(0, i));
     buf = buf.slice(i + 1);
+    if (line.type === "control_response") {
+      log({ answered: line.response });
+      const go = pending.get(line.response.request_id);
+      pending.delete(line.response.request_id);
+      go?.(line.response.response);
+      continue;
+    }
+    const text = line.message.content[0].text;
     log({ turn: text });
     if (missing) {
       process.stderr.write("No conversation found with session ID: " + id + "\\n");
@@ -69,6 +86,41 @@ process.stdin.setEncoding("utf8").on("data", (d) => {
     if (text.includes("hang")) continue;
     if (text.includes("crash")) { setTimeout(() => process.exit(3), 20); continue; }
     const secretName = "mcp__keys-" + process.env.FAKE_KEY;
+    if (text.includes("elicit")) {
+      // A request that isn't a permission prompt, as the turn's first output; the turn ends once it is answered.
+      const rid = "req-" + ++asked;
+      out({ type: "control_request", request_id: rid, request: { subtype: "elicitation", mcp_server_name: "forms", message: "Pick one" } });
+      pending.set(rid, () => finish("Went on"));
+      continue;
+    }
+    if (text.includes("ask after")) {
+      // The turn ends first; then a prompt comes outside any turn, and a line of other output while it waits.
+      finish("Done: " + text);
+      const rid = "req-" + ++asked;
+      const input = { command: "echo hi > probe.txt", description: "Write hi into probe.txt" };
+      out({ type: "control_request", request_id: rid, request: { subtype: "can_use_tool", tool_name: "Bash", display_name: "Bash", input, description: input.description, tool_use_id: "t" + rid } });
+      out({ type: "system", subtype: "status", session_id: id });
+      log({ waiting: rid });
+      pending.set(rid, () => {});
+      continue;
+    }
+    if (text.includes("ask")) {
+      const rid = "req-" + ++asked;
+      const name = text.includes("named") ? secretName : "Bash";
+      const input = { command: text.includes("leak") ? "echo " + process.env.FAKE_KEY + " > key.txt" : "echo hi > probe.txt", description: "Write hi into probe.txt" };
+      out({ type: "assistant", parent_tool_use_id: null, message: { content: [{ type: "tool_use", id: "t" + rid, name, input }] } });
+      out({ type: "control_request", request_id: rid, request: { subtype: "can_use_tool", tool_name: name, display_name: name, input, description: input.description, tool_use_id: "t" + rid } });
+      pending.set(rid, (r) => {
+        out({ type: "user", parent_tool_use_id: null, message: { content: [{ type: "tool_result", tool_use_id: "t" + rid, content: r.behavior === "allow" ? "ran" : r.message, is_error: r.behavior !== "allow" }] } });
+        finish(r.behavior === "allow" ? "Ran: " + r.updatedInput.command : "Not run: " + r.message);
+      });
+      if (text.includes("cancel")) setTimeout(() => {
+        pending.delete(rid);
+        out({ type: "control_cancel_request", request_id: rid });
+        finish("Cancelled");
+      }, 100);
+      continue;
+    }
     if (text.includes("tool")) {
       const name = text.includes("long") ? "mcp__" + "x".repeat(300) : text.includes("named") ? secretName : "Bash";
       out({ type: "assistant", parent_tool_use_id: null, message: { content: [{ type: "tool_use", id: "t1", name, input: { command: "echo hi", description: text.includes("leak") ? "Use " + process.env.FAKE_KEY : "Say hi" } }] } });
@@ -115,13 +167,15 @@ async function setUp({ settings = {}, linger = false, records = [] as ProcessRec
   await registry.restore();
   const patterns = await loadPatterns(path.join(modDir, "secret-patterns.json"), path.join(root, "none.json"), log);
   const sent: DrivenMessage[] = [];
+  // What the driver sent while the office's link was down, which the link drops.
+  const dropped: DrivenMessage[] = [];
   const link = { up: true };
   const ids = [...UUIDS];
   const current = { ...SETTINGS, ...settings };
   const driver = createDriver({
     claudeDir,
     account: { id: ADA.id },
-    offices: [{ server: SERVER, send: (m) => (link.up ? (sent.push(m), true) : false), folder: async (sessions) => (sessions.includes("claude-code:room-1") ? folder : null) }],
+    offices: [{ server: SERVER, send: (m) => (link.up ? (sent.push(m), true) : (dropped.push(m), false)), folder: async (sessions) => (sessions.includes("claude-code:room-1") ? folder : null) }],
     registry,
     binary: async () => bin,
     settings: async () => current,
@@ -139,6 +193,7 @@ async function setUp({ settings = {}, linger = false, records = [] as ProcessRec
     for (const l of fakeLog()) for (const pid of [l.pid, l.grandchild]) if (pid && alive(pid)) process.kill(pid);
   });
   const drive = (m: Record<string, unknown>) => driver.take(SERVER, { type: "drive", v: PROTOCOL_VERSION, by: ADA, ...m } as DriveMessage);
+  const policy = (bypassAllowed: string[]) => driver.take(SERVER, { type: "drive-policy", v: PROTOCOL_VERSION, bypassAllowed });
   const until = async (check: () => boolean, ms = 15000) => {
     const end = Date.now() + ms;
     while (!check()) {
@@ -149,7 +204,7 @@ async function setUp({ settings = {}, linger = false, records = [] as ProcessRec
   };
   const of = <K extends Kind>(kind: K) => sent.filter((m): m is Of<K> => m.kind === kind);
   const saved = () => JSON.parse(fs.readFileSync(file, "utf8")) as { version: number; runner: number; processes: ProcessRecord[] };
-  return { root, claudeDir, state, bin, folder, file, driver, registry, sent, link, logs, current, drive, until, of, fakeLog, saved };
+  return { root, claudeDir, state, bin, folder, file, driver, registry, sent, dropped, link, logs, current, drive, policy, until, of, fakeLog, saved };
 }
 
 const start = (id: string, extra: Record<string, unknown> = {}) => ({ id, kind: "start", room: "room-1", project: PROJECT, roomSessions: ["claude-code:gone", "claude-code:room-1"], permissions: "auto", ...extra });
@@ -169,7 +224,7 @@ test("start: a new session in the folder the room's session ran in, its turn's t
   ]);
   const [first] = t.fakeLog();
   expect(first.argv).toEqual(drivenArgs({ uuid: UUIDS[0]!, resume: false, permissions: "auto" }));
-  expect(first.argv).toEqual(["-p", "--session-id", UUIDS[0], "--input-format", "stream-json", "--output-format", "stream-json", "--verbose", "--permission-mode", "auto", "--permission-prompts", "none"]);
+  expect(first.argv).toEqual(["-p", "--session-id", UUIDS[0], "--input-format", "stream-json", "--output-format", "stream-json", "--verbose", "--permission-mode", "auto", "--permission-prompts", "host", "--permission-prompt-tool", "stdio"]);
   expect(fs.realpathSync(first.cwd)).toBe(fs.realpathSync(t.folder));
   await t.registry.flushed();
   const saved = t.saved();
@@ -184,7 +239,7 @@ test("start: a new session in the folder the room's session ran in, its turn's t
       started: expect.any(String),
       lastActivity: expect.any(String),
       state: "idle",
-      driven: { room: "room-1", project: "github.com/ada/app", office: SERVER, owner: ADA.id, permissions: "auto", transcript: true },
+      driven: { room: "room-1", project: "github.com/ada/app", office: SERVER, owner: ADA.id, permissions: "auto", asked: "auto", transcript: true },
     },
   ]);
 });
@@ -293,7 +348,7 @@ test("scan: a reply that may hold a secret is held back with an id, a tool whose
   await t.until(() => t.of("turn-ended").length === 2);
   expect(JSON.stringify(t.sent.slice(before))).not.toContain(AWS_KEY);
   expect(t.of("tool")[1]).toEqual({ type: "driven", v: 1, kind: "tool", session: S1, turn: "d2", tool: "tool", withheld: true });
-  expect(t.of("error")).toEqual([{ type: "driven", v: 1, kind: "error", session: S1, turn: "d2", text: expect.stringContaining("wanted to use a tool, which needs your permission") }]);
+  expect(t.of("error")).toEqual([{ type: "driven", v: 1, kind: "error", session: S1, turn: "d2", text: expect.stringContaining("wanted to use a tool, but Claude Code on this computer didn't allow it") }]);
 });
 
 test("scan: a whole session's output held back is kept as its release sends it, within the protocol's limit and marked cut when its transcript was", async () => {
@@ -329,12 +384,14 @@ test("a Claude Code command as an instruction: its result, with no turn of the m
   expect(t.of("reply").map((m) => m.text)).toEqual(["Total cost: $0.00 (cost)", "Done: next"]);
 });
 
-test("bounds: a tool name past the protocol's limit is cut to fit, and a prompt that wasn't allowed is said in plain words", async () => {
+test("bounds: a tool name past the protocol's limit is cut to fit, and a tool Claude Code itself turned down is said in plain words", async () => {
   const t = await setUp();
   t.drive(start("d1", { instruction: "use a long tool, then deny" }));
   await t.until(() => t.of("turn-ended").length === 1);
   expect(t.of("tool")[0]!.tool).toHaveLength(MAX_TOOL_NAME_LENGTH);
-  expect(t.of("error")).toEqual([{ type: "driven", v: 1, kind: "error", session: S1, turn: "d1", text: expect.stringContaining("wanted to use Write, which needs your permission") }]);
+  expect(t.of("error")).toEqual([
+    { type: "driven", v: 1, kind: "error", session: S1, turn: "d1", text: "The agent wanted to use Write, but Claude Code on this computer didn't allow it (its permission rules, or its own safety check), so it wasn't used." },
+  ]);
 });
 
 test("hand back: stdin closes, the process ends by itself, the command and folder come back, and the session is forgotten here", async () => {
@@ -597,7 +654,7 @@ test("a driven take: only for the runner's own person; past the cap it isn't rea
   const t = await setUp({ settings: { drivenPerProject: 1 } });
   expect(t.driver.takeProblem({ id: "claude:bob" })).toContain("someone other than this computer's own person");
   expect(t.driver.takeProblem(ADA)).toBe(null);
-  const take = { session: UUIDS[2]!, folder: t.folder, prompt: "Isoplan handoff h1: read the brief", name: "Isoplan handoff h1", addDir: path.join(t.root, "brief"), room: "room-2", by: ADA };
+  const take = { session: UUIDS[2]!, folder: t.folder, prompt: "Isoplan handoff h1: read the brief", name: "Isoplan handoff h1", addDir: path.join(t.root, "brief"), room: "room-2", by: ADA, permissions: "auto" as const };
   expect(await t.driver.prepareTake(SERVER, take)).toBe(null);
   // The take about to open counts against the cap.
   t.drive(start("d1"));
@@ -622,4 +679,361 @@ test("a driven take: only for the runner's own person; past the cap it isn't rea
   await t.driver.settled();
   expect(t.driver.held()).toBe(0);
   expect(t.fakeLog().filter((l) => l.argv)).toHaveLength(1);
+});
+
+const BOB = { id: "claude:bob", name: "Bob" };
+const S2 = `claude-code:${UUIDS[1]}`;
+const ASKED = "Run this command: echo hi > probe.txt\nWhat for: Write hi into probe.txt";
+const modeOf = (argv: string[]) => argv[argv.indexOf("--permission-mode") + 1];
+
+test("bypass: a start asking to skip prompts is refused bypass-off until a drive-policy lists its project, then runs in bypassPermissions; one asking for auto runs auto", async () => {
+  const t = await setUp();
+  t.drive(start("d1", { permissions: "bypassPermissions" }));
+  t.policy(["github.com/ada/other"]);
+  t.drive(start("d2", { permissions: "bypassPermissions" }));
+  await t.until(() => t.of("refused").length === 2);
+  const off = { type: "driven", v: 1, kind: "refused", reason: "bypass-off", detail: expect.stringContaining("doesn't let sessions in this project skip permission prompts") };
+  expect(t.of("refused")).toEqual([{ ...off, id: "d1" }, { ...off, id: "d2" }]);
+  // Project ids are matched lower-cased.
+  t.policy(["GitHub.com/Ada/App"]);
+  t.drive(start("d3", { permissions: "bypassPermissions" }));
+  await t.until(() => t.of("held").length === 1);
+  t.drive(start("d4"));
+  await t.until(() => t.of("held").length === 2);
+  expect(t.of("started").map((m) => [m.id, m.permissions])).toEqual([
+    ["d3", "bypassPermissions"],
+    ["d4", "auto"],
+  ]);
+  expect(t.of("held").map((m) => m.permissions)).toEqual(["bypassPermissions", "auto"]);
+  await t.until(() => t.fakeLog().filter((l) => l.argv).length === 2);
+  const argvOf = (uuid: string) => t.fakeLog().find((l) => l.argv?.includes(uuid)).argv;
+  expect(argvOf(UUIDS[0]!)).toEqual(drivenArgs({ uuid: UUIDS[0]!, resume: false, permissions: "bypassPermissions" }));
+  expect(modeOf(argvOf(UUIDS[1]!))).toBe("auto");
+  await t.registry.flushed();
+  expect(t.saved().processes.map((r) => [r.session, r.driven!.permissions, r.driven!.asked])).toEqual([
+    [S1, "bypassPermissions", "bypassPermissions"],
+    [S2, "auto", "auto"],
+  ]);
+  expect(t.of("error")).toEqual([]);
+});
+
+test("bypass: a reopen and a take skip prompts only while the current connection's drive-policy lists the project; otherwise they open in auto, held says so and an error says why, and the asked mode is kept for later", async () => {
+  const t = await setUp();
+  t.policy([PROJECT.id]);
+  t.drive(start("d1", { permissions: "bypassPermissions" }));
+  await t.until(() => t.of("held").length === 1);
+  t.drive({ id: "s1", kind: "stop", session: S1 });
+  await t.until(() => t.of("released").length === 1);
+  // A new connection, with no drive-policy on it yet.
+  t.driver.linked(SERVER);
+  expect(t.of("holding")[0]!.sessions).toEqual([{ session: S1, room: "room-1", held: false, permissions: "auto" }]);
+  t.drive({ id: "d2", kind: "instruct", session: S1, text: "first" });
+  await t.until(() => t.of("turn-ended").length === 1);
+  const reopened = t.sent.findIndex((m) => m.kind === "held" && m.why === "reopened");
+  expect(t.sent.slice(reopened, reopened + 2)).toEqual([
+    { type: "driven", v: 1, kind: "held", session: S1, room: "room-1", why: "reopened", permissions: "auto" },
+    { type: "driven", v: 1, kind: "error", session: S1, text: expect.stringContaining("so this one runs with them on: whenever the agent needs your permission, it asks you here first") },
+  ]);
+  expect(t.registry.list()[0]!.driven).toMatchObject({ permissions: "auto", asked: "bypassPermissions" });
+  // Allowed again, the next reopen skips prompts once more.
+  t.policy([PROJECT.id]);
+  t.drive({ id: "s2", kind: "stop", session: S1 });
+  await t.until(() => t.of("released").length === 2);
+  t.drive({ id: "d3", kind: "instruct", session: S1, text: "second" });
+  await t.until(() => t.of("turn-ended").length === 2);
+  expect(t.of("held").at(-1)).toMatchObject({ why: "reopened", permissions: "bypassPermissions" });
+  // A take readied and opened after the link dropped: no drive-policy holds.
+  t.driver.unlinked(SERVER);
+  const take = { session: UUIDS[1]!, folder: t.folder, prompt: "Isoplan handoff h1: read the brief", name: "Isoplan handoff h1", addDir: path.join(t.root, "brief"), room: "room-2", by: ADA, permissions: "bypassPermissions" as const };
+  expect(await t.driver.prepareTake(SERVER, take)).toBe(null);
+  t.driver.taken(UUIDS[1]!, true);
+  await t.until(() => t.of("turn-ended").length === 3);
+  const taken = t.sent.findIndex((m) => m.kind === "held" && m.session === S2);
+  expect(t.sent.slice(taken, taken + 2)).toEqual([
+    { type: "driven", v: 1, kind: "held", session: S2, room: "room-2", why: "started", permissions: "auto" },
+    { type: "driven", v: 1, kind: "error", session: S2, text: expect.stringContaining("so this one runs with them on") },
+  ]);
+  // On a new connection with a drive-policy that lists the project, a take skips prompts.
+  t.driver.linked(SERVER);
+  t.policy([PROJECT.id]);
+  expect(await t.driver.prepareTake(SERVER, { ...take, session: UUIDS[2]! })).toBe(null);
+  t.driver.taken(UUIDS[2]!, true);
+  await t.until(() => t.of("turn-ended").length === 4);
+  expect(t.of("held").at(-1)).toMatchObject({ session: `claude-code:${UUIDS[2]}`, why: "started", permissions: "bypassPermissions" });
+  expect(t.of("error")).toHaveLength(2);
+  expect(t.fakeLog().filter((l) => l.argv).map((l) => modeOf(l.argv))).toEqual(["bypassPermissions", "auto", "bypassPermissions", "auto", "bypassPermissions"]);
+});
+
+test("bypass: a session restored after the runner's restart skips prompts again only where the drive-policy lists its project", async () => {
+  const at = new Date().toISOString();
+  const t = await setUp();
+  for (const uuid of [UUIDS[1]!, UUIDS[2]!])
+    t.registry.put({ kind: "driven", pid: null, spawned: null, session: `claude-code:${uuid}`, folder: t.folder, started: at, lastActivity: at, state: "closed", driven: { room: "room-1", project: PROJECT.id, office: SERVER, owner: ADA.id, permissions: "bypassPermissions", asked: "bypassPermissions", transcript: false } });
+  t.driver.close();
+  const sent: DrivenMessage[] = [];
+  const again = createDriver({
+    claudeDir: t.claudeDir,
+    account: { id: ADA.id },
+    offices: [{ server: SERVER, send: (m) => (sent.push(m), true), folder: async () => null }],
+    registry: t.registry,
+    binary: async () => t.bin,
+    settings: async () => SETTINGS,
+    scan: async () => null,
+    log: () => {},
+    projectOf: async () => PROJECT.id,
+    env: { ...process.env, CLAUDE_CONFIG_DIR: t.claudeDir, FAKE_STATE: t.state },
+  });
+  cleanups.push(() => again.close());
+  const instruct = (id: string, uuid: string) => again.take(SERVER, { type: "drive", v: 1, id, by: ADA, kind: "instruct", session: `claude-code:${uuid}`, text: "carry on" });
+  instruct("d1", UUIDS[1]!);
+  await t.until(() => sent.some((m) => m.kind === "turn-ended"));
+  await again.settled();
+  again.take(SERVER, { type: "drive-policy", v: 1, bypassAllowed: [PROJECT.id] });
+  instruct("d2", UUIDS[2]!);
+  await t.until(() => sent.filter((m) => m.kind === "turn-ended").length === 2);
+  await again.settled();
+  expect(sent.filter((m) => m.kind === "held" || m.kind === "error").map((m) => (m.kind === "held" ? [m.session, m.why, m.permissions] : [m.session, m.kind === "error" ? m.text : ""]))).toEqual([
+    [S2, "restored", "auto"],
+    [S2, expect.stringContaining("so this one runs with them on")],
+    [`claude-code:${UUIDS[2]}`, "restored", "bypassPermissions"],
+  ]);
+  expect(t.fakeLog().filter((l) => l.argv).map((l) => modeOf(l.argv))).toEqual(["auto", "bypassPermissions"]);
+});
+
+test("bypass: a drive-policy that no longer lists the project ends its sessions running in bypassPermissions at once, mid-turn with a prompt waiting; a link drop alone ends nothing; the next instruction reopens it in auto", async () => {
+  const t = await setUp();
+  t.policy([PROJECT.id]);
+  t.drive(start("d0"));
+  await t.until(() => t.of("held").length === 1);
+  t.drive(start("d1", { permissions: "bypassPermissions", instruction: "ask first" }));
+  await t.until(() => t.of("prompt").length === 1);
+  const [p] = t.of("prompt");
+  t.driver.unlinked(SERVER);
+  t.driver.linked(SERVER);
+  await t.driver.settled();
+  expect(t.of("released")).toEqual([]);
+  expect(t.of("holding")[0]!.sessions.find((x) => x.session === S2)).toEqual({ session: S2, room: "room-1", held: true, permissions: "bypassPermissions", turn: "d1" });
+  expect(t.sent.at(-1)).toEqual(p);
+  const before = t.sent.length;
+  t.policy([]);
+  await t.until(() => t.of("released").length === 1);
+  expect(t.sent.slice(before)).toEqual([
+    { type: "driven", v: 1, kind: "prompt-ended", session: S2, prompt: p!.prompt, outcome: "cancelled" },
+    { type: "driven", v: 1, kind: "turn-ended", session: S2, turn: "d1", outcome: "stopped" },
+    { type: "driven", v: 1, kind: "error", session: S2, text: "Skipping permission prompts was turned off for this project, so this session was closed. Your next instruction reopens it with prompts on." },
+    { type: "driven", v: 1, kind: "released", session: S2, why: "stopped" },
+  ]);
+  const { pid } = t.fakeLog().find((l) => l.argv && modeOf(l.argv) === "bypassPermissions");
+  for (let i = 0; i < 100 && alive(pid); i++) await new Promise((r) => setTimeout(r, 50));
+  expect(alive(pid)).toBe(false);
+  // The session in auto runs on.
+  expect(t.driver.held()).toBe(1);
+  t.drive({ id: "d2", kind: "instruct", session: S2, text: "again" });
+  await t.until(() => t.of("turn-ended").length === 2);
+  expect(t.of("held").at(-1)).toEqual({ type: "driven", v: 1, kind: "held", session: S2, room: "room-1", why: "reopened", permissions: "auto" });
+  expect(modeOf(t.fakeLog().filter((l) => l.argv).at(-1).argv)).toBe("auto");
+  expect(t.of("reply").at(-1)).toMatchObject({ session: S2, text: "Done: again" });
+});
+
+test("bypass: a session whose bypassPermissions was withdrawn but whose process won't end stays held and takes no instruction, refused unavailable, and ending it is tried again", async () => {
+  const stuck: Spawn = () => Object.assign(new EventEmitter(), { stdin: new PassThrough(), stdout: new PassThrough(), stderr: new PassThrough(), pid: undefined, exitCode: null, signalCode: null, kill: () => true }) as unknown as ChildProcessWithoutNullStreams;
+  const t = await setUp({ spawn: stuck });
+  t.policy([PROJECT.id]);
+  t.drive(start("d1", { permissions: "bypassPermissions" }));
+  await t.until(() => t.of("held").length === 1);
+  // The 10 s an ended process gets passes at once, each time.
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+  try {
+    t.policy([]);
+    await vi.advanceTimersByTimeAsync(11000);
+    t.drive({ id: "d2", kind: "instruct", session: S1, text: "more" });
+    await vi.advanceTimersByTimeAsync(11000);
+  } finally {
+    vi.useRealTimers();
+  }
+  await t.driver.settled();
+  expect(t.of("refused")).toEqual([{ type: "driven", v: 1, kind: "refused", id: "d2", reason: "unavailable", detail: expect.stringContaining("Claude Code couldn't be closed for this session") }]);
+  expect([t.of("released"), t.of("turn-started")]).toEqual([[], []]);
+  expect(t.logs.filter((l) => l.includes("didn't end when skipping permission prompts was turned off"))).toHaveLength(2);
+  expect(t.driver.held()).toBe(1);
+});
+
+test("prompt: relayed under the runner's own id, in plain words, with when it expires; the owner's allow runs the tool and deny doesn't, each ending it once; a forged or answered id is no-prompt, and someone else's answer not-owner", async () => {
+  const t = await setUp();
+  t.drive(start("d1", { instruction: "ask first" }));
+  await t.until(() => t.of("prompt").length === 1);
+  const [p] = t.of("prompt");
+  expect(p).toEqual({ type: "driven", v: 1, kind: "prompt", session: S1, turn: "d1", prompt: expect.stringMatching(/^p-/), tool: "Bash", description: ASKED, expires: expect.any(String) });
+  const left = Date.parse(p!.expires) - Date.now();
+  expect(left > 9 * 60000 && left <= 10 * 60000).toBe(true);
+  t.driver.take(SERVER, { type: "drive", v: 1, id: "a0", by: BOB, kind: "answer", session: S1, prompt: p!.prompt, answer: "allow" });
+  // Claude Code's own id for it isn't one the runner raised.
+  t.drive({ id: "a1", kind: "answer", session: S1, prompt: "req-1", answer: "allow" });
+  await t.until(() => t.of("refused").length === 2);
+  expect(t.of("refused").map((m) => [m.id, m.reason])).toEqual([
+    ["a0", "not-owner"],
+    ["a1", "no-prompt"],
+  ]);
+  expect(t.fakeLog().filter((l) => l.answered)).toEqual([]);
+  t.drive({ id: "a2", kind: "answer", session: S1, prompt: p!.prompt, answer: "allow" });
+  t.drive({ id: "a3", kind: "answer", session: S1, prompt: p!.prompt, answer: "deny" });
+  await t.until(() => t.of("turn-ended").length === 1 && t.of("refused").length === 3);
+  expect(t.of("refused")[2]).toEqual({ type: "driven", v: 1, kind: "refused", id: "a3", reason: "no-prompt", detail: expect.stringContaining("isn't waiting for an answer any more") });
+  expect(t.of("prompt-ended")).toEqual([{ type: "driven", v: 1, kind: "prompt-ended", session: S1, prompt: p!.prompt, outcome: "allowed", id: "a2" }]);
+  expect(t.of("reply")[0]).toMatchObject({ text: "Ran: echo hi > probe.txt" });
+  expect(t.of("turn-ended")[0]).toMatchObject({ outcome: "done" });
+  t.drive({ id: "d2", kind: "instruct", session: S1, text: "ask again" });
+  await t.until(() => t.of("prompt").length === 2);
+  const q = t.of("prompt")[1]!;
+  expect(q.prompt).not.toBe(p!.prompt);
+  t.drive({ id: "a4", kind: "answer", session: S1, prompt: q.prompt, answer: "deny" });
+  await t.until(() => t.of("turn-ended").length === 2);
+  expect(t.of("prompt-ended")[1]).toEqual({ type: "driven", v: 1, kind: "prompt-ended", session: S1, prompt: q.prompt, outcome: "denied", id: "a4" });
+  expect(t.of("reply")[1]).toMatchObject({ text: "Not run: The user denied this permission request from the Isoplan floor." });
+  expect(t.fakeLog().filter((l) => l.answered).map((l) => l.answered)).toEqual([
+    { subtype: "success", request_id: "req-1", response: { behavior: "allow", updatedInput: { command: "echo hi > probe.txt", description: "Write hi into probe.txt" } } },
+    { subtype: "success", request_id: "req-2", response: { behavior: "deny", message: "The user denied this permission request from the Isoplan floor." } },
+  ]);
+});
+
+test("prompt: with no answer by expires it is denied to Claude Code and ends timed-out, and an answer after is no-prompt; neither the idle close nor the stuck timeout ends the session while it waits", async () => {
+  const t = await setUp({ settings: { drivenPromptMinutes: 0.05, drivenIdleMinutes: 0.005, drivenStartSeconds: 2 } });
+  t.drive(start("d1", { instruction: "ask first" }));
+  await t.until(() => t.of("prompt").length === 1);
+  const [p] = t.of("prompt");
+  expect(Date.parse(p!.expires) - Date.now()).toBeLessThanOrEqual(3000);
+  await t.until(() => t.of("turn-ended").length === 1);
+  // Nothing came between the prompt and its end, though it waited past drivenStartSeconds and drivenIdleMinutes.
+  expect(t.sent.slice(t.sent.indexOf(p!) + 1).map((m) => m.kind)).toEqual(["prompt-ended", "reply", "turn-ended"]);
+  expect(Date.now()).toBeGreaterThanOrEqual(Date.parse(p!.expires));
+  expect(t.of("prompt-ended")).toEqual([{ type: "driven", v: 1, kind: "prompt-ended", session: S1, prompt: p!.prompt, outcome: "timed-out" }]);
+  expect(t.fakeLog().filter((l) => l.answered).map((l) => l.answered.response)).toEqual([{ behavior: "deny", message: "No answer to this permission request came from the Isoplan floor in time, so it was denied." }]);
+  t.drive({ id: "a1", kind: "answer", session: S1, prompt: p!.prompt, answer: "allow" });
+  await t.until(() => t.of("refused").length === 1);
+  expect(t.of("refused")[0]).toMatchObject({ id: "a1", reason: "no-prompt" });
+  // Once the turn is over, the idle close runs again.
+  await t.until(() => t.of("released").length === 1);
+  expect(t.of("released")[0]).toMatchObject({ why: "idle-closed" });
+});
+
+test("prompt: one raised after its turn has ended keeps the idle close off while it waits, through other output too; once answered, the session is idle-closed", async () => {
+  const t = await setUp({ settings: { drivenIdleMinutes: 0.01 } });
+  t.drive(start("d1", { instruction: "ask after" }));
+  await t.until(() => t.of("prompt").length === 1 && t.fakeLog().some((l) => l.waiting));
+  const [p] = t.of("prompt");
+  expect(p).toEqual({ type: "driven", v: 1, kind: "prompt", session: S1, prompt: expect.stringMatching(/^p-/), tool: "Bash", description: ASKED, expires: expect.any(String) });
+  // Several times drivenIdleMinutes (0.6 s) go by while it waits.
+  await new Promise((r) => setTimeout(r, 2500));
+  await t.driver.settled();
+  expect(t.of("released")).toEqual([]);
+  expect(t.driver.held()).toBe(1);
+  t.drive({ id: "a1", kind: "answer", session: S1, prompt: p!.prompt, answer: "allow" });
+  await t.until(() => t.of("released").length === 1);
+  expect(t.sent.slice(-2)).toEqual([
+    { type: "driven", v: 1, kind: "prompt-ended", session: S1, prompt: p!.prompt, outcome: "allowed", id: "a1" },
+    { type: "driven", v: 1, kind: "released", session: S1, why: "idle-closed" },
+  ]);
+});
+
+test("prompt: a request from Claude Code that isn't a permission prompt is answered with an error at once, and the turn goes on to its end", async () => {
+  const t = await setUp();
+  t.drive(start("d1", { instruction: "elicit first" }));
+  await t.until(() => t.of("turn-ended").length === 1);
+  expect(t.of("turn-ended")[0]).toMatchObject({ turn: "d1", outcome: "done" });
+  expect(t.of("prompt")).toEqual([]);
+  expect(t.fakeLog().filter((l) => l.answered).map((l) => l.answered)).toEqual([
+    { subtype: "error", request_id: "req-1", error: "Not supported: the Isoplan runner driving this session answers only permission requests." },
+  ]);
+  expect(t.logs.filter((l) => l.includes("request of subtype elicitation"))).toHaveLength(1);
+});
+
+test("prompt: a stop while one waits ends it cancelled before the turn, as a hand-back does; one Claude Code cancels itself ends cancelled; Claude Code gets no answer for any, and each is then no-prompt", async () => {
+  const t = await setUp();
+  t.drive(start("d1", { instruction: "ask first" }));
+  await t.until(() => t.of("prompt").length === 1);
+  const p1 = t.of("prompt")[0]!.prompt;
+  t.drive({ id: "s1", kind: "stop", session: S1 });
+  await t.until(() => t.of("released").length === 1);
+  expect(t.sent.slice(-3)).toEqual([
+    { type: "driven", v: 1, kind: "prompt-ended", session: S1, prompt: p1, outcome: "cancelled" },
+    { type: "driven", v: 1, kind: "turn-ended", session: S1, turn: "d1", outcome: "stopped" },
+    { type: "driven", v: 1, kind: "released", session: S1, why: "stopped", id: "s1" },
+  ]);
+  t.drive({ id: "d2", kind: "instruct", session: S1, text: "ask, then cancel" });
+  await t.until(() => t.of("turn-ended").length === 2);
+  const p2 = t.of("prompt")[1]!.prompt;
+  expect(t.sent.slice(-3)).toEqual([
+    { type: "driven", v: 1, kind: "prompt-ended", session: S1, prompt: p2, outcome: "cancelled" },
+    { type: "driven", v: 1, kind: "reply", session: S1, turn: "d2", text: "Cancelled" },
+    { type: "driven", v: 1, kind: "turn-ended", session: S1, turn: "d2", outcome: "done" },
+  ]);
+  t.drive({ id: "a1", kind: "answer", session: S1, prompt: p1, answer: "allow" });
+  t.drive({ id: "a2", kind: "answer", session: S1, prompt: p2, answer: "allow" });
+  await t.until(() => t.of("refused").length === 2);
+  expect(t.of("refused").map((m) => [m.id, m.reason])).toEqual([
+    ["a1", "no-prompt"],
+    ["a2", "no-prompt"],
+  ]);
+  t.drive({ id: "d3", kind: "instruct", session: S1, text: "ask third" });
+  await t.until(() => t.of("prompt").length === 3);
+  t.drive({ id: "h1", kind: "hand-back", session: S1 });
+  await t.until(() => t.of("handed-back").length === 1);
+  expect(t.sent.slice(-4).map((m) => m.kind)).toEqual(["prompt-ended", "turn-ended", "released", "handed-back"]);
+  expect(t.sent.at(-4)).toEqual({ type: "driven", v: 1, kind: "prompt-ended", session: S1, prompt: t.of("prompt")[2]!.prompt, outcome: "cancelled" });
+  expect(t.fakeLog().filter((l) => l.answered)).toEqual([]);
+});
+
+test("prompt: one raised while the link is down isn't kept anywhere; after every hello, right after holding, each still waiting goes again with the same id and expires", async () => {
+  const t = await setUp();
+  t.drive(start("d1"));
+  await t.until(() => t.of("held").length === 1);
+  t.link.up = false;
+  t.drive({ id: "d2", kind: "instruct", session: S1, text: "ask first" });
+  await t.until(() => t.dropped.some((m) => m.kind === "prompt"));
+  const made = t.dropped.find((m): m is Of<"prompt"> => m.kind === "prompt")!;
+  t.link.up = true;
+  await new Promise((r) => setTimeout(r, 100));
+  await t.driver.settled();
+  expect(t.of("prompt")).toEqual([]);
+  const before = t.sent.length;
+  t.driver.linked(SERVER);
+  expect(t.sent.slice(before).map((m) => m.kind)).toEqual(["holding", "prompt"]);
+  expect(t.sent.at(-1)).toEqual(made);
+  t.driver.linked(SERVER);
+  expect(t.sent.at(-1)).toEqual(made);
+  t.drive({ id: "a1", kind: "answer", session: S1, prompt: made.prompt, answer: "allow" });
+  await t.until(() => t.of("turn-ended").length === 1);
+  expect(t.of("prompt-ended")).toEqual([{ type: "driven", v: 1, kind: "prompt-ended", session: S1, prompt: made.prompt, outcome: "allowed", id: "a1" }]);
+  t.driver.linked(SERVER);
+  expect(t.sent.at(-1)!.kind).toBe("holding");
+});
+
+test("scan: a prompt whose tool name may hold a secret goes as `tool`, and one whose description may with a description that only says so, both withheld, and either can still be answered", async () => {
+  const t = await setUp();
+  t.drive(start("d1", { instruction: "ask, with a leak" }));
+  await t.until(() => t.of("prompt").length === 1);
+  t.drive({ id: "a1", kind: "answer", session: S1, prompt: t.of("prompt")[0]!.prompt, answer: "deny" });
+  await t.until(() => t.of("turn-ended").length === 1);
+  t.drive({ id: "d2", kind: "instruct", session: S1, text: "ask, through a named tool" });
+  await t.until(() => t.of("prompt").length === 2);
+  t.drive({ id: "a2", kind: "answer", session: S1, prompt: t.of("prompt")[1]!.prompt, answer: "deny" });
+  await t.until(() => t.of("turn-ended").length === 2);
+  expect(JSON.stringify(t.sent)).not.toContain(AWS_KEY);
+  expect(t.of("prompt").map(({ tool, description, withheld }) => ({ tool, description, withheld }))).toEqual([
+    { tool: "Bash", description: "Held back on this computer: what the agent wants to do may contain a secret, so it isn't shown here.", withheld: true },
+    { tool: "tool", description: ASKED, withheld: true },
+  ]);
+  expect(t.of("prompt-ended").map((m) => m.outcome)).toEqual(["denied", "denied"]);
+  expect(t.logs.filter((l) => l.startsWith("withheld what permission prompt"))).toHaveLength(2);
+});
+
+test("promptDescription: what a prompt asks, in plain words, for a command, a file, an address, a search, and any other tool", () => {
+  expect(promptDescription("Bash", { command: "npm test", description: "Run the tests" })).toBe("Run this command: npm test\nWhat for: Run the tests");
+  expect(promptDescription("PowerShell", { command: "Remove-Item build -Recurse" })).toBe("Run this command: Remove-Item build -Recurse");
+  expect(promptDescription("Write", { file_path: "C:\\app\\notes.md", content: "..." })).toBe("Write the file C:\\app\\notes.md");
+  expect(promptDescription("Edit", { file_path: "/app/src/a.ts", old_string: "a", new_string: "b" })).toBe("Change the file /app/src/a.ts");
+  expect(promptDescription("WebFetch", { url: "https://example.com/docs", prompt: "Summarise it" })).toBe("Open the web address https://example.com/docs");
+  expect(promptDescription("WebSearch", { query: "zod 4 discriminated unions" })).toBe("Search the web for: zod 4 discriminated unions");
+  expect(promptDescription("mcp__github__create_issue", { title: "Fix", body: "Broken" })).toBe('Use mcp__github__create_issue with: {"title":"Fix","body":"Broken"}');
+  expect(promptDescription("ExitPlanMode", {})).toBe("Use ExitPlanMode");
 });
