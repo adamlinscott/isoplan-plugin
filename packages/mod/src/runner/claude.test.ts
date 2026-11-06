@@ -88,15 +88,17 @@ function fake(mode = "") {
   fs.writeFileSync(bin, FAKE);
   const cwd = fs.mkdtempSync(path.join(root, "lead-"));
   const lead: Lead = { cwd, working: false, compacted: false, context: 572000, lastActive: Date.now() };
+  const tracked: { kind: string; session: string; folder: string }[] = [];
   const answerer = createClaudeAnswerer({
     claudeDir: path.join(root, ".claude"),
     binary: async () => bin,
     model: async () => "opus",
     config: async () => ({ tailBytes: 1048576, stalledMinutes: 5 }),
     env: { ...process.env, FAKE_LOG: logFile, FAKE_MODE: mode, CLAUDECODE: "1", CLAUDE_CODE_ENTRYPOINT: "cli" },
+    track: (_child, about) => void tracked.push(about),
   });
   const logged = () => fs.readFileSync(logFile, "utf8").trim().split("\n").map((l) => JSON.parse(l));
-  return { answerer, lead, logged, cwd, logFile };
+  return { answerer, lead, logged, cwd, logFile, tracked };
 }
 
 const ask = { instructions: "Reply with only the word: ready", request: "What was the coverage?", timeoutMs: 10000 };
@@ -109,6 +111,8 @@ test("fork: turn 2 goes after turn 1's real result, stdin closes, and the last r
   expect(start.argv).toEqual(forkArgs("e8fd707b", "opus"));
   expect(fs.realpathSync(start.cwd)).toBe(fs.realpathSync(f.cwd));
   expect(start.env.filter((k: string) => FORK_ENV_DROPPED.includes(k))).toEqual([]);
+  // The fork is in the process registry while it runs.
+  expect(f.tracked).toEqual([{ kind: "fork", session: "claude-code:e8fd707b", folder: f.cwd }]);
   expect(rest).toEqual([
     { turn: 1, text: ask.instructions, afterReal: false },
     { turn: 2, text: ask.request, afterReal: true },

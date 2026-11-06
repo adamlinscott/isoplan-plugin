@@ -5,7 +5,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import http from "node:http";
-import { realpath, statSync } from "node:fs";
+import fs$1, { realpath, statSync } from "node:fs";
 import { promisify } from "node:util";
 //#region ../../node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/core/util.js
 function getEnumValues(entries) {
@@ -6119,7 +6119,7 @@ const AskedAckMessageSchema = object({
 	v: Version,
 	question: RequestId
 });
-const driven = {
+const driven$1 = {
 	type: literal("driven"),
 	v: Version
 };
@@ -6138,7 +6138,7 @@ const driven = {
 */
 const DrivenRefusedSchema = discriminatedUnion("reason", [
 	object({
-		...driven,
+		...driven$1,
 		kind: literal("refused"),
 		id: DriveId,
 		reason: _enum([
@@ -6153,7 +6153,7 @@ const DrivenRefusedSchema = discriminatedUnion("reason", [
 		detail: Detail.optional()
 	}),
 	object({
-		...driven,
+		...driven$1,
 		kind: literal("refused"),
 		id: DriveId,
 		reason: literal("cap-reached"),
@@ -6161,11 +6161,173 @@ const DrivenRefusedSchema = discriminatedUnion("reason", [
 		detail: Detail.optional()
 	}),
 	object({
-		...driven,
+		...driven$1,
 		kind: literal("refused"),
 		id: DriveId,
 		reason: literal("unavailable"),
 		detail: Detail
+	})
+]);
+/**
+* What a runner says of the driven sessions it holds (protocol 0.5.0), sent only by a runner that said
+* `drive`. `started`, `output` (for an output request or a release) and `handed-back` answer a `drive`
+* request by its `id`, and `refused` is sent in place of any answer; the rest are the sessions' own
+* events, in the order they happened. A turn is named by the instruction that started it (`turn`): a
+* start's first instruction by the start's `id`, and a driven take's first turn by the handoff
+* message's `session`, the bare uuid. A driven take is answered by `taken`, as every take is (its
+* failures say why no session opened), and then by `held` with why `started`. A turn that ends with no
+* reply text sends no `reply`.
+*
+* Every `driven` message is live-only: it goes only while the runner's link is up and never waits in
+* the link's reply outbox, so a long turn can't push the replies to the server's requests out of it,
+* and a prompt that has timed out isn't shown again. After every hello, `holding` says where each
+* session stands, and right after it the runner sends `prompt` again for each prompt still waiting,
+* with the same `prompt` id and `expires`, so one raised while the link was down, or before the server
+* restarted, can still be answered.
+*
+* The runner keeps every field within its limit (the MAX_* constants), cutting what it doesn't pick
+* itself, such as a tool name, to fit: the server refuses a message over any limit and closes the
+* runner's link.
+*
+* Nothing from a session leaves the machine without the runner's secret scan. A reply or output it
+* matched has a `text` that only says so, and `withheld.id` for the owner to release it (drive
+* `release`); a tool summary it matched isn't sent, and a prompt description it matched only says so,
+* both marked `withheld`.
+*/
+const DrivenMessageSchema = discriminatedUnion("kind", [
+	object({
+		...driven$1,
+		kind: literal("started"),
+		id: DriveId,
+		session: DrivenSessionId,
+		room: Room,
+		permissions: DrivePermissionsSchema
+	}),
+	object({
+		...driven$1,
+		kind: literal("turn-started"),
+		session: DrivenSessionId,
+		turn: DriveId
+	}),
+	object({
+		...driven$1,
+		kind: literal("tool"),
+		session: DrivenSessionId,
+		turn: DriveId,
+		tool: ToolName,
+		summary: string().min(1).max(500).optional(),
+		withheld: literal(true).optional()
+	}).superRefine((message, context) => {
+		if (message.withheld && message.summary !== void 0) context.addIssue({
+			code: "custom",
+			path: ["summary"],
+			message: "no summary when the secret scan withheld it"
+		});
+	}),
+	object({
+		...driven$1,
+		kind: literal("reply"),
+		session: DrivenSessionId,
+		turn: DriveId,
+		text: string().min(1).max(MAX_REPLY_LENGTH),
+		cut: Cut,
+		withheld: Withheld
+	}),
+	object({
+		...driven$1,
+		kind: literal("turn-ended"),
+		session: DrivenSessionId,
+		turn: DriveId,
+		outcome: _enum([
+			"done",
+			"failed",
+			"stopped"
+		])
+	}),
+	object({
+		...driven$1,
+		kind: literal("error"),
+		session: DrivenSessionId,
+		turn: DriveId.optional(),
+		text: Detail
+	}),
+	object({
+		...driven$1,
+		kind: literal("output"),
+		id: DriveId,
+		session: DrivenSessionId,
+		turn: DriveId.optional(),
+		text: string().max(MAX_OUTPUT_LENGTH),
+		cut: Cut,
+		withheld: Withheld
+	}),
+	object({
+		...driven$1,
+		kind: literal("prompt"),
+		session: DrivenSessionId,
+		turn: DriveId.optional(),
+		prompt: DriveId,
+		tool: ToolName,
+		description: string().min(1).max(MAX_PROMPT_LENGTH),
+		withheld: literal(true).optional(),
+		expires: datetime({ offset: true })
+	}),
+	object({
+		...driven$1,
+		kind: literal("prompt-ended"),
+		session: DrivenSessionId,
+		prompt: DriveId,
+		outcome: _enum([
+			"allowed",
+			"denied",
+			"timed-out",
+			"cancelled"
+		]),
+		id: DriveId.optional()
+	}),
+	object({
+		...driven$1,
+		kind: literal("held"),
+		session: DrivenSessionId,
+		room: Room,
+		why: _enum([
+			"started",
+			"reopened",
+			"restored"
+		]),
+		permissions: DrivePermissionsSchema
+	}),
+	object({
+		...driven$1,
+		kind: literal("released"),
+		session: DrivenSessionId,
+		why: _enum([
+			"stopped",
+			"handed-back",
+			"idle-closed",
+			"crashed"
+		]),
+		id: DriveId.optional()
+	}),
+	object({
+		...driven$1,
+		kind: literal("handed-back"),
+		id: DriveId,
+		session: DrivenSessionId,
+		command: string().min(1).max(500),
+		folder: string().min(1).max(MAX_FOLDER_LENGTH)
+	}),
+	DrivenRefusedSchema,
+	object({
+		...driven$1,
+		kind: literal("holding"),
+		sessions: array(object({
+			session: DrivenSessionId,
+			room: Room,
+			held: boolean(),
+			permissions: DrivePermissionsSchema,
+			turn: DriveId.optional()
+		})).max(200)
 	})
 ]);
 discriminatedUnion("type", [
@@ -6182,142 +6344,7 @@ discriminatedUnion("type", [
 	AskRoomMessageSchema,
 	AskCheckMessageSchema,
 	AskedAckMessageSchema,
-	discriminatedUnion("kind", [
-		object({
-			...driven,
-			kind: literal("started"),
-			id: DriveId,
-			session: DrivenSessionId,
-			room: Room,
-			permissions: DrivePermissionsSchema
-		}),
-		object({
-			...driven,
-			kind: literal("turn-started"),
-			session: DrivenSessionId,
-			turn: DriveId
-		}),
-		object({
-			...driven,
-			kind: literal("tool"),
-			session: DrivenSessionId,
-			turn: DriveId,
-			tool: ToolName,
-			summary: string().min(1).max(500).optional(),
-			withheld: literal(true).optional()
-		}).superRefine((message, context) => {
-			if (message.withheld && message.summary !== void 0) context.addIssue({
-				code: "custom",
-				path: ["summary"],
-				message: "no summary when the secret scan withheld it"
-			});
-		}),
-		object({
-			...driven,
-			kind: literal("reply"),
-			session: DrivenSessionId,
-			turn: DriveId,
-			text: string().min(1).max(MAX_REPLY_LENGTH),
-			cut: Cut,
-			withheld: Withheld
-		}),
-		object({
-			...driven,
-			kind: literal("turn-ended"),
-			session: DrivenSessionId,
-			turn: DriveId,
-			outcome: _enum([
-				"done",
-				"failed",
-				"stopped"
-			])
-		}),
-		object({
-			...driven,
-			kind: literal("error"),
-			session: DrivenSessionId,
-			turn: DriveId.optional(),
-			text: Detail
-		}),
-		object({
-			...driven,
-			kind: literal("output"),
-			id: DriveId,
-			session: DrivenSessionId,
-			turn: DriveId.optional(),
-			text: string().max(MAX_OUTPUT_LENGTH),
-			cut: Cut,
-			withheld: Withheld
-		}),
-		object({
-			...driven,
-			kind: literal("prompt"),
-			session: DrivenSessionId,
-			turn: DriveId.optional(),
-			prompt: DriveId,
-			tool: ToolName,
-			description: string().min(1).max(MAX_PROMPT_LENGTH),
-			withheld: literal(true).optional(),
-			expires: datetime({ offset: true })
-		}),
-		object({
-			...driven,
-			kind: literal("prompt-ended"),
-			session: DrivenSessionId,
-			prompt: DriveId,
-			outcome: _enum([
-				"allowed",
-				"denied",
-				"timed-out",
-				"cancelled"
-			]),
-			id: DriveId.optional()
-		}),
-		object({
-			...driven,
-			kind: literal("held"),
-			session: DrivenSessionId,
-			room: Room,
-			why: _enum([
-				"started",
-				"reopened",
-				"restored"
-			]),
-			permissions: DrivePermissionsSchema
-		}),
-		object({
-			...driven,
-			kind: literal("released"),
-			session: DrivenSessionId,
-			why: _enum([
-				"stopped",
-				"handed-back",
-				"idle-closed",
-				"crashed"
-			]),
-			id: DriveId.optional()
-		}),
-		object({
-			...driven,
-			kind: literal("handed-back"),
-			id: DriveId,
-			session: DrivenSessionId,
-			command: string().min(1).max(500),
-			folder: string().min(1).max(MAX_FOLDER_LENGTH)
-		}),
-		DrivenRefusedSchema,
-		object({
-			...driven,
-			kind: literal("holding"),
-			sessions: array(object({
-				session: DrivenSessionId,
-				room: Room,
-				held: boolean(),
-				permissions: DrivePermissionsSchema,
-				turn: DriveId.optional()
-			})).max(200)
-		})
-	])
+	DrivenMessageSchema
 ]);
 /** Asks the data layer to send its facts in full. */
 const RepairMessageSchema = object({
@@ -7810,7 +7837,7 @@ const same = (a, b) => a !== void 0 && JSON.stringify(a) === JSON.stringify(b);
 const STABLE_MS$1 = 3e4;
 const OUTBOX_MAX$1 = 100;
 const OUTBOX_MAX_AGE_MS$1 = 36e5;
-function createLink({ url, hello, emit, minIntervalMs = 1e3, retryBaseMs = 1e3, retryCapMs = 3e4, notWantedRetryMs = 36e5, takenRetryMs = 36e5, onNotWanted, onPairingEnded, onMessage, filter = (facts) => facts, answered, pairing, pairPollMs = 5e3, admit, random = Math.random }) {
+function createLink({ url, hello, emit, minIntervalMs = 1e3, retryBaseMs = 1e3, retryCapMs = 3e4, notWantedRetryMs = 36e5, takenRetryMs = 36e5, onNotWanted, onPairingEnded, onMessage, onDrive, onOpen, filter = (facts) => facts, answered, pairing, pairPollMs = 5e3, admit, random = Math.random }) {
 	const outbox = [];
 	let latest = null;
 	let socket = null;
@@ -7894,6 +7921,7 @@ function createLink({ url, hello, emit, minIntervalMs = 1e3, retryBaseMs = 1e3, 
 				server: url,
 				state: "connected"
 			});
+			onOpen?.();
 		};
 		ws.onmessage = (event) => {
 			if (socket === ws) receive(event.data);
@@ -8052,6 +8080,7 @@ function createLink({ url, hello, emit, minIntervalMs = 1e3, retryBaseMs = 1e3, 
 				onNotWanted?.();
 			}
 		} else if (onMessage && (message.type === "request" || message.type === "release" || message.type === "handoff" || message.type === "drop")) onMessage(message);
+		else if (onDrive && (message.type === "drive" || message.type === "drive-policy")) onDrive(message);
 		else emit({
 			type: "log",
 			text: `the office server sent a ${message.type} message, which this data layer doesn't handle yet`
@@ -8073,6 +8102,11 @@ function createLink({ url, hello, emit, minIntervalMs = 1e3, retryBaseMs = 1e3, 
 				});
 				if (outbox.length > OUTBOX_MAX$1) outbox.shift();
 			}
+		},
+		sendLive(message) {
+			if (!isOpen || socket.readyState !== WebSocket.OPEN) return false;
+			send(message);
+			return true;
 		},
 		projects: () => projects,
 		close() {
@@ -9036,7 +9070,7 @@ function createClaudeCode(io) {
 				const item = {
 					with: agentId(to),
 					kind: c.kind,
-					since: iso(c.at, fallbackMs)
+					since: iso$1(c.at, fallbackMs)
 				};
 				if (!list.some((x) => x.with === item.with && x.kind === item.kind && x.since === item.since)) list.push(item);
 			}
@@ -9068,7 +9102,7 @@ function createClaudeCode(io) {
 				titleFrom: main.title ? "source" : "branch",
 				branch,
 				checkout: where.toplevel,
-				lastActive: iso(c.lastActive),
+				lastActive: iso$1(c.lastActive),
 				status: now - c.lastActive <= config.activeMinutes * 6e4 ? "active" : "idle",
 				lights: c.lights
 			},
@@ -9088,8 +9122,8 @@ function createClaudeCode(io) {
 			agentType: null,
 			task: null,
 			status: leadWorking ? "working" : "idle",
-			statusSince: iso(leadWorking ? main.turnAt : main.lastMessageAt, c.ownMtime),
-			lastActive: iso(c.ownMtime),
+			statusSince: iso$1(leadWorking ? main.turnAt : main.lastMessageAt, c.ownMtime),
+			lastActive: iso$1(c.ownMtime),
 			doing: leadWorking ? await doingOf(main, place, c.ownMtime, config) : null,
 			...checkInsOf(lead, main, c.ownMtime),
 			usage: usageOf(main, c.ownMtime)
@@ -9119,8 +9153,8 @@ function createClaudeCode(io) {
 				agentType: type,
 				task: typeof a.meta.description === "string" && a.meta.description ? a.meta.description : null,
 				status: s.status,
-				statusSince: iso(s.since, a.mtimeMs),
-				lastActive: iso(a.mtimeMs),
+				statusSince: iso$1(s.since, a.mtimeMs),
+				lastActive: iso$1(a.mtimeMs),
 				doing: live ? await doingOf(a.t, place, a.mtimeMs, config) : null,
 				...checkInsOf(id, a.t, a.mtimeMs),
 				usage: usageOf(a.t, a.mtimeMs),
@@ -9136,12 +9170,12 @@ function createClaudeCode(io) {
 			if (live) facts.waits.push({
 				waiter: startedBy,
 				on: id,
-				since: iso(spawn ? spawn.at : a.t.firstAt, a.mtimeMs)
+				since: iso$1(spawn ? spawn.at : a.t.firstAt, a.mtimeMs)
 			});
 			if (live) addQuestions(facts.questions, id, a.t, results, a.mtimeMs);
 			if ((s.status === "done" || s.status === "failed") && a.t.lastText !== null) facts.reports.push({
 				agent: id,
-				at: iso(a.t.lastTextAt, a.mtimeMs),
+				at: iso$1(a.t.lastTextAt, a.mtimeMs),
 				text: a.t.lastText
 			});
 			a.t.touches = await addFiles(facts.edits, id, a.t.touches, [...config.touchedTools, ...config.shellTools], now, config, place);
@@ -9245,14 +9279,14 @@ function addQuestions(list, agent, t, results, mtimeMs) {
 		if (questions.length) list.push({
 			id,
 			agent,
-			at: iso(ask.at, mtimeMs),
+			at: iso$1(ask.at, mtimeMs),
 			questions,
 			...incomplete ? { extra: { incomplete: true } } : {}
 		});
 	}
 }
 const message = (err) => String(err && err.message || err);
-function iso(ms, fallback) {
+function iso$1(ms, fallback) {
 	return new Date(Number.isFinite(ms) ? ms : fallback).toISOString();
 }
 async function addFiles(list, agent, touches, tools, now, config, place) {
@@ -9272,7 +9306,7 @@ async function addFiles(list, agent, touches, tools, now, config, place) {
 	for (const { placed, at } of newest.values()) list.push({
 		agent,
 		...placed,
-		at: iso(at)
+		at: iso$1(at)
 	});
 	return kept;
 }
@@ -9498,7 +9532,7 @@ function usageOf(st, fallbackMs) {
 		context: st.usage.context,
 		...st.totals,
 		over100k: { ...st.over100k },
-		at: iso(st.usage.at, fallbackMs)
+		at: iso$1(st.usage.at, fallbackMs)
 	};
 }
 function setTurn(st, open, at) {
@@ -9615,7 +9649,7 @@ async function doingOf(st, place, fallbackMs, config) {
 	return {
 		kind,
 		...t.file && t.cwd ? await place.file(t.file) : t.dir ? await place.dir(t.dir) : null,
-		since: iso(t.at, fallbackMs)
+		since: iso$1(t.at, fallbackMs)
 	};
 }
 //#endregion
@@ -9751,9 +9785,18 @@ const forkableId = (session) => {
 /** Ends a process and everything it started: on Windows `kill` reaches only the process itself. */
 function killTree(child, platform = process.platform) {
 	if (child.exitCode !== null || child.signalCode !== null || child.pid === void 0) return;
+	killPid(child.pid, platform, () => child.kill("SIGKILL"));
+}
+/**
+* Ends the process `pid` and everything it started, as killTree does, for a process this runner
+* didn't start itself (one an earlier run left, from the process registry). Off Windows the process
+* leads its own group (spawned detached); `fallback` runs when it doesn't, and by default kills the
+* process alone.
+*/
+function killPid(pid, platform = process.platform, fallback = () => process.kill(pid, "SIGKILL")) {
 	if (platform === "win32") spawnSync("taskkill", [
 		"/pid",
-		String(child.pid),
+		String(pid),
 		"/T",
 		"/F"
 	], {
@@ -9761,12 +9804,15 @@ function killTree(child, platform = process.platform) {
 		stdio: "ignore"
 	});
 	else try {
-		process.kill(-child.pid, "SIGKILL");
+		process.kill(-pid, "SIGKILL");
 	} catch {
-		child.kill("SIGKILL");
+		try {
+			fallback();
+		} catch {}
 	}
 }
-const defaultSpawn = ([cmd, ...args], { cwd, env }) => spawn(cmd, args, {
+/** Starts a process with no window and its three pipes; off Windows it leads its own process group, for killTree. */
+const hiddenSpawn = ([cmd, ...args], { cwd, env }) => spawn(cmd, args, {
 	cwd,
 	env,
 	stdio: [
@@ -9777,7 +9823,7 @@ const defaultSpawn = ([cmd, ...args], { cwd, env }) => spawn(cmd, args, {
 	windowsHide: true,
 	detached: process.platform !== "win32"
 });
-function createClaudeAnswerer({ claudeDir, binary, model, config, spawn = defaultSpawn, env = process.env, now = Date.now }) {
+function createClaudeAnswerer({ claudeDir, binary, model, config, spawn = hiddenSpawn, env = process.env, now = Date.now, track }) {
 	const forks = /* @__PURE__ */ new Set();
 	return {
 		async lead(session) {
@@ -9818,6 +9864,11 @@ function createClaudeAnswerer({ claudeDir, binary, model, config, spawn = defaul
 			}
 			forks.add(child);
 			child.on("close", () => forks.delete(child));
+			track?.(child, {
+				kind: "fork",
+				session,
+				folder: lead.cwd
+			});
 			return drive(child, ask);
 		},
 		close() {
@@ -10916,7 +10967,7 @@ async function openLaunch(l, env) {
 		child.on("exit", (code) => (clearTimeout(timer), code === 0 ? resolve() : reject(/* @__PURE__ */ new Error(`${path.basename(cmd)} exited with code ${code}`))));
 	});
 }
-function hidden([cmd, ...args], cwd, env, timeoutMs) {
+function hidden([cmd, ...args], cwd, env, timeoutMs, started) {
 	return new Promise((resolve) => {
 		let stdout = "";
 		let stderr = "";
@@ -10932,6 +10983,7 @@ function hidden([cmd, ...args], cwd, env, timeoutMs) {
 			windowsHide: true,
 			detached: process.platform !== "win32"
 		});
+		started?.(child);
 		child.stdout.setEncoding("utf8").on("data", (piece) => stdout += piece);
 		child.stderr.setEncoding("utf8").on("data", (piece) => stderr = (stderr + piece).slice(-2e3));
 		const timer = setTimeout(() => (timedOut = true, killTree(child)), timeoutMs);
@@ -11158,6 +11210,7 @@ const noHooks = async () => ["-c", `core.hooksPath=${await (emptyHooks ??= fs.mk
 async function takeHandoff(message, o) {
 	const { handoff } = message;
 	const headless = message.mode === "headless";
+	const driven = message.mode === "driven";
 	let orca = null;
 	const failures = [];
 	const done = (session) => ({
@@ -11175,9 +11228,16 @@ async function takeHandoff(message, o) {
 			output: matched ? `The end of its output is withheld here: it matches a secret pattern. It is on ${o.machine}.` : tail(output)
 		});
 	};
-	if (message.mode !== "terminal" && message.mode !== "headless" && message.mode !== "orca" && message.mode !== "desktop") {
+	if (message.mode !== "terminal" && message.mode !== "headless" && message.mode !== "orca" && message.mode !== "desktop" && message.mode !== "driven") {
 		await fail("open", "The office server didn't say how to open the session, so none was opened: take it again from the floor.");
 		return done();
+	}
+	if (driven) {
+		const problem = o.driven ? o.driven.problem(message.by) : "This computer's Isoplan can't run sessions from the floor yet, so nothing was made: take it again another way.";
+		if (problem || !message.session || !message.room) {
+			await fail("open", problem ?? "The office server didn't say which session and room to open, so none was opened: take it again from the floor.");
+			return done();
+		}
 	}
 	const desktop = message.mode === "desktop";
 	const startedAt = Date.now();
@@ -11293,6 +11353,29 @@ async function takeHandoff(message, o) {
 		}
 		const id = message.session ?? (o.newSession ?? randomUUID)();
 		const name = `Isoplan handoff ${handoff.id}`;
+		if (driven) {
+			try {
+				await trustFolder(o.claudeJson, dir, o.platform);
+			} catch (err) {
+				await fail("open", `The session couldn't be readied to run from the floor: ${err.message}. The worktree is ${dir}.`);
+				return done();
+			}
+			const problem = await o.driven.prepare({
+				session: id,
+				folder: dir,
+				prompt: takePrompt(handoff.id, briefFile, setupLog, failedRepos),
+				name,
+				addDir: folder,
+				room: message.room,
+				by: message.by
+			});
+			if (problem) {
+				await fail("open", `${problem} The worktree is ${dir}.`);
+				return done();
+			}
+			o.log(`handoff ${handoff.id}: Claude Code session ${id} opens in ${dir}, run from the floor`);
+			return done(`claude-code:${id}`);
+		}
 		const argv = sessionArgv(bin, {
 			prompt: takePrompt(handoff.id, briefFile, setupLog, failedRepos),
 			session: id,
@@ -11317,7 +11400,11 @@ async function takeHandoff(message, o) {
 				return done();
 			}
 			const readMs = Math.min(s.desktopReadTimeoutMinutes * 6e4, left());
-			const read = await hidden(argv, dir, env, readMs);
+			const read = await hidden(argv, dir, env, readMs, (child) => o.track?.(child, {
+				kind: "desktop-read",
+				session: `claude-code:${id}`,
+				folder: dir
+			}));
 			const said = (() => {
 				try {
 					return JSON.parse(read.stdout.trim().split(/\r?\n/).at(-1) ?? "");
@@ -11991,7 +12078,7 @@ function answerOffices(o) {
 			}
 			if (!o.idle()) continue;
 			if (!states.some((s) => s.link)) return states.some((s) => s.notWanted) ? "not-wanted" : "unpaired";
-			if (!await o.lit()) return "done";
+			if (!await o.keep?.() && !await o.lit()) return "done";
 		}
 	}
 	return {
@@ -12007,6 +12094,7 @@ function answerOffices(o) {
 				o.log(`dropped the oldest of the runner's replies for ${o.name(o.offices[i])}: more than 100 waited for its link`);
 			}
 		},
+		live: (i) => (message) => states[i].link?.sendLive?.(message) ?? false,
 		ended: run().finally(() => {
 			for (const [i, s] of states.entries()) {
 				s.link?.close();
@@ -12044,7 +12132,7 @@ const FAILED = {
 	"no-claude": "Claude Code for the terminal isn't installed on this machine, so it can't run the fork"
 };
 const REMEMBER_DROPPED = 200;
-function createRunner({ answerer, ledger, settings, prompts, scan, send, log, isDir, isReported, push, prepareBrief, take, focus, forks = createForkSlots(), now = Date.now }) {
+function createRunner({ answerer, ledger, settings, prompts, scan, send, log, isDir, isReported, push, prepareBrief, take, onTaken, focus, forks = createForkSlots(), now = Date.now }) {
 	const rooms = /* @__PURE__ */ new Map();
 	const running = /* @__PURE__ */ new Set();
 	const finished = /* @__PURE__ */ new Map();
@@ -12300,7 +12388,11 @@ function createRunner({ answerer, ledger, settings, prompts, scan, send, log, is
 							});
 						}, s.takeCapMinutes * 6e4);
 					});
-					take(message, () => droppedTakes.has(takeId)).then(finish, (err) => (log(`handoff ${handoff.id}: taking it failed: ${err?.stack ?? String(err)}`), finish(null))).finally(() => (runningTakes.delete(takeId), droppedTakes.delete(takeId)));
+					take(message, () => droppedTakes.has(takeId)).then((m) => {
+						const first = !over;
+						finish(m);
+						if (first) onTaken?.(message, m);
+					}, (err) => (log(`handoff ${handoff.id}: taking it failed: ${err?.stack ?? String(err)}`), finish(null))).finally(() => (runningTakes.delete(takeId), droppedTakes.delete(takeId)));
 				}
 				return;
 			}
@@ -12392,6 +12484,1155 @@ async function loadPatterns(modFile, ownerFile, log) {
 function scan(text, patterns) {
 	if (!patterns) return UNREADABLE;
 	return patterns.find((p) => p.regex.test(text))?.name ?? null;
+}
+const registryPath = (claudeDir) => path.join(claudeDir, "isoplan", "runner", "processes.json");
+const ABOUT = "The processes Isoplan's runner started on this machine that may still run, and the sessions driven from the floor it may open again. Written by the runner alone; the format is in the Isoplan plugin's README.";
+const TOUCH_SAVE_MS = 1e4;
+/** The command that asks the OS about `pid`, hidden: PowerShell on Windows, ps elsewhere. */
+function infoCommand(pid, platform) {
+	if (platform === "win32") return [
+		"powershell.exe",
+		"-NoProfile",
+		"-NonInteractive",
+		"-Command",
+		`$p = Get-CimInstance Win32_Process -Filter "ProcessId = ${pid}"; if ($p) { [DateTimeOffset]::new($p.CreationDate).ToUnixTimeMilliseconds(); $p.CommandLine }`
+	];
+	return [
+		"ps",
+		"-o",
+		"etime=",
+		"-o",
+		"command=",
+		"-p",
+		String(pid)
+	];
+}
+/** PowerShell's answer: the start time in ms on the first line, the command line after it. */
+function parseWindowsInfo(stdout) {
+	const [first, ...rest] = stdout.trim().split(/\r?\n/);
+	const startMs = Number(first?.trim());
+	return first && Number.isFinite(startMs) && startMs > 0 ? {
+		startMs,
+		command: rest.join("\n").trim()
+	} : null;
+}
+/** ps's answer: `[[dd-]hh:]mm:ss` since the process started, then its command line. */
+function parsePsInfo(stdout, now) {
+	const m = /^\s*(?:(\d+)-)?(?:(\d+):)?(\d+):(\d+)\s+(.*)$/s.exec(stdout.trim());
+	if (!m) return null;
+	const [, days, hours, minutes, seconds, command] = m;
+	return {
+		startMs: now - (((Number(days ?? 0) * 24 + Number(hours ?? 0)) * 60 + Number(minutes)) * 60 + Number(seconds)) * 1e3,
+		command: command.trim()
+	};
+}
+/** What the OS says of `pid` now, or null when it can't say (gone, or the command failed). */
+function processInfo(pid, platform = process.platform, now = Date.now) {
+	const [cmd, ...args] = infoCommand(pid, platform);
+	return new Promise((resolve) => {
+		execFile(cmd, args, {
+			windowsHide: true,
+			timeout: 15e3,
+			env: platform === "win32" ? process.env : {
+				...process.env,
+				LC_ALL: "C"
+			}
+		}, (err, stdout) => {
+			if (err) return resolve(null);
+			resolve(platform === "win32" ? parseWindowsInfo(stdout) : parsePsInfo(stdout, now()));
+		});
+	});
+}
+const uuidOf$1 = (session) => session.slice(session.indexOf(":") + 1);
+/** Whether `info`, what the OS says of the record's pid, shows the process is the one the record names. */
+function isOurs(record, info) {
+	if (!info || !record.spawned) return false;
+	const spawned = Date.parse(record.spawned);
+	const uuid = uuidOf$1(record.session);
+	return Number.isFinite(spawned) && Math.abs(info.startMs - spawned) <= 15e3 && uuid.length >= 8 && info.command.includes(uuid);
+}
+const keyOf = (r) => r.kind === "driven" ? `driven ${r.session}` : `${r.kind} ${r.pid}`;
+/** The records in the file's text, or null when it isn't a registry this version reads. */
+function parseRegistry(text) {
+	try {
+		const value = JSON.parse(text);
+		if (value?.version !== 1 || !Array.isArray(value.processes)) return null;
+		return value.processes.filter((r) => r && [
+			"driven",
+			"fork",
+			"desktop-read"
+		].includes(r.kind) && typeof r.session === "string" && typeof r.folder === "string" && (r.pid === null || Number.isSafeInteger(r.pid)) && (r.kind !== "driven" || r.driven && typeof r.driven.office === "string"));
+	} catch {
+		return null;
+	}
+}
+function createRegistry({ file, log, pid = process.pid, isAlive = alive, info = (p) => processInfo(p), kill = (p) => killPid(p), now = Date.now }) {
+	const records = /* @__PURE__ */ new Map();
+	let writing = Promise.resolve();
+	let queued = false;
+	let savedAt = -Infinity;
+	const text = () => JSON.stringify({
+		about: ABOUT,
+		version: 1,
+		runner: pid,
+		written: new Date(now()).toISOString(),
+		processes: [...records.values()]
+	}, null, 2) + "\n";
+	function save() {
+		savedAt = now();
+		if (queued) return writing;
+		queued = true;
+		writing = writing.then(async () => {
+			queued = false;
+			await fs.mkdir(path.dirname(file), { recursive: true });
+			const temp = `${file}.${pid}.tmp`;
+			await fs.writeFile(temp, text());
+			for (let tries = 0;; tries++) try {
+				await fs.rename(temp, file);
+				return;
+			} catch (err) {
+				if (tries >= 5 || ![
+					"EPERM",
+					"EBUSY",
+					"EACCES"
+				].includes(err.code ?? "")) throw err;
+				await new Promise((r) => setTimeout(r, 50 * (tries + 1)));
+			}
+		}).catch((err) => log(`couldn't write the process registry ${file}: ${err.message}`));
+		return writing;
+	}
+	return {
+		list: () => [...records.values()].map((r) => ({
+			...r,
+			...r.driven ? { driven: { ...r.driven } } : {}
+		})),
+		put(record) {
+			records.set(keyOf(record), { ...record });
+			save();
+		},
+		touch(session, at) {
+			const r = records.get(`driven ${session}`);
+			if (!r) return;
+			r.lastActivity = new Date(at).toISOString();
+			if (now() - savedAt >= TOUCH_SAVE_MS) save();
+		},
+		remove(session) {
+			if (records.delete(`driven ${session}`)) save();
+		},
+		track(child, { kind, session, folder }) {
+			if (child.pid === void 0) return;
+			const at = new Date(now()).toISOString();
+			const record = {
+				kind,
+				pid: child.pid,
+				spawned: at,
+				session,
+				folder,
+				started: at,
+				lastActivity: at,
+				state: "working"
+			};
+			const key = keyOf(record);
+			records.set(key, record);
+			save();
+			child.once("close", () => {
+				if (records.get(key) === record && records.delete(key)) save();
+			});
+		},
+		async restore() {
+			const found = await fs.readFile(file, "utf8").then(parseRegistry, (err) => err.code === "ENOENT" ? [] : null);
+			if (found === null) {
+				log(`the process registry ${file} couldn't be read, or is of another version, so nothing in it was ended or kept; it is written anew`);
+				await save();
+				return;
+			}
+			for (const r of found) {
+				if (r.pid !== null && isAlive(r.pid)) {
+					if (isOurs(r, await info(r.pid))) {
+						log(`ended ${r.kind} process ${r.pid} of ${r.session}, which an earlier run of the runner left`);
+						try {
+							kill(r.pid);
+						} catch {}
+					} else log(`left process ${r.pid} running: the registry names it for ${r.session}, but it can't be shown to be the one Isoplan started`);
+				}
+				if (r.kind !== "driven") continue;
+				records.set(keyOf(r), {
+					...r,
+					pid: null,
+					spawned: null,
+					state: "closed"
+				});
+			}
+			await save();
+		},
+		closeSync() {
+			for (const [key, r] of records) if (r.kind === "driven") records.set(key, {
+				...r,
+				pid: null,
+				spawned: null,
+				state: "closed"
+			});
+			else records.delete(key);
+			try {
+				const temp = `${file}.${pid}.tmp`;
+				fs$1.writeFileSync(temp, text());
+				fs$1.renameSync(temp, file);
+			} catch {}
+		},
+		flushed: () => writing
+	};
+}
+//#endregion
+//#region src/runner/session.ts
+/** The permission mode every driven session runs in until #42. */
+const DRIVEN_PERMISSIONS = "auto";
+/**
+* The permission flags of a driven session's process. Until #42 every session runs in Claude Code's
+* `auto` mode and nobody answers its prompts, so whatever still asks is denied at once. #42 puts
+* `--permission-prompts host` here and relays the prompts, and runs bypassPermissions where the
+* office's drive-policy allows it (the policy is kept by office in the driver).
+*/
+function permissionArgs(_asked) {
+	return [
+		"--permission-mode",
+		DRIVEN_PERMISSIONS,
+		"--permission-prompts",
+		"none"
+	];
+}
+/** Every flag of a driven session's command line, after the binary. --add-dir takes every argument after it, so it is last. */
+function drivenArgs({ uuid, resume, permissions, name, addDir }) {
+	return [
+		"-p",
+		...resume ? ["--resume", uuid] : ["--session-id", uuid],
+		"--input-format",
+		"stream-json",
+		"--output-format",
+		"stream-json",
+		"--verbose",
+		...permissionArgs(permissions),
+		...name && !resume ? ["--name", name] : [],
+		...addDir ? ["--add-dir", addDir] : []
+	];
+}
+const TOOL_RESULT_CHARS = 2e3;
+const TRANSCRIPT_TAIL_BYTES = 4194304;
+const TURNS_KEPT = 10;
+const STARTS_KEPT = 200;
+const TAKES_KEPT = 20;
+const KILL_WAIT_MS = 1e4;
+const NO_CLAUDE = "Claude Code for the terminal isn't installed on this computer, so no session can run here.";
+const NO_FOLDER = "This computer has no folder for this room: open Claude Code once in the room's repo here, then try again.";
+const NOT_STARTED = "Claude Code couldn't be started on this computer. Its runner log says why.";
+const BUSY = "The agent is still working on the last instruction. Wait for it to finish, or stop it.";
+const CLOSING = "This session is being closed. Try again in a moment.";
+const TURN_GONE = "This computer no longer has that instruction's output (Isoplan restarted since, or it was long ago). Ask for the whole session's output instead.";
+const RELEASE_GONE = "Nothing is held back under that id on this computer any more: Isoplan may have restarted since.";
+const MISSING = "Claude Code can't find this session's saved conversation on this computer any more, so it can't be continued from the floor.";
+const WITHHELD = "Held back on this computer: it may contain a secret. Release it from the floor to see it.";
+const NOT_YOURS_TAKE = "This handoff was taken from the floor by someone other than this computer's own person, so nothing was opened here.";
+const capReached = (limit) => `This project already has ${limit} sessions running from the floor on this computer, the most allowed. Stop one, then try again.`;
+const uuidOf = (session) => session.slice(session.indexOf(":") + 1);
+const iso = (ms) => new Date(ms).toISOString();
+/** `text` within `max`, its start kept, and whether it was cut. */
+function cutStart(text, max) {
+	return text.length <= max ? {
+		text,
+		cut: false
+	} : {
+		text: text.slice(0, max - 1) + "…",
+		cut: true
+	};
+}
+/** `text` within `max`, its end kept, and whether it was cut. */
+function cutEnd(text, max) {
+	return text.length <= max ? {
+		text,
+		cut: false
+	} : {
+		text: "…" + text.slice(-(max - 1)),
+		cut: true
+	};
+}
+/** A short summary of what a tool use was for, from its input: its description, else the file, pattern, command or address it names. */
+function summaryOf(input) {
+	if (!input || typeof input !== "object") return void 0;
+	const i = input;
+	for (const key of [
+		"description",
+		"file_path",
+		"notebook_path",
+		"path",
+		"pattern",
+		"command",
+		"url",
+		"query",
+		"prompt",
+		"skill",
+		"subject"
+	]) {
+		const value = i[key];
+		if (typeof value === "string" && value.trim()) return cutStart(value.replace(/\s+/g, " ").trim(), 500).text;
+	}
+}
+function resultText(block) {
+	const c = block.content;
+	return cutStart((typeof c === "string" ? c : Array.isArray(c) ? c.map((x) => x && typeof x === "object" && typeof x.text === "string" ? x.text : "").join("\n") : "").trim(), TOOL_RESULT_CHARS).text;
+}
+/**
+* The plain text of one message line, as stream-json writes it and as the transcript keeps it: an
+* instruction as `> ...`, the agent's words, `[Tool] what for`, and a tool's result. Empty for
+* anything else, and for a subagent's own lines.
+*/
+function messageText(e) {
+	if (!e || typeof e !== "object") return "";
+	const line = e;
+	if (line.type !== "user" && line.type !== "assistant" || line.isSidechain === true || line.isMeta === true || line.parent_tool_use_id) return "";
+	const content = line.message?.content;
+	if (typeof content === "string") return line.type === "user" ? `> ${content.trim()}` : content.trim();
+	if (!Array.isArray(content)) return "";
+	const parts = [];
+	for (const block of content) {
+		if (!block || typeof block !== "object") continue;
+		if (block.type === "text" && typeof block.text === "string" && block.text.trim()) parts.push(line.type === "user" ? `> ${block.text.trim()}` : block.text.trim());
+		else if (block.type === "tool_use") {
+			const summary = summaryOf(block.input);
+			parts.push(`[${typeof block.name === "string" ? block.name : "tool"}]${summary ? ` ${summary}` : ""}`);
+		} else if (block.type === "tool_result") {
+			const text = resultText(block);
+			if (text) parts.push(text);
+		}
+	}
+	return parts.join("\n");
+}
+/** The session's transcript: where Claude Code puts it for the folder, else wherever it is under projects/. */
+async function transcriptOf(claudeDir, folder, uuid) {
+	const projects = path.join(claudeDir, "projects");
+	const exists = (p) => fs.stat(p).then((s) => s.isFile(), () => false);
+	const guess = path.join(projects, folder.replace(/[^a-zA-Z0-9]/g, "-"), `${uuid}.jsonl`);
+	if (await exists(guess)) return guess;
+	for (const dir of await fs.readdir(projects).catch(() => [])) {
+		const p = path.join(projects, dir, `${uuid}.jsonl`);
+		if (await exists(p)) return p;
+	}
+	return null;
+}
+/** The plain text of the end of a transcript, at most TRANSCRIPT_TAIL_BYTES of it, and whether its start was left out. */
+async function transcriptText(file) {
+	const handle = await fs.open(file, "r");
+	try {
+		const { size } = await handle.stat();
+		const start = Math.max(0, size - TRANSCRIPT_TAIL_BYTES);
+		const buffer = Buffer.alloc(size - start);
+		await handle.read(buffer, 0, buffer.length, start);
+		const lines = buffer.toString("utf8").split("\n");
+		if (start > 0) lines.shift();
+		const parts = [];
+		for (const l of lines) {
+			if (!l.trim()) continue;
+			try {
+				const text = messageText(JSON.parse(l));
+				if (text) parts.push(text);
+			} catch {}
+		}
+		return {
+			text: parts.join("\n"),
+			cut: start > 0
+		};
+	} finally {
+		await handle.close();
+	}
+}
+/** The message cut to the protocol's limits in every free-text field it has. */
+function fit(m) {
+	const out = { ...m };
+	const limit = (key, max) => {
+		if (typeof out[key] === "string" && out[key].length > max) out[key] = cutStart(out[key], max).text;
+	};
+	limit("tool", 100);
+	limit("summary", 500);
+	limit("room", 200);
+	limit("command", 500);
+	limit("folder", MAX_FOLDER_LENGTH);
+	limit("detail", MAX_DETAIL_LENGTH);
+	limit("text", m.kind === "reply" ? MAX_REPLY_LENGTH : m.kind === "output" ? MAX_OUTPUT_LENGTH : MAX_DETAIL_LENGTH);
+	if (m.kind === "holding") out.sessions = m.sessions.map((s) => ({
+		...s,
+		room: cutStart(s.room, 200).text,
+		session: s.session.slice(0, 200)
+	}));
+	return out;
+}
+const driven = {
+	type: "driven",
+	v: 1
+};
+function createDriver(o) {
+	const now = o.now ?? Date.now;
+	const spawn = o.spawn ?? hiddenSpawn;
+	const env = o.env ?? process.env;
+	const newId = o.newId ?? randomUUID;
+	const platform = o.platform ?? process.platform;
+	const offices = new Map(o.offices.map((office) => [office.server, office]));
+	const sessions = /* @__PURE__ */ new Map();
+	const withheld = /* @__PURE__ */ new Map();
+	const policies = /* @__PURE__ */ new Map();
+	const takes = /* @__PURE__ */ new Map();
+	const starts = /* @__PURE__ */ new Set();
+	function newSession(record, fromBefore) {
+		return {
+			record,
+			child: null,
+			opening: false,
+			closed: Promise.resolve(),
+			turn: null,
+			output: "",
+			cut: false,
+			outputs: /* @__PURE__ */ new Map(),
+			ending: null,
+			failure: null,
+			fromBefore,
+			stderr: "",
+			idle: null,
+			idleToken: 0,
+			starting: null,
+			work: Promise.resolve(),
+			out: Promise.resolve()
+		};
+	}
+	let busy = 0;
+	const waiting = [];
+	function count(p) {
+		busy++;
+		p.finally(() => {
+			if (--busy === 0) for (const resolve of waiting.splice(0)) resolve();
+		});
+		return p;
+	}
+	function sendTo(server, m) {
+		const office = offices.get(server);
+		if (!office) return;
+		const parsed = DrivenMessageSchema.safeParse(fit(m));
+		if (!parsed.success) {
+			o.log(`a driven ${m.kind} message wasn't sent, as it doesn't fit the protocol: ${parsed.error.issues.map((i) => `${i.path.join(".")} ${i.message}`).join("; ")}`);
+			return;
+		}
+		office.send(parsed.data);
+	}
+	const refuse = (server, id, reason, extra = {}) => sendTo(server, {
+		...driven,
+		kind: "refused",
+		id,
+		reason,
+		...extra
+	});
+	function emit(s, make) {
+		const server = s.record.driven.office;
+		s.out = count(s.out.then(async () => {
+			const m = await make();
+			if (m) sendTo(server, m);
+		}).catch((err) => o.log(`couldn't send a message of ${s.record.session}: ${err.message}`)));
+	}
+	function queue(s, run) {
+		s.work = count(s.work.then(run).catch((err) => o.log(`driving ${s.record.session} failed: ${err?.stack ?? String(err)}`)));
+	}
+	const current = (s) => sessions.get(s.record.session) === s;
+	function save(s, patch = {}) {
+		s.record = {
+			...s.record,
+			...patch
+		};
+		if (current(s)) o.registry.put(s.record);
+	}
+	function heldIn(project) {
+		let n = 0;
+		for (const s of sessions.values()) if ((s.child || s.opening) && s.record.driven.project === project) n++;
+		for (const t of takes.values()) if (t.project === project) n++;
+		return n;
+	}
+	function prune() {
+		const closed = [...sessions.values()].filter((s) => !s.child && !s.opening).sort((a, b) => Date.parse(b.record.lastActivity) - Date.parse(a.record.lastActivity));
+		for (const s of closed.slice(Math.max(0, 200 - (sessions.size - closed.length)))) forget(s);
+	}
+	function forget(s) {
+		clearIdle(s);
+		if (s.starting) clearTimeout(s.starting);
+		if (!current(s)) return;
+		sessions.delete(s.record.session);
+		o.registry.remove(s.record.session);
+		for (const [id, w] of withheld) if (w.session === s.record.session) withheld.delete(id);
+	}
+	function hold(entry) {
+		const id = `w-${randomUUID()}`;
+		withheld.set(id, entry);
+		if (withheld.size > 50) withheld.delete(withheld.keys().next().value);
+		return id;
+	}
+	function clearIdle(s) {
+		s.idleToken++;
+		if (s.idle) clearTimeout(s.idle);
+		s.idle = null;
+	}
+	function armIdle(s) {
+		clearIdle(s);
+		const token = s.idleToken;
+		o.settings().then((st) => {
+			if (token !== s.idleToken || !s.child || s.turn) return;
+			s.idle = setTimeout(() => queue(s, () => closeIdle(s)), st.drivenIdleMinutes * 6e4);
+			s.idle.unref?.();
+		});
+	}
+	function addOutput(s, text) {
+		if (!text) return;
+		s.output += text + "\n";
+		if (s.output.length > 2e5) {
+			s.output = s.output.slice(-2e5);
+			s.cut = true;
+		}
+	}
+	function keepTurn(s, turn) {
+		s.outputs.set(turn, {
+			text: s.output,
+			cut: s.cut
+		});
+		if (s.outputs.size > TURNS_KEPT) s.outputs.delete(s.outputs.keys().next().value);
+	}
+	/** Opens the session's process: null, or why it couldn't. */
+	async function open(s, bin) {
+		s.opening = true;
+		try {
+			bin ??= await o.binary();
+			if (!bin) return {
+				reason: "no-claude",
+				detail: NO_CLAUDE
+			};
+			const d = s.record.driven;
+			const uuid = uuidOf(s.record.session);
+			const resume = d.transcript || await transcriptOf(o.claudeDir, s.record.folder, uuid) !== null;
+			const argv = [...claudeCommand(bin), ...drivenArgs({
+				uuid,
+				resume,
+				permissions: d.permissions,
+				...d.name ? { name: d.name } : {},
+				...d.addDir ? { addDir: d.addDir } : {}
+			})];
+			let child;
+			try {
+				child = spawn(argv, {
+					cwd: s.record.folder,
+					env: forkEnv(env)
+				});
+			} catch (err) {
+				o.log(`couldn't start claude for ${s.record.session} in ${s.record.folder}: ${err.message}`);
+				return {
+					reason: "unavailable",
+					detail: NOT_STARTED
+				};
+			}
+			wire(s, child);
+			const at = iso(now());
+			save(s, {
+				pid: child.pid ?? null,
+				spawned: at,
+				state: "idle",
+				lastActivity: at
+			});
+			o.log(`opened driven session ${s.record.session} in ${s.record.folder} (process ${child.pid})`);
+			armIdle(s);
+			return null;
+		} finally {
+			s.opening = false;
+		}
+	}
+	function wire(s, child) {
+		s.child = child;
+		s.stderr = "";
+		let closed = () => {};
+		s.closed = new Promise((resolve) => closed = resolve);
+		let buffer = "";
+		child.stdout.setEncoding("utf8").on("data", (piece) => {
+			buffer += piece;
+			let nl;
+			while ((nl = buffer.indexOf("\n")) >= 0) {
+				const text = buffer.slice(0, nl).trim();
+				buffer = buffer.slice(nl + 1);
+				if (!text) continue;
+				let e;
+				try {
+					e = JSON.parse(text);
+				} catch {
+					continue;
+				}
+				if (e && typeof e === "object") onEvent(s, child, e);
+			}
+		});
+		child.stderr.setEncoding("utf8").on("data", (piece) => s.stderr = (s.stderr + piece).slice(-2e3));
+		child.stdin.on("error", () => {});
+		let over = false;
+		const end = (code) => {
+			if (over) return;
+			over = true;
+			closed();
+			ended(s, child, code);
+		};
+		child.on("error", (err) => {
+			o.log(`claude for ${s.record.session} failed: ${err.message}`);
+			end(null);
+		});
+		child.on("close", (code) => end(code));
+	}
+	function onEvent(s, child, e) {
+		if (s.child !== child) return;
+		if (s.starting) clearTimeout(s.starting);
+		s.starting = null;
+		s.record.lastActivity = iso(now());
+		o.registry.touch(s.record.session, now());
+		const turn = s.turn;
+		if (!turn) {
+			armIdle(s);
+			return;
+		}
+		if (e.parent_tool_use_id) return;
+		if (e.type === "assistant" || e.type === "user") {
+			addOutput(s, messageText(e));
+			if (e.type !== "assistant") return;
+			const content = e.message?.content;
+			for (const block of Array.isArray(content) ? content : []) {
+				if (block?.type !== "tool_use") continue;
+				const tool = typeof block.name === "string" && block.name ? block.name : "tool";
+				const summary = summaryOf(block.input);
+				emit(s, async () => {
+					if (summary === void 0) return {
+						...driven,
+						kind: "tool",
+						session: s.record.session,
+						turn,
+						tool
+					};
+					if (await o.scan(summary)) return {
+						...driven,
+						kind: "tool",
+						session: s.record.session,
+						turn,
+						tool,
+						withheld: true
+					};
+					return {
+						...driven,
+						kind: "tool",
+						session: s.record.session,
+						turn,
+						tool,
+						summary
+					};
+				});
+			}
+		} else if (e.type === "system" && e.subtype === "permission_denied") {
+			const tool = typeof e.tool_name === "string" && e.tool_name ? e.tool_name : "a tool";
+			addOutput(s, `(${tool} wasn't allowed: it needs your permission)`);
+			emit(s, () => ({
+				...driven,
+				kind: "error",
+				session: s.record.session,
+				turn,
+				text: `The agent wanted to use ${tool}, which needs your permission. Sessions run from the floor can't ask for it yet, so it wasn't allowed.`
+			}));
+		} else if (e.type === "result" && (typeof e.num_turns === "number" && e.num_turns >= 1 || e.is_error === true)) endTurn(s, turn, e);
+	}
+	function endTurn(s, turn, e) {
+		s.turn = null;
+		keepTurn(s, turn);
+		const failed = e.is_error === true || e.subtype !== "success";
+		const missing = Array.isArray(e.errors) && e.errors.some((x) => typeof x === "string" && x.includes("No conversation found"));
+		const session = s.record.session;
+		if (missing) s.failure = MISSING;
+		else if (failed) {
+			const kind = typeof e.subtype === "string" && /^[a-z_]+$/.test(e.subtype) ? ` (${e.subtype})` : "";
+			emit(s, () => ({
+				...driven,
+				kind: "error",
+				session,
+				turn,
+				text: `Claude Code stopped this instruction with an error${kind}.`
+			}));
+		}
+		const text = !failed && typeof e.result === "string" ? e.result.trim() : "";
+		if (text) emit(s, async () => {
+			const matched = await o.scan(text);
+			if (matched) {
+				o.log(`withheld the reply to ${turn} in ${session}: it matches the secret pattern "${matched}"`);
+				return {
+					...driven,
+					kind: "reply",
+					session,
+					turn,
+					text: WITHHELD,
+					withheld: { id: hold({
+						session,
+						turn,
+						text
+					}) }
+				};
+			}
+			const c = cutStart(text, MAX_REPLY_LENGTH);
+			return {
+				...driven,
+				kind: "reply",
+				session,
+				turn,
+				text: c.text,
+				...c.cut ? { cut: true } : {}
+			};
+		});
+		emit(s, () => ({
+			...driven,
+			kind: "turn-ended",
+			session,
+			turn,
+			outcome: failed ? "failed" : "done"
+		}));
+		save(s, {
+			state: "idle",
+			driven: {
+				...s.record.driven,
+				transcript: s.record.driven.transcript || !missing
+			}
+		});
+		armIdle(s);
+	}
+	function ended(s, child, code) {
+		if (s.child !== child) return;
+		s.child = null;
+		clearIdle(s);
+		if (s.starting) clearTimeout(s.starting);
+		s.starting = null;
+		const turn = s.turn;
+		s.turn = null;
+		if (turn) keepTurn(s, turn);
+		const session = s.record.session;
+		const why = s.ending;
+		s.record = {
+			...s.record,
+			pid: null,
+			spawned: null,
+			state: "closed"
+		};
+		if (why) {
+			if (turn) emit(s, () => ({
+				...driven,
+				kind: "turn-ended",
+				session,
+				turn,
+				outcome: "stopped"
+			}));
+			save(s);
+			return;
+		}
+		const missing = s.failure === MISSING || /No conversation found/i.test(s.stderr);
+		const said = missing ? MISSING : s.failure ?? "Claude Code stopped running for this session unexpectedly. Send another instruction to start it again.";
+		s.failure = null;
+		o.log(`the process of driven session ${session} ended by itself${code === null ? "" : ` with code ${code}`}${s.stderr.trim() ? `: ${s.stderr.trim().split("\n").slice(-3).join(" ")}` : ""}`);
+		emit(s, () => ({
+			...driven,
+			kind: "error",
+			session,
+			...turn ? { turn } : {},
+			text: said
+		}));
+		if (turn) emit(s, () => ({
+			...driven,
+			kind: "turn-ended",
+			session,
+			turn,
+			outcome: "failed"
+		}));
+		emit(s, () => ({
+			...driven,
+			kind: "released",
+			session,
+			why: "crashed"
+		}));
+		if (missing) forget(s);
+		else save(s);
+	}
+	async function within(p, ms) {
+		let timer;
+		const done = await Promise.race([p.then(() => true), new Promise((r) => timer = setTimeout(() => r(false), ms))]);
+		clearTimeout(timer);
+		return done;
+	}
+	async function closeGently(s) {
+		const st = await o.settings();
+		const child = s.child;
+		if (!child) return;
+		child.stdin.end();
+		if (await within(s.closed, st.drivenCloseSeconds * 1e3)) return;
+		o.log(`driven session ${s.record.session} didn't end within ${st.drivenCloseSeconds} s of being closed, so its process was ended`);
+		if (s.child === child) killTree(child, platform);
+		await within(s.closed, KILL_WAIT_MS);
+	}
+	async function beginTurn(s, turn, text) {
+		const st = await o.settings();
+		const child = s.child;
+		if (!child) return;
+		clearIdle(s);
+		s.turn = turn;
+		s.output = "";
+		s.cut = false;
+		s.failure = null;
+		addOutput(s, `> ${text}`);
+		s.starting = setTimeout(() => {
+			if (s.child !== child || s.turn !== turn) return;
+			o.log(`driven session ${s.record.session} wrote nothing within ${st.drivenStartSeconds} s of instruction ${turn}, so its process was ended`);
+			s.failure = `Claude Code didn't start on the instruction within ${st.drivenStartSeconds} seconds, so it was stopped. Send the instruction again to retry.`;
+			killTree(child, platform);
+		}, st.drivenStartSeconds * 1e3);
+		s.starting.unref?.();
+		save(s, {
+			state: "working",
+			lastActivity: iso(now())
+		});
+		emit(s, () => ({
+			...driven,
+			kind: "turn-started",
+			session: s.record.session,
+			turn
+		}));
+		child.stdin.write(userTurn(text));
+	}
+	async function start(server, m) {
+		if (starts.has(m.id)) {
+			o.log(`start ${m.id} was handled already, so it isn't run again`);
+			return;
+		}
+		starts.add(m.id);
+		if (starts.size > STARTS_KEPT) starts.delete(starts.values().next().value);
+		const bin = await o.binary();
+		if (!bin) return refuse(server, m.id, "no-claude", { detail: NO_CLAUDE });
+		const folder = await offices.get(server).folder(m.roomSessions ?? []);
+		if (!folder) return refuse(server, m.id, "no-folder", { detail: NO_FOLDER });
+		const st = await o.settings();
+		const project = m.project.id.toLowerCase();
+		if (heldIn(project) >= st.drivenPerProject) return refuse(server, m.id, "cap-reached", {
+			limit: st.drivenPerProject,
+			detail: capReached(st.drivenPerProject)
+		});
+		if (m.permissions !== "auto") o.log(`start ${m.id} asked for ${m.permissions}; it runs in ${DRIVEN_PERMISSIONS}, which is all this runner does yet`);
+		const at = iso(now());
+		const s = newSession({
+			kind: "driven",
+			pid: null,
+			spawned: null,
+			session: `claude-code:${newId()}`,
+			folder,
+			started: at,
+			lastActivity: at,
+			state: "closed",
+			driven: {
+				room: m.room,
+				project,
+				office: server,
+				owner: m.by.id,
+				permissions: DRIVEN_PERMISSIONS,
+				transcript: false
+			}
+		}, false);
+		s.opening = true;
+		sessions.set(s.record.session, s);
+		queue(s, async () => {
+			const problem = await open(s, bin);
+			if (problem) {
+				forget(s);
+				return refuse(server, m.id, problem.reason, { detail: problem.detail });
+			}
+			prune();
+			emit(s, () => ({
+				...driven,
+				kind: "started",
+				id: m.id,
+				session: s.record.session,
+				room: m.room,
+				permissions: DRIVEN_PERMISSIONS
+			}));
+			emit(s, () => ({
+				...driven,
+				kind: "held",
+				session: s.record.session,
+				room: m.room,
+				why: "started",
+				permissions: DRIVEN_PERMISSIONS
+			}));
+			if (m.instruction) await beginTurn(s, m.id, m.instruction);
+		});
+	}
+	async function instruct(s, id, text) {
+		const server = s.record.driven.office;
+		if (!current(s)) return refuse(server, id, "not-found");
+		if (s.ending) return refuse(server, id, "busy", { detail: CLOSING });
+		if (s.turn) return refuse(server, id, "busy", { detail: BUSY });
+		if (!s.child) {
+			const st = await o.settings();
+			if (heldIn(s.record.driven.project) >= st.drivenPerProject) return refuse(server, id, "cap-reached", {
+				limit: st.drivenPerProject,
+				detail: capReached(st.drivenPerProject)
+			});
+			const why = s.fromBefore ? "restored" : "reopened";
+			const problem = await open(s);
+			if (problem) return refuse(server, id, problem.reason, { detail: problem.detail });
+			s.fromBefore = false;
+			emit(s, () => ({
+				...driven,
+				kind: "held",
+				session: s.record.session,
+				room: s.record.driven.room,
+				why,
+				permissions: s.record.driven.permissions
+			}));
+		}
+		await beginTurn(s, id, text);
+	}
+	async function stop(s, id) {
+		if (!current(s)) return refuse(s.record.driven.office, id, "not-found");
+		const child = s.child;
+		if (child) {
+			s.ending = "stopped";
+			killTree(child, platform);
+			if (!await within(s.closed, KILL_WAIT_MS)) o.log(`driven session ${s.record.session}'s process ${child.pid} didn't end when stopped`);
+			s.ending = null;
+		}
+		emit(s, () => ({
+			...driven,
+			kind: "released",
+			session: s.record.session,
+			why: "stopped",
+			id
+		}));
+	}
+	async function handBack(s, id) {
+		if (!current(s)) return refuse(s.record.driven.office, id, "not-found");
+		if (s.child) {
+			s.ending = "handed-back";
+			await closeGently(s);
+			s.ending = null;
+		}
+		const session = s.record.session;
+		emit(s, () => ({
+			...driven,
+			kind: "released",
+			session,
+			why: "handed-back",
+			id
+		}));
+		emit(s, () => ({
+			...driven,
+			kind: "handed-back",
+			id,
+			session,
+			command: `claude --resume ${uuidOf(session)}`,
+			folder: s.record.folder
+		}));
+		o.log(`handed driven session ${session} back to its person, in ${s.record.folder}`);
+		forget(s);
+	}
+	async function closeIdle(s) {
+		if (!current(s) || !s.child || s.turn || s.ending) return;
+		s.ending = "idle-closed";
+		await closeGently(s);
+		s.ending = null;
+		o.log(`closed driven session ${s.record.session}: nothing happened in it for a while`);
+		emit(s, () => ({
+			...driven,
+			kind: "released",
+			session: s.record.session,
+			why: "idle-closed"
+		}));
+	}
+	async function output(s, id, turn) {
+		const server = s.record.driven.office;
+		const session = s.record.session;
+		let found;
+		if (turn !== void 0) {
+			const kept = s.turn === turn ? {
+				text: s.output,
+				cut: s.cut
+			} : s.outputs.get(turn);
+			if (!kept) return refuse(server, id, "unavailable", { detail: TURN_GONE });
+			found = kept;
+		} else {
+			const file = await transcriptOf(o.claudeDir, s.record.folder, uuidOf(session));
+			found = file ? await transcriptText(file).catch(() => ({
+				text: "",
+				cut: false
+			})) : {
+				text: "",
+				cut: false
+			};
+		}
+		const text = found.text.trim();
+		emit(s, async () => {
+			const matched = text ? await o.scan(text) : null;
+			if (matched) {
+				o.log(`withheld the output of ${turn ?? "the whole session"} in ${session}: it matches the secret pattern "${matched}"`);
+				return {
+					...driven,
+					kind: "output",
+					id,
+					session,
+					...turn !== void 0 ? { turn } : {},
+					text: WITHHELD,
+					withheld: { id: hold({
+						session,
+						...turn !== void 0 ? { turn } : {},
+						text
+					}) }
+				};
+			}
+			const c = cutEnd(text, MAX_OUTPUT_LENGTH);
+			return {
+				...driven,
+				kind: "output",
+				id,
+				session,
+				...turn !== void 0 ? { turn } : {},
+				text: c.text,
+				...c.cut || found.cut ? { cut: true } : {}
+			};
+		});
+	}
+	function release(s, id, withheldId) {
+		const w = withheld.get(withheldId);
+		if (!w || w.session !== s.record.session) return refuse(s.record.driven.office, id, "not-found", { detail: RELEASE_GONE });
+		withheld.delete(withheldId);
+		const c = cutEnd(w.text, MAX_OUTPUT_LENGTH);
+		emit(s, () => ({
+			...driven,
+			kind: "output",
+			id,
+			session: w.session,
+			...w.turn !== void 0 ? { turn: w.turn } : {},
+			text: c.text,
+			...c.cut ? { cut: true } : {}
+		}));
+	}
+	for (const r of o.registry.list()) if (r.kind === "driven" && r.driven) sessions.set(r.session, newSession(r, true));
+	prune();
+	return {
+		take(server, m) {
+			if (!offices.has(server)) return;
+			if (m.type === "drive-policy") {
+				policies.set(server, new Set(m.bypassAllowed.map((p) => p.toLowerCase())));
+				return;
+			}
+			if (m.by.id !== o.account.id) return refuse(server, m.id, "not-owner");
+			if (m.kind === "start") {
+				start(server, m).catch((err) => (o.log(`start ${m.id} failed: ${err?.stack ?? String(err)}`), refuse(server, m.id, "unavailable", { detail: NOT_STARTED })));
+				return;
+			}
+			const s = sessions.get(m.session);
+			if (!s || s.record.driven.office !== server) return refuse(server, m.id, "not-found");
+			if (s.record.driven.owner !== m.by.id) return refuse(server, m.id, "not-owner");
+			if (m.kind === "instruct") queue(s, () => instruct(s, m.id, m.text));
+			else if (m.kind === "stop") queue(s, () => stop(s, m.id));
+			else if (m.kind === "hand-back") queue(s, () => handBack(s, m.id));
+			else if (m.kind === "output") output(s, m.id, m.turn).catch((err) => o.log(`output ${m.id} failed: ${err.message}`));
+			else if (m.kind === "release") release(s, m.id, m.withheld);
+			else refuse(server, m.id, "no-prompt");
+		},
+		linked(server) {
+			const list = [...sessions.values()].filter((s) => s.record.driven.office === server).sort((a, b) => Number(!!b.child) - Number(!!a.child) || Date.parse(b.record.lastActivity) - Date.parse(a.record.lastActivity)).slice(0, 200).map((s) => ({
+				session: s.record.session,
+				room: s.record.driven.room,
+				held: !!s.child,
+				permissions: s.record.driven.permissions,
+				...s.turn ? { turn: s.turn } : {}
+			}));
+			sendTo(server, {
+				...driven,
+				kind: "holding",
+				sessions: list
+			});
+		},
+		held: () => [...sessions.values()].filter((s) => s.child || s.opening).length,
+		takeProblem: (by) => by?.id === o.account.id ? null : NOT_YOURS_TAKE,
+		async prepareTake(server, take) {
+			const project = (await o.projectOf(take.folder).catch(() => null) ?? take.folder).toLowerCase();
+			const st = await o.settings();
+			if (heldIn(project) >= st.drivenPerProject) return capReached(st.drivenPerProject);
+			takes.set(take.session, {
+				...take,
+				server,
+				project
+			});
+			if (takes.size > TAKES_KEPT) takes.delete(takes.keys().next().value);
+			return null;
+		},
+		taken(uuid) {
+			const t = takes.get(uuid);
+			if (!t) return;
+			takes.delete(uuid);
+			const at = iso(now());
+			const s = newSession({
+				kind: "driven",
+				pid: null,
+				spawned: null,
+				session: `claude-code:${uuid}`,
+				folder: t.folder,
+				started: at,
+				lastActivity: at,
+				state: "closed",
+				driven: {
+					room: t.room,
+					project: t.project,
+					office: t.server,
+					owner: t.by.id,
+					permissions: DRIVEN_PERMISSIONS,
+					transcript: false,
+					addDir: t.addDir,
+					name: t.name
+				}
+			}, false);
+			s.opening = true;
+			sessions.set(s.record.session, s);
+			queue(s, async () => {
+				const problem = await open(s);
+				if (problem) {
+					emit(s, () => ({
+						...driven,
+						kind: "error",
+						session: s.record.session,
+						text: problem.detail
+					}));
+					emit(s, () => ({
+						...driven,
+						kind: "released",
+						session: s.record.session,
+						why: "crashed"
+					}));
+					forget(s);
+					return;
+				}
+				prune();
+				emit(s, () => ({
+					...driven,
+					kind: "held",
+					session: s.record.session,
+					room: t.room,
+					why: "started",
+					permissions: DRIVEN_PERMISSIONS
+				}));
+				await beginTurn(s, uuid, t.prompt);
+			});
+		},
+		close() {
+			for (const s of sessions.values()) {
+				if (!s.child) continue;
+				s.ending = "stopped";
+				killTree(s.child, platform);
+			}
+			o.registry.closeSync();
+		},
+		settled: () => busy === 0 ? Promise.resolve() : new Promise((resolve) => waiting.push(resolve))
+	};
 }
 //#endregion
 //#region src/runner/environment.ts
@@ -12507,13 +13748,24 @@ async function worker() {
 	for (const { server } of offices.filter((o) => o.plainRefused)) log(`the runner doesn't answer through ${server}: it is plain ws:// to another machine; use wss://, or set "allowPlainWs": true in config.json`);
 	if (offices.every((o) => o.plainRefused)) return 0;
 	await settings();
+	const registry = createRegistry({
+		file: registryPath(claudeDir),
+		log
+	});
+	await registry.restore();
+	const binary = () => claudeBinary(claudeDir, process.env, process.platform, os.homedir());
 	const answerer = createClaudeAnswerer({
 		claudeDir,
-		binary: () => claudeBinary(claudeDir, process.env, process.platform, os.homedir()),
+		binary,
 		model: async () => (await settings()).claudeModel,
-		config
+		config,
+		track: registry.track
 	});
-	process.on("exit", () => answerer.close());
+	let driver = null;
+	process.on("exit", () => {
+		answerer.close();
+		driver?.close();
+	});
 	const git = createRunGit();
 	const gitMs = async () => (await settings()).gitTimeoutSeconds * 1e3;
 	const told = (err) => {
@@ -12550,6 +13802,9 @@ async function worker() {
 	const forks = createForkSlots();
 	const answering = offices.filter((o) => !o.plainRefused);
 	let send = (_index) => () => {};
+	let live = (_index) => (_message) => false;
+	const isDir = (p) => fs.stat(p).then((s) => s.isDirectory(), () => false);
+	const drives = [];
 	const runnerFor = (office, index) => {
 		const { server } = office;
 		const pairing = createPairing({
@@ -12575,6 +13830,19 @@ async function worker() {
 			await approved.refresh();
 			return takesFrom(homeIo, approved.repos());
 		};
+		drives[index] = {
+			server,
+			send: (message) => live(index)(message),
+			folder: async (roomSessions) => {
+				for (const session of roomSessions) {
+					const lead = await answerer.lead(session);
+					if (!lead || !await isDir(lead.cwd)) continue;
+					await approved.refresh();
+					if (await approvedHome(lead.cwd, homeIo, approved.repos()) !== null) return lead.cwd;
+				}
+				return null;
+			}
+		};
 		return {
 			pairing,
 			runner: createRunner({
@@ -12586,7 +13854,7 @@ async function worker() {
 				scan: scanText,
 				send: (message) => send(index)(message),
 				log,
-				isDir: (p) => fs.stat(p).then((s) => s.isDirectory(), () => false),
+				isDir,
 				isReported: async (session, lead) => {
 					const id = forkableId(session);
 					const lock = id ? await readLock(lockPath(claudeDir, id)) : null;
@@ -12633,14 +13901,22 @@ async function worker() {
 						platform: process.platform,
 						env: process.env,
 						settings,
-						claude: () => claudeBinary(claudeDir, process.env, process.platform, os.homedir()),
+						claude: binary,
 						claudeJson,
 						scan: scanText,
 						log,
-						orca: takeOrca
+						orca: takeOrca,
+						driven: {
+							problem: (by) => driver.takeProblem(by),
+							prepare: (take) => driver.prepareTake(server, take)
+						},
+						track: registry.track
 					});
 					if (taken.session) await recordTakenOffice(claudeDir, taken.session, server).catch(() => {});
 					return taken;
+				},
+				onTaken: (message, taken) => {
+					if (message.mode === "driven" && message.session && taken.session) driver.taken(message.session);
 				},
 				focus: (handoff) => focusHandoff(handoff, {
 					claudeDir,
@@ -12652,6 +13928,18 @@ async function worker() {
 		};
 	};
 	const answerers = answering.map(runnerFor);
+	const drive = createDriver({
+		claudeDir,
+		account,
+		offices: drives,
+		registry,
+		binary,
+		settings,
+		scan: scanText,
+		log,
+		projectOf: async (folder) => (await homeIo.projectOf(await homeIo.resolve(folder), folder)).id
+	});
+	driver = drive;
 	const links = answerOffices({
 		offices: answering,
 		name: (office) => office.server,
@@ -12663,6 +13951,8 @@ async function worker() {
 				emit: emitFor(office.server),
 				pairing,
 				onMessage: (message) => runner.take(message),
+				onDrive: (message) => drive.take(office.server, message),
+				onOpen: () => drive.linked(office.server),
 				onNotWanted: said.notWanted,
 				onPairingEnded: said.unpaired,
 				hello: {
@@ -12671,19 +13961,22 @@ async function worker() {
 					account,
 					machine: { name: os.hostname() },
 					...hasOrca ? { orca: true } : {},
-					...hasDesktop ? { desktop: true } : {}
+					...hasDesktop ? { desktop: true } : {},
+					drive: true
 				}
 			});
 		},
 		paired: async (office) => !!pairingEntry(await readPairing(pairingPath(claudeDir)), office.server, account.id)?.credential,
 		idle: () => answerers.every((a) => a.runner.idle()),
 		lit: async () => anyRoomSince(io, path.join(claudeDir, "projects"), Date.now() - askableMs(await config().catch(() => first))),
+		keep: async () => drive.held() > 0 || (await settings()).startAtLogin,
 		gone: new Promise((resolve) => process.stdin.on("end", resolve).on("error", resolve).resume()),
 		log,
 		checkMs: CHECK_MS,
 		holdOffMs: HOLD_OFF_MS
 	});
 	send = links.sender;
+	live = links.live;
 	const ended = await links.ended;
 	return ended === "not-wanted" ? 3 : ended === "unpaired" ? 4 : 0;
 }

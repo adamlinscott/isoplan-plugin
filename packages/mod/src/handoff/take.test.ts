@@ -7,6 +7,7 @@ import { nodeIo } from "../data-layer/io.js";
 import { createRunGit, pushHandoff, type RunGit } from "./git.js";
 import { fakeClaude, fakeOrca, git, remoteAndClone, workspace } from "./fixture.js";
 import { orcaRunner } from "./orca.js";
+import type { PreparedTake } from "../runner/session.js";
 import { checkoutHere, findClone, findWorkspace, launch, onTheWire, parseSetup, sessionArgv, takeHandoff, trustFolder, trustKey, type Background, type Launch, type TakeOptions } from "./take.js";
 
 // Every test here drives real git, a few dozen spawns each, which is slow on Windows under load.
@@ -110,6 +111,30 @@ test("headless: a session claude agents doesn't list is reported, not taken", as
   const taken = await takeHandoff({ handoff: t.handoff, mode: "headless", session: SESSION }, { ...t.options, agents: async () => [] });
   expect(taken.session).toBe(undefined);
   expect(taken.failures).toEqual([{ step: "open", output: expect.stringContaining("doesn't list session") }]);
+});
+
+test("driven: the same worktree and setup, the worktree alone trusted, then the driver readies the session under the server's session id, with the take's prompt and the brief's folder; nothing opens", async () => {
+  const t = await handedOver("h2d", { command: "node -e \"require('fs').writeFileSync('setup-ran.txt', 'yes')\"" });
+  const prepared: PreparedTake[] = [];
+  const by = { id: "claude:sam", name: "Sam" };
+  const taken = await takeHandoff({ handoff: t.handoff, mode: "driven", session: SESSION, by, room: "room-1" }, { ...t.options, driven: { problem: () => null, prepare: async (p) => (prepared.push(p), null) } });
+  expect(taken).toEqual({ type: "taken", v: 1, handoff: "h2d", session: `claude-code:${SESSION}`, failures: [] });
+  expect([t.opened, t.started]).toEqual([[], []]);
+  const dir = `${t.receiver.clone}-handoff-h2d`;
+  expect(fs.readFileSync(path.join(dir, "setup-ran.txt"), "utf8")).toBe("yes");
+  const folder = path.join(t.claudeDir, "isoplan", "handoffs", "h2d");
+  expect(prepared).toEqual([{ session: SESSION, folder: dir, prompt: expect.stringMatching(/^Isoplan handoff h2d: you are taking this work over\. Read its brief in /), name: "Isoplan handoff h2d", addDir: folder, room: "room-1", by }]);
+  expect(JSON.parse(fs.readFileSync(t.claudeJson, "utf8")).projects[trustKey(dir, "win32")]).toEqual({ hasTrustDialogAccepted: true });
+});
+
+test("driven: for someone other than the runner's own person nothing is made; past the cap the take says so, and where the worktree is", async () => {
+  const t = await handedOver("h2e");
+  const notYours = await takeHandoff({ handoff: t.handoff, mode: "driven", session: SESSION, by: { id: "claude:bob", name: "Bob" }, room: "room-1" }, { ...t.options, driven: { problem: () => "not yours", prepare: async () => null } });
+  expect(notYours).toEqual({ type: "taken", v: 1, handoff: "h2e", failures: [{ step: "open", output: "not yours" }] });
+  expect(fs.existsSync(`${t.receiver.clone}-handoff-h2e`)).toBe(false);
+  const full = await takeHandoff({ handoff: t.handoff, mode: "driven", session: SESSION, by: { id: "claude:sam", name: "Sam" }, room: "room-1" }, { ...t.options, driven: { problem: () => null, prepare: async () => "This project already has 4 sessions running from the floor on this computer." } });
+  expect(full.session).toBe(undefined);
+  expect(full.failures).toEqual([{ step: "open", output: `This project already has 4 sessions running from the floor on this computer. The worktree is ${t.receiver.clone}-handoff-h2e.` }]);
 });
 
 // A take into Orca with the fake Orca CLI: what it was asked, and the take's options that use it.

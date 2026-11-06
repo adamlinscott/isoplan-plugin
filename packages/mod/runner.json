@@ -21,5 +21,9 @@
   "repoSearchDepth": 3,
   "askPolls": 6,
   "askPollSeconds": 10,
-  "startAtLogin": true
+  "startAtLogin": true,
+  "drivenIdleMinutes": 30,
+  "drivenPerProject": 4,
+  "drivenCloseSeconds": 30,
+  "drivenStartSeconds": 120
 }

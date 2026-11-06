@@ -37,7 +37,8 @@
 // `take`, with how to open its session; each take (the session id the server chose) runs once, however
 // often it is sent, and what it did goes back as `taken`. A `drop` naming a take's id (the server
 // cancelled it, or it timed out there) tells the take, which then doesn't open the Claude app; and a
-// take still running after takeCapMinutes is given up: `taken` says so, and the take is told it was dropped. owner-answer requests go to the live session, not
+// take still running after takeCapMinutes is given up: `taken` says so, and the take is told it was dropped. Once a take's own
+// `taken` has gone, `onTaken` is told, so a take as a driven session opens it only then (session.ts). owner-answer requests go to the live session, not
 // the runner (#50). A focus request (Focus this session, for a handoff this machine took into Orca)
 // goes to `focus`, and is answered with a focus reply, or refused `unavailable` saying why.
 
@@ -86,6 +87,8 @@ export interface RunnerOptions {
   prepareBrief?: (lead: Lead, handoff: string) => Promise<{ files: string[] | null; note: string }>;
   /** Takes a handoff on this machine (#48); without it, handoffs are logged as not handled. `dropped` says whether the server has dropped the take since, or it was given up. */
   take?: (message: HandoffMessage, dropped: () => boolean) => Promise<TakenMessage>;
+  /** Told once a take's own `taken` has been sent (not one given up), so a driven take's session opens after it. */
+  onTaken?: (message: HandoffMessage, taken: TakenMessage) => void;
   /** Brings a handoff's session to the front in Orca: null when it is, else why not. Without it, focus requests are refused. */
   focus?: (handoff: string) => Promise<string | null>;
   /** The fork slots, shared by every office's runner on the machine; without it, this runner's own. */
@@ -142,7 +145,7 @@ const FAILED: Record<FailureKind, string> = {
 // Ids of replies dropped from the held set, remembered so a release for one says so.
 const REMEMBER_DROPPED = 200;
 
-export function createRunner({ answerer, ledger, settings, prompts, scan, send, log, isDir, isReported, push, prepareBrief, take, focus, forks = createForkSlots(), now = Date.now }: RunnerOptions): Runner {
+export function createRunner({ answerer, ledger, settings, prompts, scan, send, log, isDir, isReported, push, prepareBrief, take, onTaken, focus, forks = createForkSlots(), now = Date.now }: RunnerOptions): Runner {
   const rooms = new Map<string, Promise<void>>(); // each room's last queued request
   const running = new Set<string>(); // ids queued or running
   const finished = new Map<string, Outgoing>(); // id → what was last sent for it
@@ -350,7 +353,14 @@ export function createRunner({ answerer, ledger, settings, prompts, scan, send, 
             }, s.takeCapMinutes * 60000);
           });
           void take(message, () => droppedTakes.has(takeId))
-            .then(finish, (err: unknown) => (log(`handoff ${handoff.id}: taking it failed: ${(err as Error)?.stack ?? String(err)}`), finish(null)))
+            .then(
+              (m) => {
+                const first = !over;
+                finish(m);
+                if (first) onTaken?.(message, m);
+              },
+              (err: unknown) => (log(`handoff ${handoff.id}: taking it failed: ${(err as Error)?.stack ?? String(err)}`), finish(null)),
+            )
             .finally(() => (runningTakes.delete(takeId), droppedTakes.delete(takeId)));
         }
         return;

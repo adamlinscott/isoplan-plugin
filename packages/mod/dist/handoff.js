@@ -7371,9 +7371,18 @@ new TextEncoder();
 /** Ends a process and everything it started: on Windows `kill` reaches only the process itself. */
 function killTree(child, platform = process.platform) {
 	if (child.exitCode !== null || child.signalCode !== null || child.pid === void 0) return;
+	killPid(child.pid, platform, () => child.kill("SIGKILL"));
+}
+/**
+* Ends the process `pid` and everything it started, as killTree does, for a process this runner
+* didn't start itself (one an earlier run left, from the process registry). Off Windows the process
+* leads its own group (spawned detached); `fallback` runs when it doesn't, and by default kills the
+* process alone.
+*/
+function killPid(pid, platform = process.platform, fallback = () => process.kill(pid, "SIGKILL")) {
 	if (platform === "win32") spawnSync("taskkill", [
 		"/pid",
-		String(child.pid),
+		String(pid),
 		"/T",
 		"/F"
 	], {
@@ -7381,9 +7390,11 @@ function killTree(child, platform = process.platform) {
 		stdio: "ignore"
 	});
 	else try {
-		process.kill(-child.pid, "SIGKILL");
+		process.kill(-pid, "SIGKILL");
 	} catch {
-		child.kill("SIGKILL");
+		try {
+			fallback();
+		} catch {}
 	}
 }
 //#endregion
