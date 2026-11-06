@@ -260,7 +260,7 @@ const getJson = async (url, headers) => {
 };
 /** While the machine waits to be paired the list is asked for again this soon, and after a failure this soon. */
 const PAIR_POLL_MS = 5e3;
-const RETRY_MS = 3e4;
+const RETRY_MS$1 = 3e4;
 /** A rename the file system refuses for a moment (a scanner holding the file, on Windows) is tried this often. */
 const RENAME_TRIES = 5;
 const isList = (value) => {
@@ -325,7 +325,7 @@ function createApproved({ server, file, pairing, refreshMs, maxAgeMs, log, get =
 			tell(`couldn't read which repos the office takes: ${String(err?.message ?? err)}`);
 			problem = "unreachable";
 			failedAt = now();
-			nextAt = failedAt + RETRY_MS;
+			nextAt = failedAt + RETRY_MS$1;
 			return "unreachable";
 		}
 		if (token === null) {
@@ -384,7 +384,7 @@ function createApproved({ server, file, pairing, refreshMs, maxAgeMs, log, get =
 		}
 		tell(`couldn't read which repos the office takes from ${server}: ${answer.status ? `it answered ${answer.status}` : String(answer.body)}`);
 		problem = "unreachable";
-		nextAt = at + RETRY_MS;
+		nextAt = at + RETRY_MS$1;
 		return "unreachable";
 	}
 	function run(force, ask = false) {
@@ -7252,9 +7252,10 @@ async function accountOf(io, claudeJson, cwd) {
 * remote, the main checkout's folder on this machine (so every worktree of one repo is one
 * project). A folder git can't place is its own local project. On a file system that ignores case
 * (Windows, macOS) a local project's id is lower-cased, so one folder reached in two spellings is
-* one project, in the hello and in every edit alike.
+* one project, in the hello and in every edit alike. With `names`, a remote naming a GitHub repo by
+* an old name gives the repo's current id (remote-names.ts), so an old clone is the same project.
 */
-async function projectOf(run, where, cwd, machine, caseless = process.platform === "win32" || process.platform === "darwin") {
+async function projectOf(run, where, cwd, machine, { caseless = process.platform === "win32" || process.platform === "darwin", names = null } = {}) {
 	let remote = null;
 	if (run && where) {
 		const r = await Promise.resolve(run([
@@ -7270,6 +7271,7 @@ async function projectOf(run, where, cwd, machine, caseless = process.platform =
 		machine,
 		root
 	});
+	if (remote !== null && names && !project.id.startsWith("local:")) return names.current(project);
 	return caseless && project.id.startsWith("local:") ? {
 		...project,
 		id: project.id.toLowerCase()
@@ -7378,19 +7380,123 @@ async function candidatesOf(folder, io) {
 		workspace: true
 	};
 }
-/** A HomeIo on this machine, for the runner and the commands. */
-function machineHomeIo(workspaceRepos, machine = os.hostname()) {
+/** A HomeIo on this machine, for the runner and the commands, naming GitHub repos as `names` does. */
+function machineHomeIo(workspaceRepos, names = null, machine = os.hostname()) {
 	const io = nodeIo();
 	const git = createGit(io);
 	return {
 		resolve: (dir) => git.resolve(dir),
-		projectOf: (where, dir) => projectOf(io.run, where, dir, machine),
+		projectOf: (where, dir) => projectOf(io.run, where, dir, machine, { names }),
 		stat: (p) => Promise.resolve(io.stat(p)),
 		listDir: (d) => io.listDir(d),
 		home: os.homedir(),
 		workspaceRepos
 	};
 }
+//#endregion
+//#region src/data-layer/remote-names.ts
+/** Where the answers are kept. */
+const remoteNamesPath = (claudeDir) => path.join(claudeDir, "isoplan", "remote-names.json");
+const ANSWER_MS = 864e5;
+const RETRY_MS = 3e5;
+/**
+* The repos' current names. With `ask`, for a long-lived process, GitHub is asked as above; without
+* it the cache is only read.
+*/
+function remoteNames({ file, ask = null, now = Date.now }) {
+	let entries = null;
+	const asking = /* @__PURE__ */ new Map();
+	const load = () => entries ??= readEntries(file);
+	const stale = (e) => now() - e.at >= (e.failures ? Math.min(ANSWER_MS, RETRY_MS * 2 ** (e.failures - 1)) : ANSWER_MS);
+	const refresh = (id, owner, repo) => {
+		const running = asking.get(id);
+		if (running) return running;
+		const done = (async () => {
+			const onDisk = (await readEntries(file))[id];
+			const known = await load();
+			if (onDisk && !stale(onDisk)) return known[id] = onDisk;
+			const before = onDisk ?? known[id];
+			const name = await ask(owner, repo).catch(() => null);
+			const entry = name ? {
+				at: now(),
+				name
+			} : {
+				at: now(),
+				...before?.name && { name: before.name },
+				failures: (before?.failures ?? 0) + 1
+			};
+			known[id] = entry;
+			await writeEntry(file, id, entry).catch(() => {});
+			return entry;
+		})().finally(() => asking.delete(id));
+		asking.set(id, done);
+		return done;
+	};
+	const current = async (project) => {
+		const m = /^github\.com\/([^/]+)\/([^/]+)$/.exec(project.id);
+		if (!m) return project;
+		let entry = (await load())[project.id];
+		if (ask && !entry) entry = await refresh(project.id, m[1], m[2]);
+		else if (ask && stale(entry)) refresh(project.id, m[1], m[2]).catch(() => {});
+		const name = entry?.name;
+		if (!name || name.toLowerCase() === `${m[1]}/${m[2]}`) return project;
+		return {
+			id: `github.com/${name}`.toLowerCase(),
+			name: name.split("/")[1]
+		};
+	};
+	const projectOfUrl = (remote) => projectId(remote, {
+		machine: "",
+		root: ""
+	});
+	return {
+		current,
+		idOf: async (remote) => (await current(projectOfUrl(remote))).id,
+		async urlOf(remote) {
+			const was = projectOfUrl(remote);
+			const now = await current(was);
+			return now.id === was.id ? remote : renamedUrl(remote, now.id.slice(11));
+		}
+	};
+}
+function renamedUrl(remote, name) {
+	const git = (p) => /\.git\/?$/.test(p) ? ".git" : "";
+	if (remote.includes("://")) {
+		const url = new URL(remote);
+		url.pathname = `/${name}${git(url.pathname)}`;
+		return url.toString();
+	}
+	return remote.replace(/:([^:]*)$/, (_, p) => `:${name}${git(p)}`);
+}
+async function readEntries(file) {
+	const parsed = await fs.readFile(file, "utf8").then((text) => JSON.parse(text), () => null);
+	const out = {};
+	if (!parsed || typeof parsed !== "object") return out;
+	for (const [id, e] of Object.entries(parsed)) {
+		if (!e || typeof e.at !== "number") continue;
+		out[id] = {
+			at: e.at,
+			...typeof e.name === "string" && { name: e.name },
+			...typeof e.failures === "number" && e.failures > 0 && { failures: e.failures }
+		};
+	}
+	return out;
+}
+async function writeEntry(file, id, entry) {
+	const all = {
+		...await readEntries(file),
+		[id]: entry
+	};
+	await fs.mkdir(path.dirname(file), { recursive: true });
+	const temp = `${file}.${process.pid}.tmp`;
+	await fs.writeFile(temp, JSON.stringify(all, null, 2) + "\n");
+	await fs.rename(temp, file).catch(async (err) => {
+		await fs.rm(temp, { force: true }).catch(() => {});
+		throw err;
+	});
+}
+/** The resolver a one-shot command uses: it only reads the cache. */
+const cachedRemoteNames = (claudeDir) => remoteNames({ file: remoteNamesPath(claudeDir) });
 //#endregion
 //#region src/repos/repos.ts
 /**
@@ -7464,7 +7570,7 @@ else {
 	}, claudeJson, os.homedir());
 	const session = process.env.CLAUDE_CODE_SESSION_ID;
 	const locked = session && /^[\w-]+$/.test(session) ? (await readLock(lockPath(claudeDir, session)))?.extra.cwd : void 0;
-	const { projects, workspace } = await candidatesOf(typeof locked === "string" && locked ? locked : process.env.CLAUDE_PROJECT_DIR || process.cwd(), machineHomeIo(config.workspaceRepos));
+	const { projects, workspace } = await candidatesOf(typeof locked === "string" && locked ? locked : process.env.CLAUDE_PROJECT_DIR || process.cwd(), machineHomeIo(config.workspaceRepos, cachedRemoteNames(claudeDir)));
 	const lines = await Promise.all(officesOf(config).map(async (office) => {
 		const answer = office.plainRefused ? { kind: "plain" } : await checkOffice({
 			server: office.server,

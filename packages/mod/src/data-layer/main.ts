@@ -85,6 +85,7 @@ import { nodeIo } from "./io.js";
 import { createLink, type Link } from "./link.js";
 import { lateTake, prepareQuestions, relayOwnerAnswer } from "./owner-answers.js";
 import { createPairing, pairingLockPath, pairingPath, pairingWriteLockPath, type Pairing } from "./pairing.js";
+import { askingRemoteNames } from "./remote-names.js";
 import { openReportHold, releasedPath, type ReportHold } from "./reports.js";
 import { cleanTitle, nextTitle, TITLE_SYSTEM, type TitleCache } from "./titles.js";
 
@@ -156,6 +157,9 @@ async function main(argv: string[]): Promise<number> {
   // The project of each repo an edit or command lands in, by its common dir, looked up again as
   // git's answers are (#74).
   const projects = new Map<string, { at: number; project: ReturnType<typeof projectOf> }>();
+  // A GitHub repo's current name, asked for before a remote first seen is reported, so an old clone
+  // never reports as a second project (remote-names.ts).
+  const names = askingRemoteNames(claudeDir);
   const source = createClaudeCode({ ...io, claudeDir, home: os.homedir() });
 
   // Ends when stdout can no longer be written, or the parent is gone (checked each pass). On POSIX
@@ -508,7 +512,7 @@ async function main(argv: string[]): Promise<number> {
       const key = pathKey(where.commonDir);
       const hit = projects.get(key);
       if (hit && now - hit.at <= gitOpts.maxAgeMs) return hit.project;
-      const project = projectOf(io.run, where, where.toplevel, machine);
+      const project = projectOf(io.run, where, where.toplevel, machine, { names });
       projects.set(key, { at: now, project });
       return project;
     };
@@ -516,7 +520,7 @@ async function main(argv: string[]): Promise<number> {
     // sent, not even a hello; one already open closes. A workspace reports as the first of its repos
     // the office takes. It connects once the list has one.
     if (!candidates || now - candidatesAt > gitOpts.maxAgeMs) {
-      const io2 = { resolve, projectOf: (where: Where | null, dir: string) => projectOf(io.run, where, dir, machine), stat: (f: string) => io.stat(f), listDir: (d: string) => io.listDir(d) };
+      const io2 = { resolve, projectOf: (where: Where | null, dir: string) => projectOf(io.run, where, dir, machine, { names }), stat: (f: string) => io.stat(f), listDir: (d: string) => io.listDir(d) };
       candidates = await candidatesOf(cwd, { ...io2, home: os.homedir(), workspaceRepos: config.workspaceRepos });
       candidatesAt = now;
     }

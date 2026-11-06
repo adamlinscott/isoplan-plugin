@@ -47,6 +47,7 @@ import path from "node:path";
 import { projectId, type HandoffRepo } from "@isoplan/protocol";
 import { killTree } from "../runner/claude.js";
 import { pathKey } from "../data-layer/git.js";
+import type { RemoteNames } from "../data-layer/remote-names.js";
 
 /** A new handoff id: short, and safe in a branch name. */
 export const newHandoffId = () => randomBytes(5).toString("hex");
@@ -171,6 +172,12 @@ export function sameRemote(a: string, b: string): boolean {
   if (!pa.startsWith("local:") || !pb.startsWith("local:")) return pa === pb;
   const asPath = (r: string) => pathKey(path.resolve(r.replace(/^file:\/\//, ""))).replace(/(\/\.git|\.git)$/, "");
   return asPath(a) === asPath(b);
+}
+
+/** Whether two remote URLs name the same repository, an old and the current name of one GitHub repo counted as one (remote-names.ts). */
+export async function sameRepo(a: string, b: string, names: RemoteNames | null = null): Promise<boolean> {
+  if (sameRemote(a, b)) return true;
+  return !!names && (await names.idOf(withoutCredentials(a))) === (await names.idOf(withoutCredentials(b)));
 }
 
 /** The repo's remotes with their fetch and push URLs (which may hold spaces: a local path). */
@@ -511,6 +518,8 @@ export interface PushOptions {
   prepared?: Prepared;
   /** Which repos the office takes, for a prepare made here. */
   takes?: Takes;
+  /** GitHub repos' current names: the brief names a repo that moved by its current remote. */
+  names?: RemoteNames | null;
 }
 
 /**
@@ -536,7 +545,7 @@ interface Ready extends PreparedRepo {
  * records names its push URL, where the branch is. Nothing is pushed until every repo's commit is
  * made and scanned. A push that fails after others went names them. Throws a HandoffGitError.
  */
-export async function pushHandoff(run: RunGit, cwd: string, id: string, timeoutMs: number, { scan, pushAnyway = {}, depth, prepared, takes }: PushOptions = {}): Promise<Pushed> {
+export async function pushHandoff(run: RunGit, cwd: string, id: string, timeoutMs: number, { scan, pushAnyway = {}, depth, prepared, takes, names }: PushOptions = {}): Promise<Pushed> {
   const { repos } = prepared ?? (await prepare(run, cwd, timeoutMs, depth, undefined, takes));
   const temp = await fs.mkdtemp(path.join(os.tmpdir(), "isoplan-handoff-"));
   const ready: Ready[] = [];
@@ -560,7 +569,8 @@ export async function pushHandoff(run: RunGit, cwd: string, id: string, timeoutM
       if (err instanceof HandoffGitError && !err.pushed.length && done.length) throw new HandoffGitError(err.kind, err.detail, err.repo, done);
       throw err;
     }
-    pushed.push({ path: r.path, remote: withoutCredentials(r.url), branch: r.branch, commit: r.commit });
+    const remote = withoutCredentials(r.url);
+    pushed.push({ path: r.path, remote: names ? await names.urlOf(remote) : remote, branch: r.branch, commit: r.commit });
   }
   return { repos: pushed };
 }

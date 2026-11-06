@@ -49,6 +49,7 @@ import { PROTOCOL_VERSION, type DrivenMessage, type RefusalMessage, type ReplyMe
 import { loadConfig, loadSettings, officesOf, type Office } from "../data-layer/config.js";
 import { approvedPath, createApproved } from "../data-layer/approved.js";
 import { approvedHome, machineHomeIo, takesFrom } from "../data-layer/home.js";
+import { askingRemoteNames } from "../data-layer/remote-names.js";
 import { accountOf, claudePaths } from "../data-layer/identity.js";
 import { nodeIo } from "../data-layer/io.js";
 import { createLink } from "../data-layer/link.js";
@@ -209,7 +210,9 @@ async function worker(): Promise<number> {
   };
   await checkDesktop().catch((err: Error) => log(`couldn't check whether the Claude app can take handoffs here: ${err.message}`));
   setInterval(() => void checkDesktop().catch(() => {}), DESKTOP_CHECK_MS).unref();
-  const homeIo = machineHomeIo(first.workspaceRepos);
+  // A GitHub repo's current name, asked for before a remote first seen is used (remote-names.ts).
+  const names = askingRemoteNames(claudeDir);
+  const homeIo = machineHomeIo(first.workspaceRepos, names);
   const ledger = await openLedger(path.join(isoplanDir, "runner", "ledger.json"));
   // What each brief's prepare found, by handoff, for its push and any push anyway after it.
   const preparedFor = new Map<string, Prepared>();
@@ -293,7 +296,7 @@ async function worker(): Promise<number> {
         return { files, note: handoffNote({ branch: handoffBranch(handoff), from, files, at: new Date(), repos, left }) };
       },
       push: async (_session, lead, handoff, pushAnyway) => {
-        const pushed = await pushHandoff(git, lead.cwd, handoff, await gitMs(), { scan: scanText, depth: (await settings()).repoSearchDepth, prepared: preparedFor.get(handoff), takes: await takes(), ...(pushAnyway ? { pushAnyway } : {}) }).catch((err) => Promise.reject(told(err)));
+        const pushed = await pushHandoff(git, lead.cwd, handoff, await gitMs(), { scan: scanText, depth: (await settings()).repoSearchDepth, prepared: preparedFor.get(handoff), takes: await takes(), names, ...(pushAnyway ? { pushAnyway } : {}) }).catch((err) => Promise.reject(told(err)));
         return "held" in pushed ? pushed : pushed.repos;
       },
       // The session it opens asks the room in this office (handoff/taken-office.ts).
@@ -314,6 +317,7 @@ async function worker(): Promise<number> {
           orca: takeOrca,
           driven: { problem: (by) => driver!.takeProblem(by), prepare: (take) => driver!.prepareTake(server, take) },
           track: registry.track,
+          names,
         });
         if (taken.session) await recordTakenOffice(claudeDir, taken.session, server).catch(() => {});
         return taken;

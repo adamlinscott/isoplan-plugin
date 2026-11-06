@@ -10,6 +10,7 @@ import { createGit, join, pathKey, relativeTo, type MaybePromise, type Stat, typ
 import { cachedRepos } from "./approved.js";
 import { projectOf } from "./identity.js";
 import { nodeIo, type DirEntry } from "./io.js";
+import type { RemoteNames } from "./remote-names.js";
 
 export interface HomeIo {
   resolve(dir: string): Promise<Where | null>;
@@ -70,13 +71,13 @@ export const takesFrom =
     return !!where && repos!.has((await io.projectOf(where, dir)).id.toLowerCase());
   };
 
-/** A HomeIo on this machine, for the runner and the commands. */
-export function machineHomeIo(workspaceRepos: number, machine = os.hostname()): HomeIo {
+/** A HomeIo on this machine, for the runner and the commands, naming GitHub repos as `names` does. */
+export function machineHomeIo(workspaceRepos: number, names: RemoteNames | null = null, machine = os.hostname()): HomeIo {
   const io = nodeIo();
   const git = createGit(io);
   return {
     resolve: (dir) => git.resolve(dir),
-    projectOf: (where, dir) => projectOf(io.run, where, dir, machine),
+    projectOf: (where, dir) => projectOf(io.run, where, dir, machine, { names }),
     stat: (p) => Promise.resolve(io.stat(p)),
     listDir: (d) => io.listDir(d),
     home: os.homedir(),

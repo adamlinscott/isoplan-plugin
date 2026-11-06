@@ -9,6 +9,7 @@
 import { projectId, type HelloMessage, type Project } from "@isoplan/protocol";
 import type { MaybePromise, Run, Where } from "./git.js";
 import { dirname, normalize } from "./git.js";
+import type { RemoteNames } from "./remote-names.js";
 
 export type Account = HelloMessage["account"];
 
@@ -41,9 +42,10 @@ export async function accountOf(io: IdentityIo, claudeJson: string, cwd: string)
  * remote, the main checkout's folder on this machine (so every worktree of one repo is one
  * project). A folder git can't place is its own local project. On a file system that ignores case
  * (Windows, macOS) a local project's id is lower-cased, so one folder reached in two spellings is
- * one project, in the hello and in every edit alike.
+ * one project, in the hello and in every edit alike. With `names`, a remote naming a GitHub repo by
+ * an old name gives the repo's current id (remote-names.ts), so an old clone is the same project.
  */
-export async function projectOf(run: Run | null, where: Where | null, cwd: string, machine: string, caseless = process.platform === "win32" || process.platform === "darwin"): Promise<Project> {
+export async function projectOf(run: Run | null, where: Where | null, cwd: string, machine: string, { caseless = process.platform === "win32" || process.platform === "darwin", names = null }: { caseless?: boolean; names?: RemoteNames | null } = {}): Promise<Project> {
   let remote: string | null = null;
   if (run && where) {
     const r = await Promise.resolve(run(["git", "remote", "get-url", "origin"], { cwd: where.toplevel })).catch(() => null);
@@ -51,6 +53,7 @@ export async function projectOf(run: Run | null, where: Where | null, cwd: strin
   }
   const root = !where ? normalize(cwd) : /\/\.git$/.test(where.commonDir) ? dirname(where.commonDir) : where.toplevel;
   const project = projectId(remote, { machine, root });
+  if (remote !== null && names && !project.id.startsWith("local:")) return names.current(project);
   return caseless && project.id.startsWith("local:") ? { ...project, id: project.id.toLowerCase() } : project;
 }
 

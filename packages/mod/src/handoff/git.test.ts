@@ -2,7 +2,8 @@ import fs from "node:fs";
 import path from "node:path";
 import { expect, test, vi } from "vitest";
 import { tempRoot } from "../data-layer/fixture.js";
-import { addedLines, createRunGit, gitFailed, handoffNote, HandoffGitError, noPromptEnv, prepare, pushHandoff, remotesOf, sameRemote, untrackedLine, withoutCredentials, type Pushed } from "./git.js";
+import { remoteNames, remoteNamesPath } from "../data-layer/remote-names.js";
+import { addedLines, createRunGit, gitFailed, handoffNote, HandoffGitError, noPromptEnv, prepare, pushHandoff, remotesOf, sameRemote, sameRepo, untrackedLine, withoutCredentials, type Pushed } from "./git.js";
 import { git, remoteAndClone, workspace } from "./fixture.js";
 
 // Every test here drives real git, a few dozen spawns each, which is slow on Windows under load.
@@ -49,6 +50,23 @@ test("a dirty tree: tracked changes go to the handoff's branch alone; the tree, 
   fs.writeFileSync(path.join(clone, "app.js"), "console.log(3);\n");
   const again = repoOf(await pushHandoff(run, clone, "h1", MS));
   expect(git(remote, "show", `${again.commit}:app.js`)).toBe("console.log(3);");
+});
+
+test("a repo that moved on GitHub: the brief names its current remote, and its old and current names are one repo", async () => {
+  const { clone } = remoteAndClone(tempRoot());
+  git(clone, "remote", "set-url", "--push", "origin", "https://ada:token@github.com/adamlinscott/isoplan.git");
+  const asked: string[] = [];
+  const names = remoteNames({ file: remoteNamesPath(tempRoot()), ask: async (owner, repo) => (asked.push(`${owner}/${repo}`), owner === "adamlinscott" ? "isoplan-app/isoplan-app" : `${owner}/${repo}`) });
+  // The push itself goes to the clone's own push URL; only what the brief records changes.
+  const urls: string[] = [];
+  const recording: typeof run = (args, opts) => (args.includes("push") && urls.push(args.at(-2)!), args.includes("push") ? Promise.resolve({ code: 0, stdout: "", stderr: "", timedOut: false }) : run(args, opts));
+  fs.writeFileSync(path.join(clone, "app.js"), "console.log(3);\n");
+  expect(repoOf(await pushHandoff(recording, clone, "h1", MS, { names })).remote).toBe("https://github.com/isoplan-app/isoplan-app.git");
+  expect(urls).toEqual(["origin"]);
+  expect(await sameRepo("git@github.com:AdamLinscott/Isoplan.git", "https://github.com/isoplan-app/isoplan-app", names)).toBe(true);
+  expect(await sameRepo("git@github.com:adamlinscott/isoplan.git", "https://github.com/isoplan-app/isoplan-app")).toBe(false);
+  expect(await sameRepo("https://github.com/team/app", "https://github.com/team/api", names)).toBe(false);
+  expect(asked).toEqual(["adamlinscott/isoplan", "isoplan-app/isoplan-app", "team/app", "team/api"]);
 });
 
 test("a possible secret in what the push sends holds it, naming the file and what couldn't be checked; pushing anyway pushes that exact commit", async () => {

@@ -96,7 +96,8 @@ import type { NodeIo } from "../data-layer/io.js";
 import { atLeast, claudeCommand, claudeVersion, DESKTOP_MIN_VERSION, desktopPlatform } from "../runner/claude-binary.js";
 import { forkEnv, killTree, type Track } from "../runner/claude.js";
 import type { PreparedTake } from "../runner/session.js";
-import { handoffBranch, remotesOf, sameRemote, type RunGit } from "./git.js";
+import type { RemoteNames } from "../data-layer/remote-names.js";
+import { handoffBranch, remotesOf, sameRepo, type RunGit } from "./git.js";
 import type { RunOrca } from "./orca.js";
 
 /** The repo's own labelled settings file, at its top. */
@@ -168,15 +169,23 @@ export interface TakeOptions {
   driven?: { problem(by: { id: string } | undefined): string | null; prepare(take: PreparedTake): Promise<string | null> };
   /** Records the take into the Claude app's first turn in the process registry while it runs. */
   track?: Track;
+  /** GitHub repos' current names, so a clone that names the handoff's repo by an old name is found too. */
+  names?: RemoteNames | null;
 }
 
 /** The handoff's folder on this machine: its brief, launcher and setup log. */
 export const handoffDir = (claudeDir: string, id: string) => path.join(claudeDir, "isoplan", "handoffs", id);
 
+// The first of a repo's remotes with a URL that names the same repo as `remote` (git.ts sameRepo).
+async function remoteFor(remotes: { name: string; urls: string[] }[] | null, remote: string, names: RemoteNames | null): Promise<{ name: string; urls: string[] } | undefined> {
+  for (const r of remotes ?? []) for (const url of r.urls) if (await sameRepo(url, remote, names)) return r;
+  return undefined;
+}
+
 const tail = (text: string) => (text.length > OUTPUT_TAIL ? "…" + text.slice(-OUTPUT_TAIL) : text).trim();
 
 /** The main checkout of a clone of `remote` on this machine, the most recently used first, and that remote's name there; null with none. */
-export async function findClone(io: NodeIo, run: RunGit, projectsDir: string, remote: string, since: number, timeoutMs: number): Promise<{ dir: string; remote: string } | null> {
+export async function findClone(io: NodeIo, run: RunGit, projectsDir: string, remote: string, since: number, timeoutMs: number, names: RemoteNames | null = null): Promise<{ dir: string; remote: string } | null> {
   const tried = new Set<string>();
   for (const cwd of await recentFolders(io, projectsDir, since)) {
     const where = await run(["rev-parse", "--path-format=absolute", "--show-toplevel", "--git-common-dir"], { cwd, timeoutMs });
@@ -186,7 +195,7 @@ export async function findClone(io: NodeIo, run: RunGit, projectsDir: string, re
     const main = normalize(commonDir).endsWith("/.git") ? path.dirname(commonDir) : toplevel;
     if (tried.has(pathKey(main))) continue;
     tried.add(pathKey(main));
-    const match = (await remotesOf(run, main, timeoutMs))?.find((r) => r.urls.some((url) => sameRemote(url, remote)));
+    const match = await remoteFor(await remotesOf(run, main, timeoutMs), remote, names);
     if (match) return { dir: path.resolve(main), remote: match.name };
   }
   return null;
@@ -197,14 +206,14 @@ export async function findClone(io: NodeIo, run: RunGit, projectsDir: string, re
  * used session folder with a clone of one of `repos` at that repo's path in it, or the folder above
  * a session's repo that is one of them; null with none.
  */
-export async function findWorkspace(io: NodeIo, run: RunGit, projectsDir: string, repos: HandoffRepo[], since: number, timeoutMs: number): Promise<string | null> {
+export async function findWorkspace(io: NodeIo, run: RunGit, projectsDir: string, repos: HandoffRepo[], since: number, timeoutMs: number, names: RemoteNames | null = null): Promise<string | null> {
   const tried = new Set<string>();
   const holds = async (folder: string) => {
     for (const repo of repos) {
       const dir = path.join(folder, repo.path);
       const top = await run(["rev-parse", "--show-toplevel"], { cwd: dir, timeoutMs });
       if (top.code !== 0 || pathKey(top.stdout.trim()) !== pathKey(dir)) continue;
-      if ((await remotesOf(run, dir, timeoutMs))?.some((r) => r.urls.some((url) => sameRemote(url, repo.remote)))) return true;
+      if (await remoteFor(await remotesOf(run, dir, timeoutMs), repo.remote, names)) return true;
     }
     return false;
   };
@@ -626,7 +635,7 @@ export async function takeHandoff(message: Pick<HandoffMessage, "handoff" | "mod
     let dir: string;
     let clone: { dir: string; remote: string } | null = null;
     if (repo) {
-      clone = await findClone(o.io, o.run, projects, repo.remote, since, timeoutMs);
+      clone = await findClone(o.io, o.run, projects, repo.remote, since, timeoutMs, o.names);
       if (!clone) {
         await fail("worktree", `No clone of ${repo.remote} was found on ${o.machine}: none of its Claude Code sessions from the last ${s.cloneSearchDays} days ran in one. Open Claude Code once in your clone of the repo, then take the handoff again, or copy its prompt into a session there.`);
         return done();
@@ -651,7 +660,7 @@ export async function takeHandoff(message: Pick<HandoffMessage, "handoff" | "mod
         return done();
       }
       // A handoff from a plain folder above its repos: a plain folder beside the receiver's own.
-      const workspace = await findWorkspace(o.io, o.run, projects, subs, since, timeoutMs);
+      const workspace = await findWorkspace(o.io, o.run, projects, subs, since, timeoutMs, o.names);
       if (!workspace) {
         await fail("worktree", `No folder holding a clone of ${subs.map((r) => r.remote).join(" or ")} at its path in the handoff (${subs.map((r) => r.path).join(", ")}) was found on ${o.machine}: none of its Claude Code sessions from the last ${s.cloneSearchDays} days ran in one. Open Claude Code once in your folder of these repos, then take the handoff again, or copy its prompt into a session there.`);
         return done();
@@ -689,7 +698,7 @@ export async function takeHandoff(message: Pick<HandoffMessage, "handoff" | "mod
     // The repos under the folder, after setup, which may have cloned some of them on main.
     const failedRepos: string[] = [];
     for (const sub of subs) {
-      const failed = await repoAt(o.run, dir, sub, folder, timeoutMs, o.cloneFrom ?? onTheWire);
+      const failed = await repoAt(o.run, dir, sub, folder, timeoutMs, o.cloneFrom ?? onTheWire, o.names ?? null);
       if (!failed) continue;
       failedRepos.push(sub.path);
       await fail(failed.step, failed.error, sub.path);
@@ -870,7 +879,7 @@ async function resolved(run: RunGit, cwd: string, ref: string, timeoutMs: number
  * set up this folder. Returns the failed steps, each with the end of git's output and the repo it
  * was in when that is one under the folder, and the folder's own repo's remote name.
  */
-export async function checkoutHere(run: RunGit, cwd: string, handoff: Handoff, folder: string, timeoutMs: number, { cloneFrom = onTheWire }: { cloneFrom?: (remote: string) => boolean } = {}): Promise<{ failures: Failure[]; remote: string | null; dir: string }> {
+export async function checkoutHere(run: RunGit, cwd: string, handoff: Handoff, folder: string, timeoutMs: number, { cloneFrom = onTheWire, names = null }: { cloneFrom?: (remote: string) => boolean; names?: RemoteNames | null } = {}): Promise<{ failures: Failure[]; remote: string | null; dir: string }> {
   const repo = handoff.repos.find((r) => r.path === ".");
   const subs = byDepth(handoff.repos.filter((r) => r.path !== "."));
   const refused = (output: string, remote: string | null = null) => ({ failures: [{ step: "checkout" as const, output: tail(output) }], remote, dir: at ?? cwd });
@@ -879,12 +888,12 @@ export async function checkoutHere(run: RunGit, cwd: string, handoff: Handoff, f
   let inside: HandoffRepo | undefined;
   for (const sub of at ? subs : []) {
     if (pathKey(path.join(aboveOf(at!, sub.path), sub.path)) !== pathKey(at!)) continue;
-    if ((await remotesOf(run, at!, timeoutMs))?.some((r) => r.urls.some((url) => sameRemote(url, sub.remote)))) inside = sub;
+    if (await remoteFor(await remotesOf(run, at!, timeoutMs), sub.remote, names)) inside = sub;
   }
   const base = inside ? aboveOf(at!, inside.path) : (at ?? cwd);
   let remote: string | null = null;
   if (repo) {
-    const own = at ? await checkoutIn(run, base, repo, repo.branch, folder, timeoutMs) : { error: `${cwd} isn't in a git repo.`, remote: null };
+    const own = at ? await checkoutIn(run, base, repo, repo.branch, folder, timeoutMs, names) : { error: `${cwd} isn't in a git repo.`, remote: null };
     if (own.error) return refused(own.error, own.remote);
     remote = own.remote;
   } else if (at && !inside) {
@@ -892,21 +901,21 @@ export async function checkoutHere(run: RunGit, cwd: string, handoff: Handoff, f
   }
   const failures: Failure[] = [];
   for (const sub of subs) {
-    const failed = await repoAt(run, base, sub, folder, timeoutMs, cloneFrom);
+    const failed = await repoAt(run, base, sub, folder, timeoutMs, cloneFrom, names);
     if (failed) failures.push({ step: failed.step, repo: sub.path, output: tail(failed.error) });
   }
   return { failures, remote, dir: base };
 }
 
 // The handoff's branch checked out in the repo at `cwd`, by the shortcut's rules; the error, else null.
-async function checkoutIn(run: RunGit, cwd: string, repo: HandoffRepo, branch: string, folder: string, timeoutMs: number): Promise<{ error: string | null; remote: string | null }> {
+async function checkoutIn(run: RunGit, cwd: string, repo: HandoffRepo, branch: string, folder: string, timeoutMs: number, names: RemoteNames | null): Promise<{ error: string | null; remote: string | null }> {
   const git = (args: string[]) => run(args, { cwd, timeoutMs });
   // Checking out downloads no LFS files: a handoff never carries any.
   const checkout = (args: string[]) => run(args, { cwd, timeoutMs, env: NO_LFS });
   const remotes = await remotesOf(run, cwd, timeoutMs);
   const failed = (error: string, remote: string | null = null) => ({ error, remote });
   if (!remotes) return failed(`${cwd} isn't in a git repo.`);
-  const name = remotes.find((r) => r.urls.some((url) => sameRemote(url, repo.remote)))?.name;
+  const name = (await remoteFor(remotes, repo.remote, names))?.name;
   if (!name) return failed(`No remote of the repo in ${cwd} is ${repo.remote}, the repo the handoff was pushed to.`);
   if ((await git(["status", "--porcelain", "--untracked-files=no"])).stdout.trim()) {
     return failed(`${cwd} has uncommitted changes to tracked files, so the handoff's branch wasn't checked out over them. Commit or stash them, then take it again.`, name);
@@ -971,7 +980,7 @@ function badPath(p: string): string | null {
  * allows, with Git LFS's download off (a handoff never carries LFS files). The failed step,
  * `clone` when git clone failed and `checkout` otherwise, with its error; else null.
  */
-async function repoAt(run: RunGit, base: string, repo: HandoffRepo, folder: string, timeoutMs: number, cloneFrom: (remote: string) => boolean): Promise<{ step: "clone" | "checkout"; error: string } | null> {
+async function repoAt(run: RunGit, base: string, repo: HandoffRepo, folder: string, timeoutMs: number, cloneFrom: (remote: string) => boolean, names: RemoteNames | null): Promise<{ step: "clone" | "checkout"; error: string } | null> {
   const refused = (error: string) => ({ step: "checkout" as const, error });
   const bad = badPath(repo.path);
   if (bad) return refused(`${bad}, so nothing was checked out there.`);
@@ -996,7 +1005,7 @@ async function repoAt(run: RunGit, base: string, repo: HandoffRepo, folder: stri
   }
   const top = await run(["rev-parse", "--show-toplevel"], { cwd: target, timeoutMs });
   if (top.code !== 0 || pathKey(top.stdout.trim()) !== pathKey(target)) return refused(`${target} is there already and isn't a repo of its own, so ${repo.remote} wasn't cloned into it.`);
-  const { error } = await checkoutIn(run, target, repo, repo.branch, folder, timeoutMs);
+  const { error } = await checkoutIn(run, target, repo, repo.branch, folder, timeoutMs, names);
   return error ? refused(error) : null;
 }
 
