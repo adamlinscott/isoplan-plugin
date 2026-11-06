@@ -367,10 +367,12 @@ const DrivenRefusedSchema = z.discriminatedUnion("reason", [
  *
  * Every `driven` message is live-only: it goes only while the runner's link is up and never waits in
  * the link's reply outbox, so a long turn can't push the replies to the server's requests out of it,
- * and a prompt that has timed out isn't shown again. After every hello, `holding` says where each
- * session stands, and right after it the runner sends `prompt` again for each prompt still waiting,
- * with the same `prompt` id and `expires`, so one raised while the link was down, or before the server
- * restarted, can still be answered.
+ * and a prompt that has timed out isn't shown again. The runner sends none on a connection until the
+ * server's first `drive-policy` on it has come, so a server from before driven sessions, which sends
+ * no drive-policy, is never sent one. With that first drive-policy, `holding` says where each session
+ * stands, and right after it the runner sends `prompt` again for each prompt still waiting, with the
+ * same `prompt` id and `expires`, so one raised while the link was down, or before the server
+ * restarted, can still be answered. A later drive-policy on the same connection sends neither again.
  *
  * The runner keeps every field within its limit (the MAX_* constants), cutting what it doesn't pick
  * itself, such as a tool name, to fit: the server refuses a message over any limit and closes the
@@ -420,11 +422,12 @@ export const DrivenMessageSchema = z.discriminatedUnion("kind", [
   // terminal opened in `folder`, a path on the runner's machine.
   z.object({ ...driven, kind: z.literal("handed-back"), id: DriveId, session: DrivenSessionId, command: z.string().min(1).max(MAX_COMMAND_LENGTH), folder: z.string().min(1).max(MAX_FOLDER_LENGTH) }),
   DrivenRefusedSchema,
-  // Sent after every hello: the driven sessions the runner holds, or would reopen for an instruction,
-  // at most MAX_HOLDING of them, held ones first, then the most recently active. `held`: a process
-  // holds it now. `turn`: the turn running now, if any. The server takes it in place of what it knew
-  // of this runner's driven sessions and forgets any it doesn't list, so the floor's held state
-  // survives a reconnect. Right after it the runner sends `prompt` again for each prompt still waiting.
+  // Sent once per connection, after its first drive-policy: the driven sessions the runner holds, or
+  // would reopen for an instruction, at most MAX_HOLDING of them, held ones first, then the most
+  // recently active. `held`: a process holds it now. `turn`: the turn running now, if any. The server
+  // takes it in place of what it knew of this runner's driven sessions and forgets any it doesn't
+  // list, so the floor's held state survives a reconnect. Right after it the runner sends `prompt`
+  // again for each prompt still waiting.
   z.object({
     ...driven,
     kind: z.literal("holding"),
@@ -691,7 +694,8 @@ export const DriveMessageSchema = z.discriminatedUnion("kind", [
  * the projects, lower-cased, whose office allows `bypassPermissions`; an admin can turn it off for the
  * whole office. A project id here is as long as it comes, as everywhere in the protocol, so any
  * project the server holds can be listed. Sent to a runner that said `drive` once its hello is let in,
- * before any drive request, and again whenever an admin changes it. Until one arrives on a connection,
+ * before any drive request, and again whenever an admin changes it. The runner sends no `driven`
+ * message on a connection before the first one has come on it. Until one arrives on a connection,
  * and in any project it doesn't list, the runner opens no session's process with `bypassPermissions`:
  * not to start, reopen or restore one. What a session already running does when its project leaves
  * the list is the runner's to decide (#42).

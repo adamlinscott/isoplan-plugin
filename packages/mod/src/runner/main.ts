@@ -356,7 +356,7 @@ async function worker(): Promise<number> {
         pairing,
         onMessage: (message) => runner.take(message),
         onDrive: (message) => drive.take(office.server, message),
-        // After every hello, where this office's driven sessions stand; at every drop, its drive-policy no longer holds.
+        // At every hello and every drop, this office's drive-policy no longer holds; nothing driven goes on the new connection until its first one, which `holding` follows.
         onOpen: () => drive.linked(office.server),
         onClose: () => drive.unlinked(office.server),
         onNotWanted: said.notWanted,
