@@ -41,6 +41,9 @@ export const SessionFactSchema = z.object({
   lastActive: Time,
   status: z.enum(["active", "idle"]),
   lights: z.enum(["on", "off"]),
+  // `contextWindow` (protocol 0.6.0 on): the session's context window in tokens, as Claude Code
+  // tells its status line (`context_window_size`); absent when the plugin wasn't told it.
+  contextWindow: z.number().int().positive().optional(),
   extra: Extra,
 });
 

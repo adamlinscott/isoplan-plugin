@@ -5677,6 +5677,7 @@ const SessionFactSchema = object({
 	lastActive: Time,
 	status: _enum(["active", "idle"]),
 	lights: _enum(["on", "off"]),
+	contextWindow: number().int().positive().optional(),
 	extra: Extra
 });
 const TokenCount = number().int().nonnegative();
@@ -11587,6 +11588,7 @@ async function main(argv) {
 	const titleFile = path.join(titlesDir, `${sessionId}.json`);
 	const answersDir = path.join(claudeDir, "isoplan", "answers", sessionId);
 	const waitsDir = path.join(claudeDir, "isoplan", "waits", sessionId);
+	const windowFile = path.join(claudeDir, "isoplan", "windows", `${sessionId}.json`);
 	const modPatterns = path.join(here, "..", "secret-patterns.json");
 	const ownerPatterns = path.join(claudeDir, "isoplan", "secret-patterns.json");
 	const machine = os.hostname();
@@ -11806,6 +11808,11 @@ async function main(argv) {
 			type: "waits",
 			dir: waitsDir
 		});
+		await fs.rm(windowFile, { force: true }).catch(() => {});
+		if (await fs.mkdir(path.dirname(windowFile), { recursive: true }).then(() => true, () => false)) emit({
+			type: "window",
+			file: windowFile
+		});
 	}
 	const machineAccount = await accountOf({
 		readText: (p) => fs.readFile(p, "utf8").catch(() => null),
@@ -11834,6 +11841,7 @@ async function main(argv) {
 	const outgoing = (run, facts, patterns) => prepareQuestions(run.hold.apply(facts, patterns), patterns, waiting, patternLog);
 	let checkouts = {};
 	let answered = (_id) => false;
+	let contextWindow = null;
 	const account = await accountOf({
 		readText: (p) => fs.readFile(p, "utf8").catch(() => null),
 		run: io.run
@@ -12173,13 +12181,21 @@ async function main(argv) {
 				file: titleFile
 			});
 		}
-		const facts = read.facts.session.titleFrom === "branch" && title?.title ? {
+		if (!detached) contextWindow = await windowOf(windowFile) ?? contextWindow;
+		const titled = read.facts.session.titleFrom === "branch" && title?.title ? {
 			...read.facts,
 			session: {
 				...read.facts.session,
 				title: title.title
 			}
 		} : read.facts;
+		const facts = contextWindow ? {
+			...titled,
+			session: {
+				...titled.session,
+				contextWindow
+			}
+		} : titled;
 		checkouts = read.checkouts ?? {};
 		answered = read.answered ?? answered;
 		const patterns = await loadPatterns(modPatterns, ownerPatterns, patternLog).catch((err) => {
@@ -12250,6 +12266,17 @@ async function waitsOf(dir, facts) {
 		if (mark?.question === q.id && mark.waiting === true) out.add(q.id);
 	}
 	return out;
+}
+/** The context window the hooks module wrote, in tokens; null while there is none, or it isn't a whole positive number. */
+async function windowOf(file) {
+	let said;
+	try {
+		said = JSON.parse(await fs.readFile(file, "utf8"));
+	} catch {
+		return null;
+	}
+	const value = said && typeof said === "object" ? said.contextWindow : null;
+	return Number.isInteger(value) && value > 0 ? value : null;
 }
 async function takeFile(file) {
 	const text = await fs.readFile(file, "utf8").catch(() => null);

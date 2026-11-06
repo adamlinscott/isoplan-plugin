@@ -52,6 +52,8 @@ let shownStatus;
 let updated = false;
 let superseded = null;
 let marking = Promise.resolve();
+let windowFile = null;
+let windowSent = null;
 function register(on) {
 	on("session.start", async ($, e, next) => {
 		const result = await next(e);
@@ -72,6 +74,7 @@ function register(on) {
 		const r = await (e.tool === ASK_TOOL ? askBoth($, e, next) : next(e));
 		try {
 			checkSession($);
+			sendWindow($);
 			if (!lead || r.deny || r.isError) return r;
 			const agent = e.agentId ? "claude-code:" + e.agentId : lead;
 			const waiting = notes.get(agent) ?? [];
@@ -131,6 +134,24 @@ function ownerAnswer($, line) {
 		taken: !!answer
 	};
 	$.fs.write(line.file, JSON.stringify(taken)).catch((err) => $.ui.log("isoplan: could not say whether the floor's answer was taken: " + message(err), { to: "debug" }));
+}
+async function sendWindow($) {
+	const file = windowFile;
+	if (!file) return;
+	if (!$.session.usage) return;
+	let size;
+	try {
+		size = (await $.session.usage()).context.window;
+	} catch {
+		return;
+	}
+	if (!Number.isInteger(size) || size <= 0 || size === windowSent) return;
+	windowSent = size;
+	const window = { contextWindow: size };
+	await $.fs.write(file, JSON.stringify(window)).catch((err) => {
+		windowSent = null;
+		$.ui.log("isoplan: could not write the session's context window: " + message(err), { to: "debug" });
+	});
 }
 async function checkSession($) {
 	const id = await $.session.id().catch(() => null);
@@ -277,6 +298,11 @@ function handle($, text) {
 			break;
 		case "owner-answer":
 			ownerAnswer($, line);
+			break;
+		case "window":
+			windowFile = line.file;
+			windowSent = null;
+			sendWindow($);
 			break;
 		case "waits":
 			waitsDir = line.dir;

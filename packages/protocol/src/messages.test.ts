@@ -415,6 +415,12 @@ test("facts from a data layer that doesn't report questions still parse", () => 
   expect(parseDataLayerMessage({ ...valid.full, facts: older })).toEqual({ ok: true, message: { ...valid.full, facts: older } });
 });
 
+test("a session's context window parses as a whole number of tokens, and not as none or a fraction", () => {
+  const sized = { ...facts, session: { ...facts.session, contextWindow: 1000000 } };
+  expect(parseDataLayerMessage({ ...valid.full, facts: sized })).toEqual({ ok: true, message: { ...valid.full, facts: sized } });
+  for (const contextWindow of [0, 200000.5]) expect(parseDataLayerMessage({ ...valid.full, facts: { ...facts, session: { ...facts.session, contextWindow } } })).toMatchObject({ ok: false, kind: "invalid" });
+});
+
 test("a withheld report parses with its hold id, and not without one", () => {
   const report = { agent: worker.id, at, text: "Held for its owner to check.", withheld: { id: "h-1" } };
   expect(parseDataLayerMessage({ ...valid.full, facts: { ...facts, reports: [report] } })).toMatchObject({ ok: true });

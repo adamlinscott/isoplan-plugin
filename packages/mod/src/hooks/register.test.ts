@@ -16,10 +16,12 @@ interface HostOptions {
   noNode?: boolean;
   /** Lines the data layer writes later, once this settles. */
   later?: Promise<DataLayerLine[]>;
+  /** $.session.usage; none, as in a Claude Code build without it, unless given. */
+  usage?: Host["session"]["usage"];
 }
 
 // A host whose data layer writes `lines` and then exits (or stays up).
-function host(lines: DataLayerLine[], { wakes = 0, runMs = 0, stays = false, noNode = false, later }: HostOptions = {}) {
+function host(lines: DataLayerLine[], { wakes = 0, runMs = 0, stays = false, noNode = false, later, usage }: HostOptions = {}) {
   const status: (string | undefined)[] = [];
   const written: [string, string][] = [];
   const spawned: (readonly string[])[] = [];
@@ -35,7 +37,7 @@ function host(lines: DataLayerLine[], { wakes = 0, runMs = 0, stays = false, noN
   let now = 0;
   const $: Host = {
     plugin: { root: "C:\\plugins\\isoplan" },
-    session: { id: async () => session.id, cwd: async () => "C:/w/repo" },
+    session: { id: async () => session.id, cwd: async () => "C:/w/repo", ...(usage ? { usage } : {}) },
     process: {
       spawn: ({ argv, cwd }) => {
         spawned.push(argv);
@@ -456,4 +458,44 @@ test("hooks: a question's wait is marked where the data layer says, from its sta
   await hooks["tool.call"]!(h.$, { tool: "AskUserQuestion", tool_use_id: "../x" }, async () => ({ result: "ok" }));
   await new Promise((r) => setTimeout(r, 10));
   expect(h.written).toHaveLength(before);
+});
+
+// What Claude Code gives a status line command on stdin (code.claude.com/docs/en/statusline.md),
+// the part $.session.usage answers from.
+const statusLineInput = () => ({
+  session_id: "s1",
+  model: { id: "claude-opus-5-5", display_name: "Opus" },
+  context_window: { context_window_size: 1000000, total_input_tokens: 42000, used_percentage: 4 },
+});
+const usageOf = (input: ReturnType<typeof statusLineInput>) => async () => ({ context: { window: input.context_window.context_window_size } });
+
+test.each([
+  ["Windows", "C:\\Users\\ada\\.claude\\isoplan\\windows\\s1.json"],
+  ["macOS", "/Users/ada/.claude/isoplan/windows/s1.json"],
+])("hooks: on %s the session's context window, as the status line gets it, is written where the window line says, and again only once it changes", async (_os, file) => {
+  const input = statusLineInput();
+  const h = await start([{ type: "window", file }], { stays: true, usage: usageOf(input) });
+  await vi.waitFor(() => expect(h.written).toEqual([[file, JSON.stringify({ contextWindow: 1000000 })]]));
+  await call(h, {});
+  await new Promise((r) => setTimeout(r, 10));
+  expect(h.written).toHaveLength(1);
+  // A /model switch to a 200K window: the next tool call writes it.
+  input.context_window.context_window_size = 200000;
+  await call(h, {});
+  await vi.waitFor(() => expect(h.written.at(-1)).toEqual([file, JSON.stringify({ contextWindow: 200000 })]));
+  expect(h.written).toHaveLength(2);
+});
+
+test("hooks: without $.session.usage, or without a size, nothing is written", async () => {
+  const file = "/Users/ada/.claude/isoplan/windows/s1.json";
+  for (const usage of [undefined, async () => ({ context: { window: 0 } }), async () => Promise.reject(new Error("no session"))]) {
+    vi.resetModules();
+    const { register } = await import("./register.js");
+    register(((event: keyof Hooks, hook: Function) => ((hooks[event] = hook), { catch: () => {} })) as unknown as On);
+    const h = await start([{ type: "window", file }], { stays: true, usage });
+    await vi.waitFor(() => expect(h.spawned).toHaveLength(1));
+    await call(h, {});
+    await new Promise((r) => setTimeout(r, 10));
+    expect(h.written).toEqual([]);
+  }
 });

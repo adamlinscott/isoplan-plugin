@@ -309,3 +309,36 @@ test("a data layer never gives the session up to an older or equal holder, nor t
   expect(await fresh.exited).toBe(0);
   expect(fresh.lines()).toContainEqual({ type: "superseded", reason: "newer" });
 });
+
+test("the session's context window reaches the office only once the hooks module has written it where the window line says", async () => {
+  const o = await office();
+  o.state.repos = ["github.com/team/app"];
+  const v = versions(o.url);
+  const file = path.join(v.claudeDir, "isoplan", "windows", "s1.json");
+  // One left by an earlier run: the data layer deletes it as it starts, so it is never sent.
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, JSON.stringify({ contextWindow: 200000 }));
+  const r = v.run("0.2.0");
+  await until(() => r.lines().some((l) => l.type === "window"));
+  expect(r.lines().find((l) => l.type === "window")).toEqual({ type: "window", file });
+  type Sent = { type: string; facts?: { session: Record<string, unknown> }; upsert?: { session?: Record<string, unknown> } };
+  const sent = () => (o.state.connections[0]?.messages ?? []) as Sent[];
+  await until(() => sent().some((m) => m.type === "full"));
+  await wait(1500);
+  expect(sent().find((m) => m.type === "full")!.facts!.session).not.toHaveProperty("contextWindow");
+  expect(sent().some((m) => m.upsert?.session && "contextWindow" in m.upsert.session)).toBe(false);
+
+  fs.writeFileSync(file, JSON.stringify({ contextWindow: 1000000 }));
+  await until(() => sent().some((m) => m.upsert?.session?.contextWindow === 1000000));
+
+  // Emptied, or written as null, mid-write: the data layer keeps running and the size stays.
+  const upserts = () => sent().filter((m) => m.upsert?.session && "contextWindow" in m.upsert.session).length;
+  const before = upserts();
+  for (const text of ["", "null", '{"contextW']) {
+    fs.writeFileSync(file, text);
+    await wait(700);
+  }
+  expect(upserts()).toBe(before);
+  fs.writeFileSync(file, JSON.stringify({ contextWindow: 200000 }));
+  await until(() => sent().some((m) => m.upsert?.session?.contextWindow === 200000));
+});

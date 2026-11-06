@@ -6253,6 +6253,7 @@ const SessionFactSchema = object({
 	lastActive: Time,
 	status: _enum(["active", "idle"]),
 	lights: _enum(["on", "off"]),
+	contextWindow: number().int().positive().optional(),
 	extra: Extra
 });
 const TokenCount = number().int().nonnegative();
@@ -7920,6 +7921,7 @@ const WRITTEN = [
 	"waits",
 	"answers",
 	"handoffs",
+	"windows",
 	"offices",
 	"approved.json",
 	"update.json",
@@ -7931,6 +7933,7 @@ const SESSION_TRACES = [
 	"released",
 	"waits",
 	"answers",
+	"windows",
 	"offices",
 	"approved.json",
 	"update.json",

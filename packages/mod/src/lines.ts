@@ -76,6 +76,20 @@ export interface WaitsLine {
   dir: string;
 }
 
+/**
+ * Where the hooks module writes the session's context window, a ContextWindow, whenever the size
+ * Claude Code gives the status line changes. Sent once each time the data layer starts.
+ */
+export interface WindowLine {
+  type: "window";
+  file: string;
+}
+
+/** What a window line's file holds: the context window in tokens. */
+export interface ContextWindow {
+  contextWindow: number;
+}
+
 /** A question's wait mark. */
 export interface WaitMark {
   question: string;
@@ -124,7 +138,7 @@ export interface TitleReply {
  * waiting, and `ask-rights` whether the session may ask its room (#49), each with the office server
  * it came from (#105), which the room is asked through.
  */
-export type DataLayerLine = StatusLine | TitleAskLine | PairLine | WaitsLine | OwnerAnswerLine | UpdatedLine | SupersededLine | LogLine | ConflictMessage | ErrorMessage | FromOffice<AskedMessage> | FromOffice<AskRightsMessage>;
+export type DataLayerLine = StatusLine | TitleAskLine | PairLine | WaitsLine | WindowLine | OwnerAnswerLine | UpdatedLine | SupersededLine | LogLine | ConflictMessage | ErrorMessage | FromOffice<AskedMessage> | FromOffice<AskRightsMessage>;
 
 /** A server's message, with the data-layer address of the office server that sent it; none from a data layer before #105. */
 export type FromOffice<M> = M & { server?: string };

@@ -266,12 +266,13 @@ async function finishOptOut({ claudeDir, settings }: Paths): Promise<string[]> {
 // while a pairing is under way, pairing.write.lock while the file is written), and the sessions'
 // traces: locks, logs, title files, released-report hashes, the hooks module's marks of the questions
 // it waits on (waits/), owner answers waiting for their session (answers/), taken and unsent
-// handoffs' briefs and launchers (handoffs/), each office's list of repos and pairing lock (offices/),
+// handoffs' briefs and launchers (handoffs/), the hooks module's record of each session's context
+// window (windows/), each office's list of repos and pairing lock (offices/),
 // the one list and lock a version before #105 kept (approved.json, pairing.lock), and the update
 // check's record and lock (src/update). Removed before the hooks.
-const WRITTEN = ["runner", "pairing.json", "pairing.lock", "pairing.write.lock", "live", "logs", "titles", "released", "waits", "answers", "handoffs", "offices", "approved.json", "update.json", "update.lock"];
+const WRITTEN = ["runner", "pairing.json", "pairing.lock", "pairing.write.lock", "live", "logs", "titles", "released", "waits", "answers", "handoffs", "windows", "offices", "approved.json", "update.json", "update.lock"];
 // What a session's data layer writes as it runs, so may come back during an uninstall.
-const SESSION_TRACES = ["live", "titles", "released", "waits", "answers", "offices", "approved.json", "update.json", "update.lock"];
+const SESSION_TRACES = ["live", "titles", "released", "waits", "answers", "windows", "offices", "approved.json", "update.json", "update.lock"];
 
 export interface UninstallOptions {
   /** Leave wake.json as `{ "disabled": true }`, so a plugin still installed doesn't put the hook back. */
