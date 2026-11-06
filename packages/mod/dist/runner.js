@@ -12755,6 +12755,7 @@ const NO_PROMPT = "That permission request isn't waiting for an answer any more:
 const PROMPT_WITHHELD = "Held back on this computer: what the agent wants to do may contain a secret, so it isn't shown here.";
 const DENIED_TO_CLAUDE = "The user denied this permission request from the Isoplan floor.";
 const TIMED_OUT_TO_CLAUDE = "No answer to this permission request came from the Isoplan floor in time, so it was denied.";
+const UNSUPPORTED_TO_CLAUDE = "Not supported: the Isoplan runner driving this session answers only permission requests.";
 const capOf = (st) => Math.max(1, Math.floor(st.drivenPerProject));
 const uuidOf = (session) => session.slice(session.indexOf(":") + 1);
 const iso = (ms) => new Date(ms).toISOString();
@@ -13190,8 +13191,8 @@ function createDriver(o) {
 			}
 		} else if (e.type === "system" && e.subtype === "permission_denied") {
 			const tool = typeof e.tool_name === "string" && e.tool_name ? e.tool_name : "a tool";
-			addOutput(s, `(${tool} wasn't allowed by the permission settings)`);
-			const said = (name) => `The agent wanted to use ${name}, but the permission settings for Claude Code on this computer don't allow it, so it wasn't used.`;
+			addOutput(s, `(${tool} wasn't allowed by Claude Code on this computer)`);
+			const said = (name) => `The agent wanted to use ${name}, but Claude Code on this computer didn't allow it (its permission rules, or its own safety check), so it wasn't used.`;
 			emit(s, async () => ({
 				...driven,
 				kind: "error",
@@ -13203,7 +13204,20 @@ function createDriver(o) {
 	}
 	function ask(s, child, e) {
 		const request = e.request;
-		if (typeof e.request_id !== "string" || request?.subtype !== "can_use_tool" || child.stdin.writableEnded) return;
+		if (typeof e.request_id !== "string" || child.stdin.writableEnded) return;
+		if (request?.subtype !== "can_use_tool") {
+			const subtype = typeof request?.subtype === "string" ? request.subtype.slice(0, 60) : "(none)";
+			child.stdin.write(JSON.stringify({
+				type: "control_response",
+				response: {
+					subtype: "error",
+					request_id: e.request_id,
+					error: UNSUPPORTED_TO_CLAUDE
+				}
+			}) + "\n");
+			o.log(`answered Claude Code's request of subtype ${subtype} in ${s.record.session} with an error: only permission prompts are answered`);
+			return;
+		}
 		const tool = typeof request.tool_name === "string" && request.tool_name ? request.tool_name : "tool";
 		const w = {
 			id: `p-${randomUUID()}`,

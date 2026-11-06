@@ -108,7 +108,8 @@
 //   `expires`, `drivenPromptMinutes` on. Only the owner's `answer` naming a prompt still waiting
 //   allows or denies it; with none by `expires` it is denied, `timed-out`. A stop, a hand-back, the
 //   process ending or Claude Code cancelling it ends it `cancelled`. Each ends once, with
-//   `prompt-ended`, and Claude Code gets an answer for each it still waits on. No idle close or
+//   `prompt-ended`, and Claude Code gets an answer for each it still waits on; a `control_request`
+//   that isn't a prompt gets an error at once, so a turn never waits on one. No idle close or
 //   stuck timeout runs while one waits. After every hello the waiting ones go again, right after
 //   `holding`, unchanged; while the link is down they aren't kept anywhere else.
 
@@ -284,6 +285,7 @@ const PROMPT_WITHHELD = "Held back on this computer: what the agent wants to do 
 // What Claude Code, and so the agent, is told of a prompt the floor didn't allow.
 const DENIED_TO_CLAUDE = "The user denied this permission request from the Isoplan floor.";
 const TIMED_OUT_TO_CLAUDE = "No answer to this permission request came from the Isoplan floor in time, so it was denied.";
+const UNSUPPORTED_TO_CLAUDE = "Not supported: the Isoplan runner driving this session answers only permission requests.";
 // runner.json may say 2.5, but the cap is a whole number of sessions, and at least one.
 const capOf = (st: DriveSettings) => Math.max(1, Math.floor(st.drivenPerProject));
 
@@ -726,10 +728,11 @@ export function createDriver(o: DriverOptions): Driver {
         });
       }
     } else if (e.type === "system" && e.subtype === "permission_denied") {
-      // Claude Code's own denial (a deny rule in the settings, or auto mode's check): no prompt came for it.
+      // Claude Code's own denial, with no prompt for it: a deny rule in the settings (the probe above),
+      // or, not probed, maybe auto mode's own safety check. The words cover both.
       const tool = typeof e.tool_name === "string" && e.tool_name ? e.tool_name : "a tool";
-      addOutput(s, `(${tool} wasn't allowed by the permission settings)`);
-      const said = (name: string) => `The agent wanted to use ${name}, but the permission settings for Claude Code on this computer don't allow it, so it wasn't used.`;
+      addOutput(s, `(${tool} wasn't allowed by Claude Code on this computer)`);
+      const said = (name: string) => `The agent wanted to use ${name}, but Claude Code on this computer didn't allow it (its permission rules, or its own safety check), so it wasn't used.`;
       emit(s, async () => ({ ...driven, kind: "error", session: s.record.session, turn, text: (await o.scan(said(tool))) ? said("a tool") : said(tool) }));
     } else if (e.type === "result" && ((typeof e.num_turns === "number" && e.num_turns >= 1) || e.is_error === true || typeof e.local_command === "string")) {
       // A Claude Code command (`/cost`) is answered with num_turns 0 and `local_command`: see the probe above.
@@ -742,7 +745,15 @@ export function createDriver(o: DriverOptions): Driver {
   function ask(s: Session, child: ChildProcessWithoutNullStreams, e: Record<string, unknown>): void {
     const request = e.request as Record<string, unknown> | undefined;
     // With its stdin closed (a hand-back), Claude Code gives it up at once: nobody could answer it.
-    if (typeof e.request_id !== "string" || request?.subtype !== "can_use_tool" || child.stdin.writableEnded) return;
+    if (typeof e.request_id !== "string" || child.stdin.writableEnded) return;
+    if (request?.subtype !== "can_use_tool") {
+      // None came in the probes (the runner sends no `initialize`), but Claude Code may wait on one as
+      // it does on a prompt, so it gets the error the Agent SDK gives a request it doesn't support.
+      const subtype = typeof request?.subtype === "string" ? request.subtype.slice(0, 60) : "(none)";
+      child.stdin.write(JSON.stringify({ type: "control_response", response: { subtype: "error", request_id: e.request_id, error: UNSUPPORTED_TO_CLAUDE } }) + "\n");
+      o.log(`answered Claude Code's request of subtype ${subtype} in ${s.record.session} with an error: only permission prompts are answered`);
+      return;
+    }
     const tool = typeof request.tool_name === "string" && request.tool_name ? request.tool_name : "tool";
     const w: Waiting = { id: `p-${randomUUID()}`, request: e.request_id, child, turn: s.turn, input: request.input, message: null, timer: null };
     s.prompts.set(w.id, w);

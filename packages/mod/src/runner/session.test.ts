@@ -30,6 +30,7 @@ const SETTINGS: DriveSettings = { drivenIdleMinutes: 30, drivenPerProject: 4, dr
 // FAKE_LINGER is set. An instruction with "ask" uses Bash through a permission prompt, as the probe
 // found it with --permission-prompts host --permission-prompt-tool stdio, waits for its answer on
 // stdin (logged as `answered`), and runs it or not; with "cancel" Claude Code cancels the prompt itself.
+// "ask after" raises one only once its turn has ended, and "elicit" a request that isn't a prompt.
 const FAKE = `
 import fs from "node:fs";
 import path from "node:path";
@@ -85,6 +86,24 @@ process.stdin.setEncoding("utf8").on("data", (d) => {
     if (text.includes("hang")) continue;
     if (text.includes("crash")) { setTimeout(() => process.exit(3), 20); continue; }
     const secretName = "mcp__keys-" + process.env.FAKE_KEY;
+    if (text.includes("elicit")) {
+      // A request that isn't a permission prompt, as the turn's first output; the turn ends once it is answered.
+      const rid = "req-" + ++asked;
+      out({ type: "control_request", request_id: rid, request: { subtype: "elicitation", mcp_server_name: "forms", message: "Pick one" } });
+      pending.set(rid, () => finish("Went on"));
+      continue;
+    }
+    if (text.includes("ask after")) {
+      // The turn ends first; then a prompt comes outside any turn, and a line of other output while it waits.
+      finish("Done: " + text);
+      const rid = "req-" + ++asked;
+      const input = { command: "echo hi > probe.txt", description: "Write hi into probe.txt" };
+      out({ type: "control_request", request_id: rid, request: { subtype: "can_use_tool", tool_name: "Bash", display_name: "Bash", input, description: input.description, tool_use_id: "t" + rid } });
+      out({ type: "system", subtype: "status", session_id: id });
+      log({ waiting: rid });
+      pending.set(rid, () => {});
+      continue;
+    }
     if (text.includes("ask")) {
       const rid = "req-" + ++asked;
       const name = text.includes("named") ? secretName : "Bash";
@@ -329,7 +348,7 @@ test("scan: a reply that may hold a secret is held back with an id, a tool whose
   await t.until(() => t.of("turn-ended").length === 2);
   expect(JSON.stringify(t.sent.slice(before))).not.toContain(AWS_KEY);
   expect(t.of("tool")[1]).toEqual({ type: "driven", v: 1, kind: "tool", session: S1, turn: "d2", tool: "tool", withheld: true });
-  expect(t.of("error")).toEqual([{ type: "driven", v: 1, kind: "error", session: S1, turn: "d2", text: expect.stringContaining("wanted to use a tool, but the permission settings for Claude Code on this computer don't allow it") }]);
+  expect(t.of("error")).toEqual([{ type: "driven", v: 1, kind: "error", session: S1, turn: "d2", text: expect.stringContaining("wanted to use a tool, but Claude Code on this computer didn't allow it") }]);
 });
 
 test("scan: a whole session's output held back is kept as its release sends it, within the protocol's limit and marked cut when its transcript was", async () => {
@@ -365,12 +384,14 @@ test("a Claude Code command as an instruction: its result, with no turn of the m
   expect(t.of("reply").map((m) => m.text)).toEqual(["Total cost: $0.00 (cost)", "Done: next"]);
 });
 
-test("bounds: a tool name past the protocol's limit is cut to fit, and a tool Claude Code's own permission settings turned down is said in plain words", async () => {
+test("bounds: a tool name past the protocol's limit is cut to fit, and a tool Claude Code itself turned down is said in plain words", async () => {
   const t = await setUp();
   t.drive(start("d1", { instruction: "use a long tool, then deny" }));
   await t.until(() => t.of("turn-ended").length === 1);
   expect(t.of("tool")[0]!.tool).toHaveLength(MAX_TOOL_NAME_LENGTH);
-  expect(t.of("error")).toEqual([{ type: "driven", v: 1, kind: "error", session: S1, turn: "d1", text: expect.stringContaining("wanted to use Write, but the permission settings") }]);
+  expect(t.of("error")).toEqual([
+    { type: "driven", v: 1, kind: "error", session: S1, turn: "d1", text: "The agent wanted to use Write, but Claude Code on this computer didn't allow it (its permission rules, or its own safety check), so it wasn't used." },
+  ]);
 });
 
 test("hand back: stdin closes, the process ends by itself, the command and folder come back, and the session is forgotten here", async () => {
@@ -893,6 +914,37 @@ test("prompt: with no answer by expires it is denied to Claude Code and ends tim
   // Once the turn is over, the idle close runs again.
   await t.until(() => t.of("released").length === 1);
   expect(t.of("released")[0]).toMatchObject({ why: "idle-closed" });
+});
+
+test("prompt: one raised after its turn has ended keeps the idle close off while it waits, through other output too; once answered, the session is idle-closed", async () => {
+  const t = await setUp({ settings: { drivenIdleMinutes: 0.01 } });
+  t.drive(start("d1", { instruction: "ask after" }));
+  await t.until(() => t.of("prompt").length === 1 && t.fakeLog().some((l) => l.waiting));
+  const [p] = t.of("prompt");
+  expect(p).toEqual({ type: "driven", v: 1, kind: "prompt", session: S1, prompt: expect.stringMatching(/^p-/), tool: "Bash", description: ASKED, expires: expect.any(String) });
+  // Several times drivenIdleMinutes (0.6 s) go by while it waits.
+  await new Promise((r) => setTimeout(r, 2500));
+  await t.driver.settled();
+  expect(t.of("released")).toEqual([]);
+  expect(t.driver.held()).toBe(1);
+  t.drive({ id: "a1", kind: "answer", session: S1, prompt: p!.prompt, answer: "allow" });
+  await t.until(() => t.of("released").length === 1);
+  expect(t.sent.slice(-2)).toEqual([
+    { type: "driven", v: 1, kind: "prompt-ended", session: S1, prompt: p!.prompt, outcome: "allowed", id: "a1" },
+    { type: "driven", v: 1, kind: "released", session: S1, why: "idle-closed" },
+  ]);
+});
+
+test("prompt: a request from Claude Code that isn't a permission prompt is answered with an error at once, and the turn goes on to its end", async () => {
+  const t = await setUp();
+  t.drive(start("d1", { instruction: "elicit first" }));
+  await t.until(() => t.of("turn-ended").length === 1);
+  expect(t.of("turn-ended")[0]).toMatchObject({ turn: "d1", outcome: "done" });
+  expect(t.of("prompt")).toEqual([]);
+  expect(t.fakeLog().filter((l) => l.answered).map((l) => l.answered)).toEqual([
+    { subtype: "error", request_id: "req-1", error: "Not supported: the Isoplan runner driving this session answers only permission requests." },
+  ]);
+  expect(t.logs.filter((l) => l.includes("request of subtype elicitation"))).toHaveLength(1);
 });
 
 test("prompt: a stop while one waits ends it cancelled before the turn, as a hand-back does; one Claude Code cancels itself ends cancelled; Claude Code gets no answer for any, and each is then no-prompt", async () => {
