@@ -9,7 +9,8 @@
 //   (AssocQueryString's friendly app name, probed on Windows 11: without it, "Microsoft Windows
 //   Based Script Host"). Where Windows Script Host is turned off, the command runs node on the
 //   handler with the link ("%1") instead, which shows a console window for a moment. A registration
-//   of that older form is redone through the launcher once Script Host is on.
+//   of that older form is redone through the launcher once Script Host is on, and one through the
+//   launcher is redone in that form once Script Host is turned off.
 // - macOS: a small AppleScript app, <claude dir>/isoplan/Isoplan Connect.app, made with osacompile,
 //   claiming the isoplan scheme in its Info.plist (CFBundleURLTypes), signed again ad hoc once that
 //   is changed, and registered with LaunchServices (lsregister). It hands the link to node in the
@@ -133,12 +134,12 @@ async function register(given: LinkHandler): Promise<string[]> {
   };
   if (h.platform === "win32") {
     const current = regValue((await run("reg", ["query", COMMAND_KEY, "/ve"])).stdout);
-    // Through a launcher, this config folder's or another's: kept while the node and handler it names are there.
-    const launcher = launcherOf(current);
-    if (launcher && (await works(launcherPaths(await fs.readFile(launcher, "utf8").catch(() => null))))) return [];
-    // Script Host is checked only here, as it registers: one turned off later leaves the links to its message.
+    // With Script Host off, a launcher would show its message, so only a working direct command is kept.
     const off = await scriptHostOff(run);
     if (off && (await works(directPaths(current)))) return [];
+    // Through a launcher, this config folder's or another's: kept while the node and handler it names are there.
+    const launcher = launcherOf(current);
+    if (!off && launcher && (await works(launcherPaths(await fs.readFile(launcher, "utf8").catch(() => null))))) return [];
     const file = linkLauncherPath(h.claudeDir);
     if (!off) {
       await fs.mkdir(path.dirname(file), { recursive: true });

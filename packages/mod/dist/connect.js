@@ -7386,8 +7386,8 @@ async function unregisterLoginItem(h) {
 	if (h.platform === "darwin") {
 		const file = launchAgentPath(h.home, h.claudeDir);
 		if (!await fs.stat(file).catch(() => null)) return [];
-		await run("launchctl", ["bootout", `gui/${h.uid}/${launchAgentLabel(h.claudeDir)}`]);
 		await fs.rm(file, { force: true });
+		await run("launchctl", ["bootout", `gui/${h.uid}/${launchAgentLabel(h.claudeDir)}`]);
 		return removed(file);
 	}
 	if (h.platform === "linux") {

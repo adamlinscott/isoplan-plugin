@@ -6,8 +6,18 @@
 // way ran with no window, saw the link it was given in its environment unchanged (`%41` stayed as
 // it was), and wscript exited 0.
 //
+// The launcher is pure ASCII: wscript reads a .js file with no byte-order mark in the computer's
+// ANSI code page, so a path such as C:\Users\José written as UTF-8 reaches node garbled. Probed on
+// Windows 11 (26200), in a folder named "José 张": a launcher with the paths as raw UTF-8 started
+// nothing, and wscript still exited 0; the same launcher with them as \uXXXX escapes ran.
+//
+// //E:JScript names the engine, which wscript otherwise picks by the file's extension, through the
+// .js file association, which another program may have changed. Probed: a launcher with an
+// extension that has no engine made wscript exit 1 and run nothing; the same file with //E:JScript ran.
+//
 // Windows Script Host can be turned off by policy, and wscript then shows a message instead of
-// running anything, so `scriptHostOff` is checked before anything is registered through it.
+// running anything, so `scriptHostOff` is checked each time, before a registration through it is
+// kept or made.
 
 import path from "node:path";
 import type { Exec } from "../connect/dialog.js";
@@ -15,11 +25,14 @@ import type { Exec } from "../connect/dialog.js";
 /** wscript.exe, by its full path, so no other program of that name is found first. */
 export const wscriptPath = (env: Record<string, string | undefined> = process.env) => path.win32.join(env.SystemRoot || "C:\\Windows", "System32", "wscript.exe");
 
-/** The command Windows runs: wscript in batch mode (no prompts, no logo) on `launcher`, then `args`. */
-export const launchCommand = (launcher: string, args = "") => `"${wscriptPath()}" //B //NoLogo "${launcher}"${args ? ` ${args}` : ""}`;
+/** The command Windows runs: wscript in batch mode (no prompts, no logo), with the JScript engine, on `launcher`, then `args`. */
+export const launchCommand = (launcher: string, args = "") => `"${wscriptPath()}" //B //NoLogo //E:JScript "${launcher}"${args ? ` ${args}` : ""}`;
 
 /** The launcher `launchCommand` names in a command; null for any other command. */
-export const launcherOf = (command: string | null) => (command ? (/^"[^"]+\\wscript\.exe" \/\/B \/\/NoLogo "([^"]+)"/i.exec(command)?.[1] ?? null) : null);
+export const launcherOf = (command: string | null) => (command ? (/^"[^"]+\\wscript\.exe" \/\/B \/\/NoLogo \/\/E:JScript "([^"]+)"/i.exec(command)?.[1] ?? null) : null);
+
+/** A literal JScript and JSON both read: JSON, with every character outside printable ASCII as \uXXXX. */
+const asciiLiteral = (value: unknown) => JSON.stringify(value).replace(/[^\x20-\x7e]/g, (c) => `\\u${c.charCodeAt(0).toString(16).padStart(4, "0")}`);
 
 /**
  * The launcher: runs `"<node>" "<script>" <args>` hidden. With `link`, the link Windows gives it goes
@@ -29,10 +42,10 @@ export function hiddenLauncher(node: string, script: string, { args = "", link =
   const command = `"${node}" "${script}"${args ? ` ${args}` : ""}`;
   return [
     "// Isoplan: starts node with no window. The plugin's install wrote this file; uninstall removes it.",
-    `var isoplan = ${JSON.stringify({ node, script })};`,
+    `var isoplan = ${asciiLiteral({ node, script })};`,
     'var shell = new ActiveXObject("WScript.Shell");',
     ...(link ? ['shell.Environment("PROCESS")("ISOPLAN_CONNECT_URL") = WScript.Arguments(0);'] : []),
-    `shell.Run(${JSON.stringify(command)}, 0, false);`,
+    `shell.Run(${asciiLiteral(command)}, 0, false);`,
     "",
   ].join("\r\n");
 }

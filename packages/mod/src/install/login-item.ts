@@ -10,7 +10,7 @@
 // - Windows: a value, "Isoplan runner <id>", under HKCU\Software\Microsoft\Windows\CurrentVersion\Run,
 //   running wscript on a launcher, <claude dir>/isoplan/start-at-login.js, which starts node hidden
 //   (hidden-launch.ts): node straight from the Run key would show a console window for as long as it
-//   ran. Not registered while Windows Script Host is turned off.
+//   ran. Not registered, and taken out, while Windows Script Host is turned off.
 // - macOS: a LaunchAgent, ~/Library/LaunchAgents/dev.isoplan.runner.<id>.plist, with RunAtLoad and no
 //   KeepAlive, so launchd starts it once at login and never again behind the runner's own lifecycle,
 //   loaded now into this person's GUI domain with `launchctl bootstrap gui/<uid>`.
@@ -151,12 +151,18 @@ async function register(given: LoginItem): Promise<string[]> {
     if (r.code !== 0) throw new Error(`${path.basename(file)} ${args[0] ?? ""} failed${r.code === null ? " to start" : ` (${r.code})`}`);
   };
   if (h.platform === "win32") {
+    // Checked first: with Script Host off, an item made before would show its message at every login.
+    if (await scriptHostOff(run)) {
+      const why = "Windows Script Host is turned off on this computer, and without it the runner can't start with no window";
+      const removed = await unregisterLoginItem(h);
+      if (!removed.length) throw new Error(why);
+      return removed.map((change) => `${change}: ${why}`);
+    }
     const launcher = loginLauncherPath(h.claudeDir);
     const want = windowsLoginCommand(h.claudeDir);
     const current = regValue((await run("reg", ["query", RUN_KEY, "/v", runValueName(h.claudeDir)])).stdout);
     // In any letter case, as Windows reads paths: %SystemRoot% may be C:\WINDOWS or C:\Windows.
     if (current?.toLowerCase() === want.toLowerCase() && (await works(launcherPaths(await read(launcher))))) return [];
-    if (await scriptHostOff(run)) throw new Error("Windows Script Host is turned off on this computer, and without it the runner can't start with no window");
     await fs.mkdir(path.dirname(launcher), { recursive: true });
     await fs.writeFile(launcher, hiddenLauncher(h.node, h.script, { args: LOGIN_ARG }));
     await must("reg", ["add", RUN_KEY, "/v", runValueName(h.claudeDir), "/d", want, "/f"]);
@@ -199,8 +205,9 @@ export async function unregisterLoginItem(h: Omit<LoginItem, "node">): Promise<s
   if (h.platform === "darwin") {
     const file = launchAgentPath(h.home, h.claudeDir);
     if (!(await fs.stat(file).catch(() => null))) return [];
-    await run("launchctl", ["bootout", `gui/${h.uid}/${launchAgentLabel(h.claudeDir)}`]);
+    // The file goes first: at login this runs in the agent's own job, which bootout may end.
     await fs.rm(file, { force: true });
+    await run("launchctl", ["bootout", `gui/${h.uid}/${launchAgentLabel(h.claudeDir)}`]);
     return removed(file);
   }
   if (h.platform === "linux") {

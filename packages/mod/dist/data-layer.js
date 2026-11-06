@@ -7318,10 +7318,12 @@ const exec = (file, args, env) => new Promise((resolve) => {
 //#region src/install/hidden-launch.ts
 /** wscript.exe, by its full path, so no other program of that name is found first. */
 const wscriptPath = (env = process.env) => path.win32.join(env.SystemRoot || "C:\\Windows", "System32", "wscript.exe");
-/** The command Windows runs: wscript in batch mode (no prompts, no logo) on `launcher`, then `args`. */
-const launchCommand = (launcher, args = "") => `"${wscriptPath()}" //B //NoLogo "${launcher}"${args ? ` ${args}` : ""}`;
+/** The command Windows runs: wscript in batch mode (no prompts, no logo), with the JScript engine, on `launcher`, then `args`. */
+const launchCommand = (launcher, args = "") => `"${wscriptPath()}" //B //NoLogo //E:JScript "${launcher}"${args ? ` ${args}` : ""}`;
 /** The launcher `launchCommand` names in a command; null for any other command. */
-const launcherOf = (command) => command ? /^"[^"]+\\wscript\.exe" \/\/B \/\/NoLogo "([^"]+)"/i.exec(command)?.[1] ?? null : null;
+const launcherOf = (command) => command ? /^"[^"]+\\wscript\.exe" \/\/B \/\/NoLogo \/\/E:JScript "([^"]+)"/i.exec(command)?.[1] ?? null : null;
+/** A literal JScript and JSON both read: JSON, with every character outside printable ASCII as \uXXXX. */
+const asciiLiteral = (value) => JSON.stringify(value).replace(/[^\x20-\x7e]/g, (c) => `\\u${c.charCodeAt(0).toString(16).padStart(4, "0")}`);
 /**
 * The launcher: runs `"<node>" "<script>" <args>` hidden. With `link`, the link Windows gives it goes
 * to node in ISOPLAN_CONNECT_URL, never on a command line, as the Mac handler passes it.
@@ -7330,13 +7332,13 @@ function hiddenLauncher(node, script, { args = "", link = false } = {}) {
 	const command = `"${node}" "${script}"${args ? ` ${args}` : ""}`;
 	return [
 		"// Isoplan: starts node with no window. The plugin's install wrote this file; uninstall removes it.",
-		`var isoplan = ${JSON.stringify({
+		`var isoplan = ${asciiLiteral({
 			node,
 			script
 		})};`,
 		"var shell = new ActiveXObject(\"WScript.Shell\");",
 		...link ? ["shell.Environment(\"PROCESS\")(\"ISOPLAN_CONNECT_URL\") = WScript.Arguments(0);"] : [],
-		`shell.Run(${JSON.stringify(command)}, 0, false);`,
+		`shell.Run(${asciiLiteral(command)}, 0, false);`,
 		""
 	].join("\r\n");
 }
@@ -7452,10 +7454,10 @@ async function register$1(given) {
 			COMMAND_KEY,
 			"/ve"
 		])).stdout);
-		const launcher = launcherOf(current);
-		if (launcher && await works(launcherPaths(await fs.readFile(launcher, "utf8").catch(() => null)))) return [];
 		const off = await scriptHostOff(run);
 		if (off && await works(directPaths(current))) return [];
+		const launcher = launcherOf(current);
+		if (!off && launcher && await works(launcherPaths(await fs.readFile(launcher, "utf8").catch(() => null)))) return [];
 		const file = linkLauncherPath(h.claudeDir);
 		if (!off) {
 			await fs.mkdir(path.dirname(file), { recursive: true });
@@ -7678,6 +7680,12 @@ async function register(given) {
 		if (r.code !== 0) throw new Error(`${path.basename(file)} ${args[0] ?? ""} failed${r.code === null ? " to start" : ` (${r.code})`}`);
 	};
 	if (h.platform === "win32") {
+		if (await scriptHostOff(run)) {
+			const why = "Windows Script Host is turned off on this computer, and without it the runner can't start with no window";
+			const removed = await unregisterLoginItem(h);
+			if (!removed.length) throw new Error(why);
+			return removed.map((change) => `${change}: ${why}`);
+		}
 		const launcher = loginLauncherPath(h.claudeDir);
 		const want = windowsLoginCommand(h.claudeDir);
 		if (regValue((await run("reg", [
@@ -7686,7 +7694,6 @@ async function register(given) {
 			"/v",
 			runValueName(h.claudeDir)
 		])).stdout)?.toLowerCase() === want.toLowerCase() && await works(launcherPaths(await read(launcher)))) return [];
-		if (await scriptHostOff(run)) throw new Error("Windows Script Host is turned off on this computer, and without it the runner can't start with no window");
 		await fs.mkdir(path.dirname(launcher), { recursive: true });
 		await fs.writeFile(launcher, hiddenLauncher(h.node, h.script, { args: LOGIN_ARG }));
 		await must("reg", [
@@ -7750,8 +7757,8 @@ async function unregisterLoginItem(h) {
 	if (h.platform === "darwin") {
 		const file = launchAgentPath(h.home, h.claudeDir);
 		if (!await fs.stat(file).catch(() => null)) return [];
-		await run("launchctl", ["bootout", `gui/${h.uid}/${launchAgentLabel(h.claudeDir)}`]);
 		await fs.rm(file, { force: true });
+		await run("launchctl", ["bootout", `gui/${h.uid}/${launchAgentLabel(h.claudeDir)}`]);
 		return removed(file);
 	}
 	if (h.platform === "linux") {

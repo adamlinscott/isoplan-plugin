@@ -46,7 +46,7 @@ test("Windows: the isoplan URL protocol goes under HKCU, named Isoplan, through 
     ["reg", "add", "HKCU\\Software\\Classes\\isoplan", "/ve", "/d", "URL:Isoplan", "/f"],
     ["reg", "add", "HKCU\\Software\\Classes\\isoplan", "/v", "URL Protocol", "/d", "", "/f"],
     ["reg", "add", "HKCU\\Software\\Classes\\isoplan\\shell\\open", "/v", "FriendlyAppName", "/d", "Isoplan", "/f"],
-    ["reg", "add", COMMAND_KEY, "/ve", "/d", `"${wscriptPath()}" //B //NoLogo "${launcher}" "%1"`, "/f"],
+    ["reg", "add", COMMAND_KEY, "/ve", "/d", `"${wscriptPath()}" //B //NoLogo //E:JScript "${launcher}" "%1"`, "/f"],
   ]);
   // The launcher puts the link in node's environment, never on its command line, and starts it with window style 0.
   const text = fs.readFileSync(launcher, "utf8");
@@ -54,6 +54,16 @@ test("Windows: the isoplan URL protocol goes under HKCU, named Isoplan, through 
   expect(text).toContain('shell.Environment("PROCESS")("ISOPLAN_CONNECT_URL") = WScript.Arguments(0);');
   expect(text).toContain(`shell.Run(${JSON.stringify(`"${NODE}" "${SCRIPT}"`)}, 0, false);`);
   expect(launcherPaths(text)).toEqual({ node: NODE, script: SCRIPT });
+});
+
+test("Windows: a launcher is pure ASCII, as wscript reads a file with no byte-order mark in the ANSI code page, and still names paths outside it", () => {
+  const node = "C:\\Users\\José\\nodejs\\node.exe";
+  const script = "C:\\Users\\José\\张\\.claude\\isoplan\\runner\\app\\dist\\connect.mjs";
+  const text = hiddenLauncher(node, script, { args: "--login", link: true });
+  expect(text).toMatch(/^[\x20-\x7e\r\n]*$/);
+  expect(launcherPaths(text)).toEqual({ node, script });
+  // The command shell.Run is given, read as JScript reads the literal.
+  expect(JSON.parse(/^shell\.Run\((.*), 0, false\);\r?$/m.exec(text)![1]!)).toBe(`"${node}" "${script}" --login`);
 });
 
 /** A node and a handler that exist, in a temp folder. */
@@ -74,7 +84,8 @@ test("Windows: a launcher whose node and handler exist is left alone, even anoth
   fs.writeFileSync(theirs, hiddenLauncher(there.node, there.script, { link: true }));
   const working = windows(windowsCommand(theirs));
   expect(await registerLinkHandler({ ...h, run: working.run })).toEqual([]);
-  expect(working.calls).toHaveLength(1);
+  // The command, then Script Host's two settings.
+  expect(working.calls).toHaveLength(3);
   fs.writeFileSync(theirs, hiddenLauncher(there.node, path.join(path.dirname(there.script), "gone.mjs"), { link: true }));
   const broken = windows(windowsCommand(theirs));
   expect(await registerLinkHandler({ ...h, run: broken.run })).toHaveLength(1);
@@ -90,7 +101,7 @@ test("Windows: a launcher whose node and handler exist is left alone, even anoth
   expect(held.calls).toEqual([]);
 });
 
-test("Windows: with Script Host turned off, links run node directly, and a working direct command is kept", async () => {
+test("Windows: with Script Host turned off, links run node directly, a working direct command is kept, and a working launcher is redone directly", async () => {
   const claudeDir = path.join(tempRoot(), ".claude");
   const there = realFiles();
   const h = { platform: "win32" as const, claudeDir, home: "C:\\Users\\ada", node: NODE, script: SCRIPT };
@@ -101,6 +112,12 @@ test("Windows: with Script Host turned off, links run node directly, and a worki
   const kept = windows(directCommand(there.node, there.script), true);
   expect(await registerLinkHandler({ ...h, run: kept.run })).toEqual([]);
   expect(kept.calls.filter((c) => c[1] === "add")).toEqual([]);
+  // Turned off after a launcher was registered: wscript would show its message on every link.
+  const theirs = path.join(tempRoot(), "open-link.js");
+  fs.writeFileSync(theirs, hiddenLauncher(there.node, there.script, { link: true }));
+  const launched = windows(windowsCommand(theirs), true);
+  expect(await registerLinkHandler({ ...h, run: launched.run })).toEqual([expect.stringContaining("Windows Script Host is turned off")]);
+  expect(launched.calls.at(-1)).toEqual(["reg", "add", COMMAND_KEY, "/ve", "/d", directCommand(NODE, SCRIPT), "/f"]);
 });
 
 test("Windows: uninstall takes the protocol out only when it runs this config folder's handler or launcher, and the launcher goes", async () => {

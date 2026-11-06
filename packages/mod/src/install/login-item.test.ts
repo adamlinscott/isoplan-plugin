@@ -5,7 +5,7 @@ import type { Exec } from "../connect/dialog.js";
 import { tempRoot } from "../data-layer/fixture.js";
 import { hiddenLauncher, launcherPaths, wscriptPath } from "./hidden-launch.js";
 import { installWake, uninstall, wakeScriptPath } from "./install.js";
-import { autostartEntry, autostartPath, launchAgentLabel, launchAgentPath, launchAgentPlist, loginLauncherPath, registerLoginItem, runValueName, unregisterLoginItem } from "./login-item.js";
+import { autostartEntry, autostartPath, launchAgentLabel, launchAgentPath, launchAgentPlist, loginLauncherPath, registerLoginItem, runValueName, unregisterLoginItem, windowsLoginCommand } from "./login-item.js";
 
 const RUN_KEY = "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run";
 
@@ -30,14 +30,16 @@ function realFiles() {
   return { node: fs.realpathSync(node), script };
 }
 
-/** A Windows registry holding Run values, and Script Host on unless `off`. */
+/** A Windows registry holding Run values, and Script Host on unless `state.off`. */
 function registry(off = false) {
   const values = new Map<string, string>();
+  const state = { off };
   return {
     values,
+    state,
     ...fakeOs((_, args) => {
       const [verb, key, , name] = args;
-      if (key !== RUN_KEY) return verb === "query" && off ? { code: 0, stdout: "    Enabled    REG_SZ    0\r\n" } : { code: 1 };
+      if (key !== RUN_KEY) return verb === "query" && state.off ? { code: 0, stdout: "    Enabled    REG_SZ    0\r\n" } : { code: 1 };
       if (verb === "add") values.set(name!, args[5]!);
       if (verb === "delete") return { code: values.delete(name!) ? 0 : 1 };
       if (verb === "query") return values.has(name!) ? { code: 0, stdout: `\r\n${RUN_KEY}\r\n    ${name}    REG_SZ    ${values.get(name!)}\r\n\r\n` } : { code: 1 };
@@ -55,7 +57,7 @@ test("Windows: a Run value of the config folder's own starts wake.mjs --login th
   const name = runValueName(claudeDir);
   expect(name).toMatch(/^Isoplan runner [0-9a-f]{8}$/);
   // wscript has no console window, and the launcher starts node with window style 0.
-  expect(reg.values.get(name)).toBe(`"${wscriptPath()}" //B //NoLogo "${launcher}"`);
+  expect(reg.values.get(name)).toBe(`"${wscriptPath()}" //B //NoLogo //E:JScript "${launcher}"`);
   const text = fs.readFileSync(launcher, "utf8");
   expect(text).toBe(hiddenLauncher(h.node, h.script, { args: "--login" }));
   expect(text).toContain(`shell.Run(${JSON.stringify(`"${h.node}" "${h.script}" --login`)}, 0, false);`);
@@ -63,9 +65,17 @@ test("Windows: a Run value of the config folder's own starts wake.mjs --login th
   // Another config folder gets its own value.
   expect(runValueName(path.join(tempRoot(), ".claude"))).not.toBe(name);
 
+  // Script Host's two settings, then the Run value.
   const before = reg.calls.length;
   expect(await registerLoginItem(h)).toEqual([]);
-  expect(reg.calls.length).toBe(before + 1);
+  expect(reg.calls.length).toBe(before + 3);
+  // Windows reads the path in any letter case: %SystemRoot% may be C:\WINDOWS or C:\Windows.
+  const adds = () => reg.calls.filter((c) => c[1] === "add").length;
+  const added = adds();
+  reg.values.set(name, reg.values.get(name)!.replace(wscriptPath(), wscriptPath().toUpperCase()));
+  expect(reg.values.get(name)).not.toBe(windowsLoginCommand(claudeDir));
+  expect(await registerLoginItem(h)).toEqual([]);
+  expect(adds()).toBe(added);
   fs.rmSync(h.node);
   expect(await registerLoginItem({ ...h, ...realFiles() })).toHaveLength(1);
 
@@ -75,10 +85,20 @@ test("Windows: a Run value of the config folder's own starts wake.mjs --login th
   expect(await unregisterLoginItem(h)).toEqual([]);
 });
 
-test("Windows: with Script Host turned off nothing is registered, and it says why", async () => {
+test("Windows: with Script Host turned off nothing is registered, and it says why; an item registered before is taken out", async () => {
   const claudeDir = path.join(tempRoot(), ".claude");
   const reg = registry(true);
-  await expect(registerLoginItem({ platform: "win32", claudeDir, home: "C:\\Users\\ada", ...realFiles(), run: reg.run })).rejects.toThrow("Windows Script Host is turned off");
+  const h = { platform: "win32" as const, claudeDir, home: "C:\\Users\\ada", ...realFiles(), run: reg.run };
+  await expect(registerLoginItem(h)).rejects.toThrow("Windows Script Host is turned off");
+  expect(reg.values.size).toBe(0);
+  expect(fs.existsSync(loginLauncherPath(claudeDir))).toBe(false);
+  // Turned off after the item was added: wscript would show its message at every login.
+  reg.state.off = false;
+  expect(await registerLoginItem(h)).toHaveLength(1);
+  reg.state.off = true;
+  expect(await registerLoginItem(h)).toEqual([
+    `took out the runner's start at login (${RUN_KEY}\\${runValueName(claudeDir)}): Windows Script Host is turned off on this computer, and without it the runner can't start with no window`,
+  ]);
   expect(reg.values.size).toBe(0);
   expect(fs.existsSync(loginLauncherPath(claudeDir))).toBe(false);
 });
@@ -86,9 +106,14 @@ test("Windows: with Script Host turned off nothing is registered, and it says wh
 test("macOS: a LaunchAgent that runs at load and never again, loaded into this person's GUI domain; uninstall boots it out and removes it", async () => {
   const root = tempRoot();
   const claudeDir = path.join(root, ".claude");
-  const os = fakeOs();
-  const h = { platform: "darwin" as const, claudeDir, home: root, uid: 501, ...realFiles(), run: os.run };
   const file = launchAgentPath(root, claudeDir);
+  // Whether the plist was there at each bootout.
+  const bootouts: boolean[] = [];
+  const os = fakeOs((_, args) => {
+    if (args[0] === "bootout") bootouts.push(fs.existsSync(file));
+    return { code: 0 };
+  });
+  const h = { platform: "darwin" as const, claudeDir, home: root, uid: 501, ...realFiles(), run: os.run };
   const label = launchAgentLabel(claudeDir);
   expect(await registerLoginItem(h)).toEqual([`set the runner to start at login, through ${file}`]);
   expect(file).toBe(path.join(root, "Library", "LaunchAgents", `${label}.plist`));
@@ -110,6 +135,8 @@ test("macOS: a LaunchAgent that runs at load and never again, loaded into this p
   expect(await unregisterLoginItem(h)).toEqual([`took out the runner's start at login (${file})`]);
   expect(os.calls.at(-1)).toEqual(["launchctl", "bootout", `gui/501/${label}`]);
   expect(fs.existsSync(file)).toBe(false);
+  // At login the agent's own job takes it out, and bootout may end that job, so the file is gone first.
+  expect(bootouts).toEqual([false, false]);
 });
 
 test("Linux: an XDG autostart entry with no terminal; uninstall removes it", async () => {
