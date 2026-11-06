@@ -125,6 +125,17 @@ export const MAX_ROOM_SESSIONS = 20;
 /** The most driven sessions a `holding` message lists. */
 export const MAX_HOLDING = 200;
 
+/** The longest sign-in link a `driven` `claude` carries. */
+export const MAX_SIGN_IN_URL_LENGTH = 4000;
+
+/**
+ * Claude Code for the terminal on the runner's machine (protocol 0.7.0, #180), as the runner finds
+ * it the way it finds it for driven sessions: `ready`, found and signed in, or found with a sign-in
+ * `claude auth status` couldn't say; `signed-out`, found, and `claude auth status` says it isn't
+ * signed in; `missing`, no claude binary found.
+ */
+export const ClaudeCliSchema = z.enum(["ready", "signed-out", "missing"]);
+
 /** A drive request's, an instruction's, a prompt's or a withheld text's id. */
 const DriveId = z.string().min(1).max(MAX_DRIVE_ID_LENGTH);
 /** A driven session, by its id as its facts name it (`claude-code:<uuid>`). */
@@ -171,6 +182,10 @@ export const HelloMessageSchema = z.object({
  * `drive-policy`, sends `driven` messages, and takes a handoff as a driven session (mode `driven`). The
  * server sends none of these to a runner that didn't say it. A machine with no claude binary still says
  * it, and refuses each start `no-claude`.
+ * `claude` (protocol 0.7.0, #180): Claude Code for the terminal on this machine (ClaudeCli), which
+ * driven sessions, a take into a terminal and a headless one all need. A runner that says it says it
+ * on every hello, says `driven` `claude` whenever it changes, and takes the `install-claude` and
+ * `sign-in-claude` drive requests; the server sends neither to a runner that didn't say it.
  */
 export const RunnerHelloMessageSchema = z.object({
   type: z.literal("runner"),
@@ -181,6 +196,7 @@ export const RunnerHelloMessageSchema = z.object({
   orca: z.boolean().optional(),
   desktop: z.boolean().optional(),
   drive: z.boolean().optional(),
+  claude: ClaudeCliSchema.optional(),
 });
 
 /** All of the session's facts. Sent on connect and on repair. */
@@ -343,7 +359,7 @@ const driven = { type: z.literal("driven"), v: Version };
  * withheld under that id (it was dropped, or the runner restarted since). `bypass-off`: the start asked for
  * `bypassPermissions` in a project whose office doesn't allow it (`drive-policy`). `no-folder`: this
  * machine has no folder for the room's project, or a start named a folder it didn't list in `folders` for that project, or that is no longer in it. `no-claude`: it has no claude binary. `busy`: the
- * session can't take this now, such as while a turn runs. `no-prompt`: an answer names a prompt the
+ * session can't take this now, such as while a turn runs, or an install or sign-in of Claude Code runs already. `no-prompt`: an answer names a prompt the
  * session isn't waiting on (never raised by this runner, answered already, timed out or cancelled).
  * `cap-reached`: the project already has `limit` driven sessions running on this machine.
  * `unavailable` is anything else, saying what in `detail`. A runner never refuses `offline`: that is
@@ -428,6 +444,23 @@ export const DrivenMessageSchema = z.discriminatedUnion("kind", [
   // terminal opened in `folder`, a path on the runner's machine.
   z.object({ ...driven, kind: z.literal("handed-back"), id: DriveId, session: DrivenSessionId, command: z.string().min(1).max(MAX_COMMAND_LENGTH), folder: Folder }),
   DrivenRefusedSchema,
+  // Claude Code for the terminal here (protocol 0.7.0, #180), sent to every office whenever it
+  // changes: as the runner finds it again, and through an `install-claude` or `sign-in-claude`, whose
+  // messages carry that request's `id`. `doing`: the install or sign-in running now; one with no
+  // `doing` and an `id` is the request's last. `progress`: the installer's latest line, through the
+  // secret scan. `url`: the sign-in page `claude auth login` opened in the browser on this machine,
+  // for the floor to offer if no browser came up. `failed`: why the request ended without Claude
+  // Code ready, in the runner's own words.
+  z.object({
+    ...driven,
+    kind: z.literal("claude"),
+    claude: ClaudeCliSchema,
+    doing: z.enum(["installing", "signing-in"]).optional(),
+    progress: Detail.optional(),
+    url: z.url({ protocol: /^https$/ }).max(MAX_SIGN_IN_URL_LENGTH).optional(),
+    failed: Detail.optional(),
+    id: DriveId.optional(),
+  }),
   // Sent once per connection, after its first drive-policy: the driven sessions the runner holds, or
   // would reopen for an instruction, at most MAX_HOLDING of them, held ones first, then the most
   // recently active. `held`: a process holds it now. `turn`: the turn running now, if any. The server
@@ -723,6 +756,17 @@ export const DriveMessageSchema = z.discriminatedUnion("kind", [
   // `output` under this request's id, with the released text, or `refused` `not-found` when it holds
   // nothing withheld under that id.
   z.object({ ...drive, kind: z.literal("release"), session: DrivenSessionId, withheld: DriveId }),
+  // Install Claude Code for the terminal on this machine (protocol 0.7.0, #180), sent only to a runner
+  // that said `claude`, on its person's press, which is their consent: the runner runs Anthropic's
+  // native installer (claude.ai/install.ps1 on Windows, claude.ai/install.sh elsewhere) with no
+  // window, and answers with `claude` messages under this id. One while another install or sign-in
+  // runs is refused `busy`.
+  z.object({ ...drive, kind: z.literal("install-claude") }),
+  // Sign Claude Code for the terminal in (protocol 0.7.0): the runner runs `claude auth login` with no
+  // window, which opens the sign-in in the browser on this machine, and answers with `claude`
+  // messages under this id once it is signed in, or it gave up. With no claude binary it is refused
+  // `no-claude`; while another install or sign-in runs, `busy`.
+  z.object({ ...drive, kind: z.literal("sign-in-claude") }),
 ]);
 
 /**
@@ -800,6 +844,7 @@ export type DrivePermissions = z.infer<typeof DrivePermissionsSchema>;
 export type DriveMessage = z.infer<typeof DriveMessageSchema>;
 export type DriveKind = DriveMessage["kind"];
 export type DrivePolicyMessage = z.infer<typeof DrivePolicyMessageSchema>;
+export type ClaudeCli = z.infer<typeof ClaudeCliSchema>;
 export type DrivenMessage = z.infer<typeof DrivenMessageSchema>;
 export type DrivenKind = DrivenMessage["kind"];
 export type DriveRefusal = Extract<DrivenMessage, { kind: "refused" }>;

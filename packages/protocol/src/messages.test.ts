@@ -196,6 +196,7 @@ const valid = {
   asked: { type: "asked", v, question: "q-4f9c", text: "Why does the CRLF check exist?", state: "answered", answer: "Windows checkouts.", owner: "Adam", key: "toolu_01" },
   "asked queued": { type: "asked", v, question: "q-4f9c", text: "Why does the CRLF check exist?", state: "queued", note: "Adam's machine isn't reachable." },
   "runner that drives sessions": { type: "runner", v, account: adam, machine: { name: "sevengill" }, drive: true },
+  "runner without Claude Code": { type: "runner", v, account: adam, machine: { name: "sevengill" }, drive: true, claude: "missing" },
   "handoff as a driven session": { type: "handoff", v, handoff, mode: "driven", session: "0b5c4d3e-0000-4000-8000-000000000001", by: sam, room, permissions: "auto" },
   "drive start": { type: "drive", v, kind: "start", id: "d1", by: adam, room, project: isoplan, roomSessions: ["claude-code:s1"], instruction: "Fix the failing test in src/a.ts.", permissions: "auto" },
   "drive start in a folder": { type: "drive", v, kind: "start", id: "d8", by: adam, folder: "C:\\Users\\adam\\isoplan", project: isoplan, instruction: "Add a dark mode.", permissions: "auto" },
@@ -205,6 +206,8 @@ const valid = {
   "drive output": { type: "drive", v, kind: "output", id: "d5", by: adam, session: driving, turn: "i2" },
   "drive answer": { type: "drive", v, kind: "answer", id: "d6", by: adam, session: driving, prompt: "p1", answer: "allow" },
   "drive release": { type: "drive", v, kind: "release", id: "d7", by: adam, session: driving, withheld: "w1" },
+  "drive install-claude": { type: "drive", v, kind: "install-claude", id: "c1", by: adam },
+  "drive sign-in-claude": { type: "drive", v, kind: "sign-in-claude", id: "c2", by: adam },
   "drive-policy": { type: "drive-policy", v, bypassAllowed: ["github.com/isoplan-app/isoplan"] },
   "driven started": { type: "driven", v, kind: "started", id: "d1", session: driving, room, permissions: "auto" },
   "driven turn-started": { type: "driven", v, kind: "turn-started", session: driving, turn: "i2" },
@@ -223,6 +226,9 @@ const valid = {
   "driven refused unavailable": { type: "driven", v, kind: "refused", id: "d1", reason: "unavailable", detail: "Claude Code isn't signed in on this machine." },
   "driven folders": { type: "driven", v, kind: "folders", repos: [{ project: isoplan.id, folders: ["/Users/sam/code/isoplan", "/Users/sam/code/isoplan-wt"] }] },
   "driven holding": { type: "driven", v, kind: "holding", sessions: [{ session: driving, room, held: true, permissions: "auto", turn: "i2" }] },
+  "driven claude installing": { type: "driven", v, kind: "claude", claude: "missing", doing: "installing", progress: "Downloading Claude Code...", id: "c1" },
+  "driven claude signing in": { type: "driven", v, kind: "claude", claude: "signed-out", doing: "signing-in", url: "https://claude.ai/oauth/authorize?code=true", id: "c2" },
+  "driven claude failed": { type: "driven", v, kind: "claude", claude: "missing", failed: "The installer stopped with code 1.", id: "c1" },
 };
 
 const parsers = {
@@ -273,6 +279,7 @@ const parsers = {
   asked: parseOfficeServerMessage,
   "asked queued": parseOfficeServerMessage,
   "runner that drives sessions": parseDataLayerMessage,
+  "runner without Claude Code": parseDataLayerMessage,
   "handoff as a driven session": parseOfficeServerMessage,
   "drive start": parseOfficeServerMessage,
   "drive start in a folder": parseOfficeServerMessage,
@@ -282,6 +289,8 @@ const parsers = {
   "drive output": parseOfficeServerMessage,
   "drive answer": parseOfficeServerMessage,
   "drive release": parseOfficeServerMessage,
+  "drive install-claude": parseOfficeServerMessage,
+  "drive sign-in-claude": parseOfficeServerMessage,
   "drive-policy": parseOfficeServerMessage,
   "driven started": parseDataLayerMessage,
   "driven turn-started": parseDataLayerMessage,
@@ -300,6 +309,9 @@ const parsers = {
   "driven refused unavailable": parseDataLayerMessage,
   "driven holding": parseDataLayerMessage,
   "driven folders": parseDataLayerMessage,
+  "driven claude installing": parseDataLayerMessage,
+  "driven claude signing in": parseDataLayerMessage,
+  "driven claude failed": parseDataLayerMessage,
 } satisfies Record<keyof typeof valid, (value: unknown) => ParseResult<unknown>>;
 
 // Each message with one field made wrong, and the path the error should name.
@@ -351,6 +363,7 @@ const broken: Record<keyof typeof valid, [unknown, string]> = {
   asked: [{ ...valid.asked, state: "lost" }, "state"],
   "asked queued": [{ ...valid["asked queued"], note: "" }, "note"],
   "runner that drives sessions": [{ ...valid["runner that drives sessions"], drive: "yes" }, "drive"],
+  "runner without Claude Code": [{ ...valid["runner without Claude Code"], claude: "none" }, "claude"],
   "handoff as a driven session": [{ ...valid["handoff as a driven session"], room: undefined }, "room"],
   "drive start": [{ ...valid["drive start"], permissions: "default" }, "permissions"],
   "drive start in a folder": [{ ...valid["drive start in a folder"], folder: "" }, "folder"],
@@ -360,6 +373,8 @@ const broken: Record<keyof typeof valid, [unknown, string]> = {
   "drive output": [{ ...valid["drive output"], turn: "" }, "turn"],
   "drive answer": [{ ...valid["drive answer"], answer: "always" }, "answer"],
   "drive release": [{ ...valid["drive release"], withheld: "" }, "withheld"],
+  "drive install-claude": [{ ...valid["drive install-claude"], by: undefined }, "by"],
+  "drive sign-in-claude": [{ ...valid["drive sign-in-claude"], id: "" }, "id"],
   "drive-policy": [{ ...valid["drive-policy"], bypassAllowed: [""] }, "bypassAllowed[0]"],
   "driven started": [{ ...valid["driven started"], room: undefined }, "room"],
   "driven turn-started": [{ ...valid["driven turn-started"], turn: "x".repeat(MAX_DRIVE_ID_LENGTH + 1) }, "turn"],
@@ -378,6 +393,9 @@ const broken: Record<keyof typeof valid, [unknown, string]> = {
   "driven refused unavailable": [{ ...valid["driven refused unavailable"], detail: undefined }, "detail"],
   "driven holding": [{ ...valid["driven holding"], sessions: [{ ...valid["driven holding"].sessions[0], held: "yes" }] }, "sessions[0].held"],
   "driven folders": [{ ...valid["driven folders"], repos: [{ project: isoplan.id, folders: [] }] }, "repos[0].folders"],
+  "driven claude installing": [{ ...valid["driven claude installing"], doing: "updating" }, "doing"],
+  "driven claude signing in": [{ ...valid["driven claude signing in"], url: "http://claude.ai/oauth/authorize" }, "url"],
+  "driven claude failed": [{ ...valid["driven claude failed"], claude: "gone" }, "claude"],
 };
 
 describe.each(Object.keys(valid) as (keyof typeof valid)[])("%s", (type) => {
