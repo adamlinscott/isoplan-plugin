@@ -12269,7 +12269,13 @@ async function waitsOf(dir, facts) {
 }
 /** The context window the hooks module wrote, in tokens; null while there is none, or it isn't a whole positive number. */
 async function windowOf(file) {
-	const value = await fs.readFile(file, "utf8").then((text) => JSON.parse(text).contextWindow, () => null);
+	let said;
+	try {
+		said = JSON.parse(await fs.readFile(file, "utf8"));
+	} catch {
+		return null;
+	}
+	const value = said && typeof said === "object" ? said.contextWindow : null;
 	return Number.isInteger(value) && value > 0 ? value : null;
 }
 async function takeFile(file) {

@@ -673,7 +673,13 @@ async function waitsOf(dir: string, facts: Facts): Promise<Set<string>> {
 
 /** The context window the hooks module wrote, in tokens; null while there is none, or it isn't a whole positive number. */
 async function windowOf(file: string): Promise<number | null> {
-  const value = await fs.readFile(file, "utf8").then((text) => (JSON.parse(text) as Partial<ContextWindow>).contextWindow, () => null);
+  let said: unknown;
+  try {
+    said = JSON.parse(await fs.readFile(file, "utf8"));
+  } catch {
+    return null;
+  }
+  const value = said && typeof said === "object" ? (said as Partial<ContextWindow>).contextWindow : null;
   return Number.isInteger(value) && value! > 0 ? value! : null;
 }
 

@@ -470,7 +470,7 @@ const statusLineInput = () => ({
 const usageOf = (input: ReturnType<typeof statusLineInput>) => async () => ({ context: { window: input.context_window.context_window_size } });
 
 test.each([
-  ["Windows", "C:\Users\ada\.claude\isoplan\windows\s1.json"],
+  ["Windows", "C:\\Users\\ada\\.claude\\isoplan\\windows\\s1.json"],
   ["macOS", "/Users/ada/.claude/isoplan/windows/s1.json"],
 ])("hooks: on %s the session's context window, as the status line gets it, is written where the window line says, and again only once it changes", async (_os, file) => {
   const input = statusLineInput();

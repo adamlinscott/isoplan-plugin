@@ -192,9 +192,10 @@ function ownerAnswer($: Host, line: OwnerAnswerLine): void {
 async function sendWindow($: Host): Promise<void> {
   const file = windowFile;
   if (!file) return;
+  if (!$.session.usage) return;
   let size: number;
   try {
-    size = (await $.session.usage!()).context.window; // throws when the host has no usage
+    size = (await $.session.usage()).context.window;
   } catch {
     return;
   }
