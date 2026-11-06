@@ -6040,10 +6040,10 @@ const ChangesMessageSchema = object({
 	upsert: FactUpsertSchema,
 	remove: FactRemoveSchema
 });
-/** The longest message an owner sends their open session from the floor (protocol 0.7.0 on). */
+/** The longest message an owner sends their open session from the floor (protocol 0.8.0 on). */
 const MAX_OWNER_MESSAGE_LENGTH = 2e4;
 /**
-* Why an owner-message didn't reach its session (protocol 0.7.0 on), on its `unavailable` refusal:
+* Why an owner-message didn't reach its session (protocol 0.8.0 on), on its `unavailable` refusal:
 * `not-owner`, it came from someone other than the session's owner; `detached`, the session is seen
 * only through the wake hook, with no plugin in it to pass the message on; `no-submit`, its Claude
 * Code build can't take a message from a plugin; `ended`, the session has ended or moved on (a

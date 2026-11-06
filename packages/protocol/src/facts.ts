@@ -44,7 +44,7 @@ export const SessionFactSchema = z.object({
   // `contextWindow` (protocol 0.6.0 on): the session's context window in tokens, as Claude Code
   // tells its status line (`context_window_size`); absent when the plugin wasn't told it.
   contextWindow: z.number().int().positive().optional(),
-  // `takesMessages` (protocol 0.7.0 on): the plugin in this session can pass it a message from the
+  // `takesMessages` (protocol 0.8.0 on): the plugin in this session can pass it a message from the
   // floor (an owner-message request); absent, the session takes none, and none is sent.
   takesMessages: z.literal(true).optional(),
   extra: Extra,
