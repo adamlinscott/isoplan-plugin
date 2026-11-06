@@ -5111,6 +5111,9 @@ const ZodURL = /*@__PURE__*/ $constructor("ZodURL", (inst, def) => {
 	$ZodURL.init(inst, def);
 	ZodStringFormat.init(inst, def);
 });
+function url(params) {
+	return /* @__PURE__ */ _url(ZodURL, params);
+}
 const ZodEmoji = /*@__PURE__*/ $constructor("ZodEmoji", (inst, def) => {
 	$ZodEmoji.init(inst, def);
 	ZodStringFormat.init(inst, def);
@@ -5951,6 +5954,19 @@ const MAX_PROMPT_LENGTH = 2e3;
 const MAX_DETAIL_LENGTH = 1e3;
 /** The longest folder a `handed-back`, a `folders` or a start names. */
 const MAX_FOLDER_LENGTH = 4096;
+/** The longest sign-in link a `driven` `claude` carries. */
+const MAX_SIGN_IN_URL_LENGTH = 4e3;
+/**
+* Claude Code for the terminal on the runner's machine (protocol 0.7.0, #180), as the runner finds
+* it the way it finds it for driven sessions: `ready`, found and signed in, or found with a sign-in
+* `claude auth status` couldn't say; `signed-out`, found, and `claude auth status` says it isn't
+* signed in; `missing`, no claude binary found.
+*/
+const ClaudeCliSchema = _enum([
+	"ready",
+	"signed-out",
+	"missing"
+]);
 /** A drive request's, an instruction's, a prompt's or a withheld text's id. */
 const DriveId = string().min(1).max(100);
 /** A driven session, by its id as its facts name it (`claude-code:<uuid>`). */
@@ -5992,6 +6008,10 @@ const HelloMessageSchema = object({
 * `drive-policy`, sends `driven` messages, and takes a handoff as a driven session (mode `driven`). The
 * server sends none of these to a runner that didn't say it. A machine with no claude binary still says
 * it, and refuses each start `no-claude`.
+* `claude` (protocol 0.7.0, #180): Claude Code for the terminal on this machine (ClaudeCli), which
+* driven sessions, a take into a terminal and a headless one all need. A runner that says it says it
+* on every hello, says `driven` `claude` whenever it changes, and takes the `install-claude` and
+* `sign-in-claude` drive requests; the server sends neither to a runner that didn't say it.
 */
 const RunnerHelloMessageSchema = object({
 	type: literal$1("runner"),
@@ -6001,7 +6021,8 @@ const RunnerHelloMessageSchema = object({
 	token: Token,
 	orca: boolean().optional(),
 	desktop: boolean().optional(),
-	drive: boolean().optional()
+	drive: boolean().optional(),
+	claude: ClaudeCliSchema.optional()
 });
 /** All of the session's facts. Sent on connect and on repair. */
 const FullMessageSchema = object({
@@ -6166,7 +6187,7 @@ const AskedAckMessageSchema = object({
 	v: Version,
 	question: RequestId
 });
-const driven$1 = {
+const driven$2 = {
 	type: literal$1("driven"),
 	v: Version
 };
@@ -6177,7 +6198,7 @@ const driven$1 = {
 * withheld under that id (it was dropped, or the runner restarted since). `bypass-off`: the start asked for
 * `bypassPermissions` in a project whose office doesn't allow it (`drive-policy`). `no-folder`: this
 * machine has no folder for the room's project, or a start named a folder it didn't list in `folders` for that project, or that is no longer in it. `no-claude`: it has no claude binary. `busy`: the
-* session can't take this now, such as while a turn runs. `no-prompt`: an answer names a prompt the
+* session can't take this now, such as while a turn runs, or an install or sign-in of Claude Code runs already. `no-prompt`: an answer names a prompt the
 * session isn't waiting on (never raised by this runner, answered already, timed out or cancelled).
 * `cap-reached`: the project already has `limit` driven sessions running on this machine.
 * `unavailable` is anything else, saying what in `detail`. A runner never refuses `offline`: that is
@@ -6185,7 +6206,7 @@ const driven$1 = {
 */
 const DrivenRefusedSchema = discriminatedUnion("reason", [
 	object({
-		...driven$1,
+		...driven$2,
 		kind: literal$1("refused"),
 		id: DriveId,
 		reason: _enum([
@@ -6200,7 +6221,7 @@ const DrivenRefusedSchema = discriminatedUnion("reason", [
 		detail: Detail.optional()
 	}),
 	object({
-		...driven$1,
+		...driven$2,
 		kind: literal$1("refused"),
 		id: DriveId,
 		reason: literal$1("cap-reached"),
@@ -6208,7 +6229,7 @@ const DrivenRefusedSchema = discriminatedUnion("reason", [
 		detail: Detail.optional()
 	}),
 	object({
-		...driven$1,
+		...driven$2,
 		kind: literal$1("refused"),
 		id: DriveId,
 		reason: literal$1("unavailable"),
@@ -6245,7 +6266,7 @@ const DrivenRefusedSchema = discriminatedUnion("reason", [
 */
 const DrivenMessageSchema = discriminatedUnion("kind", [
 	object({
-		...driven$1,
+		...driven$2,
 		kind: literal$1("started"),
 		id: DriveId,
 		session: DrivenSessionId,
@@ -6253,13 +6274,13 @@ const DrivenMessageSchema = discriminatedUnion("kind", [
 		permissions: DrivePermissionsSchema
 	}),
 	object({
-		...driven$1,
+		...driven$2,
 		kind: literal$1("turn-started"),
 		session: DrivenSessionId,
 		turn: DriveId
 	}),
 	object({
-		...driven$1,
+		...driven$2,
 		kind: literal$1("tool"),
 		session: DrivenSessionId,
 		turn: DriveId,
@@ -6274,7 +6295,7 @@ const DrivenMessageSchema = discriminatedUnion("kind", [
 		});
 	}),
 	object({
-		...driven$1,
+		...driven$2,
 		kind: literal$1("reply"),
 		session: DrivenSessionId,
 		turn: DriveId,
@@ -6283,7 +6304,7 @@ const DrivenMessageSchema = discriminatedUnion("kind", [
 		withheld: Withheld
 	}),
 	object({
-		...driven$1,
+		...driven$2,
 		kind: literal$1("turn-ended"),
 		session: DrivenSessionId,
 		turn: DriveId,
@@ -6294,14 +6315,14 @@ const DrivenMessageSchema = discriminatedUnion("kind", [
 		])
 	}),
 	object({
-		...driven$1,
+		...driven$2,
 		kind: literal$1("error"),
 		session: DrivenSessionId,
 		turn: DriveId.optional(),
 		text: Detail
 	}),
 	object({
-		...driven$1,
+		...driven$2,
 		kind: literal$1("output"),
 		id: DriveId,
 		session: DrivenSessionId,
@@ -6311,7 +6332,7 @@ const DrivenMessageSchema = discriminatedUnion("kind", [
 		withheld: Withheld
 	}),
 	object({
-		...driven$1,
+		...driven$2,
 		kind: literal$1("prompt"),
 		session: DrivenSessionId,
 		turn: DriveId.optional(),
@@ -6322,7 +6343,7 @@ const DrivenMessageSchema = discriminatedUnion("kind", [
 		expires: datetime({ offset: true })
 	}),
 	object({
-		...driven$1,
+		...driven$2,
 		kind: literal$1("prompt-ended"),
 		session: DrivenSessionId,
 		prompt: DriveId,
@@ -6335,7 +6356,7 @@ const DrivenMessageSchema = discriminatedUnion("kind", [
 		id: DriveId.optional()
 	}),
 	object({
-		...driven$1,
+		...driven$2,
 		kind: literal$1("held"),
 		session: DrivenSessionId,
 		room: Room,
@@ -6347,7 +6368,7 @@ const DrivenMessageSchema = discriminatedUnion("kind", [
 		permissions: DrivePermissionsSchema
 	}),
 	object({
-		...driven$1,
+		...driven$2,
 		kind: literal$1("released"),
 		session: DrivenSessionId,
 		why: _enum([
@@ -6359,7 +6380,7 @@ const DrivenMessageSchema = discriminatedUnion("kind", [
 		id: DriveId.optional()
 	}),
 	object({
-		...driven$1,
+		...driven$2,
 		kind: literal$1("handed-back"),
 		id: DriveId,
 		session: DrivenSessionId,
@@ -6368,7 +6389,17 @@ const DrivenMessageSchema = discriminatedUnion("kind", [
 	}),
 	DrivenRefusedSchema,
 	object({
-		...driven$1,
+		...driven$2,
+		kind: literal$1("claude"),
+		claude: ClaudeCliSchema,
+		doing: _enum(["installing", "signing-in"]).optional(),
+		progress: Detail.optional(),
+		url: url({ protocol: /^https$/ }).max(MAX_SIGN_IN_URL_LENGTH).optional(),
+		failed: Detail.optional(),
+		id: DriveId.optional()
+	}),
+	object({
+		...driven$2,
 		kind: literal$1("holding"),
 		sessions: array(object({
 			session: DrivenSessionId,
@@ -6379,7 +6410,7 @@ const DrivenMessageSchema = discriminatedUnion("kind", [
 		})).max(200)
 	}),
 	object({
-		...driven$1,
+		...driven$2,
 		kind: literal$1("folders"),
 		repos: array(object({
 			project: string().min(1),
@@ -6667,6 +6698,14 @@ const OfficeServerMessageSchema = discriminatedUnion("type", [
 			kind: literal$1("release"),
 			session: DrivenSessionId,
 			withheld: DriveId
+		}),
+		object({
+			...drive$1,
+			kind: literal$1("install-claude")
+		}),
+		object({
+			...drive$1,
+			kind: literal$1("sign-in-claude")
 		})
 	]),
 	object({
@@ -9356,8 +9395,8 @@ function viewWorkflow(input) {
 	const agents = /* @__PURE__ */ new Map();
 	for (const a of input.agents) {
 		const started = run.started.get(a.file.id);
-		const label = cut(started?.label || text(a.meta.description) || "", 200);
-		const phase = cut(started?.phase || text(a.meta.workflowPhase) || "", 100);
+		const label = cut$1(started?.label || text(a.meta.description) || "", 200);
+		const phase = cut$1(started?.phase || text(a.meta.workflowPhase) || "", 100);
 		const workflow = {
 			id: files.id,
 			phase,
@@ -9407,11 +9446,11 @@ function viewWorkflow(input) {
 			id: files.id,
 			session: input.session,
 			startedBy: launch?.by ?? input.lead,
-			name: cut(name, 200),
-			...description ? { description: cut(description, MAX_WORKFLOW_DESCRIPTION_LENGTH) } : {},
+			name: cut$1(name, 200),
+			...description ? { description: cut$1(description, MAX_WORKFLOW_DESCRIPTION_LENGTH) } : {},
 			phases: phases.slice(0, 30).map((p) => ({
-				title: cut(p.title, 100),
-				...p.detail ? { detail: cut(p.detail, 500) } : {}
+				title: cut$1(p.title, 100),
+				...p.detail ? { detail: cut$1(p.detail, 500) } : {}
 			})),
 			status,
 			startedAt: iso$2(startedAt, files.lastActive),
@@ -9601,7 +9640,7 @@ function resultText$1(v) {
 	}
 }
 const text = (v) => typeof v === "string" && v.trim() ? v.trim() : null;
-function cut(s, max) {
+function cut$1(s, max) {
 	if (s.length <= max) return s;
 	let end = max;
 	const code = s.charCodeAt(end - 1);
@@ -10796,6 +10835,205 @@ function drive(child, { instructions, request, timeoutMs }) {
 		child.on("close", (code) => fail("failed", `claude exited${code === null ? "" : ` with code ${code}`} before answering${stderr.trim() ? `: ${stderr.trim().split("\n").slice(-3).join(" ")}` : ""}`));
 		child.stdin.write(userTurn(instructions));
 	});
+}
+//#endregion
+//#region src/runner/claude-setup.ts
+/** What runs Anthropic's native installer, hidden, on this OS. */
+function installerArgv(platform) {
+	return platform === "win32" ? [
+		"powershell.exe",
+		"-NoProfile",
+		"-NonInteractive",
+		"-ExecutionPolicy",
+		"Bypass",
+		"-Command",
+		"irm https://claude.ai/install.ps1 | iex"
+	] : [
+		"/bin/bash",
+		"-c",
+		"curl -fsSL https://claude.ai/install.sh | bash"
+	];
+}
+const INSTALL_MS = 6e5;
+const SIGN_IN_MS = 6e5;
+const STATUS_MS = 3e4;
+const driven$1 = {
+	type: "driven",
+	v: 1
+};
+const ANSI = /\x1b\[[0-9;?]*[A-Za-z]/g;
+const cut = (text) => text.length > 1e3 ? `${text.slice(0, 999)}…` : text;
+function createClaudeSetup(o) {
+	const spawn = o.spawn ?? hiddenSpawn;
+	const platform = o.platform ?? process.platform;
+	let state = "missing";
+	let running = null;
+	function run(argv, ms, line = () => {}) {
+		let child;
+		try {
+			child = spawn(argv, {
+				cwd: o.cwd,
+				env: o.env
+			});
+		} catch (err) {
+			return {
+				done: Promise.resolve({
+					code: null,
+					timedOut: false,
+					error: err.message
+				}),
+				stop: () => {}
+			};
+		}
+		let timedOut = false;
+		const timer = setTimeout(() => (timedOut = true, killTree(child, platform)), ms);
+		for (const stream of [child.stdout, child.stderr]) {
+			let buf = "";
+			stream.setEncoding("utf8").on("data", (d) => {
+				buf += d;
+				const lines = buf.split(/\r?\n|\r/);
+				buf = lines.pop();
+				for (const l of lines) line(l);
+			});
+			stream.on("end", () => buf && line(buf));
+		}
+		return {
+			done: new Promise((resolve) => {
+				child.on("error", (err) => (clearTimeout(timer), resolve({
+					code: null,
+					timedOut,
+					error: err.message
+				})));
+				child.on("close", (code) => (clearTimeout(timer), resolve({
+					code,
+					timedOut
+				})));
+			}),
+			stop: () => killTree(child, platform)
+		};
+	}
+	async function signedIn(bin) {
+		let out = "";
+		const { done } = run([
+			...claudeCommand(bin),
+			"auth",
+			"status",
+			"--json"
+		], STATUS_MS, (l) => out += l);
+		const r = await done;
+		try {
+			const loggedIn = JSON.parse(out).loggedIn;
+			return r.code === 0 && typeof loggedIn === "boolean" ? loggedIn : null;
+		} catch {
+			return null;
+		}
+	}
+	async function find() {
+		const bin = await o.binary();
+		if (!bin) return "missing";
+		return await signedIn(bin) === false ? "signed-out" : "ready";
+	}
+	function say(fields) {
+		o.send({
+			...driven$1,
+			kind: "claude",
+			claude: state,
+			...fields
+		});
+	}
+	async function install(id) {
+		say({
+			doing: "installing",
+			id
+		});
+		let last = "";
+		let lines = Promise.resolve();
+		const { done } = run(o.installer ?? installerArgv(platform), o.installMs ?? INSTALL_MS, (raw) => {
+			const text = raw.replace(ANSI, "").trim();
+			if (!text) return;
+			lines = lines.then(async () => {
+				if (await o.scan(text)) return;
+				last = cut(text);
+				say({
+					doing: "installing",
+					progress: last,
+					id
+				});
+			});
+		});
+		const r = await done;
+		await lines;
+		state = await find();
+		if (state !== "missing") return say({ id });
+		const why = r.error ? `The installer couldn't start: ${r.error}` : r.timedOut ? `The installer didn't finish within ${Math.round((o.installMs ?? INSTALL_MS) / 6e4)} minutes, so it was stopped.` : r.code !== 0 ? `The installer stopped with code ${r.code}${last ? `: ${last}` : "."}` : "The installer finished, but Claude Code isn't where it puts it.";
+		o.log(`installing Claude Code failed: ${why}`);
+		say({
+			failed: cut(why),
+			id
+		});
+	}
+	async function signIn(id, bin) {
+		say({
+			doing: "signing-in",
+			id
+		});
+		let url;
+		const login = run([
+			...claudeCommand(bin),
+			"auth",
+			"login"
+		], o.signInMs ?? SIGN_IN_MS, (raw) => {
+			const found = /https:\/\/\S+/.exec(raw.replace(ANSI, ""))?.[0];
+			if (url || !found || found.length > 4e3) return;
+			url = found;
+			o.scan(found).then((match) => !match && say({
+				doing: "signing-in",
+				url: found,
+				id
+			}));
+		});
+		let ended = false;
+		login.done.then(() => ended = true);
+		while (!ended) {
+			await Promise.race([login.done, new Promise((resolve) => setTimeout(resolve, o.signInCheckMs ?? 3e3))]);
+			if (!ended && await signedIn(bin) === true) login.stop();
+		}
+		const r = await login.done;
+		state = await find();
+		if (state === "ready") return say({ id });
+		say({
+			failed: r.error ? `The sign-in couldn't start: ${r.error}` : r.timedOut ? "The sign-in wasn't finished in time, so it was stopped: sign in again." : "Claude Code isn't signed in: sign in again.",
+			id
+		});
+	}
+	return {
+		state: () => state,
+		async check() {
+			const was = state;
+			state = await find();
+			if (state !== was && !running) say({});
+			return state;
+		},
+		take(m) {
+			const refuse = (reason) => o.send({
+				...driven$1,
+				kind: "refused",
+				id: m.id,
+				reason
+			});
+			if (running) return refuse("busy");
+			running = (async () => {
+				if (m.kind === "install-claude") return install(m.id);
+				const bin = await o.binary();
+				if (!bin) {
+					state = "missing";
+					return refuse("no-claude");
+				}
+				return signIn(m.id, bin);
+			})().catch((err) => o.log(`${m.kind} ${m.id} failed: ${err?.stack ?? String(err)}`)).finally(() => running = null);
+		},
+		settled: () => running ?? Promise.resolve()
+	};
 }
 //#endregion
 //#region src/runner/lifecycle.ts
@@ -14663,6 +14901,7 @@ function createDriver(o) {
 				return;
 			}
 			if (m.by.id !== o.account.id) return refuse(server, m.id, "not-owner");
+			if (m.kind === "install-claude" || m.kind === "sign-in-claude") return o.setup ? o.setup(m) : refuse(server, m.id, "unavailable", { detail: "This runner can't install Claude Code." });
 			if (m.kind === "start") {
 				start(server, m).catch((err) => (o.log(`start ${m.id} failed: ${err?.stack ?? String(err)}`), refuse(server, m.id, "unavailable", { detail: NOT_STARTED })));
 				return;
@@ -14682,6 +14921,9 @@ function createDriver(o) {
 		},
 		unlinked(server) {
 			policies.delete(server);
+		},
+		say(m) {
+			for (const server of offices.keys()) sendTo(server, m);
 		},
 		held: () => [...sessions.values()].filter((s) => s.child || s.opening).length,
 		takeProblem: (by) => by?.id === o.account.id ? null : NOT_YOURS_TAKE,
@@ -14935,7 +15177,16 @@ async function worker() {
 		hasDesktop = !!bin && await desktopProblem(bin, forkEnv(process.env), process.platform, process.arch, os.hostname()) === null;
 	};
 	await checkDesktop().catch((err) => log(`couldn't check whether the Claude app can take handoffs here: ${err.message}`));
-	setInterval(() => void checkDesktop().catch(() => {}), DESKTOP_CHECK_MS).unref();
+	const claude = createClaudeSetup({
+		binary,
+		send: (message) => driver?.say(message),
+		scan: scanText,
+		log,
+		cwd: os.homedir(),
+		env: forkEnv(process.env)
+	});
+	await claude.check().catch((err) => log(`couldn't check for Claude Code here: ${err.message}`));
+	setInterval(() => void checkDesktop().then(() => claude.check()).catch(() => {}), DESKTOP_CHECK_MS).unref();
 	const names = askingRemoteNames(claudeDir);
 	const homeIo = machineHomeIo(first.workspaceRepos, names);
 	const ledger = await openLedger(path.join(isoplanDir, "runner", "ledger.json"));
@@ -15102,7 +15353,11 @@ async function worker() {
 		settings,
 		scan: scanText,
 		log,
-		projectOf: async (folder) => (await homeIo.projectOf(await homeIo.resolve(folder), folder)).id
+		projectOf: async (folder) => (await homeIo.projectOf(await homeIo.resolve(folder), folder)).id,
+		setup: (m) => {
+			claude.take(m);
+			claude.settled().then(checkDesktop).catch(() => {});
+		}
 	});
 	driver = drive;
 	const links = answerOffices({
@@ -15128,7 +15383,8 @@ async function worker() {
 					machine: { name: os.hostname() },
 					...hasOrca ? { orca: true } : {},
 					...hasDesktop ? { desktop: true } : {},
-					drive: true
+					drive: true,
+					claude: claude.state()
 				}
 			});
 		},
