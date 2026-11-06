@@ -216,6 +216,19 @@ export const ChangesMessageSchema = z.object({
   remove: FactRemoveSchema,
 });
 
+/** The longest message an owner sends their open session from the floor (protocol 0.7.0 on). */
+export const MAX_OWNER_MESSAGE_LENGTH = 20000;
+
+/**
+ * Why an owner-message didn't reach its session (protocol 0.7.0 on), on its `unavailable` refusal:
+ * `not-owner`, it came from someone other than the session's owner; `detached`, the session is seen
+ * only through the wake hook, with no plugin in it to pass the message on; `no-submit`, its Claude
+ * Code build can't take a message from a plugin; `ended`, the session has ended or moved on (a
+ * /clear); `dropped`, Claude Code didn't let the message in (a hook or its own limits); `no-answer`,
+ * the plugin in the session never said whether it took the message (the session may have closed).
+ */
+export const OwnerMessageRefusalSchema = z.enum(["not-owner", "detached", "no-submit", "ended", "dropped", "no-answer"]);
+
 /** A cap on the answers a machine gives: a room's per hour, the owner's per day, or the owner's tokens per day. */
 export const CapSchema = z.enum(["room-hour", "owner-day", "owner-tokens"]);
 
@@ -232,6 +245,9 @@ export const ReplyMessageSchema = z.discriminatedUnion("kind", [
   // it took the answer after this request was refused for taking too long, so this reply follows that
   // refusal, with the same id.
   z.object({ type: z.literal("reply"), v: Version, id: RequestId, kind: z.literal("owner-answer"), closed: z.literal(true).optional(), late: z.literal(true).optional() }),
+  // The owner's message entered their session as a turn of its own (protocol 0.7.0 on). `queued`: the
+  // session was busy, so the message waits and runs once the running turn ends.
+  z.object({ type: z.literal("reply"), v: Version, id: RequestId, kind: z.literal("owner-message"), queued: z.literal(true).optional() }),
   // The handoff's session is in front in Orca now (protocol 0.3.8); one that couldn't be is refused `unavailable`.
   z.object({ type: z.literal("reply"), v: Version, id: RequestId, kind: z.literal("focus") }),
 ]);
@@ -264,7 +280,8 @@ export const RefusalMessageSchema = z.discriminatedUnion("reason", [
     held: z.number().int().positive().optional(),
     unchecked: z.array(z.string().min(1)).optional(),
   }),
-  z.object({ type: z.literal("refusal"), v: Version, id: RequestId, reason: z.literal("unavailable"), detail: z.string().min(1) }),
+  // `code` (protocol 0.7.0 on): on an owner-message's refusal, why, for the floor to tell apart.
+  z.object({ type: z.literal("refusal"), v: Version, id: RequestId, reason: z.literal("unavailable"), detail: z.string().min(1), code: OwnerMessageRefusalSchema.optional() }),
 ]);
 
 /**
@@ -587,6 +604,19 @@ export const RequestMessageSchema = z.discriminatedUnion("kind", [
     question: z.string().min(1),
     answers: z.record(z.string(), z.string()),
   }),
+  // The owner sends their session a message from the floor (protocol 0.7.0 on), sent only for a
+  // session whose fact says `takesMessages`: the plugin in that session submits `text` as the owner's
+  // own turn, or queues it behind the running one. `from` is the person sending, whom the data layer
+  // checks is the session's owner (its hello's account), and refuses `not-owner` otherwise.
+  z.object({
+    type: z.literal("request"),
+    v: Version,
+    id: RequestId,
+    kind: z.literal("owner-message"),
+    session: z.string().min(1),
+    from: Account,
+    text: z.string().trim().min(1).max(MAX_OWNER_MESSAGE_LENGTH),
+  }),
   // The receiver clicked Focus this session on the floor (protocol 0.3.8): the runner of the machine
   // that took this handoff into Orca brings its session to the front there.
   z.object({
@@ -818,6 +848,7 @@ export type FullMessage = z.infer<typeof FullMessageSchema>;
 export type ChangesMessage = z.infer<typeof ChangesMessageSchema>;
 export type ReplyMessage = z.infer<typeof ReplyMessageSchema>;
 export type RefusalMessage = z.infer<typeof RefusalMessageSchema>;
+export type OwnerMessageRefusal = z.infer<typeof OwnerMessageRefusalSchema>;
 export type HandOverMessage = z.infer<typeof HandOverMessageSchema>;
 export type TakeMessage = z.infer<typeof TakeMessageSchema>;
 export type TakenMessage = z.infer<typeof TakenMessageSchema>;
