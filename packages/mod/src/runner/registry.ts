@@ -27,7 +27,8 @@
 // question or writing a brief, claude.ts) and `desktop-read` (a take into the Claude app reading the
 // brief, handoff/take.ts). A fork or a first turn is there while it runs; a driven session stays
 // after its process ends (closed when idle, stopped, crashed, or ended at a restart), for the next
-// instruction to open again, until it is handed back.
+// instruction to open again, until it is handed back, its saved conversation is found gone, or it is
+// past the MAX_HOLDING sessions kept (the least recently active go first).
 //
 // A pid alone doesn't name a process: after a reboot, or long enough, another process may have it.
 // So a process counts as Isoplan's only while its pid is alive, the OS says it started within
@@ -281,9 +282,10 @@ export function createRegistry({ file, log, pid = process.pid, isAlive = alive, 
         if (r.kind === "driven") records.set(key, { ...r, pid: null, spawned: null, state: "closed" });
         else records.delete(key);
       }
-      // Never makes the folder: one an uninstall took away as the worker exited stays gone.
+      // Never makes the folder: one an uninstall took away as the worker exited stays gone. Its own
+      // file beside it, so a save still writing on another thread can't be mixed into it.
       try {
-        const temp = `${file}.${pid}.tmp`;
+        const temp = `${file}.${pid}.exit.tmp`;
         fs.writeFileSync(temp, text());
         fs.renameSync(temp, file);
       } catch {

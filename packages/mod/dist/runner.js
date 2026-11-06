@@ -11354,10 +11354,19 @@ async function takeHandoff(message, o) {
 		const id = message.session ?? (o.newSession ?? randomUUID)();
 		const name = `Isoplan handoff ${handoff.id}`;
 		if (driven) {
+			const dropped = `The take stopped before its session was opened: it was cancelled or timed out on the floor. The worktree is ${dir}: take it again from the floor.`;
+			if (o.dropped?.()) {
+				await fail("open", dropped);
+				return done();
+			}
 			try {
 				await trustFolder(o.claudeJson, dir, o.platform);
 			} catch (err) {
 				await fail("open", `The session couldn't be readied to run from the floor: ${err.message}. The worktree is ${dir}.`);
+				return done();
+			}
+			if (o.dropped?.()) {
+				await fail("open", dropped);
 				return done();
 			}
 			const problem = await o.driven.prepare({
@@ -12389,10 +12398,14 @@ function createRunner({ answerer, ledger, settings, prompts, scan, send, log, is
 						}, s.takeCapMinutes * 6e4);
 					});
 					take(message, () => droppedTakes.has(takeId)).then((m) => {
-						const first = !over;
+						const opens = !over && !droppedTakes.has(takeId);
 						finish(m);
-						if (first) onTaken?.(message, m);
-					}, (err) => (log(`handoff ${handoff.id}: taking it failed: ${err?.stack ?? String(err)}`), finish(null))).finally(() => (runningTakes.delete(takeId), droppedTakes.delete(takeId)));
+						onTaken?.(message, m, opens);
+					}, (err) => {
+						log(`handoff ${handoff.id}: taking it failed: ${err?.stack ?? String(err)}`);
+						finish(null);
+						onTaken?.(message, null, false);
+					}).finally(() => (runningTakes.delete(takeId), droppedTakes.delete(takeId)));
 				}
 				return;
 			}
@@ -12674,7 +12687,7 @@ function createRegistry({ file, log, pid = process.pid, isAlive = alive, info = 
 			});
 			else records.delete(key);
 			try {
-				const temp = `${file}.${pid}.tmp`;
+				const temp = `${file}.${pid}.exit.tmp`;
 				fs$1.writeFileSync(temp, text());
 				fs$1.renameSync(temp, file);
 			} catch {}
@@ -12725,13 +12738,14 @@ const NO_CLAUDE = "Claude Code for the terminal isn't installed on this computer
 const NO_FOLDER = "This computer has no folder for this room: open Claude Code once in the room's repo here, then try again.";
 const NOT_STARTED = "Claude Code couldn't be started on this computer. Its runner log says why.";
 const BUSY = "The agent is still working on the last instruction. Wait for it to finish, or stop it.";
-const CLOSING = "This session is being closed. Try again in a moment.";
+const NOT_CLOSED = "Claude Code couldn't be closed for this session on this computer, so it is still running there. Try again in a moment.";
 const TURN_GONE = "This computer no longer has that instruction's output (Isoplan restarted since, or it was long ago). Ask for the whole session's output instead.";
 const RELEASE_GONE = "Nothing is held back under that id on this computer any more: Isoplan may have restarted since.";
 const MISSING = "Claude Code can't find this session's saved conversation on this computer any more, so it can't be continued from the floor.";
 const WITHHELD = "Held back on this computer: it may contain a secret. Release it from the floor to see it.";
 const NOT_YOURS_TAKE = "This handoff was taken from the floor by someone other than this computer's own person, so nothing was opened here.";
 const capReached = (limit) => `This project already has ${limit} sessions running from the floor on this computer, the most allowed. Stop one, then try again.`;
+const capOf = (st) => Math.max(1, Math.floor(st.drivenPerProject));
 const uuidOf = (session) => session.slice(session.indexOf(":") + 1);
 const iso = (ms) => new Date(ms).toISOString();
 /** `text` within `max`, its start kept, and whether it was cut. */
@@ -12962,9 +12976,14 @@ function createDriver(o) {
 		o.registry.remove(s.record.session);
 		for (const [id, w] of withheld) if (w.session === s.record.session) withheld.delete(id);
 	}
-	function hold(entry) {
+	function hold({ text, cut = false, ...about }) {
 		const id = `w-${randomUUID()}`;
-		withheld.set(id, entry);
+		const c = cutEnd(text, MAX_OUTPUT_LENGTH);
+		withheld.set(id, {
+			...about,
+			text: c.text,
+			cut: cut || c.cut
+		});
 		if (withheld.size > 50) withheld.delete(withheld.keys().next().value);
 		return id;
 	}
@@ -13102,19 +13121,12 @@ function createDriver(o) {
 				const tool = typeof block.name === "string" && block.name ? block.name : "tool";
 				const summary = summaryOf(block.input);
 				emit(s, async () => {
-					if (summary === void 0) return {
+					if (await o.scan(summary === void 0 ? tool : `${tool} ${summary}`)) return {
 						...driven,
 						kind: "tool",
 						session: s.record.session,
 						turn,
-						tool
-					};
-					if (await o.scan(summary)) return {
-						...driven,
-						kind: "tool",
-						session: s.record.session,
-						turn,
-						tool,
+						tool: "tool",
 						withheld: true
 					};
 					return {
@@ -13123,21 +13135,22 @@ function createDriver(o) {
 						session: s.record.session,
 						turn,
 						tool,
-						summary
+						...summary !== void 0 ? { summary } : {}
 					};
 				});
 			}
 		} else if (e.type === "system" && e.subtype === "permission_denied") {
 			const tool = typeof e.tool_name === "string" && e.tool_name ? e.tool_name : "a tool";
 			addOutput(s, `(${tool} wasn't allowed: it needs your permission)`);
-			emit(s, () => ({
+			const said = (name) => `The agent wanted to use ${name}, which needs your permission. Sessions run from the floor can't ask for it yet, so it wasn't allowed.`;
+			emit(s, async () => ({
 				...driven,
 				kind: "error",
 				session: s.record.session,
 				turn,
-				text: `The agent wanted to use ${tool}, which needs your permission. Sessions run from the floor can't ask for it yet, so it wasn't allowed.`
+				text: await o.scan(said(tool)) ? said("a tool") : said(tool)
 			}));
-		} else if (e.type === "result" && (typeof e.num_turns === "number" && e.num_turns >= 1 || e.is_error === true)) endTurn(s, turn, e);
+		} else if (e.type === "result" && (typeof e.num_turns === "number" && e.num_turns >= 1 || e.is_error === true || typeof e.local_command === "string")) endTurn(s, turn, e);
 	}
 	function endTurn(s, turn, e) {
 		s.turn = null;
@@ -13313,9 +13326,10 @@ function createDriver(o) {
 		if (!folder) return refuse(server, m.id, "no-folder", { detail: NO_FOLDER });
 		const st = await o.settings();
 		const project = m.project.id.toLowerCase();
-		if (heldIn(project) >= st.drivenPerProject) return refuse(server, m.id, "cap-reached", {
-			limit: st.drivenPerProject,
-			detail: capReached(st.drivenPerProject)
+		const cap = capOf(st);
+		if (heldIn(project) >= cap) return refuse(server, m.id, "cap-reached", {
+			limit: cap,
+			detail: capReached(cap)
 		});
 		if (m.permissions !== "auto") o.log(`start ${m.id} asked for ${m.permissions}; it runs in ${DRIVEN_PERMISSIONS}, which is all this runner does yet`);
 		const at = iso(now());
@@ -13368,13 +13382,12 @@ function createDriver(o) {
 	async function instruct(s, id, text) {
 		const server = s.record.driven.office;
 		if (!current(s)) return refuse(server, id, "not-found");
-		if (s.ending) return refuse(server, id, "busy", { detail: CLOSING });
 		if (s.turn) return refuse(server, id, "busy", { detail: BUSY });
 		if (!s.child) {
-			const st = await o.settings();
-			if (heldIn(s.record.driven.project) >= st.drivenPerProject) return refuse(server, id, "cap-reached", {
-				limit: st.drivenPerProject,
-				detail: capReached(st.drivenPerProject)
+			const cap = capOf(await o.settings());
+			if (heldIn(s.record.driven.project) >= cap) return refuse(server, id, "cap-reached", {
+				limit: cap,
+				detail: capReached(cap)
 			});
 			const why = s.fromBefore ? "restored" : "reopened";
 			const problem = await open(s);
@@ -13397,8 +13410,12 @@ function createDriver(o) {
 		if (child) {
 			s.ending = "stopped";
 			killTree(child, platform);
-			if (!await within(s.closed, KILL_WAIT_MS)) o.log(`driven session ${s.record.session}'s process ${child.pid} didn't end when stopped`);
+			await within(s.closed, KILL_WAIT_MS);
 			s.ending = null;
+			if (s.child === child) {
+				o.log(`driven session ${s.record.session}'s process ${child.pid} didn't end when stopped, so it is still held`);
+				return refuse(s.record.driven.office, id, "unavailable", { detail: NOT_CLOSED });
+			}
 		}
 		emit(s, () => ({
 			...driven,
@@ -13410,10 +13427,15 @@ function createDriver(o) {
 	}
 	async function handBack(s, id) {
 		if (!current(s)) return refuse(s.record.driven.office, id, "not-found");
-		if (s.child) {
+		const child = s.child;
+		if (child) {
 			s.ending = "handed-back";
 			await closeGently(s);
 			s.ending = null;
+			if (s.child === child) {
+				o.log(`driven session ${s.record.session}'s process ${child.pid} didn't end when handed back, so it is still held`);
+				return refuse(s.record.driven.office, id, "unavailable", { detail: NOT_CLOSED });
+			}
 		}
 		const session = s.record.session;
 		emit(s, () => ({
@@ -13483,7 +13505,8 @@ function createDriver(o) {
 					withheld: { id: hold({
 						session,
 						...turn !== void 0 ? { turn } : {},
-						text
+						text,
+						cut: found.cut
 					}) }
 				};
 			}
@@ -13503,15 +13526,14 @@ function createDriver(o) {
 		const w = withheld.get(withheldId);
 		if (!w || w.session !== s.record.session) return refuse(s.record.driven.office, id, "not-found", { detail: RELEASE_GONE });
 		withheld.delete(withheldId);
-		const c = cutEnd(w.text, MAX_OUTPUT_LENGTH);
 		emit(s, () => ({
 			...driven,
 			kind: "output",
 			id,
 			session: w.session,
 			...w.turn !== void 0 ? { turn: w.turn } : {},
-			text: c.text,
-			...c.cut ? { cut: true } : {}
+			text: w.text,
+			...w.cut ? { cut: true } : {}
 		}));
 	}
 	for (const r of o.registry.list()) if (r.kind === "driven" && r.driven) sessions.set(r.session, newSession(r, true));
@@ -13556,8 +13578,8 @@ function createDriver(o) {
 		takeProblem: (by) => by?.id === o.account.id ? null : NOT_YOURS_TAKE,
 		async prepareTake(server, take) {
 			const project = (await o.projectOf(take.folder).catch(() => null) ?? take.folder).toLowerCase();
-			const st = await o.settings();
-			if (heldIn(project) >= st.drivenPerProject) return capReached(st.drivenPerProject);
+			const cap = capOf(await o.settings());
+			if (heldIn(project) >= cap) return capReached(cap);
 			takes.set(take.session, {
 				...take,
 				server,
@@ -13566,10 +13588,14 @@ function createDriver(o) {
 			if (takes.size > TAKES_KEPT) takes.delete(takes.keys().next().value);
 			return null;
 		},
-		taken(uuid) {
+		taken(uuid, opens) {
 			const t = takes.get(uuid);
 			if (!t) return;
 			takes.delete(uuid);
+			if (!opens) {
+				o.log(`driven take ${uuid} won't open: the server dropped it, it was given up, or its taken wasn't sent`);
+				return;
+			}
 			const at = iso(now());
 			const s = newSession({
 				kind: "driven",
@@ -13915,8 +13941,8 @@ async function worker() {
 					if (taken.session) await recordTakenOffice(claudeDir, taken.session, server).catch(() => {});
 					return taken;
 				},
-				onTaken: (message, taken) => {
-					if (message.mode === "driven" && message.session && taken.session) driver.taken(message.session);
+				onTaken: (message, taken, opens) => {
+					if (message.mode === "driven" && message.session) driver.taken(message.session, opens && !!taken?.session);
 				},
 				focus: (handoff) => focusHandoff(handoff, {
 					claudeDir,

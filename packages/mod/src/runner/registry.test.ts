@@ -57,6 +57,37 @@ test("registry: a fork is in while it runs and out once it closes; as the worker
   expect(JSON.parse(fs.readFileSync(file, "utf8")).processes).toEqual([{ ...driven, pid: null, spawned: null, state: "closed" }]);
 });
 
+test("registry: the write as the worker exits has a file of its own beside it, so a save still being written can't be mixed into it", async () => {
+  const root = tempRoot();
+  const file = registryPath(root);
+  const registry = createRegistry({ file, log: () => {}, pid: 77 });
+  registry.put(driven);
+  await registry.flushed();
+  // What a save still being written has written so far.
+  fs.writeFileSync(`${file}.77.tmp`, "{ half");
+  registry.closeSync();
+  expect(fs.readFileSync(`${file}.77.tmp`, "utf8")).toBe("{ half");
+  expect(JSON.parse(fs.readFileSync(file, "utf8")).processes).toEqual([{ ...driven, pid: null, spawned: null, state: "closed" }]);
+});
+
+test("restore: a file that can't be read, or is of another version, ends nothing, keeps nothing, and is written anew", async () => {
+  for (const text of ["{ not json", JSON.stringify({ version: 2, processes: [driven] })]) {
+    const root = tempRoot();
+    const file = registryPath(root);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, text);
+    const killed: number[] = [];
+    const logs: string[] = [];
+    // Every pid alive, and each would pass as Isoplan's: still nothing is ended.
+    const registry = createRegistry({ file, log: (l) => void logs.push(l), pid: 77, now: () => Date.parse(AT), isAlive: () => true, info: async () => ({ startMs: Date.parse(AT), command: `claude -p --resume ${UUID}` }), kill: (p) => void killed.push(p) });
+    await registry.restore();
+    expect(killed).toEqual([]);
+    expect(registry.list()).toEqual([]);
+    expect(JSON.parse(fs.readFileSync(file, "utf8"))).toMatchObject({ version: 1, runner: 77, processes: [] });
+    expect(logs).toEqual([expect.stringContaining("couldn't be read, or is of another version, so nothing in it was ended or kept")]);
+  }
+});
+
 test("identity: Windows asks PowerShell's Win32_Process, a Mac and Linux ps; each answer gives the start time and the command line", () => {
   expect(infoCommand(4242, "win32").slice(0, 4)).toEqual(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command"]);
   expect(infoCommand(4242, "win32")[4]).toContain('Get-CimInstance Win32_Process -Filter "ProcessId = 4242"');

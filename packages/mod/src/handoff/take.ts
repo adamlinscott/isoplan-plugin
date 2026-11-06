@@ -71,8 +71,10 @@
 //    - `driven` (protocol 0.5.0): a session driven from the floor, run by the runner's session driver
 //      (runner/session.ts). Only for the runner's own person (`by`), checked before anything is made.
 //      The worktree and setup are as for a terminal, and the worktree is trusted as for headless;
-//      then the driver checks its cap and readies the session, which it opens once `taken` has gone,
-//      under the take's session id, with the take's prompt as its first instruction.
+//      then the driver checks its cap and readies the session, which it opens once `taken` has been
+//      handed to the link (which sends it now, or after the next hello), under the take's session id,
+//      with the take's prompt as its first instruction. A take the server has dropped (cancelled, or
+//      timed out) by then isn't trusted or readied.
 //
 // After Orca (for a take into Orca), the claude binary is looked for, in every mode, before anything
 // is made: without it nothing is.
@@ -159,7 +161,7 @@ export interface TakeOptions {
   cloneFrom?: (remote: string) => boolean;
   /** Orca's CLI, for a take into Orca, or null when Orca isn't on this machine. */
   orca?: () => Promise<RunOrca | null>;
-  /** Whether the office server has dropped this take since (cancelled, or timed out): checked before the Claude app is opened. */
+  /** Whether the office server has dropped this take since (cancelled, or timed out): checked before the Claude app is opened, and before a driven take is trusted and readied. */
   dropped?: () => boolean;
   /** The runner's session driver, for a take as a driven session: why not, before anything is made; then readying it, null or why it can't open. */
   driven?: { problem(by: { id: string } | undefined): string | null; prepare(take: PreparedTake): Promise<string | null> };
@@ -695,11 +697,20 @@ export async function takeHandoff(message: Pick<HandoffMessage, "handoff" | "mod
     const id = message.session ?? (o.newSession ?? randomUUID)();
     const name = `Isoplan handoff ${handoff.id}`;
     if (driven) {
+      const dropped = `The take stopped before its session was opened: it was cancelled or timed out on the floor. The worktree is ${dir}: take it again from the floor.`;
+      if (o.dropped?.()) {
+        await fail("open", dropped);
+        return done();
+      }
       try {
         // The floor told the receiver: this trusts the worktree, so its settings, hooks and scripts run.
         await trustFolder(o.claudeJson, dir, o.platform);
       } catch (err) {
         await fail("open", `The session couldn't be readied to run from the floor: ${(err as Error).message}. The worktree is ${dir}.`);
+        return done();
+      }
+      if (o.dropped?.()) {
+        await fail("open", dropped);
         return done();
       }
       const problem = await o.driven!.prepare({ session: id, folder: dir, prompt: takePrompt(handoff.id, briefFile, setupLog, failedRepos), name, addDir: folder, room: message.room!, by: message.by! });

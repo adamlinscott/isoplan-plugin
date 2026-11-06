@@ -137,6 +137,25 @@ test("driven: for someone other than the runner's own person nothing is made; pa
   expect(full.failures).toEqual([{ step: "open", output: `This project already has 4 sessions running from the floor on this computer. The worktree is ${t.receiver.clone}-handoff-h2e.` }]);
 });
 
+test("driven: a take the server dropped (cancelled, or timed out there) isn't trusted, or readied, once it is known, and says so with the worktree", async () => {
+  const t = await handedOver("h2f");
+  const prepared: PreparedTake[] = [];
+  const options: TakeOptions = { ...t.options, driven: { problem: () => null, prepare: async (p) => (prepared.push(p), null) } };
+  const message = { handoff: t.handoff, mode: "driven" as const, session: SESSION, by: { id: "claude:sam", name: "Sam" }, room: "room-1" };
+  const dir = `${t.receiver.clone}-handoff-h2f`;
+  const said = [{ step: "open", output: `The take stopped before its session was opened: it was cancelled or timed out on the floor. The worktree is ${dir}: take it again from the floor.` }];
+  const before = fs.readFileSync(t.claudeJson, "utf8");
+  const early = await takeHandoff(message, { ...options, dropped: () => true });
+  expect(early).toEqual({ type: "taken", v: 1, handoff: "h2f", failures: said });
+  expect(fs.readFileSync(t.claudeJson, "utf8")).toBe(before);
+  // Dropped while the worktree was being trusted.
+  let checks = 0;
+  const late = await takeHandoff(message, { ...options, dropped: () => ++checks > 1 });
+  expect(late).toEqual({ type: "taken", v: 1, handoff: "h2f", failures: said });
+  expect(JSON.parse(fs.readFileSync(t.claudeJson, "utf8")).projects[trustKey(dir, "win32")]).toEqual({ hasTrustDialogAccepted: true });
+  expect(prepared).toEqual([]);
+});
+
 // A take into Orca with the fake Orca CLI: what it was asked, and the take's options that use it.
 function intoOrca(t: Awaited<ReturnType<typeof handedOver>>, setup: Parameters<typeof fakeOrca>[1] = {}) {
   const orca = fakeOrca(t.root, setup);

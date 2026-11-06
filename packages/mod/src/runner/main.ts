@@ -318,9 +318,10 @@ async function worker(): Promise<number> {
         if (taken.session) await recordTakenOffice(claudeDir, taken.session, server).catch(() => {});
         return taken;
       },
-      // A driven take's session opens once its `taken` has gone.
-      onTaken: (message, taken) => {
-        if (message.mode === "driven" && message.session && taken.session) driver!.taken(message.session);
+      // A driven take's session opens once its `taken` has been handed to the link, which sends it now
+      // or after the next hello. One that won't open (dropped, given up, or failed) frees its place.
+      onTaken: (message, taken, opens) => {
+        if (message.mode === "driven" && message.session) driver!.taken(message.session, opens && !!taken?.session);
       },
       // Focus this session: the handoff's session, which a take into Orca opened, to the front in Orca.
       focus: (handoff) => focusHandoff(handoff, { claudeDir, platform: process.platform, orca: takeOrca, log }),

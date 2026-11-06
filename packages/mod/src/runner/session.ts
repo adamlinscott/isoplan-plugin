@@ -21,6 +21,12 @@
 //   `tool_result` block. Something that needs permission, with nobody answering, is denied at once:
 //   a `system` line, `subtype` "permission_denied", naming `tool_name`, then an error tool result,
 //   whether `--permission-prompts` is the default `host` or `none`.
+// - Probed on Claude Code 2.1.318 (6 Nov 2026, Haiku, a temp folder, --no-session-persistence): an
+//   instruction that is one of Claude Code's own commands, such as `/cost`, runs no turn of the
+//   model's. It gives a `system` `init` line, an `assistant` line with `local_command_source` and
+//   the command's text, then one `result`: `subtype` "success", `is_error` false, `num_turns` 0,
+//   `local_command` "cost", and that text in `result`. The next instruction runs as usual. So a
+//   result with `local_command` ends the turn too, though its `num_turns` is 0.
 // - A start opens a new session (--session-id, a fresh uuid) in the folder of the first of the
 //   room's sessions this machine has its own record of: Claude Code's transcript of that session
 //   says the folder it ran in (`office.folder`, which also needs the folder to be there and in a
@@ -32,7 +38,9 @@
 // - Held: while a process holds the session (registry.ts records it). `stop` ends the process at
 //   once, mid-turn or not; `hand-back` closes stdin and gives it `drivenCloseSeconds` to finish by
 //   itself, then ends it, and answers with `claude --resume <uuid>` and the folder: the session is
-//   the person's again and is forgotten here. A process with no turn running and no output for
+//   the person's again and is forgotten here. A process that still hasn't closed after that (or,
+//   for a stop, KILL_WAIT_MS after it was ended) keeps the session held, and the request is refused
+//   `unavailable`, to try again. A process with no turn running and no output for
 //   `drivenIdleMinutes` is closed the same way (`idle-closed`); the next instruction opens it again
 //   with --resume (`held reopened`). A process that writes nothing within `drivenStartSeconds` of an
 //   instruction is ended as stuck; one that ends by itself is `released crashed`, its turn `failed`.
@@ -45,18 +53,22 @@
 // - Only the runner's own person acts: every request whose `by` isn't the account the runner links
 //   as is refused `not-owner`, and for an existing session `by` must be the person who started it.
 //   A session is acted on only through the office it was started through.
-// - Everything built from the session (a reply, a tool summary, an output) passes the secret scan
-//   first. A matched reply or output is sent as a note with a `withheld` id, and only the owner's
-//   `release` sends it, as the runner's withheld answers are released (runner.ts); a matched tool
-//   summary isn't sent. At most MAX_HELD are held, the oldest dropped.
+// - Everything built from the session (a reply, a tool's name and summary, the words for a tool that
+//   wasn't allowed, an output) passes the secret scan first. A matched reply or output is sent as a
+//   note with a `withheld` id, and only the owner's `release` sends it, as the runner's withheld
+//   answers are released (runner.ts); a tool use whose name or summary matched is sent as `tool`,
+//   with no summary, and a tool that wasn't allowed as "a tool". At most MAX_HELD are held, the
+//   oldest dropped, each cut to what its release sends.
 // - Every message is cut to the protocol's limits and checked against DrivenMessageSchema before it
 //   goes, so one bad message can't make the server close the runner's link, and is sent only while
 //   the office's link is up (`office.send`), never kept in the reply outbox. After every hello
 //   `holding` says where each of the office's sessions stands.
 // - A handoff taken as a driven session (handoff/take.ts, mode `driven`): `takeProblem` before
-//   anything is made, `prepareTake` once the worktree is ready (the cap), and `taken` once the take's
-//   `taken` has been sent, which opens it under the take's uuid with the take's prompt as its first
-//   turn, named by that uuid, after `held` `started`.
+//   anything is made, `prepareTake` once the worktree is ready (the cap), and `taken` once the take
+//   has ended. When its `taken` was handed to the link (which sends it now, or after the next hello)
+//   and the server hadn't dropped the take, nor the runner given it up, that opens it under the
+//   take's uuid with the take's prompt as its first turn, named by that uuid, after `held`
+//   `started`; otherwise it only frees the take's place under the cap.
 // - Permission prompts, bypassPermissions and drive-policy are #42's: every session runs in `auto`
 //   and says so (`permissionArgs`), an `answer` is refused `no-prompt`, and drive-policy is only kept.
 
@@ -155,8 +167,8 @@ export interface Driver {
   takeProblem(by: { id: string } | undefined): string | null;
   /** Readies a driven take whose worktree is made: null, or why it can't be opened. */
   prepareTake(server: string, take: PreparedTake): Promise<string | null>;
-  /** The take's `taken` has been sent: its session opens now. */
-  taken(session: string): void;
+  /** The take has ended: with `opens` (its `taken` was handed to the link, and it wasn't dropped or given up) its session opens now; without, its place under the cap is freed. */
+  taken(session: string, opens: boolean): void;
   /** Ends every process at once, as the worker exits. */
   close(): void;
   /** Resolves once every request and message so far has been handled. */
@@ -211,15 +223,25 @@ const NO_CLAUDE = "Claude Code for the terminal isn't installed on this computer
 const NO_FOLDER = "This computer has no folder for this room: open Claude Code once in the room's repo here, then try again.";
 const NOT_STARTED = "Claude Code couldn't be started on this computer. Its runner log says why.";
 const BUSY = "The agent is still working on the last instruction. Wait for it to finish, or stop it.";
-const CLOSING = "This session is being closed. Try again in a moment.";
+const NOT_CLOSED = "Claude Code couldn't be closed for this session on this computer, so it is still running there. Try again in a moment.";
 const TURN_GONE = "This computer no longer has that instruction's output (Isoplan restarted since, or it was long ago). Ask for the whole session's output instead.";
 const RELEASE_GONE = "Nothing is held back under that id on this computer any more: Isoplan may have restarted since.";
 const MISSING = "Claude Code can't find this session's saved conversation on this computer any more, so it can't be continued from the floor.";
 const WITHHELD = "Held back on this computer: it may contain a secret. Release it from the floor to see it.";
 const NOT_YOURS_TAKE = "This handoff was taken from the floor by someone other than this computer's own person, so nothing was opened here.";
 const capReached = (limit: number) => `This project already has ${limit} sessions running from the floor on this computer, the most allowed. Stop one, then try again.`;
+// runner.json may say 2.5, but the cap is a whole number of sessions, and at least one.
+const capOf = (st: DriveSettings) => Math.max(1, Math.floor(st.drivenPerProject));
 
 type Ending = "stopped" | "handed-back" | "idle-closed";
+
+/** A reply or output the secret scan held back, for the owner's release. */
+interface Held {
+  session: string;
+  turn?: string;
+  text: string;
+  cut: boolean;
+}
 
 interface Session {
   record: ProcessRecord & { driven: DrivenFields };
@@ -371,7 +393,7 @@ export function createDriver(o: DriverOptions): Driver {
   const platform = o.platform ?? process.platform;
   const offices = new Map(o.offices.map((office) => [office.server, office]));
   const sessions = new Map<string, Session>();
-  const withheld = new Map<string, { session: string; turn?: string; text: string }>(); // oldest first
+  const withheld = new Map<string, Held>(); // oldest first
   const policies = new Map<string, Set<string>>(); // office → projects that allow bypassPermissions (#42)
   const takes = new Map<string, PreparedTake & { server: string; project: string }>();
   const starts = new Set<string>();
@@ -451,9 +473,11 @@ export function createDriver(o: DriverOptions): Driver {
     for (const [id, w] of withheld) if (w.session === s.record.session) withheld.delete(id);
   }
 
-  function hold(entry: { session: string; turn?: string; text: string }): string {
+  // Kept as its release sends it: cut to MAX_OUTPUT_LENGTH, so a held output is never the whole transcript's tail.
+  function hold({ text, cut = false, ...about }: { session: string; turn?: string; text: string; cut?: boolean }): string {
     const id = `w-${randomUUID()}`;
-    withheld.set(id, entry);
+    const c = cutEnd(text, MAX_OUTPUT_LENGTH);
+    withheld.set(id, { ...about, text: c.text, cut: cut || c.cut });
     if (withheld.size > MAX_HELD) withheld.delete(withheld.keys().next().value!);
     return id;
   }
@@ -578,19 +602,21 @@ export function createDriver(o: DriverOptions): Driver {
         const tool = typeof block.name === "string" && block.name ? block.name : "tool";
         const summary = summaryOf(block.input);
         emit(s, async () => {
-          if (summary === undefined) return { ...driven, kind: "tool", session: s.record.session, turn, tool };
-          if (await o.scan(summary)) return { ...driven, kind: "tool", session: s.record.session, turn, tool, withheld: true };
-          return { ...driven, kind: "tool", session: s.record.session, turn, tool, summary };
+          // A tool's name can be anyone's words (an MCP server names its own), so it is scanned with the summary.
+          if (await o.scan(summary === undefined ? tool : `${tool} ${summary}`)) return { ...driven, kind: "tool", session: s.record.session, turn, tool: "tool", withheld: true };
+          return { ...driven, kind: "tool", session: s.record.session, turn, tool, ...(summary !== undefined ? { summary } : {}) };
         });
       }
     } else if (e.type === "system" && e.subtype === "permission_denied") {
       const tool = typeof e.tool_name === "string" && e.tool_name ? e.tool_name : "a tool";
       addOutput(s, `(${tool} wasn't allowed: it needs your permission)`);
-      emit(s, () => ({ ...driven, kind: "error", session: s.record.session, turn, text: `The agent wanted to use ${tool}, which needs your permission. Sessions run from the floor can't ask for it yet, so it wasn't allowed.` }));
-    } else if (e.type === "result" && ((typeof e.num_turns === "number" && e.num_turns >= 1) || e.is_error === true)) {
+      const said = (name: string) => `The agent wanted to use ${name}, which needs your permission. Sessions run from the floor can't ask for it yet, so it wasn't allowed.`;
+      emit(s, async () => ({ ...driven, kind: "error", session: s.record.session, turn, text: (await o.scan(said(tool))) ? said("a tool") : said(tool) }));
+    } else if (e.type === "result" && ((typeof e.num_turns === "number" && e.num_turns >= 1) || e.is_error === true || typeof e.local_command === "string")) {
+      // A Claude Code command (`/cost`) is answered with num_turns 0 and `local_command`: see the probe above.
       endTurn(s, turn, e);
     }
-    // A result with no turn in it is a leftover background task replayed (claude.ts): the turn goes on.
+    // Any other result, with no turn in it, is a leftover background task replayed (claude.ts): the turn goes on.
   }
 
   function endTurn(s: Session, turn: string, e: Record<string, unknown>): void {
@@ -703,8 +729,9 @@ export function createDriver(o: DriverOptions): Driver {
     if (!folder) return refuse(server, m.id, "no-folder", { detail: NO_FOLDER });
     const st = await o.settings();
     const project = m.project.id.toLowerCase();
+    const cap = capOf(st);
     // Checked and taken with no await between, so two starts can't both take the last place.
-    if (heldIn(project) >= st.drivenPerProject) return refuse(server, m.id, "cap-reached", { limit: st.drivenPerProject, detail: capReached(st.drivenPerProject) });
+    if (heldIn(project) >= cap) return refuse(server, m.id, "cap-reached", { limit: cap, detail: capReached(cap) });
     if (m.permissions !== DRIVEN_PERMISSIONS) o.log(`start ${m.id} asked for ${m.permissions}; it runs in ${DRIVEN_PERMISSIONS}, which is all this runner does yet`);
     const at = iso(now());
     const s = newSession(
@@ -729,11 +756,10 @@ export function createDriver(o: DriverOptions): Driver {
   async function instruct(s: Session, id: string, text: string): Promise<void> {
     const server = s.record.driven.office;
     if (!current(s)) return refuse(server, id, "not-found");
-    if (s.ending) return refuse(server, id, "busy", { detail: CLOSING });
     if (s.turn) return refuse(server, id, "busy", { detail: BUSY });
     if (!s.child) {
-      const st = await o.settings();
-      if (heldIn(s.record.driven.project) >= st.drivenPerProject) return refuse(server, id, "cap-reached", { limit: st.drivenPerProject, detail: capReached(st.drivenPerProject) });
+      const cap = capOf(await o.settings());
+      if (heldIn(s.record.driven.project) >= cap) return refuse(server, id, "cap-reached", { limit: cap, detail: capReached(cap) });
       const why = s.fromBefore ? "restored" : "reopened";
       const problem = await open(s);
       if (problem) return refuse(server, id, problem.reason, { detail: problem.detail });
@@ -749,18 +775,29 @@ export function createDriver(o: DriverOptions): Driver {
     if (child) {
       s.ending = "stopped";
       killTree(child, platform);
-      if (!(await within(s.closed, KILL_WAIT_MS))) o.log(`driven session ${s.record.session}'s process ${child.pid} didn't end when stopped`);
+      await within(s.closed, KILL_WAIT_MS);
       s.ending = null;
+      // Still running: the session stays held, so nothing says it was let go.
+      if (s.child === child) {
+        o.log(`driven session ${s.record.session}'s process ${child.pid} didn't end when stopped, so it is still held`);
+        return refuse(s.record.driven.office, id, "unavailable", { detail: NOT_CLOSED });
+      }
     }
     emit(s, () => ({ ...driven, kind: "released", session: s.record.session, why: "stopped", id }));
   }
 
   async function handBack(s: Session, id: string): Promise<void> {
     if (!current(s)) return refuse(s.record.driven.office, id, "not-found");
-    if (s.child) {
+    const child = s.child;
+    if (child) {
       s.ending = "handed-back";
       await closeGently(s);
       s.ending = null;
+      // Still running: resuming it in a terminal would make two writers, so it stays held here.
+      if (s.child === child) {
+        o.log(`driven session ${s.record.session}'s process ${child.pid} didn't end when handed back, so it is still held`);
+        return refuse(s.record.driven.office, id, "unavailable", { detail: NOT_CLOSED });
+      }
     }
     const session = s.record.session;
     emit(s, () => ({ ...driven, kind: "released", session, why: "handed-back", id }));
@@ -795,7 +832,7 @@ export function createDriver(o: DriverOptions): Driver {
       const matched = text ? await o.scan(text) : null;
       if (matched) {
         o.log(`withheld the output of ${turn ?? "the whole session"} in ${session}: it matches the secret pattern "${matched}"`);
-        return { ...driven, kind: "output", id, session, ...(turn !== undefined ? { turn } : {}), text: WITHHELD, withheld: { id: hold({ session, ...(turn !== undefined ? { turn } : {}), text }) } };
+        return { ...driven, kind: "output", id, session, ...(turn !== undefined ? { turn } : {}), text: WITHHELD, withheld: { id: hold({ session, ...(turn !== undefined ? { turn } : {}), text, cut: found.cut }) } };
       }
       const c = cutEnd(text, MAX_OUTPUT_LENGTH);
       return { ...driven, kind: "output", id, session, ...(turn !== undefined ? { turn } : {}), text: c.text, ...(c.cut || found.cut ? { cut: true as const } : {}) };
@@ -806,8 +843,7 @@ export function createDriver(o: DriverOptions): Driver {
     const w = withheld.get(withheldId);
     if (!w || w.session !== s.record.session) return refuse(s.record.driven.office, id, "not-found", { detail: RELEASE_GONE });
     withheld.delete(withheldId);
-    const c = cutEnd(w.text, MAX_OUTPUT_LENGTH);
-    emit(s, () => ({ ...driven, kind: "output", id, session: w.session, ...(w.turn !== undefined ? { turn: w.turn } : {}), text: c.text, ...(c.cut ? { cut: true as const } : {}) }));
+    emit(s, () => ({ ...driven, kind: "output", id, session: w.session, ...(w.turn !== undefined ? { turn: w.turn } : {}), text: w.text, ...(w.cut ? { cut: true as const } : {}) }));
   }
 
   // The driven sessions an earlier run left, with no process now (registry.restore ended theirs).
@@ -850,16 +886,20 @@ export function createDriver(o: DriverOptions): Driver {
     takeProblem: (by) => (by?.id === o.account.id ? null : NOT_YOURS_TAKE),
     async prepareTake(server, take) {
       const project = ((await o.projectOf(take.folder).catch(() => null)) ?? take.folder).toLowerCase();
-      const st = await o.settings();
-      if (heldIn(project) >= st.drivenPerProject) return capReached(st.drivenPerProject);
+      const cap = capOf(await o.settings());
+      if (heldIn(project) >= cap) return capReached(cap);
       takes.set(take.session, { ...take, server, project });
       if (takes.size > TAKES_KEPT) takes.delete(takes.keys().next().value!);
       return null;
     },
-    taken(uuid) {
+    taken(uuid, opens) {
       const t = takes.get(uuid);
       if (!t) return;
       takes.delete(uuid);
+      if (!opens) {
+        o.log(`driven take ${uuid} won't open: the server dropped it, it was given up, or its taken wasn't sent`);
+        return;
+      }
       const at = iso(now());
       const s = newSession(
         {

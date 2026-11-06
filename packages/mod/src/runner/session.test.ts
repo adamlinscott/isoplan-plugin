@@ -1,10 +1,13 @@
-import { spawn } from "node:child_process";
+import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { EventEmitter } from "node:events";
 import fs from "node:fs";
 import path from "node:path";
+import { PassThrough } from "node:stream";
 import { MAX_TOOL_NAME_LENGTH, PROTOCOL_VERSION, type DriveMessage, type DrivenMessage } from "@isoplan/protocol";
 import { afterEach, expect, test, vi } from "vitest";
 import { modDir, tempRoot } from "../data-layer/fixture.js";
 import { alive } from "../wake/lock.js";
+import type { Spawn } from "./claude.js";
 import { createRegistry, registryPath, type ProcessRecord } from "./registry.js";
 import { loadPatterns, scan } from "./scan.js";
 import { createDriver, drivenArgs, type DriveSettings } from "./session.js";
@@ -56,14 +59,22 @@ process.stdin.setEncoding("utf8").on("data", (d) => {
     fs.writeFileSync(transcript, "");
     if (text.includes("silent")) continue;
     out({ type: "system", subtype: "init", session_id: id });
+    if (text.startsWith("/")) {
+      // One of Claude Code's own commands: no turn of the model's, a result with num_turns 0 and local_command.
+      const said = "Total cost: $0.00 (" + text.slice(1) + ")";
+      out({ type: "assistant", parent_tool_use_id: null, local_command_source: text.slice(1), message: { model: "<synthetic>", content: [{ type: "text", text: said }] } });
+      out({ type: "result", subtype: "success", is_error: false, num_turns: 0, result: said, local_command: text.slice(1), session_id: id });
+      continue;
+    }
     if (text.includes("hang")) continue;
     if (text.includes("crash")) { setTimeout(() => process.exit(3), 20); continue; }
+    const secretName = "mcp__keys-" + process.env.FAKE_KEY;
     if (text.includes("tool")) {
-      const name = text.includes("long") ? "mcp__" + "x".repeat(300) : "Bash";
+      const name = text.includes("long") ? "mcp__" + "x".repeat(300) : text.includes("named") ? secretName : "Bash";
       out({ type: "assistant", parent_tool_use_id: null, message: { content: [{ type: "tool_use", id: "t1", name, input: { command: "echo hi", description: text.includes("leak") ? "Use " + process.env.FAKE_KEY : "Say hi" } }] } });
       out({ type: "user", parent_tool_use_id: null, message: { content: [{ type: "tool_result", tool_use_id: "t1", content: "hi" }] } });
     }
-    if (text.includes("deny")) out({ type: "system", subtype: "permission_denied", tool_name: "Write", tool_use_id: "t2", message: "not granted" });
+    if (text.includes("deny")) out({ type: "system", subtype: "permission_denied", tool_name: text.includes("named") ? secretName : "Write", tool_use_id: "t2", message: "not granted" });
     out({ type: "result", subtype: "success", is_error: false, num_turns: 0, result: "", session_id: id });
     const reply = text.includes("leak") ? "The key is " + process.env.FAKE_KEY : "Done: " + text;
     out({ type: "assistant", parent_tool_use_id: null, message: { content: [{ type: "text", text: reply }] } });
@@ -84,7 +95,7 @@ afterEach(() => {
 type Kind = DrivenMessage["kind"];
 type Of<K extends Kind> = Extract<DrivenMessage, { kind: K }>;
 
-async function setUp({ settings = {}, linger = false, records = [] as ProcessRecord[] } = {}) {
+async function setUp({ settings = {}, linger = false, records = [] as ProcessRecord[], spawn }: { settings?: Partial<DriveSettings>; linger?: boolean; records?: ProcessRecord[]; spawn?: Spawn } = {}) {
   const root = tempRoot();
   const claudeDir = path.join(root, ".claude");
   const state = path.join(root, "state");
@@ -119,6 +130,7 @@ async function setUp({ settings = {}, linger = false, records = [] as ProcessRec
     projectOf: async () => PROJECT.id,
     env: { ...process.env, CLAUDE_CONFIG_DIR: claudeDir, FAKE_STATE: state, FAKE_KEY: AWS_KEY, ...(linger ? { FAKE_LINGER: "1" } : {}) },
     newId: () => ids.shift()!,
+    ...(spawn ? { spawn } : {}),
   });
   const fakeLog = () => (fs.existsSync(path.join(state, "log.jsonl")) ? fs.readFileSync(path.join(state, "log.jsonl"), "utf8").trim().split("\n").map((l) => JSON.parse(l)) : []);
   // Every process the fake started ends with the test.
@@ -253,12 +265,12 @@ test("output: a turn's full output from memory, and the whole session's from its
   expect(t.of("refused")[0]).toMatchObject({ id: "o3", reason: "unavailable", detail: expect.stringContaining("no longer has that instruction's output") });
 });
 
-test("scan: a reply that may hold a secret is held back with an id, a tool summary that may is left out, and only the owner's release sends the reply", async () => {
+test("scan: a reply that may hold a secret is held back with an id, a tool whose summary or name may goes with neither, and only the owner's release sends the reply", async () => {
   const t = await setUp();
   t.drive(start("d1", { instruction: "use a tool and leak" }));
   await t.until(() => t.of("turn-ended").length === 1);
   expect(JSON.stringify(t.sent)).not.toContain(AWS_KEY);
-  expect(t.of("tool")).toEqual([{ type: "driven", v: 1, kind: "tool", session: S1, turn: "d1", tool: "Bash", withheld: true }]);
+  expect(t.of("tool")).toEqual([{ type: "driven", v: 1, kind: "tool", session: S1, turn: "d1", tool: "tool", withheld: true }]);
   const [reply] = t.of("reply");
   expect(reply).toMatchObject({ turn: "d1", text: expect.stringContaining("Held back on this computer"), withheld: { id: expect.any(String) } });
   t.driver.take(SERVER, { type: "drive", v: 1, id: "r0", by: { id: "claude:bob", name: "Bob" }, kind: "release", session: S1, withheld: reply!.withheld!.id });
@@ -275,6 +287,46 @@ test("scan: a reply that may hold a secret is held back with an id, a tool summa
   await t.until(() => t.of("output").length === 2);
   expect(t.of("output")[1]).toMatchObject({ id: "o1", withheld: { id: expect.any(String) } });
   expect(t.logs.filter((l) => l.startsWith("withheld"))).toHaveLength(2);
+  // A tool named with one (an MCP server names its own tools), used, and then not allowed.
+  const before = t.sent.length;
+  t.drive({ id: "d2", kind: "instruct", session: S1, text: "use a named tool, then deny" });
+  await t.until(() => t.of("turn-ended").length === 2);
+  expect(JSON.stringify(t.sent.slice(before))).not.toContain(AWS_KEY);
+  expect(t.of("tool")[1]).toEqual({ type: "driven", v: 1, kind: "tool", session: S1, turn: "d2", tool: "tool", withheld: true });
+  expect(t.of("error")).toEqual([{ type: "driven", v: 1, kind: "error", session: S1, turn: "d2", text: expect.stringContaining("wanted to use a tool, which needs your permission") }]);
+});
+
+test("scan: a whole session's output held back is kept as its release sends it, within the protocol's limit and marked cut when its transcript was", async () => {
+  const t = await setUp();
+  t.drive(start("d1"));
+  await t.until(() => t.of("held").length === 1);
+  // A transcript longer than the end read for an output, whose last words hold a secret.
+  const dir = path.join(t.claudeDir, "projects", t.folder.replace(/[^a-zA-Z0-9]/g, "-"));
+  fs.mkdirSync(dir, { recursive: true });
+  const lines = [{ type: "summary", summary: "x".repeat(4.5 * 1024 * 1024) }, { type: "user", message: { role: "user", content: `The key is ${AWS_KEY}` } }];
+  fs.writeFileSync(path.join(dir, `${UUIDS[0]}.jsonl`), lines.map((l) => JSON.stringify(l)).join("\n") + "\n");
+  t.drive({ id: "o1", kind: "output", session: S1 });
+  await t.until(() => t.of("output").length === 1);
+  const [held] = t.of("output");
+  expect(held).toMatchObject({ id: "o1", withheld: { id: expect.any(String) } });
+  t.drive({ id: "r1", kind: "release", session: S1, withheld: held!.withheld!.id });
+  await t.until(() => t.of("output").length === 2);
+  expect(t.of("output")[1]).toEqual({ type: "driven", v: 1, kind: "output", id: "r1", session: S1, text: `> The key is ${AWS_KEY}`, cut: true });
+});
+
+test("a Claude Code command as an instruction: its result, with no turn of the model's, ends the instruction, and the next one runs", async () => {
+  const t = await setUp();
+  t.drive(start("d1", { instruction: "/cost" }));
+  await t.until(() => t.of("turn-ended").length === 1);
+  expect(t.sent.slice(2)).toEqual([
+    { type: "driven", v: 1, kind: "turn-started", session: S1, turn: "d1" },
+    { type: "driven", v: 1, kind: "reply", session: S1, turn: "d1", text: "Total cost: $0.00 (cost)" },
+    { type: "driven", v: 1, kind: "turn-ended", session: S1, turn: "d1", outcome: "done" },
+  ]);
+  t.drive({ id: "d2", kind: "instruct", session: S1, text: "next" });
+  await t.until(() => t.of("turn-ended").length === 2);
+  expect(t.of("refused")).toEqual([]);
+  expect(t.of("reply").map((m) => m.text)).toEqual(["Total cost: $0.00 (cost)", "Done: next"]);
 });
 
 test("bounds: a tool name past the protocol's limit is cut to fit, and a prompt that wasn't allowed is said in plain words", async () => {
@@ -317,6 +369,36 @@ test("hand back: a process that doesn't end within drivenCloseSeconds is ended, 
   expect(alive(t.fakeLog()[0].pid)).toBe(false);
 });
 
+test("stop and hand back: a process that won't close keeps the session held and in the registry, and the request is refused unavailable to try again", async () => {
+  // A process that answers nothing and never closes, however it is asked to. It has no pid, so
+  // ending it is a no-op here.
+  const stuck: Spawn = () => Object.assign(new EventEmitter(), { stdin: new PassThrough(), stdout: new PassThrough(), stderr: new PassThrough(), pid: undefined, exitCode: null, signalCode: null, kill: () => true }) as unknown as ChildProcessWithoutNullStreams;
+  const t = await setUp({ spawn: stuck });
+  t.drive(start("d1"));
+  await t.until(() => t.of("held").length === 1);
+  // The 10 s a stopped process gets, and drivenCloseSeconds then 10 s for one handed back, pass at once.
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+  try {
+    t.drive({ id: "s1", kind: "stop", session: S1 });
+    t.drive({ id: "h1", kind: "hand-back", session: S1 });
+    await vi.advanceTimersByTimeAsync(10000 + SETTINGS.drivenCloseSeconds * 1000 + 10000 + 1000);
+  } finally {
+    vi.useRealTimers();
+  }
+  await t.driver.settled();
+  expect(t.of("refused")).toEqual([
+    { type: "driven", v: 1, kind: "refused", id: "s1", reason: "unavailable", detail: expect.stringContaining("couldn't be closed for this session on this computer") },
+    { type: "driven", v: 1, kind: "refused", id: "h1", reason: "unavailable", detail: expect.stringContaining("couldn't be closed for this session on this computer") },
+  ]);
+  expect([t.of("released"), t.of("handed-back")]).toEqual([[], []]);
+  expect(t.driver.held()).toBe(1);
+  expect(t.logs.filter((l) => l.includes("so it is still held"))).toHaveLength(2);
+  await t.registry.flushed();
+  expect(t.saved().processes).toMatchObject([{ session: S1, state: "idle" }]);
+  t.driver.linked(SERVER);
+  expect(t.of("holding")[0]!.sessions).toEqual([{ session: S1, room: "room-1", held: true, permissions: "auto" }]);
+});
+
 test("idle: a process with nothing happening for drivenIdleMinutes is closed; the next instruction opens the session again with --resume", async () => {
   const t = await setUp({ settings: { drivenIdleMinutes: 0.005 } });
   t.drive(start("d1", { instruction: "first" }));
@@ -346,6 +428,16 @@ test("cap: a start or a reopen past drivenPerProject held sessions in the projec
   t.drive({ id: "d4", kind: "instruct", session: S1, text: "reopen me" });
   await t.until(() => t.of("refused").length === 2);
   expect(t.of("refused")[1]).toMatchObject({ id: "d4", reason: "cap-reached", limit: 1 });
+  expect(t.driver.held()).toBe(1);
+});
+
+test("cap: a drivenPerProject that isn't a whole number counts as the whole number below it, at least one, so the refusal fits the protocol", async () => {
+  const t = await setUp({ settings: { drivenPerProject: 1.5 } });
+  t.drive(start("d1"));
+  await t.until(() => t.of("held").length === 1);
+  t.drive(start("d2"));
+  await t.until(() => t.of("refused").length === 1);
+  expect(t.of("refused")[0]).toMatchObject({ id: "d2", reason: "cap-reached", limit: 1, detail: expect.stringContaining("already has 1 sessions") });
   expect(t.driver.held()).toBe(1);
 });
 
@@ -501,7 +593,7 @@ test("live: what is sent while the office's link is down is dropped, and after a
   });
 });
 
-test("a driven take: only for the runner's own person; past the cap it isn't readied; readied, it opens once taken has gone, its first turn named by its uuid", async () => {
+test("a driven take: only for the runner's own person; past the cap it isn't readied; readied, it opens once its taken went, its first turn named by its uuid; one that won't open frees its place", async () => {
   const t = await setUp({ settings: { drivenPerProject: 1 } });
   expect(t.driver.takeProblem({ id: "claude:bob" })).toContain("someone other than this computer's own person");
   expect(t.driver.takeProblem(ADA)).toBe(null);
@@ -511,7 +603,7 @@ test("a driven take: only for the runner's own person; past the cap it isn't rea
   t.drive(start("d1"));
   await t.until(() => t.of("refused").length === 1);
   expect(t.of("refused")[0]).toMatchObject({ reason: "cap-reached" });
-  t.driver.taken(UUIDS[2]!);
+  t.driver.taken(UUIDS[2]!, true);
   await t.until(() => t.of("turn-ended").length === 1);
   const session = `claude-code:${UUIDS[2]}`;
   expect(t.sent.slice(1).map((m) => m.kind)).toEqual(["held", "turn-started", "reply", "turn-ended"]);
@@ -520,4 +612,14 @@ test("a driven take: only for the runner's own person; past the cap it isn't rea
   expect(t.fakeLog()[0].argv).toEqual(drivenArgs({ uuid: UUIDS[2]!, resume: false, permissions: "auto", name: "Isoplan handoff h1", addDir: take.addDir }));
   expect(t.fakeLog()[0].argv.slice(-4)).toEqual(["--name", "Isoplan handoff h1", "--add-dir", take.addDir]);
   expect(await t.driver.prepareTake(SERVER, { ...take, session: UUIDS[1]! })).toContain("already has 1 sessions");
+  // A take the server dropped, or the runner gave up, opens nothing and frees its place.
+  t.drive({ id: "s1", kind: "stop", session });
+  await t.until(() => t.of("released").length === 1);
+  expect(await t.driver.prepareTake(SERVER, { ...take, session: UUIDS[1]! })).toBe(null);
+  t.driver.taken(UUIDS[1]!, false);
+  expect(await t.driver.prepareTake(SERVER, { ...take, session: UUIDS[0]! })).toBe(null);
+  t.driver.taken(UUIDS[0]!, false);
+  await t.driver.settled();
+  expect(t.driver.held()).toBe(0);
+  expect(t.fakeLog().filter((l) => l.argv)).toHaveLength(1);
 });
