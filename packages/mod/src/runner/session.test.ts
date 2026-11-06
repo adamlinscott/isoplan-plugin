@@ -823,7 +823,7 @@ test("bypass: a drive-policy that no longer lists the project ends its sessions 
     { type: "driven", v: 1, kind: "error", session: S2, text: "Skipping permission prompts was turned off for this project, so this session was closed. Your next instruction reopens it with prompts on." },
     { type: "driven", v: 1, kind: "released", session: S2, why: "stopped" },
   ]);
-  const { pid } = t.fakeLog().filter((l) => l.argv)[1];
+  const { pid } = t.fakeLog().find((l) => l.argv && modeOf(l.argv) === "bypassPermissions");
   for (let i = 0; i < 100 && alive(pid); i++) await new Promise((r) => setTimeout(r, 50));
   expect(alive(pid)).toBe(false);
   // The session in auto runs on.
