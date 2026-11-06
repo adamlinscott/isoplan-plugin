@@ -1,11 +1,11 @@
 import fs from "node:fs";
 import path from "node:path";
-import { expect, test } from "vitest";
+import { expect, test, vi } from "vitest";
 import { tempRoot } from "../data-layer/fixture.js";
 import type { Lead } from "./answerer.js";
 import { atLeast, claudeCommand, findClaude, versionOf } from "./claude-binary.js";
 import { alive } from "../wake/lock.js";
-import { createClaudeAnswerer, FORK_ENV_DROPPED, forkArgs, forkEnv, forkableId } from "./claude.js";
+import { createClaudeAnswerer, FORK_ENV_DROPPED, forkArgs, forkEnv, forkableId, killPid } from "./claude.js";
 
 test("fork: the command line is pinned, flag by flag", () => {
   expect(forkArgs("e8fd707b", "opus")).toEqual([
@@ -88,15 +88,17 @@ function fake(mode = "") {
   fs.writeFileSync(bin, FAKE);
   const cwd = fs.mkdtempSync(path.join(root, "lead-"));
   const lead: Lead = { cwd, working: false, compacted: false, context: 572000, lastActive: Date.now() };
+  const tracked: { kind: string; session: string; folder: string }[] = [];
   const answerer = createClaudeAnswerer({
     claudeDir: path.join(root, ".claude"),
     binary: async () => bin,
     model: async () => "opus",
     config: async () => ({ tailBytes: 1048576, stalledMinutes: 5 }),
     env: { ...process.env, FAKE_LOG: logFile, FAKE_MODE: mode, CLAUDECODE: "1", CLAUDE_CODE_ENTRYPOINT: "cli" },
+    track: (_child, about) => void tracked.push(about),
   });
   const logged = () => fs.readFileSync(logFile, "utf8").trim().split("\n").map((l) => JSON.parse(l));
-  return { answerer, lead, logged, cwd, logFile };
+  return { answerer, lead, logged, cwd, logFile, tracked };
 }
 
 const ask = { instructions: "Reply with only the word: ready", request: "What was the coverage?", timeoutMs: 10000 };
@@ -109,6 +111,8 @@ test("fork: turn 2 goes after turn 1's real result, stdin closes, and the last r
   expect(start.argv).toEqual(forkArgs("e8fd707b", "opus"));
   expect(fs.realpathSync(start.cwd)).toBe(fs.realpathSync(f.cwd));
   expect(start.env.filter((k: string) => FORK_ENV_DROPPED.includes(k))).toEqual([]);
+  // The fork is in the process registry while it runs.
+  expect(f.tracked).toEqual([{ kind: "fork", session: "claude-code:e8fd707b", folder: f.cwd }]);
   expect(rest).toEqual([
     { turn: 1, text: ask.instructions, afterReal: false },
     { turn: 2, text: ask.request, afterReal: true },
@@ -193,4 +197,32 @@ test("claude --version: the version on its own line wins over any other, else th
   expect(versionOf("a 1.2.3 then 2.1.300\n")).toBe("2.1.300");
   expect(versionOf("no version")).toBe(null);
   expect([atLeast("2.1.285", "2.1.285"), atLeast("2.1.284", "2.1.285"), atLeast("2.2.0", "2.1.285")]).toEqual([true, false, true]);
+});
+
+test("killPid: on a Mac or Linux the process's whole group is ended, and when it leads none, the process alone", () => {
+  // Stands in for the system's kill: nothing real is signalled.
+  const kill = vi.spyOn(process, "kill").mockImplementation(() => true);
+  const gone = () => {
+    throw Object.assign(new Error("kill ESRCH"), { code: "ESRCH" });
+  };
+  try {
+    killPid(4242, "darwin");
+    expect(kill.mock.calls).toEqual([[-4242, "SIGKILL"]]);
+    kill.mockClear();
+    kill.mockImplementationOnce(gone);
+    const fallback = vi.fn();
+    killPid(4242, "linux", fallback);
+    expect(kill.mock.calls).toEqual([[-4242, "SIGKILL"]]);
+    expect(fallback).toHaveBeenCalledTimes(1);
+    // By default the fallback ends the process alone, and one gone already is no error.
+    kill.mockClear();
+    kill.mockImplementation(gone);
+    expect(() => killPid(4242, "darwin")).not.toThrow();
+    expect(kill.mock.calls).toEqual([
+      [-4242, "SIGKILL"],
+      [4242, "SIGKILL"],
+    ]);
+  } finally {
+    kill.mockRestore();
+  }
 });

@@ -67,6 +67,14 @@
 //      server has dropped the take (cancelled, or timed out) or it has run past
 //      `desktopTakeBudgetMinutes` (kept under the server's own take timeout), the app is asked to open
 //      it. A session the app didn't open is still taken, with the failure saying how to open it.
+//      The first turn's process is in the process registry while it runs (runner/registry.ts).
+//    - `driven` (protocol 0.5.0): a session driven from the floor, run by the runner's session driver
+//      (runner/session.ts). Only for the runner's own person (`by`), checked before anything is made.
+//      The worktree and setup are as for a terminal, and the worktree is trusted as for headless;
+//      then the driver checks its cap and readies the session, which it opens once `taken` has been
+//      handed to the link (which sends it now, or after the next hello), under the take's session id,
+//      with the take's prompt as its first instruction. A take the server has dropped (cancelled, or
+//      timed out) by then isn't trusted or readied.
 //
 // After Orca (for a take into Orca), the claude binary is looked for, in every mode, before anything
 // is made: without it nothing is.
@@ -74,7 +82,7 @@
 // A failed setup script or repo checkout doesn't stop the rest: the session still opens, and the step is reported
 // with the end of its output. Output leaves the machine only after the secret scan.
 
-import { spawn } from "node:child_process";
+import { spawn, type ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { realpath } from "node:fs";
 import fs from "node:fs/promises";
@@ -85,7 +93,8 @@ import { promisify } from "node:util";
 import { normalize, pathKey } from "../data-layer/git.js";
 import type { NodeIo } from "../data-layer/io.js";
 import { atLeast, claudeCommand, claudeVersion, DESKTOP_MIN_VERSION, desktopPlatform } from "../runner/claude-binary.js";
-import { forkEnv, killTree } from "../runner/claude.js";
+import { forkEnv, killTree, type Track } from "../runner/claude.js";
+import type { PreparedTake } from "../runner/session.js";
 import { handoffBranch, remotesOf, sameRemote, type RunGit } from "./git.js";
 import type { RunOrca } from "./orca.js";
 
@@ -152,8 +161,12 @@ export interface TakeOptions {
   cloneFrom?: (remote: string) => boolean;
   /** Orca's CLI, for a take into Orca, or null when Orca isn't on this machine. */
   orca?: () => Promise<RunOrca | null>;
-  /** Whether the office server has dropped this take since (cancelled, or timed out): checked before the Claude app is opened. */
+  /** Whether the office server has dropped this take since (cancelled, or timed out): checked before the Claude app is opened, and before a driven take is trusted and readied. */
   dropped?: () => boolean;
+  /** The runner's session driver, for a take as a driven session: why not, before anything is made; then readying it, null or why it can't open. */
+  driven?: { problem(by: { id: string } | undefined): string | null; prepare(take: PreparedTake): Promise<string | null> };
+  /** Records the take into the Claude app's first turn in the process registry while it runs. */
+  track?: Track;
 }
 
 /** The handoff's folder on this machine: its brief, launcher and setup log. */
@@ -371,8 +384,8 @@ export async function openLaunch(l: Launch, env: Record<string, string>): Promis
   });
 }
 
-// Runs a command hidden and waits for it, with its output; never opens a window.
-function hidden([cmd, ...args]: string[], cwd: string, env: Record<string, string>, timeoutMs: number): Promise<{ code: number | null; stdout: string; stderr: string; timedOut: boolean }> {
+// Runs a command hidden and waits for it, with its output; never opens a window. `started` is told of the process.
+function hidden([cmd, ...args]: string[], cwd: string, env: Record<string, string>, timeoutMs: number, started?: (child: ChildProcess) => void): Promise<{ code: number | null; stdout: string; stderr: string; timedOut: boolean }> {
   return new Promise((resolve) => {
     let stdout = "";
     let stderr = "";
@@ -380,6 +393,7 @@ function hidden([cmd, ...args]: string[], cwd: string, env: Record<string, strin
     // Its own process group on a Mac, as runShell's, so killTree ends whatever it started too, and
     // nothing left holding its pipes keeps `close` from firing.
     const child = spawn(cmd!, args, { cwd, env, stdio: ["ignore", "pipe", "pipe"], windowsHide: true, detached: process.platform !== "win32" });
+    started?.(child);
     child.stdout.setEncoding("utf8").on("data", (piece: string) => (stdout += piece));
     child.stderr.setEncoding("utf8").on("data", (piece: string) => (stderr = (stderr + piece).slice(-OUTPUT_TAIL)));
     const timer = setTimeout(() => ((timedOut = true), killTree(child as never)), timeoutMs);
@@ -550,9 +564,10 @@ let emptyHooks: Promise<string> | null = null;
 const noHooks = async () => ["-c", `core.hooksPath=${await (emptyHooks ??= fs.mkdtemp(path.join(os.tmpdir(), "isoplan-no-hooks-")))}`];
 
 /** Takes the handoff on this machine; never throws. */
-export async function takeHandoff(message: Pick<HandoffMessage, "handoff" | "mode" | "session">, o: TakeOptions): Promise<TakenMessage> {
+export async function takeHandoff(message: Pick<HandoffMessage, "handoff" | "mode" | "session" | "by" | "room">, o: TakeOptions): Promise<TakenMessage> {
   const { handoff } = message;
   const headless = message.mode === "headless";
+  const driven = message.mode === "driven";
   let orca: RunOrca | null = null;
   const failures: Failure[] = [];
   const done = (session?: string): TakenMessage => ({ type: "taken", v: PROTOCOL_VERSION, handoff: handoff.id, ...(session ? { session } : {}), failures });
@@ -561,9 +576,16 @@ export async function takeHandoff(message: Pick<HandoffMessage, "handoff" | "mod
     failures.push({ step, ...(repo ? { repo } : {}), output: matched ? `The end of its output is withheld here: it matches a secret pattern. It is on ${o.machine}.` : tail(output) });
   };
   // A window opens only when the receiver asked for a terminal: a handoff that doesn't say is refused.
-  if (message.mode !== "terminal" && message.mode !== "headless" && message.mode !== "orca" && message.mode !== "desktop") {
+  if (message.mode !== "terminal" && message.mode !== "headless" && message.mode !== "orca" && message.mode !== "desktop" && message.mode !== "driven") {
     await fail("open", "The office server didn't say how to open the session, so none was opened: take it again from the floor.");
     return done();
+  }
+  if (driven) {
+    const problem = o.driven ? o.driven.problem(message.by) : "This computer's Isoplan can't run sessions from the floor yet, so nothing was made: take it again another way.";
+    if (problem || !message.session || !message.room) {
+      await fail("open", problem ?? "The office server didn't say which session and room to open, so none was opened: take it again from the floor.");
+      return done();
+    }
   }
   const desktop = message.mode === "desktop";
   const startedAt = Date.now();
@@ -674,6 +696,31 @@ export async function takeHandoff(message: Pick<HandoffMessage, "handoff" | "mod
 
     const id = message.session ?? (o.newSession ?? randomUUID)();
     const name = `Isoplan handoff ${handoff.id}`;
+    if (driven) {
+      const dropped = `The take stopped before its session was opened: it was cancelled or timed out on the floor. The worktree is ${dir}: take it again from the floor.`;
+      if (o.dropped?.()) {
+        await fail("open", dropped);
+        return done();
+      }
+      try {
+        // The floor told the receiver: this trusts the worktree, so its settings, hooks and scripts run.
+        await trustFolder(o.claudeJson, dir, o.platform);
+      } catch (err) {
+        await fail("open", `The session couldn't be readied to run from the floor: ${(err as Error).message}. The worktree is ${dir}.`);
+        return done();
+      }
+      if (o.dropped?.()) {
+        await fail("open", dropped);
+        return done();
+      }
+      const problem = await o.driven!.prepare({ session: id, folder: dir, prompt: takePrompt(handoff.id, briefFile, setupLog, failedRepos), name, addDir: folder, room: message.room!, by: message.by! });
+      if (problem) {
+        await fail("open", `${problem} The worktree is ${dir}.`);
+        return done();
+      }
+      o.log(`handoff ${handoff.id}: Claude Code session ${id} opens in ${dir}, run from the floor`);
+      return done(`claude-code:${id}`);
+    }
     const argv = sessionArgv(bin, { prompt: takePrompt(handoff.id, briefFile, setupLog, failedRepos), session: id, name, folder, headless, ...(desktop ? { print: { maxTurns: s.desktopReadMaxTurns } } : {}) });
     if (desktop) {
       const budgetMs = s.desktopTakeBudgetMinutes * 60000;
@@ -693,7 +740,7 @@ export async function takeHandoff(message: Pick<HandoffMessage, "handoff" | "mod
       }
       // The first turn ends before the app opens the session, so the two never write to it at once.
       const readMs = Math.min(s.desktopReadTimeoutMinutes * 60000, left());
-      const read = await hidden(argv, dir, env, readMs);
+      const read = await hidden(argv, dir, env, readMs, (child) => o.track?.(child, { kind: "desktop-read", session: `claude-code:${id}`, folder: dir }));
       const said = ((): { is_error?: unknown; subtype?: unknown; session_id?: unknown } | null => {
         try {
           return JSON.parse(read.stdout.trim().split(/\r?\n/).at(-1) ?? "") as { is_error?: unknown; subtype?: unknown; session_id?: unknown };

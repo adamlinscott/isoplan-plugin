@@ -25,9 +25,10 @@
 //   cached tokens, turn 1's 3,877 read plus its 829 written, and wrote 286 output tokens against
 //   turn 1's 151, the same as its `model_usage_since_last_result`. So the two turns are summed.
 // - A fork that times out, or is still running when the runner exits, is ended with its whole
-//   process tree.
+//   process tree. While it runs it is in the process registry (registry.ts), so a runner that
+//   crashed leaves nothing the next one can't find and end.
 
-import { spawn as nodeSpawn, spawnSync, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { spawn as nodeSpawn, spawnSync, type ChildProcess, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { createClaudeCode } from "../data-layer/claude-code.js";
 import type { Config } from "../data-layer/config.js";
 import { nodeIo } from "../data-layer/io.js";
@@ -102,18 +103,34 @@ export const forkableId = (session: string): string | null => {
 /** Ends a process and everything it started: on Windows `kill` reaches only the process itself. */
 export function killTree(child: ChildProcessWithoutNullStreams, platform = process.platform): void {
   if (child.exitCode !== null || child.signalCode !== null || child.pid === undefined) return;
-  if (platform === "win32") spawnSync("taskkill", ["/pid", String(child.pid), "/T", "/F"], { windowsHide: true, stdio: "ignore" });
+  killPid(child.pid, platform, () => child.kill("SIGKILL"));
+}
+
+/**
+ * Ends the process `pid` and everything it started, as killTree does, for a process this runner
+ * didn't start itself (one an earlier run left, from the process registry). Off Windows the process
+ * leads its own group (spawned detached); `fallback` runs when it doesn't, and by default kills the
+ * process alone.
+ */
+export function killPid(pid: number, platform = process.platform, fallback: () => unknown = () => process.kill(pid, "SIGKILL")): void {
+  if (platform === "win32") spawnSync("taskkill", ["/pid", String(pid), "/T", "/F"], { windowsHide: true, stdio: "ignore" });
   else {
     try {
-      // The fork leads its own process group (spawned detached), so the group goes with it.
-      process.kill(-child.pid, "SIGKILL");
+      process.kill(-pid, "SIGKILL");
     } catch {
-      child.kill("SIGKILL");
+      try {
+        fallback();
+      } catch {
+        // Gone already.
+      }
     }
   }
 }
 
 export type Spawn = (argv: string[], opts: { cwd: string; env: Record<string, string> }) => ChildProcessWithoutNullStreams;
+
+/** What a fork is recorded as in the process registry (registry.ts) while it runs. */
+export type Track = (child: ChildProcess, about: { kind: "fork" | "desktop-read"; session: string; folder: string }) => void;
 
 export interface ClaudeAnswererOptions {
   claudeDir: string;
@@ -126,12 +143,15 @@ export interface ClaudeAnswererOptions {
   spawn?: Spawn;
   env?: Record<string, string | undefined>;
   now?: () => number;
+  /** Records each fork in the process registry while it runs. */
+  track?: Track;
 }
 
-const defaultSpawn: Spawn = ([cmd, ...args], { cwd, env }) =>
+/** Starts a process with no window and its three pipes; off Windows it leads its own process group, for killTree. */
+export const hiddenSpawn: Spawn = ([cmd, ...args], { cwd, env }) =>
   nodeSpawn(cmd!, args, { cwd, env, stdio: ["pipe", "pipe", "pipe"], windowsHide: true, detached: process.platform !== "win32" });
 
-export function createClaudeAnswerer({ claudeDir, binary, model, config, spawn = defaultSpawn, env = process.env, now = Date.now }: ClaudeAnswererOptions): Answerer {
+export function createClaudeAnswerer({ claudeDir, binary, model, config, spawn = hiddenSpawn, env = process.env, now = Date.now, track }: ClaudeAnswererOptions): Answerer {
   const forks = new Set<ChildProcessWithoutNullStreams>();
   return {
     async lead(session) {
@@ -152,6 +172,7 @@ export function createClaudeAnswerer({ claudeDir, binary, model, config, spawn =
       }
       forks.add(child);
       child.on("close", () => forks.delete(child));
+      track?.(child, { kind: "fork", session, folder: lead.cwd });
       return drive(child, ask);
     },
     close() {

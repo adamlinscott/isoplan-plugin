@@ -26,12 +26,18 @@
 // The runner (src/runner) uses the same link with its own hello and no facts. The server's
 // requests, releases and handoffs go to `onMessage`, and the runner's replies and refusals go out
 // through `send`. One sent while the link is down waits, and goes out after the next hello, within
-// OUTBOX_MAX and OUTBOX_MAX_AGE_MS.
+// OUTBOX_MAX and OUTBOX_MAX_AGE_MS. Driving sessions from the floor (protocol 0.5.0), the server's
+// `drive` requests and `drive-policy` go to `onDrive`, and the runner's `driven` messages go out
+// through `sendLive`, only while the link is up: they never wait in the outbox. `onOpen` is told
+// after every hello, so the runner can say where its driven sessions stand.
 
 import {
   parseOfficeServerMessage,
   PROTOCOL_VERSION,
   type DataLayerMessage,
+  type DriveMessage,
+  type DrivenMessage,
+  type DrivePolicyMessage,
   type Facts,
   type DropMessage,
   type HandoffMessage,
@@ -75,6 +81,10 @@ export interface LinkOptions {
   onPairingEnded?: () => void;
   /** Takes the server's requests, releases and handoffs; without it they are logged as not handled. */
   onMessage?: (message: ServerAsk) => void;
+  /** Takes the server's drive requests and drive-policy; without it they are logged as not handled. */
+  onDrive?: (message: DriveMessage | DrivePolicyMessage) => void;
+  /** Told after every hello, once what waited in the outbox has gone. */
+  onOpen?: () => void;
   /**
    * What of the facts may go on this connection, given the projects its welcome named (null before
    * one): applied at every send, so a reconnect's full goes by the new connection's welcome (#74).
@@ -100,6 +110,8 @@ export interface Link {
   update(facts: Facts): void;
   /** A reply, refusal or taken, first sent at `at` (now, unless it waited elsewhere first). One sent while the link is down goes out after the next hello, unless it is older than OUTBOX_MAX_AGE_MS by then. */
   send(message: Outgoing, at?: number): void;
+  /** A driven message, sent now if the link is up; false when it is down, and the message is dropped. */
+  sendLive(message: DrivenMessage): boolean;
   /**
    * The projects the office holds, from this connection's welcome; null before one, and from a
    * server too old to send one, which would read another repo's files as the session's own (#74).
@@ -120,6 +132,8 @@ export function createLink({
   onNotWanted,
   onPairingEnded,
   onMessage,
+  onDrive,
+  onOpen,
   filter = (facts) => facts,
   answered,
   pairing,
@@ -201,6 +215,7 @@ export function createLink({
       for (const { message, at } of outbox.splice(0)) if (Date.now() - at < OUTBOX_MAX_AGE_MS) send(message);
       sendFull();
       emit({ type: "status", server: url, state: "connected" });
+      onOpen?.();
     };
     ws.onmessage = (event) => {
       if (socket === ws) receive(event.data);
@@ -337,6 +352,8 @@ export function createLink({
       }
     } else if (onMessage && (message.type === "request" || message.type === "release" || message.type === "handoff" || message.type === "drop")) {
       onMessage(message);
+    } else if (onDrive && (message.type === "drive" || message.type === "drive-policy")) {
+      onDrive(message);
     } else {
       emit({ type: "log", text: `the office server sent a ${message.type} message, which this data layer doesn't handle yet` });
     }
@@ -356,6 +373,11 @@ export function createLink({
         outbox.push({ message, at });
         if (outbox.length > OUTBOX_MAX) outbox.shift();
       }
+    },
+    sendLive(message) {
+      if (!isOpen || socket!.readyState !== WebSocket.OPEN) return false;
+      send(message);
+      return true;
     },
     projects: () => projects,
     close() {

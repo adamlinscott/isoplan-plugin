@@ -5,19 +5,19 @@ import { createForkSlots } from "./runner.js";
 const HOLD_OFF_MS = 3600000;
 
 /** Two offices' links as stand-ins, a clock, and the loop over them, checked every 5 ms. */
-function setUp(over: Partial<AnswerOfficesOptions<string, string>> = {}) {
+function setUp(over: Partial<AnswerOfficesOptions<string, string, string>> = {}) {
   let clock = 0;
   const opened: { office: string; sent: string[]; closed: boolean; said: { notWanted(): void; unpaired(): void } }[] = [];
   const logs: string[] = [];
   const state = { idle: true, lit: true, paired: new Set<string>() };
   let leave = () => {};
-  const loop = answerOffices<string, string>({
+  const loop = answerOffices<string, string, string>({
     offices: ["internal", "dev"],
     name: (o) => o,
     open: (office, said) => {
       const link = { office, sent: [] as string[], closed: false, said };
       opened.push(link);
-      return { send: (m) => void link.sent.push(m), close: () => void (link.closed = true) };
+      return { send: (m) => void link.sent.push(m), sendLive: (m) => (link.sent.push(`live ${m}`), true), close: () => void (link.closed = true) };
     },
     paired: async (o) => state.paired.has(o),
     idle: () => state.idle,
@@ -124,6 +124,38 @@ test("runner offices: unpaired everywhere ends it as unpaired; with no room lit 
   b.state.idle = true;
   expect(await b.loop.ended).toBe("done");
   expect(b.opened.every((l) => l.closed)).toBe(true);
+});
+
+test("runner offices: a driven message goes only while its office's link is open, and is never kept for later", async () => {
+  const s = setUp();
+  expect(s.loop.live(0)("held")).toBe(true);
+  expect(s.latest("internal").sent).toEqual(["live held"]);
+  s.latest("internal").said.unpaired();
+  await settle();
+  expect(s.loop.live(0)("released")).toBe(false);
+  s.state.paired.add("internal");
+  await settle();
+  expect(s.opened.filter((l) => l.office === "internal")).toHaveLength(2);
+  expect(s.latest("internal").sent).toEqual([]);
+  s.leave();
+  await s.loop.ended;
+});
+
+test("runner offices: while keep says so (a driven session's process, or starting at login), no lit room doesn't end it; no link left still does", async () => {
+  let keep = true;
+  const s = setUp({ keep: async () => keep });
+  s.state.lit = false;
+  let ended: string | null = null;
+  void s.loop.ended.then((e) => (ended = e));
+  await settle();
+  expect(ended).toBeNull();
+  keep = false;
+  expect(await s.loop.ended).toBe("done");
+
+  const a = setUp({ keep: async () => true });
+  a.latest("internal").said.unpaired();
+  a.latest("dev").said.unpaired();
+  expect(await a.loop.ended).toBe("unpaired");
 });
 
 test("runner offices: one fork cap for the machine, whichever office's runner asks", async () => {

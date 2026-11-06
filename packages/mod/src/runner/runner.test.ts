@@ -305,6 +305,43 @@ test("runner: a drop naming a running take's id tells the take; one past takeCap
   expect(t.sent).toHaveLength(1);
 });
 
+test("runner: onTaken hears of every take that ends, and says it opens only for one whose taken went and that wasn't dropped or given up", async () => {
+  const ended: [string, string | undefined, boolean][] = [];
+  const finishes: Record<string, () => void> = {};
+  const take = async (m: HandoffMessage): Promise<TakenMessage> => {
+    await new Promise<void>((r) => (finishes[m.handoff.id] = r));
+    return { type: "taken", v: PROTOCOL_VERSION, handoff: m.handoff.id, session: `claude-code:${m.session}`, failures: [] };
+  };
+  const onTaken = (m: HandoffMessage, taken: TakenMessage | null, opens: boolean) => void ended.push([m.handoff.id, taken?.session, opens]);
+  const handoff = (id: string, session: string): HandoffMessage => ({ type: "handoff", v: PROTOCOL_VERSION, mode: "driven", session, by: { id: "claude:sam", name: "Sam" }, room: "room-1", permissions: "auto", handoff: { id, brief: "b", repos: [{ path: ".", remote: "origin", branch: `isoplan/handoff/${id}`, commit: "a".repeat(40) }] } });
+  const t = await setup({ take, onTaken });
+  t.runner.take(handoff("h-1", "0b5c4d3e-0000-4000-8000-000000000011"));
+  t.runner.take(handoff("h-2", "0b5c4d3e-0000-4000-8000-000000000012"));
+  await until(() => !!finishes["h-1"] && !!finishes["h-2"]);
+  // The server cancelled h-2 while it was being taken.
+  t.runner.take({ type: "drop", v: PROTOCOL_VERSION, id: "0b5c4d3e-0000-4000-8000-000000000012" });
+  finishes["h-1"]!();
+  finishes["h-2"]!();
+  await until(() => ended.length === 2);
+  expect(ended).toEqual([
+    ["h-1", "claude-code:0b5c4d3e-0000-4000-8000-000000000011", true],
+    ["h-2", "claude-code:0b5c4d3e-0000-4000-8000-000000000012", false],
+  ]);
+  // One past takeCapMinutes is given up: its late end opens nothing.
+  const late = await setup({ settings: { takeCapMinutes: 0.002 }, take, onTaken });
+  late.runner.take(handoff("h-3", "0b5c4d3e-0000-4000-8000-000000000013"));
+  await late.sentN(1);
+  expect(late.sent[0]).toMatchObject({ type: "taken", handoff: "h-3", failures: [{ step: "open" }] });
+  finishes["h-3"]!();
+  await until(() => ended.length === 3);
+  expect(ended[2]).toEqual(["h-3", "claude-code:0b5c4d3e-0000-4000-8000-000000000013", false]);
+  // A take that failed is told too, with nothing it did.
+  const failing = await setup({ take: async () => Promise.reject(new Error("broken")), onTaken });
+  failing.runner.take(handoff("h-4", "0b5c4d3e-0000-4000-8000-000000000014"));
+  await until(() => ended.length === 4);
+  expect(ended[3]).toEqual(["h-4", undefined, false]);
+});
+
 test("runner: a handoff to take goes to take once at a time, and what it did goes back as taken", async () => {
   let finish: () => void = () => {};
   const taken: string[] = [];

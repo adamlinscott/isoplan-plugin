@@ -9836,9 +9836,18 @@ function forkEnv(env) {
 /** Ends a process and everything it started: on Windows `kill` reaches only the process itself. */
 function killTree(child, platform = process.platform) {
 	if (child.exitCode !== null || child.signalCode !== null || child.pid === void 0) return;
+	killPid(child.pid, platform, () => child.kill("SIGKILL"));
+}
+/**
+* Ends the process `pid` and everything it started, as killTree does, for a process this runner
+* didn't start itself (one an earlier run left, from the process registry). Off Windows the process
+* leads its own group (spawned detached); `fallback` runs when it doesn't, and by default kills the
+* process alone.
+*/
+function killPid(pid, platform = process.platform, fallback = () => process.kill(pid, "SIGKILL")) {
 	if (platform === "win32") spawnSync("taskkill", [
 		"/pid",
-		String(child.pid),
+		String(pid),
 		"/T",
 		"/F"
 	], {
@@ -9846,9 +9855,11 @@ function killTree(child, platform = process.platform) {
 		stdio: "ignore"
 	});
 	else try {
-		process.kill(-child.pid, "SIGKILL");
+		process.kill(-pid, "SIGKILL");
 	} catch {
-		child.kill("SIGKILL");
+		try {
+			fallback();
+		} catch {}
 	}
 }
 //#endregion
@@ -10822,7 +10833,7 @@ const same = (a, b) => a !== void 0 && JSON.stringify(a) === JSON.stringify(b);
 const STABLE_MS = 3e4;
 const OUTBOX_MAX = 100;
 const OUTBOX_MAX_AGE_MS = 36e5;
-function createLink({ url, hello, emit, minIntervalMs = 1e3, retryBaseMs = 1e3, retryCapMs = 3e4, notWantedRetryMs = 36e5, takenRetryMs = 36e5, onNotWanted, onPairingEnded, onMessage, filter = (facts) => facts, answered, pairing, pairPollMs = 5e3, admit, random = Math.random }) {
+function createLink({ url, hello, emit, minIntervalMs = 1e3, retryBaseMs = 1e3, retryCapMs = 3e4, notWantedRetryMs = 36e5, takenRetryMs = 36e5, onNotWanted, onPairingEnded, onMessage, onDrive, onOpen, filter = (facts) => facts, answered, pairing, pairPollMs = 5e3, admit, random = Math.random }) {
 	const outbox = [];
 	let latest = null;
 	let socket = null;
@@ -10906,6 +10917,7 @@ function createLink({ url, hello, emit, minIntervalMs = 1e3, retryBaseMs = 1e3, 
 				server: url,
 				state: "connected"
 			});
+			onOpen?.();
 		};
 		ws.onmessage = (event) => {
 			if (socket === ws) receive(event.data);
@@ -11064,6 +11076,7 @@ function createLink({ url, hello, emit, minIntervalMs = 1e3, retryBaseMs = 1e3, 
 				onNotWanted?.();
 			}
 		} else if (onMessage && (message.type === "request" || message.type === "release" || message.type === "handoff" || message.type === "drop")) onMessage(message);
+		else if (onDrive && (message.type === "drive" || message.type === "drive-policy")) onDrive(message);
 		else emit({
 			type: "log",
 			text: `the office server sent a ${message.type} message, which this data layer doesn't handle yet`
@@ -11085,6 +11098,11 @@ function createLink({ url, hello, emit, minIntervalMs = 1e3, retryBaseMs = 1e3, 
 				});
 				if (outbox.length > OUTBOX_MAX) outbox.shift();
 			}
+		},
+		sendLive(message) {
+			if (!isOpen || socket.readyState !== WebSocket.OPEN) return false;
+			send(message);
+			return true;
 		},
 		projects: () => projects,
 		close() {

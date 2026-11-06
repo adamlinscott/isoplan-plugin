@@ -31,13 +31,21 @@
 // patterns are secret-patterns.json plus ~/.claude/isoplan/secret-patterns.json. Its ledger of
 // answers is <claude dir>/isoplan/runner/ledger.json, and it logs to
 // <claude dir>/isoplan/logs/runner.log.
+//
+// The worker also drives its person's sessions from the floor (session.ts; its hello says `drive`),
+// for every office through one driver, and records every process it starts for that, and every
+// fork and take into the Claude app's first turn, in <claude dir>/isoplan/runner/processes.json
+// (registry.ts). As it starts, under the runner's lock, it ends what an earlier run left there that
+// is verifiably Isoplan's, keeping driven sessions to open again. It doesn't stop for lights-off
+// while a driven session's process runs, or while `startAtLogin` is on: then a person who works only
+// on the floor keeps a runner up.
 
 import { spawn } from "node:child_process";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { PROTOCOL_VERSION } from "@isoplan/protocol";
+import { PROTOCOL_VERSION, type DrivenMessage, type RefusalMessage, type ReplyMessage, type TakenMessage } from "@isoplan/protocol";
 import { loadConfig, loadSettings, officesOf, type Office } from "../data-layer/config.js";
 import { approvedPath, createApproved } from "../data-layer/approved.js";
 import { approvedHome, machineHomeIo, takesFrom } from "../data-layer/home.js";
@@ -59,6 +67,8 @@ import { recordTakenOffice } from "../handoff/taken-office.js";
 import { answerOffices } from "./offices.js";
 import { createForkSlots, createRunner, PushFailed, type RunnerSettings } from "./runner.js";
 import { loadPatterns, scan } from "./scan.js";
+import { createRegistry, registryPath } from "./registry.js";
+import { createDriver, type DriveOffice, type Driver, type DriveSettings } from "./session.js";
 import { runnerEnvPath } from "./environment.js";
 import { applyClaudeDir, LOCK_REFRESH_MS, RUNNER_FRESH_MS, runnerCode, runnerLockPath } from "./start.js";
 
@@ -140,7 +150,7 @@ async function supervisor(): Promise<number> {
 async function worker(): Promise<number> {
   const io = nodeIo();
   const config = () => loadConfig(io, path.join(appDir, "config.json"), path.join(isoplanDir, "config.json"));
-  const settings = () => loadSettings<RunnerSettings & TakeSettings & { claudeModel: string; repoSearchDepth: number }>(io, path.join(appDir, "runner.json"), path.join(isoplanDir, "runner.json"));
+  const settings = () => loadSettings<RunnerSettings & TakeSettings & DriveSettings & { claudeModel: string; repoSearchDepth: number; startAtLogin: boolean }>(io, path.join(appDir, "runner.json"), path.join(isoplanDir, "runner.json"));
   const first = await config();
   // Plain ws:// to another machine would send the machine's credential unencrypted.
   const offices = officesOf(first);
@@ -148,14 +158,24 @@ async function worker(): Promise<number> {
   if (offices.every((o) => o.plainRefused)) return 0;
   await settings(); // a broken runner.json of the plugin's is a crash to see at once
 
+  // Every process it starts is recorded; what an earlier run left that is Isoplan's ends now. Only a
+  // worker whose supervisor holds the runner's lock gets here.
+  const registry = createRegistry({ file: registryPath(claudeDir), log });
+  await registry.restore();
+  const binary = () => claudeBinary(claudeDir, process.env, process.platform, os.homedir());
   const answerer = createClaudeAnswerer({
     claudeDir,
-    binary: () => claudeBinary(claudeDir, process.env, process.platform, os.homedir()),
+    binary,
     model: async () => (await settings()).claudeModel,
     config,
+    track: registry.track,
   });
-  // However the worker ends, its forks end with it.
-  process.on("exit", () => answerer.close());
+  let driver: Driver | null = null;
+  // However the worker ends, its forks and driven sessions end with it.
+  process.on("exit", () => {
+    answerer.close();
+    driver?.close();
+  });
   const git = createRunGit();
   const gitMs = async () => (await settings()).gitTimeoutSeconds * 1000;
   // A git failure is told by its kind; git's own words stay in the log.
@@ -197,6 +217,9 @@ async function worker(): Promise<number> {
   const forks = createForkSlots();
   const answering = offices.filter((o) => !o.plainRefused);
   let send = (_index: number): Parameters<typeof createRunner>[0]["send"] => () => {};
+  let live = (_index: number) => (_message: DrivenMessage): boolean => false;
+  const isDir = (p: string) => fs.stat(p).then((s) => s.isDirectory(), () => false);
+  const drives: DriveOffice[] = [];
 
   // The runner answering what one office asks, for that office alone; it outlives its office's link.
   const runnerFor = (office: Office, index: number) => {
@@ -219,6 +242,22 @@ async function worker(): Promise<number> {
       await approved.refresh();
       return takesFrom(homeIo, approved.repos());
     };
+    // A session driven from the floor opens in the folder Claude Code's own transcript of a room
+    // session on this machine names, still there and in a repo the office takes: never a path the
+    // server sent.
+    drives[index] = {
+      server,
+      send: (message) => live(index)(message),
+      folder: async (roomSessions) => {
+        for (const session of roomSessions) {
+          const lead = await answerer.lead(session);
+          if (!lead || !(await isDir(lead.cwd))) continue;
+          await approved.refresh();
+          if ((await approvedHome(lead.cwd, homeIo, approved.repos())) !== null) return lead.cwd;
+        }
+        return null;
+      },
+    };
     const runner = createRunner({
       answerer,
       ledger,
@@ -228,7 +267,7 @@ async function worker(): Promise<number> {
       scan: scanText,
       send: (message) => send(index)(message),
       log,
-      isDir: (p) => fs.stat(p).then((s) => s.isDirectory(), () => false),
+      isDir,
       // Only the rooms the data layer would report: inside the askable window, and not held off,
       // which a detached data layer leaves when the server doesn't want the session's project (or git
       // can't place its folder). That hold-off in isoplan/live/<id>.json is the only record of it.
@@ -268,14 +307,21 @@ async function worker(): Promise<number> {
           platform: process.platform,
           env: process.env,
           settings,
-          claude: () => claudeBinary(claudeDir, process.env, process.platform, os.homedir()),
+          claude: binary,
           claudeJson,
           scan: scanText,
           log,
           orca: takeOrca,
+          driven: { problem: (by) => driver!.takeProblem(by), prepare: (take) => driver!.prepareTake(server, take) },
+          track: registry.track,
         });
         if (taken.session) await recordTakenOffice(claudeDir, taken.session, server).catch(() => {});
         return taken;
+      },
+      // A driven take's session opens once its `taken` has been handed to the link, which sends it now
+      // or after the next hello. One that won't open (dropped, given up, or failed) frees its place.
+      onTaken: (message, taken, opens) => {
+        if (message.mode === "driven" && message.session) driver!.taken(message.session, opens && !!taken?.session);
       },
       // Focus this session: the handoff's session, which a take into Orca opened, to the front in Orca.
       focus: (handoff) => focusHandoff(handoff, { claudeDir, platform: process.platform, orca: takeOrca, log }),
@@ -283,10 +329,22 @@ async function worker(): Promise<number> {
     return { pairing, runner };
   };
   const answerers = answering.map(runnerFor);
+  const drive: Driver = createDriver({
+    claudeDir,
+    account,
+    offices: drives,
+    registry,
+    binary,
+    settings,
+    scan: scanText,
+    log,
+    projectOf: async (folder) => (await homeIo.projectOf(await homeIo.resolve(folder), folder)).id,
+  });
+  driver = drive;
 
   // The supervisor holds stdin open; it closes when the supervisor has gone.
   const gone = new Promise<void>((resolve) => process.stdin.on("end", resolve).on("error", resolve).resume());
-  const links = answerOffices({
+  const links = answerOffices<Office, ReplyMessage | RefusalMessage | TakenMessage, DrivenMessage>({
     offices: answering,
     name: (office) => office.server,
     open: (office, said) => {
@@ -297,6 +355,9 @@ async function worker(): Promise<number> {
         emit: emitFor(office.server),
         pairing,
         onMessage: (message) => runner.take(message),
+        onDrive: (message) => drive.take(office.server, message),
+        // After every hello, where this office's driven sessions stand.
+        onOpen: () => drive.linked(office.server),
         onNotWanted: said.notWanted,
         // A revoked or lapsed pairing closes this link: its data layers pair the machine again.
         onPairingEnded: said.unpaired,
@@ -307,18 +368,21 @@ async function worker(): Promise<number> {
           machine: { name: os.hostname() },
           ...(hasOrca ? { orca: true } : {}),
           ...(hasDesktop ? { desktop: true } : {}),
+          drive: true,
         },
       });
     },
     paired: async (office) => !!pairingEntry(await readPairing(pairingPath(claudeDir)), office.server, account.id)?.credential,
     idle: () => answerers.every((a) => a.runner.idle()),
     lit: async () => anyRoomSince(io, path.join(claudeDir, "projects"), Date.now() - askableMs(await config().catch(() => first))),
+    keep: async () => drive.held() > 0 || (await settings()).startAtLogin,
     gone,
     log,
     checkMs: CHECK_MS,
     holdOffMs: HOLD_OFF_MS,
   });
   send = links.sender;
+  live = links.live;
   const ended = await links.ended;
   return ended === "not-wanted" ? NOT_WANTED_CODE : ended === "unpaired" ? UNPAIRED_CODE : 0;
 }
