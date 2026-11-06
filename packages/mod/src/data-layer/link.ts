@@ -29,8 +29,8 @@
 // OUTBOX_MAX and OUTBOX_MAX_AGE_MS. Driving sessions from the floor (protocol 0.5.0), the server's
 // `drive` requests and `drive-policy` go to `onDrive`, and the runner's `driven` messages go out
 // through `sendLive`, only while the link is up: they never wait in the outbox. `onOpen` is told
-// after every hello, so the runner can say where its driven sessions stand, and `onClose` at every
-// drop, so it stops trusting that connection's drive-policy.
+// after every hello and `onClose` at every drop, so the runner forgets the connection's drive-policy
+// and sends no driven message on the new one until its first drive-policy has come (runner/session.ts).
 
 import {
   parseOfficeServerMessage,

@@ -84,8 +84,12 @@
 //   its release sends.
 // - Every message is cut to the protocol's limits and checked against DrivenMessageSchema before it
 //   goes, so one bad message can't make the server close the runner's link, and is sent only while
-//   the office's link is up (`office.send`), never kept in the reply outbox. After every hello
-//   `holding` says where each of the office's sessions stands.
+//   the office's link is up (`office.send`) and its connection's first `drive-policy` has come,
+//   never kept in the reply outbox. A server that drives sessions sends that first on every
+//   connection; one from before driven sessions sends none, and closes the link on a `driven` (#58),
+//   so it is sent none. Until then a message is dropped, an answer to a drive request too, as one is
+//   while the link is down. With the connection's first drive-policy, `holding` says where each of
+//   the office's sessions stands; a later one on it doesn't send it again.
 // - A handoff taken as a driven session (handoff/take.ts, mode `driven`): `takeProblem` before
 //   anything is made, `prepareTake` once the worktree is ready (the cap), and `taken` once the take
 //   has ended. When its `taken` was handed to the link (which sends it now, or after the next hello)
@@ -110,8 +114,8 @@
 //   process ending or Claude Code cancelling it ends it `cancelled`. Each ends once, with
 //   `prompt-ended`, and Claude Code gets an answer for each it still waits on; a `control_request`
 //   that isn't a prompt gets an error at once, so a turn never waits on one. No idle close or
-//   stuck timeout runs while one waits. After every hello the waiting ones go again, right after
-//   `holding`, unchanged; while the link is down they aren't kept anywhere else.
+//   stuck timeout runs while one waits. With each connection's first drive-policy the waiting ones
+//   go again, right after `holding`, unchanged; while the link is down they aren't kept anywhere else.
 
 import { randomUUID } from "node:crypto";
 import type { ChildProcessWithoutNullStreams } from "node:child_process";
@@ -205,7 +209,7 @@ export interface DriverOptions {
 export interface Driver {
   /** A drive request or drive-policy from the office at `server`. */
   take(server: string, message: DriveMessage | DrivePolicyMessage): void;
-  /** The office's link has said hello again: where its sessions stand, and the prompts still waiting, go now. */
+  /** The office's link has said hello again, on a new connection: nothing goes on it until its first drive-policy, and then where its sessions stand and the prompts still waiting go. */
   linked(server: string): void;
   /** The office's link has dropped: its drive-policy no longer holds. */
   unlinked(server: string): void;
@@ -311,7 +315,7 @@ interface Waiting {
   turn: string | null;
   /** The tool's input, which an allow hands back unchanged. */
   input: unknown;
-  /** As it was sent, once made: sent again unchanged after every hello. */
+  /** As it was sent, once made: sent again unchanged with each connection's first drive-policy. */
   message: PromptMessage | null;
   timer: ReturnType<typeof setTimeout> | null;
 }
@@ -498,7 +502,7 @@ export function createDriver(o: DriverOptions): Driver {
   const sessions = new Map<string, Session>();
   const withheld = new Map<string, Held>(); // oldest first
   // Office → the projects whose sessions may run in bypassPermissions, from the latest drive-policy on
-  // its current connection; none until one arrives on it.
+  // its current connection; none until one arrives on it, and until then nothing is sent to it.
   const policies = new Map<string, Set<string>>();
   const takes = new Map<string, PreparedTake & { server: string; project: string }>();
   const starts = new Set<string>();
@@ -526,7 +530,8 @@ export function createDriver(o: DriverOptions): Driver {
 
   function sendTo(server: string, m: DrivenMessage): void {
     const office = offices.get(server);
-    if (!office) return;
+    // Nothing goes on a connection before its first drive-policy: a server from before driven sessions sends none, and closes the link on a `driven` (#58).
+    if (!office || !policies.has(server)) return;
     const parsed = DrivenMessageSchema.safeParse(fit(m));
     if (!parsed.success) {
       o.log(`a driven ${m.kind} message wasn't sent, as it doesn't fit the protocol: ${parsed.error.issues.map((i) => `${i.path.join(".")} ${i.message}`).join("; ")}`);
@@ -1076,6 +1081,19 @@ export function createDriver(o: DriverOptions): Driver {
     emit(s, () => ({ ...driven, kind: "output", id, session: w.session, ...(w.turn !== undefined ? { turn: w.turn } : {}), text: w.text, ...(w.cut ? { cut: true as const } : {}) }));
   }
 
+  // Where each of the office's sessions stands, then the prompts still waiting, on a connection whose first drive-policy has come.
+  function sayHolding(server: string): void {
+    const ofOffice = [...sessions.values()].filter((s) => s.record.driven.office === server);
+    // One with no process says the mode it would open in now.
+    const list = ofOffice
+      .sort((a, b) => Number(!!b.child) - Number(!!a.child) || Date.parse(b.record.lastActivity) - Date.parse(a.record.lastActivity))
+      .slice(0, MAX_HOLDING)
+      .map((s) => ({ session: s.record.session, room: s.record.driven.room, held: !!s.child, permissions: s.child ? s.record.driven.permissions : modeFor(s), ...(s.turn ? { turn: s.turn } : {}) }));
+    sendTo(server, { ...driven, kind: "holding", sessions: list });
+    // Unchanged, so the floor can still answer one raised while the link was down, or before the server restarted.
+    for (const s of ofOffice) for (const w of s.prompts.values()) if (w.message) sendTo(server, w.message);
+  }
+
   // The driven sessions an earlier run left, with no process now (registry.restore ended theirs).
   for (const r of o.registry.list()) if (r.kind === "driven" && r.driven) sessions.set(r.session, newSession(r as Session["record"], true));
   prune();
@@ -1085,7 +1103,9 @@ export function createDriver(o: DriverOptions): Driver {
       if (!offices.has(server)) return;
       if (m.type === "drive-policy") {
         const allowed = new Set(m.bypassAllowed.map((p) => p.toLowerCase()));
+        const first = !policies.has(server);
         policies.set(server, allowed);
+        if (first) sayHolding(server);
         for (const s of sessions.values()) {
           const d = s.record.driven;
           if (d.office === server && s.child && d.permissions === "bypassPermissions" && !allowed.has(d.project)) queue(s, () => closeForPolicy(s));
@@ -1108,17 +1128,8 @@ export function createDriver(o: DriverOptions): Driver {
       else answer(s, m.id, m.prompt, m.answer);
     },
     linked(server) {
-      // A new connection: its drive-policy is still to come.
+      // A new connection: its drive-policy is still to come, and nothing driven goes until it has.
       policies.delete(server);
-      const ofOffice = [...sessions.values()].filter((s) => s.record.driven.office === server);
-      // One with no process says the mode it would open in now.
-      const list = ofOffice
-        .sort((a, b) => Number(!!b.child) - Number(!!a.child) || Date.parse(b.record.lastActivity) - Date.parse(a.record.lastActivity))
-        .slice(0, MAX_HOLDING)
-        .map((s) => ({ session: s.record.session, room: s.record.driven.room, held: !!s.child, permissions: s.child ? s.record.driven.permissions : modeFor(s), ...(s.turn ? { turn: s.turn } : {}) }));
-      sendTo(server, { ...driven, kind: "holding", sessions: list });
-      // Unchanged, so the floor can still answer one raised while the link was down, or before the server restarted.
-      for (const s of ofOffice) for (const w of s.prompts.values()) if (w.message) sendTo(server, w.message);
     },
     unlinked(server) {
       policies.delete(server);

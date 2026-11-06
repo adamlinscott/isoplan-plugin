@@ -6180,10 +6180,12 @@ const DrivenRefusedSchema = discriminatedUnion("reason", [
 *
 * Every `driven` message is live-only: it goes only while the runner's link is up and never waits in
 * the link's reply outbox, so a long turn can't push the replies to the server's requests out of it,
-* and a prompt that has timed out isn't shown again. After every hello, `holding` says where each
-* session stands, and right after it the runner sends `prompt` again for each prompt still waiting,
-* with the same `prompt` id and `expires`, so one raised while the link was down, or before the server
-* restarted, can still be answered.
+* and a prompt that has timed out isn't shown again. The runner sends none on a connection until the
+* server's first `drive-policy` on it has come, so a server from before driven sessions, which sends
+* no drive-policy, is never sent one. With that first drive-policy, `holding` says where each session
+* stands, and right after it the runner sends `prompt` again for each prompt still waiting, with the
+* same `prompt` id and `expires`, so one raised while the link was down, or before the server
+* restarted, can still be answered. A later drive-policy on the same connection sends neither again.
 *
 * The runner keeps every field within its limit (the MAX_* constants), cutting what it doesn't pick
 * itself, such as a tool name, to fit: the server refuses a message over any limit and closes the
@@ -12964,7 +12966,7 @@ function createDriver(o) {
 	}
 	function sendTo(server, m) {
 		const office = offices.get(server);
-		if (!office) return;
+		if (!office || !policies.has(server)) return;
 		const parsed = DrivenMessageSchema.safeParse(fit(m));
 		if (!parsed.success) {
 			o.log(`a driven ${m.kind} message wasn't sent, as it doesn't fit the protocol: ${parsed.error.issues.map((i) => `${i.path.join(".")} ${i.message}`).join("; ")}`);
@@ -13726,6 +13728,22 @@ function createDriver(o) {
 			...w.cut ? { cut: true } : {}
 		}));
 	}
+	function sayHolding(server) {
+		const ofOffice = [...sessions.values()].filter((s) => s.record.driven.office === server);
+		const list = ofOffice.sort((a, b) => Number(!!b.child) - Number(!!a.child) || Date.parse(b.record.lastActivity) - Date.parse(a.record.lastActivity)).slice(0, 200).map((s) => ({
+			session: s.record.session,
+			room: s.record.driven.room,
+			held: !!s.child,
+			permissions: s.child ? s.record.driven.permissions : modeFor(s),
+			...s.turn ? { turn: s.turn } : {}
+		}));
+		sendTo(server, {
+			...driven,
+			kind: "holding",
+			sessions: list
+		});
+		for (const s of ofOffice) for (const w of s.prompts.values()) if (w.message) sendTo(server, w.message);
+	}
 	for (const r of o.registry.list()) if (r.kind === "driven" && r.driven) sessions.set(r.session, newSession(r, true));
 	prune();
 	return {
@@ -13733,7 +13751,9 @@ function createDriver(o) {
 			if (!offices.has(server)) return;
 			if (m.type === "drive-policy") {
 				const allowed = new Set(m.bypassAllowed.map((p) => p.toLowerCase()));
+				const first = !policies.has(server);
 				policies.set(server, allowed);
+				if (first) sayHolding(server);
 				for (const s of sessions.values()) {
 					const d = s.record.driven;
 					if (d.office === server && s.child && d.permissions === "bypassPermissions" && !allowed.has(d.project)) queue(s, () => closeForPolicy(s));
@@ -13757,20 +13777,6 @@ function createDriver(o) {
 		},
 		linked(server) {
 			policies.delete(server);
-			const ofOffice = [...sessions.values()].filter((s) => s.record.driven.office === server);
-			const list = ofOffice.sort((a, b) => Number(!!b.child) - Number(!!a.child) || Date.parse(b.record.lastActivity) - Date.parse(a.record.lastActivity)).slice(0, 200).map((s) => ({
-				session: s.record.session,
-				room: s.record.driven.room,
-				held: !!s.child,
-				permissions: s.child ? s.record.driven.permissions : modeFor(s),
-				...s.turn ? { turn: s.turn } : {}
-			}));
-			sendTo(server, {
-				...driven,
-				kind: "holding",
-				sessions: list
-			});
-			for (const s of ofOffice) for (const w of s.prompts.values()) if (w.message) sendTo(server, w.message);
 		},
 		unlinked(server) {
 			policies.delete(server);

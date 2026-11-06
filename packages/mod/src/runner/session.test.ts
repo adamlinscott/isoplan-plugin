@@ -1,11 +1,14 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { EventEmitter } from "node:events";
 import fs from "node:fs";
+import type { AddressInfo } from "node:net";
 import path from "node:path";
 import { PassThrough } from "node:stream";
-import { MAX_TOOL_NAME_LENGTH, PROTOCOL_VERSION, type DriveMessage, type DrivenMessage } from "@isoplan/protocol";
+import { MAX_TOOL_NAME_LENGTH, PROTOCOL_VERSION, type DriveMessage, type DrivenMessage, type RunnerHelloMessage } from "@isoplan/protocol";
 import { afterEach, expect, test, vi } from "vitest";
+import { WebSocketServer, type WebSocket as ServerSocket } from "ws";
 import { modDir, tempRoot } from "../data-layer/fixture.js";
+import { createLink, type Link, type ServerAsk } from "../data-layer/link.js";
 import { alive } from "../wake/lock.js";
 import type { Spawn } from "./claude.js";
 import { createRegistry, registryPath, type ProcessRecord } from "./registry.js";
@@ -147,7 +150,9 @@ afterEach(() => {
 type Kind = DrivenMessage["kind"];
 type Of<K extends Kind> = Extract<DrivenMessage, { kind: K }>;
 
-async function setUp({ settings = {}, linger = false, records = [] as ProcessRecord[], spawn }: { settings?: Partial<DriveSettings>; linger?: boolean; records?: ProcessRecord[]; spawn?: Spawn } = {}) {
+// `policy`: the drive-policy the office's server sends first on the connection, as a server that
+// drives sessions does; null for none yet. What it sends with it (holding) isn't kept in `sent`.
+async function setUp({ settings = {}, linger = false, records = [] as ProcessRecord[], spawn, policy: first = [] as string[] | null }: { settings?: Partial<DriveSettings>; linger?: boolean; records?: ProcessRecord[]; spawn?: Spawn; policy?: string[] | null } = {}) {
   const root = tempRoot();
   const claudeDir = path.join(root, ".claude");
   const state = path.join(root, "state");
@@ -204,6 +209,9 @@ async function setUp({ settings = {}, linger = false, records = [] as ProcessRec
   };
   const of = <K extends Kind>(kind: K) => sent.filter((m): m is Of<K> => m.kind === kind);
   const saved = () => JSON.parse(fs.readFileSync(file, "utf8")) as { version: number; runner: number; processes: ProcessRecord[] };
+  driver.linked(SERVER);
+  if (first) policy(first);
+  sent.splice(0);
   return { root, claudeDir, state, bin, folder, file, driver, registry, sent, dropped, link, logs, current, drive, policy, until, of, fakeLog, saved };
 }
 
@@ -409,6 +417,7 @@ test("hand back: stdin closes, the process ends by itself, the command and folde
   expect(t.saved().processes).toEqual([]);
   t.drive({ id: "d2", kind: "instruct", session: S1, text: "more" });
   t.driver.linked(SERVER);
+  t.policy([]);
   await t.until(() => t.of("refused").length === 1 && t.of("holding").length === 1);
   expect(t.of("refused")[0]).toMatchObject({ id: "d2", reason: "not-found" });
   expect(t.of("holding")[0]!.sessions).toEqual([]);
@@ -453,6 +462,7 @@ test("stop and hand back: a process that won't close keeps the session held and 
   await t.registry.flushed();
   expect(t.saved().processes).toMatchObject([{ session: S1, state: "idle" }]);
   t.driver.linked(SERVER);
+  t.policy([]);
   expect(t.of("holding")[0]!.sessions).toEqual([{ session: S1, room: "room-1", held: true, permissions: "auto" }]);
 });
 
@@ -565,6 +575,7 @@ test("restart: a recorded process still Isoplan's is ended and its session opene
     ["driven", `claude-code:${UUIDS[2]}`, null],
   ]);
   t.driver.linked(SERVER);
+  t.policy([]);
   expect(t.of("holding")[0]!.sessions).toEqual([
     { session: `claude-code:${UUIDS[1]}`, room: "room-1", held: false, permissions: "auto" },
     { session: `claude-code:${UUIDS[2]}`, room: "room-1", held: false, permissions: "auto" },
@@ -587,6 +598,7 @@ test("restart: a recorded process still Isoplan's is ended and its session opene
     env: { ...process.env, CLAUDE_CONFIG_DIR: t.claudeDir, FAKE_STATE: t.state },
   });
   cleanups.push(() => again.close());
+  again.take(SERVER, { type: "drive-policy", v: 1, bypassAllowed: [] });
   again.take(SERVER, { type: "drive", v: 1, id: "d1", by: ADA, kind: "instruct", session: `claude-code:${UUIDS[1]}`, text: "carry on" });
   // Started by someone the runner no longer links as: not its person's to act on.
   again.take(SERVER, { type: "drive", v: 1, id: "d2", by: ADA, kind: "instruct", session: `claude-code:${UUIDS[2]}`, text: "carry on" });
@@ -616,15 +628,16 @@ test("restart: a session whose saved conversation is gone fails to reopen and is
     env: { ...process.env, CLAUDE_CONFIG_DIR: t.claudeDir, FAKE_STATE: t.state },
   });
   cleanups.push(() => again.close());
+  again.take(SERVER, { type: "drive-policy", v: 1, bypassAllowed: [] });
   again.take(SERVER, { type: "drive", v: 1, id: "d1", by: ADA, kind: "instruct", session: `claude-code:${UUIDS[1]}`, text: "carry on" });
   await t.until(() => sent.some((m) => m.kind === "released"));
   await again.settled();
-  expect(sent.map((m) => m.kind)).toEqual(["held", "turn-started", "turn-ended", "error", "released"]);
-  expect(sent[3]).toMatchObject({ text: expect.stringContaining("can't find this session's saved conversation") });
+  expect(sent.map((m) => m.kind)).toEqual(["holding", "held", "turn-started", "turn-ended", "error", "released"]);
+  expect(sent[4]).toMatchObject({ text: expect.stringContaining("can't find this session's saved conversation") });
   expect(t.registry.list()).toEqual([]);
 });
 
-test("live: what is sent while the office's link is down is dropped, and after a hello holding says where each session stands, held first", async () => {
+test("live: what is sent while the office's link is down is dropped, and on the new connection holding says where each session stands, held first", async () => {
   const t = await setUp();
   t.drive(start("d1"));
   await t.until(() => t.of("held").length === 1);
@@ -638,6 +651,7 @@ test("live: what is sent while the office's link is down is dropped, and after a
   t.link.up = true;
   const before = t.sent.length;
   t.driver.linked(SERVER);
+  t.policy([]);
   expect(t.sent.length).toBe(before + 1);
   expect(t.sent.at(-1)).toEqual({
     type: "driven",
@@ -648,6 +662,102 @@ test("live: what is sent while the office's link is down is dropped, and after a
       { session: S1, room: "room-1", held: false, permissions: "auto" },
     ],
   });
+});
+
+test("live: on a new connection nothing driven goes before its first drive-policy, a session's own news dropped meanwhile; with it holding goes, then the prompts still waiting, once; a later one sends neither again", async () => {
+  const t = await setUp({ settings: { drivenIdleMinutes: 0.02 } });
+  t.drive(start("d1", { instruction: "ask first" }));
+  await t.until(() => t.of("prompt").length === 1);
+  t.drive(start("d2", { instruction: "first" }));
+  await t.until(() => t.of("turn-ended").length === 1);
+  const [p] = t.of("prompt");
+  const before = t.sent.length;
+  t.driver.unlinked(SERVER);
+  t.driver.linked(SERVER);
+  // The second session's process closes with nothing to do, and its `released` goes nowhere.
+  await t.until(() => t.driver.held() === 1);
+  expect(t.sent.length).toBe(before);
+  t.policy([]);
+  expect(t.sent.slice(before)).toEqual([
+    {
+      type: "driven",
+      v: 1,
+      kind: "holding",
+      sessions: [
+        { session: S1, room: "room-1", held: true, permissions: "auto", turn: "d1" },
+        { session: S2, room: "room-1", held: false, permissions: "auto" },
+      ],
+    },
+    p,
+  ]);
+  t.policy([PROJECT.id]);
+  t.policy([]);
+  await t.driver.settled();
+  expect(t.sent.length).toBe(before + 2);
+  t.drive({ id: "a1", kind: "answer", session: S1, prompt: p!.prompt, answer: "allow" });
+  await t.until(() => t.of("turn-ended").length === 2);
+  expect(t.of("prompt-ended")).toEqual([{ type: "driven", v: 1, kind: "prompt-ended", session: S1, prompt: p!.prompt, outcome: "allowed", id: "a1" }]);
+});
+
+// A fake office server on 127.0.0.1, with every message it got and its sockets. One that drives
+// sessions sends a drive-policy as it lets in a runner that says `drive`, as isoplan-app's does
+// (sessions.ts, runnerLinked). One from before driven sessions (isoplan-app edef22d, data-layer.ts,
+// `refuse`) sends none, and answers a message of a type it doesn't know with an error and closes
+// the link with 1008.
+async function office(drives: boolean) {
+  const wss = new WebSocketServer({ port: 0, host: "127.0.0.1" });
+  await new Promise((resolve) => wss.once("listening", resolve));
+  cleanups.push(() => wss.close());
+  const got: { type: string }[] = [];
+  const sockets: ServerSocket[] = [];
+  const known = ["runner", "reply", "refusal", "taken", ...(drives ? ["driven"] : [])];
+  wss.on("connection", (ws) => {
+    sockets.push(ws);
+    ws.on("message", (data) => {
+      const m = JSON.parse(String(data)) as { type: string; drive?: boolean };
+      got.push(m);
+      if (!known.includes(m.type)) {
+        ws.send(JSON.stringify({ type: "error", v: PROTOCOL_VERSION, code: "invalid", message: "Invalid discriminator value." }));
+        ws.close(1008, "invalid");
+      } else if (drives && m.type === "runner" && m.drive) ws.send(JSON.stringify({ type: "drive-policy", v: PROTOCOL_VERSION, bypassAllowed: [] }));
+    });
+  });
+  return { url: `ws://127.0.0.1:${(wss.address() as AddressInfo).port}/data-layer`, got, sockets };
+}
+
+test("live: an office on a server from before driven sessions is sent no driven message, so its link stays up and the runner's replies and taken go; one that drives sessions gets holding on each connection, after its drive-policy", async () => {
+  const t = await setUp({ policy: null });
+  t.driver.close();
+  // The runner's link to the office, wired to a driver as runner/main.ts wires them.
+  const runnerLink = (url: string) => {
+    let link: Link | null = null;
+    const driver = createDriver({ claudeDir: t.claudeDir, account: { id: ADA.id }, offices: [{ server: url, send: (m) => link!.sendLive(m), folder: async () => null }], registry: t.registry, binary: async () => t.bin, settings: async () => SETTINGS, scan: async () => null, log: () => {}, projectOf: async () => PROJECT.id });
+    const asks: ServerAsk[] = [];
+    const hello: RunnerHelloMessage = { type: "runner", v: PROTOCOL_VERSION, account: ADA, machine: { name: "sevengill" }, drive: true };
+    link = createLink({ url, hello, emit: () => {}, onMessage: (m) => asks.push(m), onDrive: (m) => driver.take(url, m), onOpen: () => driver.linked(url), onClose: () => driver.unlinked(url), retryBaseMs: 20, retryCapMs: 100 });
+    cleanups.push(() => (link!.close(), driver.close()));
+    return { link, asks };
+  };
+  const old = await office(false);
+  const { link, asks } = runnerLink(old.url);
+  await t.until(() => old.got.length === 1);
+  old.sockets[0]!.send(JSON.stringify({ type: "request", v: PROTOCOL_VERSION, id: "q1", kind: "answer-question", session: "claude-code:s", room: "r", from: { id: "claude:bob", name: "Bob" }, question: "Why?" }));
+  await t.until(() => asks.length === 1);
+  link.send({ type: "reply", v: PROTOCOL_VERSION, id: "q1", kind: "answer-question", answer: "Because." });
+  link.send({ type: "taken", v: PROTOCOL_VERSION, handoff: "h1", session: "claude-code:0b5c", failures: [] });
+  await t.until(() => old.got.length === 3);
+  // Long enough for a closed link to have opened again several times (retryBaseMs).
+  await new Promise((r) => setTimeout(r, 300));
+  expect(old.got.map((m) => m.type)).toEqual(["runner", "reply", "taken"]);
+  expect(old.sockets).toHaveLength(1);
+
+  const current = await office(true);
+  runnerLink(current.url);
+  await t.until(() => current.got.length === 2);
+  expect(current.got[1]).toEqual({ type: "driven", v: PROTOCOL_VERSION, kind: "holding", sessions: [] });
+  current.sockets[0]!.terminate();
+  await t.until(() => current.got.length === 4);
+  expect(current.got.map((m) => m.type)).toEqual(["runner", "driven", "runner", "driven"]);
 });
 
 test("a driven take: only for the runner's own person; past the cap it isn't readied; readied, it opens once its taken went, its first turn named by its uuid; one that won't open frees its place", async () => {
@@ -724,8 +834,9 @@ test("bypass: a reopen and a take skip prompts only while the current connection
   await t.until(() => t.of("held").length === 1);
   t.drive({ id: "s1", kind: "stop", session: S1 });
   await t.until(() => t.of("released").length === 1);
-  // A new connection, with no drive-policy on it yet.
+  // A new connection, whose drive-policy doesn't list the project.
   t.driver.linked(SERVER);
+  t.policy([]);
   expect(t.of("holding")[0]!.sessions).toEqual([{ session: S1, room: "room-1", held: false, permissions: "auto" }]);
   t.drive({ id: "d2", kind: "instruct", session: S1, text: "first" });
   await t.until(() => t.of("turn-ended").length === 1);
@@ -742,25 +853,23 @@ test("bypass: a reopen and a take skip prompts only while the current connection
   t.drive({ id: "d3", kind: "instruct", session: S1, text: "second" });
   await t.until(() => t.of("turn-ended").length === 2);
   expect(t.of("held").at(-1)).toMatchObject({ why: "reopened", permissions: "bypassPermissions" });
-  // A take readied and opened after the link dropped: no drive-policy holds.
+  // A take readied and opened after the link dropped: no drive-policy holds, and what it says goes nowhere.
   t.driver.unlinked(SERVER);
   const take = { session: UUIDS[1]!, folder: t.folder, prompt: "Isoplan handoff h1: read the brief", name: "Isoplan handoff h1", addDir: path.join(t.root, "brief"), room: "room-2", by: ADA, permissions: "bypassPermissions" as const };
   expect(await t.driver.prepareTake(SERVER, take)).toBe(null);
+  const before = t.sent.length;
   t.driver.taken(UUIDS[1]!, true);
-  await t.until(() => t.of("turn-ended").length === 3);
-  const taken = t.sent.findIndex((m) => m.kind === "held" && m.session === S2);
-  expect(t.sent.slice(taken, taken + 2)).toEqual([
-    { type: "driven", v: 1, kind: "held", session: S2, room: "room-2", why: "started", permissions: "auto" },
-    { type: "driven", v: 1, kind: "error", session: S2, text: expect.stringContaining("so this one runs with them on") },
-  ]);
-  // On a new connection with a drive-policy that lists the project, a take skips prompts.
+  await t.until(() => t.fakeLog().some((l) => l.turn === take.prompt) && t.registry.list().find((r) => r.session === S2)?.state === "idle");
+  expect(t.sent.length).toBe(before);
+  // On a new connection with a drive-policy that lists the project, holding says that take runs in auto, and the next take skips prompts.
   t.driver.linked(SERVER);
   t.policy([PROJECT.id]);
+  expect(t.of("holding").at(-1)!.sessions.find((x) => x.session === S2)).toEqual({ session: S2, room: "room-2", held: true, permissions: "auto" });
   expect(await t.driver.prepareTake(SERVER, { ...take, session: UUIDS[2]! })).toBe(null);
   t.driver.taken(UUIDS[2]!, true);
-  await t.until(() => t.of("turn-ended").length === 4);
+  await t.until(() => t.of("turn-ended").length === 3);
   expect(t.of("held").at(-1)).toMatchObject({ session: `claude-code:${UUIDS[2]}`, why: "started", permissions: "bypassPermissions" });
-  expect(t.of("error")).toHaveLength(2);
+  expect(t.of("error")).toHaveLength(1);
   expect(t.fakeLog().filter((l) => l.argv).map((l) => modeOf(l.argv))).toEqual(["bypassPermissions", "auto", "bypassPermissions", "auto", "bypassPermissions"]);
 });
 
@@ -785,6 +894,7 @@ test("bypass: a session restored after the runner's restart skips prompts again 
   });
   cleanups.push(() => again.close());
   const instruct = (id: string, uuid: string) => again.take(SERVER, { type: "drive", v: 1, id, by: ADA, kind: "instruct", session: `claude-code:${uuid}`, text: "carry on" });
+  again.take(SERVER, { type: "drive-policy", v: 1, bypassAllowed: [] });
   instruct("d1", UUIDS[1]!);
   await t.until(() => sent.some((m) => m.kind === "turn-ended"));
   await again.settled();
@@ -810,6 +920,7 @@ test("bypass: a drive-policy that no longer lists the project ends its sessions 
   const [p] = t.of("prompt");
   t.driver.unlinked(SERVER);
   t.driver.linked(SERVER);
+  t.policy([PROJECT.id]);
   await t.driver.settled();
   expect(t.of("released")).toEqual([]);
   expect(t.of("holding")[0]!.sessions.find((x) => x.session === S2)).toEqual({ session: S2, room: "room-1", held: true, permissions: "bypassPermissions", turn: "d1" });
@@ -983,7 +1094,7 @@ test("prompt: a stop while one waits ends it cancelled before the turn, as a han
   expect(t.fakeLog().filter((l) => l.answered)).toEqual([]);
 });
 
-test("prompt: one raised while the link is down isn't kept anywhere; after every hello, right after holding, each still waiting goes again with the same id and expires", async () => {
+test("prompt: one raised while the link is down isn't kept anywhere; on every new connection, right after holding, each still waiting goes again with the same id and expires", async () => {
   const t = await setUp();
   t.drive(start("d1"));
   await t.until(() => t.of("held").length === 1);
@@ -997,14 +1108,18 @@ test("prompt: one raised while the link is down isn't kept anywhere; after every
   expect(t.of("prompt")).toEqual([]);
   const before = t.sent.length;
   t.driver.linked(SERVER);
+  t.policy([]);
   expect(t.sent.slice(before).map((m) => m.kind)).toEqual(["holding", "prompt"]);
   expect(t.sent.at(-1)).toEqual(made);
+  t.driver.unlinked(SERVER);
   t.driver.linked(SERVER);
-  expect(t.sent.at(-1)).toEqual(made);
+  t.policy([]);
+  expect(t.sent.slice(-2)).toEqual([expect.objectContaining({ kind: "holding" }), made]);
   t.drive({ id: "a1", kind: "answer", session: S1, prompt: made.prompt, answer: "allow" });
   await t.until(() => t.of("turn-ended").length === 1);
   expect(t.of("prompt-ended")).toEqual([{ type: "driven", v: 1, kind: "prompt-ended", session: S1, prompt: made.prompt, outcome: "allowed", id: "a1" }]);
   t.driver.linked(SERVER);
+  t.policy([]);
   expect(t.sent.at(-1)!.kind).toBe("holding");
 });
 
