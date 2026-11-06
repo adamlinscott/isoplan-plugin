@@ -26,6 +26,7 @@ import { MAX_QUESTION_LENGTH, PROTOCOL_VERSION, type HelloMessage, type Project 
 import { loadConfig, loadSettings, officesOf, type Office } from "../data-layer/config.js";
 import { approvedPath } from "../data-layer/approved.js";
 import { commandHome, machineHomeIo } from "../data-layer/home.js";
+import { cachedRemoteNames } from "../data-layer/remote-names.js";
 import { accountOf, claudePaths } from "../data-layer/identity.js";
 import { nodeIo } from "../data-layer/io.js";
 import { createPairing, pairingEntry, pairingLockPath, pairingPath, pairingWriteLockPath, postJson, readPairing } from "../data-layer/pairing.js";
@@ -119,7 +120,7 @@ async function main(argv: string[]): Promise<string> {
   for (const each of offices) {
     found = each.plainRefused
       ? { refused: `config.json's server ${each.server} is plain ws:// to another machine.` }
-      : await commandHome(cwd, machineHomeIo(config.workspaceRepos), { file: approvedPath(claudeDir, each.server), server: each.server, maxAgeMs: config.approvedMaxAgeMinutes * 60000 });
+      : await commandHome(cwd, machineHomeIo(config.workspaceRepos, cachedRemoteNames(claudeDir)), { file: approvedPath(claudeDir, each.server), server: each.server, maxAgeMs: config.approvedMaxAgeMinutes * 60000 });
     office = each;
     if ("home" in found) break;
   }

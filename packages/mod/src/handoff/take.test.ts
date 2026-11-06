@@ -8,6 +8,7 @@ import { createRunGit, pushHandoff, type RunGit } from "./git.js";
 import { fakeClaude, fakeOrca, git, remoteAndClone, workspace } from "./fixture.js";
 import { orcaRunner } from "./orca.js";
 import type { PreparedTake } from "../runner/session.js";
+import { remoteNames, remoteNamesPath } from "../data-layer/remote-names.js";
 import { checkoutHere, findClone, findWorkspace, launch, onTheWire, parseSetup, sessionArgv, takeHandoff, trustFolder, trustKey, type Background, type Launch, type TakeOptions } from "./take.js";
 
 // Every test here drives real git, a few dozen spawns each, which is slow on Windows under load.
@@ -415,6 +416,19 @@ test("findClone: the most recently used clone, with a remote whose path has spac
     fs.utimesSync(file, at, at);
   }
   expect(await findClone(nodeIo(), run, projects, remote, Date.now() - 86400000, 30000)).toEqual({ dir: path.resolve(newer), remote: "origin" });
+});
+
+test("findClone: a clone whose remote names the handoff's GitHub repo by its old name", async () => {
+  const root = tempRoot();
+  const { clone } = remoteAndClone(root);
+  git(clone, "remote", "set-url", "origin", "git@github.com:adamlinscott/isoplan.git");
+  const projects = path.join(root, "projects");
+  fs.mkdirSync(path.join(projects, "a"), { recursive: true });
+  fs.writeFileSync(path.join(projects, "a", "s.jsonl"), JSON.stringify({ cwd: clone }) + "\n");
+  const names = remoteNames({ file: remoteNamesPath(root), ask: async (owner, repo) => (owner === "adamlinscott" ? "isoplan-app/isoplan-app" : `${owner}/${repo}`) });
+  const current = "https://github.com/isoplan-app/isoplan-app.git";
+  expect(await findClone(nodeIo(), run, projects, current, Date.now() - 86400000, 30000)).toBeNull();
+  expect(await findClone(nodeIo(), run, projects, current, Date.now() - 86400000, 30000, names)).toEqual({ dir: path.resolve(clone), remote: "origin" });
 });
 
 test("the shortcut checks the branch out here, moves a local branch to the new tip, and never over commits of its own or a dirty tree", async () => {

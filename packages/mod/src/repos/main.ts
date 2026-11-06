@@ -15,6 +15,7 @@ import { fileURLToPath } from "node:url";
 import { approvedPath } from "../data-layer/approved.js";
 import { loadConfig, officesOf } from "../data-layer/config.js";
 import { candidatesOf, machineHomeIo } from "../data-layer/home.js";
+import { cachedRemoteNames } from "../data-layer/remote-names.js";
 import { accountOf, claudePaths } from "../data-layer/identity.js";
 import { nodeIo } from "../data-layer/io.js";
 import { pairingPath, pairingWriteLockPath } from "../data-layer/pairing.js";
@@ -44,7 +45,7 @@ if (!(Array.isArray(mine.servers) && mine.servers.length) && typeof mine.server 
   const session = process.env.CLAUDE_CODE_SESSION_ID;
   const locked = session && /^[\w-]+$/.test(session) ? (await readLock(lockPath(claudeDir, session)))?.extra.cwd : undefined;
   const folder = typeof locked === "string" && locked ? locked : process.env.CLAUDE_PROJECT_DIR || process.cwd();
-  const { projects, workspace } = await candidatesOf(folder, machineHomeIo(config.workspaceRepos));
+  const { projects, workspace } = await candidatesOf(folder, machineHomeIo(config.workspaceRepos, cachedRemoteNames(claudeDir)));
   const lines = await Promise.all(
     officesOf(config).map(async (office) => {
       const answer = office.plainRefused

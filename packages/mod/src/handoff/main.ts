@@ -44,6 +44,7 @@ import { recordTakenOffice } from "./taken-office.js";
 
 import { approvedPath, cachedRepos } from "../data-layer/approved.js";
 import { commandHome, machineHomeIo, takesFrom } from "../data-layer/home.js";
+import { cachedRemoteNames } from "../data-layer/remote-names.js";
 import { accountOf, claudePaths } from "../data-layer/identity.js";
 import { nodeIo } from "../data-layer/io.js";
 import { fill, loadPrompts } from "../runner/prompts.js";
@@ -136,7 +137,7 @@ async function officeHere(cwd: string, argv: string[]): Promise<{ office: Office
   const taking: { office: Office; home: Project }[] = [];
   let refused = "";
   for (const office of offices) {
-    const here = await commandHome(cwd, machineHomeIo(config.workspaceRepos), { file: approvedPath(claudeDir, office.server), server: office.server, maxAgeMs: config.approvedMaxAgeMinutes * 60000 });
+    const here = await commandHome(cwd, machineHomeIo(config.workspaceRepos, cachedRemoteNames(claudeDir)), { file: approvedPath(claudeDir, office.server), server: office.server, maxAgeMs: config.approvedMaxAgeMinutes * 60000 });
     if ("home" in here) taking.push({ office, home: here.home });
     else refused ||= here.refused;
   }
@@ -147,7 +148,7 @@ async function officeHere(cwd: string, argv: string[]): Promise<{ office: Office
 /** Which repos under `cwd` a handoff may take: the office's alone, by this machine's fresh copy of its list. */
 async function takesHere(server: string): Promise<Takes> {
   const config = await loadOwnConfig();
-  return takesFrom(machineHomeIo(config.workspaceRepos), await cachedRepos(approvedPath(claudeDir, server), server, config.approvedMaxAgeMinutes * 60000));
+  return takesFrom(machineHomeIo(config.workspaceRepos, cachedRemoteNames(claudeDir)), await cachedRepos(approvedPath(claudeDir, server), server, config.approvedMaxAgeMinutes * 60000));
 }
 
 // A kept token is used while it has longer than this left, as the data layer's renewal would.
@@ -263,7 +264,7 @@ async function handOverCommand(argv: string[]): Promise<string> {
   const { link, answer: ready } = await exchange(office.server, cwd, { type: "hand-over-check", v: PROTOCOL_VERSION, to, handoff: id }, (m): m is HandOverReadyMessage => m.type === "hand-over-ready" && m.handoff === id, "Nothing was pushed. ", home);
   try {
     if (ready.type === "error") stop(`Nothing was pushed. ${said(ready)}`);
-    const pushed = await pushHandoff(run, cwd, id, timeoutMs, { scan: async (text) => scan(text, patterns), pushAnyway, prepared }).catch((err: unknown) =>
+    const pushed = await pushHandoff(run, cwd, id, timeoutMs, { scan: async (text) => scan(text, patterns), pushAnyway, prepared, names: cachedRemoteNames(claudeDir) }).catch((err: unknown) =>
       stop(
         err instanceof HandoffGitError
           ? `The handoff wasn't sent: ${gitFailed(err)}.${err.pushed.length ? ` Run hand-over again with --id ${id} once that is fixed: it pushes the rest.` : ""}\n${err.detail}`
@@ -339,7 +340,7 @@ async function takeCommand(argv: string[]): Promise<string> {
   try {
     if (answer.type === "error") stop(said(answer));
     const { handoff } = answer as HandoffMessage;
-    const { failures, remote, dir } = await checkoutHere(run, cwd, handoff, handoffDir(claudeDir, handoff.id), timeoutMs);
+    const { failures, remote, dir } = await checkoutHere(run, cwd, handoff, handoffDir(claudeDir, handoff.id), timeoutMs, { names: cachedRemoteNames(claudeDir) });
     // Git's output leaves this machine only after the scan.
     const sent = failures.map((f) => (scan(f.output, patterns) ? { ...f, output: "The end of its output is withheld here: it matches a secret pattern." } : f));
     link.send({ type: "taken", v: PROTOCOL_VERSION, handoff: handoff.id, failures: sent });

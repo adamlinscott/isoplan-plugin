@@ -6802,9 +6802,10 @@ function claudePaths(env, home) {
 * remote, the main checkout's folder on this machine (so every worktree of one repo is one
 * project). A folder git can't place is its own local project. On a file system that ignores case
 * (Windows, macOS) a local project's id is lower-cased, so one folder reached in two spellings is
-* one project, in the hello and in every edit alike.
+* one project, in the hello and in every edit alike. With `names`, a remote naming a GitHub repo by
+* an old name gives the repo's current id (remote-names.ts), so an old clone is the same project.
 */
-async function projectOf(run, where, cwd, machine, caseless = process.platform === "win32" || process.platform === "darwin") {
+async function projectOf(run, where, cwd, machine, { caseless = process.platform === "win32" || process.platform === "darwin", names = null } = {}) {
 	let remote = null;
 	if (run && where) {
 		const r = await Promise.resolve(run([
@@ -6820,6 +6821,7 @@ async function projectOf(run, where, cwd, machine, caseless = process.platform =
 		machine,
 		root
 	});
+	if (remote !== null && names && !project.id.startsWith("local:")) return names.current(project);
 	return caseless && project.id.startsWith("local:") ? {
 		...project,
 		id: project.id.toLowerCase()

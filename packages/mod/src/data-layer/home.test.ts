@@ -13,7 +13,7 @@ const MINUTE = 60000;
 function homeIo(home: string): HomeIo {
   const io = nodeIo({ run: null });
   const git = createGit(io);
-  return { resolve: (d) => git.resolve(d), projectOf: (w, d) => projectOf(null, w, d, "desk", false), stat: (p) => Promise.resolve(io.stat(p)), listDir: (d) => io.listDir(d), home, workspaceRepos: 12 };
+  return { resolve: (d) => git.resolve(d), projectOf: (w, d) => projectOf(null, w, d, "desk", { caseless: false }), stat: (p) => Promise.resolve(io.stat(p)), listDir: (d) => io.listDir(d), home, workspaceRepos: 12 };
 }
 
 const id = (dir: string) => `local:desk/${dir.replace(/\\/g, "/")}`;

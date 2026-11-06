@@ -8247,9 +8247,10 @@ async function accountOf(io, claudeJson, cwd) {
 * remote, the main checkout's folder on this machine (so every worktree of one repo is one
 * project). A folder git can't place is its own local project. On a file system that ignores case
 * (Windows, macOS) a local project's id is lower-cased, so one folder reached in two spellings is
-* one project, in the hello and in every edit alike.
+* one project, in the hello and in every edit alike. With `names`, a remote naming a GitHub repo by
+* an old name gives the repo's current id (remote-names.ts), so an old clone is the same project.
 */
-async function projectOf(run, where, cwd, machine, caseless = process.platform === "win32" || process.platform === "darwin") {
+async function projectOf(run, where, cwd, machine, { caseless = process.platform === "win32" || process.platform === "darwin", names = null } = {}) {
 	let remote = null;
 	if (run && where) {
 		const r = await Promise.resolve(run([
@@ -8265,6 +8266,7 @@ async function projectOf(run, where, cwd, machine, caseless = process.platform =
 		machine,
 		root
 	});
+	if (remote !== null && names && !project.id.startsWith("local:")) return names.current(project);
 	return caseless && project.id.startsWith("local:") ? {
 		...project,
 		id: project.id.toLowerCase()
@@ -10505,7 +10507,7 @@ const getJson = async (url, headers) => {
 };
 /** While the machine waits to be paired the list is asked for again this soon, and after a failure this soon. */
 const PAIR_POLL_MS = 5e3;
-const RETRY_MS = 3e4;
+const RETRY_MS$1 = 3e4;
 /** A rename the file system refuses for a moment (a scanner holding the file, on Windows) is tried this often. */
 const RENAME_TRIES = 5;
 const isList = (value) => {
@@ -10577,7 +10579,7 @@ function createApproved({ server, file, pairing, refreshMs, maxAgeMs, log, get =
 			tell(`couldn't read which repos the office takes: ${String(err?.message ?? err)}`);
 			problem = "unreachable";
 			failedAt = now();
-			nextAt = failedAt + RETRY_MS;
+			nextAt = failedAt + RETRY_MS$1;
 			return "unreachable";
 		}
 		if (token === null) {
@@ -10636,7 +10638,7 @@ function createApproved({ server, file, pairing, refreshMs, maxAgeMs, log, get =
 		}
 		tell(`couldn't read which repos the office takes from ${server}: ${answer.status ? `it answered ${answer.status}` : String(answer.body)}`);
 		problem = "unreachable";
-		nextAt = at + RETRY_MS;
+		nextAt = at + RETRY_MS$1;
 		return "unreachable";
 	}
 	function run(force, ask = false) {
@@ -11238,6 +11240,201 @@ async function takenFrom(take, file, question) {
 }
 const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 //#endregion
+//#region src/data-layer/remote-names.ts
+/** Where the answers are kept. */
+const remoteNamesPath = (claudeDir) => path.join(claudeDir, "isoplan", "remote-names.json");
+const ANSWER_MS = 864e5;
+const RETRY_MS = 3e5;
+const ASK_TIMEOUT_MS = 1e4;
+/**
+* The repos' current names. With `ask`, for a long-lived process, GitHub is asked as above; without
+* it the cache is only read.
+*/
+function remoteNames({ file, ask = null, now = Date.now }) {
+	let entries = null;
+	const asking = /* @__PURE__ */ new Map();
+	const load = () => entries ??= readEntries(file);
+	const stale = (e) => now() - e.at >= (e.failures ? Math.min(ANSWER_MS, RETRY_MS * 2 ** (e.failures - 1)) : ANSWER_MS);
+	const refresh = (id, owner, repo) => {
+		const running = asking.get(id);
+		if (running) return running;
+		const done = (async () => {
+			const onDisk = (await readEntries(file))[id];
+			const known = await load();
+			if (onDisk && !stale(onDisk)) return known[id] = onDisk;
+			const before = onDisk ?? known[id];
+			const name = await ask(owner, repo).catch(() => null);
+			const entry = name ? {
+				at: now(),
+				name
+			} : {
+				at: now(),
+				...before?.name && { name: before.name },
+				failures: (before?.failures ?? 0) + 1
+			};
+			known[id] = entry;
+			await writeEntry(file, id, entry).catch(() => {});
+			return entry;
+		})().finally(() => asking.delete(id));
+		asking.set(id, done);
+		return done;
+	};
+	const current = async (project) => {
+		const m = /^github\.com\/([^/]+)\/([^/]+)$/.exec(project.id);
+		if (!m) return project;
+		let entry = (await load())[project.id];
+		if (ask && !entry) entry = await refresh(project.id, m[1], m[2]);
+		else if (ask && stale(entry)) refresh(project.id, m[1], m[2]).catch(() => {});
+		const name = entry?.name;
+		if (!name || name.toLowerCase() === `${m[1]}/${m[2]}`) return project;
+		return {
+			id: `github.com/${name}`.toLowerCase(),
+			name: name.split("/")[1]
+		};
+	};
+	const projectOfUrl = (remote) => projectId(remote, {
+		machine: "",
+		root: ""
+	});
+	return {
+		current,
+		idOf: async (remote) => (await current(projectOfUrl(remote))).id,
+		async urlOf(remote) {
+			const was = projectOfUrl(remote);
+			const now = await current(was);
+			return now.id === was.id ? remote : renamedUrl(remote, now.id.slice(11));
+		}
+	};
+}
+function renamedUrl(remote, name) {
+	const git = (p) => /\.git\/?$/.test(p) ? ".git" : "";
+	if (remote.includes("://")) {
+		const url = new URL(remote);
+		url.pathname = `/${name}${git(url.pathname)}`;
+		return url.toString();
+	}
+	return remote.replace(/:([^:]*)$/, (_, p) => `:${name}${git(p)}`);
+}
+async function readEntries(file) {
+	const parsed = await fs.readFile(file, "utf8").then((text) => JSON.parse(text), () => null);
+	const out = {};
+	if (!parsed || typeof parsed !== "object") return out;
+	for (const [id, e] of Object.entries(parsed)) {
+		if (!e || typeof e.at !== "number") continue;
+		out[id] = {
+			at: e.at,
+			...typeof e.name === "string" && { name: e.name },
+			...typeof e.failures === "number" && e.failures > 0 && { failures: e.failures }
+		};
+	}
+	return out;
+}
+async function writeEntry(file, id, entry) {
+	const all = {
+		...await readEntries(file),
+		[id]: entry
+	};
+	await fs.mkdir(path.dirname(file), { recursive: true });
+	const temp = `${file}.${process.pid}.tmp`;
+	await fs.writeFile(temp, JSON.stringify(all, null, 2) + "\n");
+	await fs.rename(temp, file).catch(async (err) => {
+		await fs.rm(temp, { force: true }).catch(() => {});
+		throw err;
+	});
+}
+/** Asks GitHub with the first token a source gives, and without one when there is none or GitHub refuses it. */
+function gitHubAsker({ fetch = globalThis.fetch, tokens, timeoutMs = ASK_TIMEOUT_MS }) {
+	return async (owner, repo) => {
+		let token = null;
+		for (const source of tokens) if (token = await source().catch(() => null)) break;
+		for (const auth of token ? [token, null] : [null]) {
+			const headers = {
+				Accept: "application/vnd.github+json",
+				"User-Agent": "isoplan-plugin",
+				"X-GitHub-Api-Version": "2022-11-28"
+			};
+			if (auth) headers.Authorization = `Bearer ${auth}`;
+			try {
+				const res = await fetch(`https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}`, {
+					headers,
+					signal: AbortSignal.timeout(timeoutMs)
+				});
+				if (res.status === 401 && auth) continue;
+				if (res.status !== 200) return null;
+				const name = (await res.json())?.full_name;
+				return typeof name === "string" && /^[^/\s]+\/[^/\s]+$/.test(name) ? name : null;
+			} catch {
+				return null;
+			}
+		}
+		return null;
+	};
+}
+/** gh's token for github.com, when gh is installed and signed in. */
+async function ghToken(exec, env) {
+	const r = await exec("gh", [
+		"auth",
+		"token",
+		"--hostname",
+		"github.com"
+	], { env: {
+		...env,
+		GH_PROMPT_DISABLED: "1",
+		GH_NO_UPDATE_NOTIFIER: "1"
+	} });
+	const token = r.stdout.trim();
+	return r.code === 0 && /^\S+$/.test(token) ? token : null;
+}
+/**
+* The password git's credential helper keeps for https://github.com, asked with no prompt of any
+* kind: Git Credential Manager non-interactive, askpass off (an empty GIT_ASKPASS stops git looking
+* for one) and no terminal prompt, so git gives up when no helper has it.
+*/
+async function credentialToken(exec, env) {
+	const r = await exec("git", [
+		"-c",
+		"credential.interactive=never",
+		"credential",
+		"fill"
+	], {
+		env: {
+			...env,
+			GIT_TERMINAL_PROMPT: "0",
+			GCM_INTERACTIVE: "never",
+			GIT_ASKPASS: "",
+			SSH_ASKPASS: ""
+		},
+		input: "protocol=https\nhost=github.com\n\n"
+	});
+	if (r.code !== 0) return null;
+	return /^password=(.+)$/m.exec(r.stdout)?.[1]?.trim() || null;
+}
+/** The token sources on this machine, in order: gh, then git's credentials on Windows. */
+function machineTokens(platform = process.platform, env = process.env, exec = execHidden) {
+	return [() => ghToken(exec, env), ...platform === "win32" ? [() => credentialToken(exec, env)] : []];
+}
+/** The resolver a long-lived process uses: it asks GitHub. */
+const askingRemoteNames = (claudeDir) => remoteNames({
+	file: remoteNamesPath(claudeDir),
+	ask: gitHubAsker({ tokens: machineTokens() })
+});
+const execHidden = (cmd, args, { env, input }) => new Promise((resolve) => {
+	const child = execFile(cmd, args, {
+		cwd: os.homedir(),
+		env,
+		encoding: "utf8",
+		timeout: ASK_TIMEOUT_MS,
+		windowsHide: true
+	}, (err, stdout) => {
+		resolve({
+			code: err ? typeof err.code === "number" ? err.code : 1 : 0,
+			stdout: stdout || ""
+		});
+	});
+	child.stdin?.on("error", () => {});
+	child.stdin?.end(input ?? "");
+});
+//#endregion
 //#region src/data-layer/reports.ts
 /** Where the reports released on one office's floor are kept for `session`; the server a version before #105 reports to keeps the old place. */
 const releasedPath = (claudeDir, office, session) => path.join(office.legacy ? path.join(claudeDir, "isoplan") : officeDir(claudeDir, office.server), "released", `${session}.json`);
@@ -11396,6 +11593,7 @@ async function main(argv) {
 	const io = nodeIo();
 	const git = createGit(io);
 	const projects = /* @__PURE__ */ new Map();
+	const names = askingRemoteNames(claudeDir);
 	const source = createClaudeCode({
 		...io,
 		claudeDir,
@@ -11861,7 +12059,7 @@ async function main(argv) {
 			const key = pathKey(where.commonDir);
 			const hit = projects.get(key);
 			if (hit && now - hit.at <= gitOpts.maxAgeMs) return hit.project;
-			const project = projectOf(io.run, where, where.toplevel, machine);
+			const project = projectOf(io.run, where, where.toplevel, machine, { names });
 			projects.set(key, {
 				at: now,
 				project
@@ -11871,7 +12069,7 @@ async function main(argv) {
 		if (!candidates || now - candidatesAt > gitOpts.maxAgeMs) {
 			candidates = await candidatesOf(cwd, {
 				resolve,
-				projectOf: (where, dir) => projectOf(io.run, where, dir, machine),
+				projectOf: (where, dir) => projectOf(io.run, where, dir, machine, { names }),
 				stat: (f) => io.stat(f),
 				listDir: (d) => io.listDir(d),
 				home: os.homedir(),
