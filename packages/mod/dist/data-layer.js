@@ -4743,7 +4743,7 @@ const initializer = (inst, issues) => {
 const ZodRealError = /*@__PURE__*/ $constructor("ZodError", initializer, void 0, { Parent: Error });
 //#endregion
 //#region ../../node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/classic/parse.js
-const parse$1 = /* @__PURE__ */ _parse(ZodRealError);
+const parse$2 = /* @__PURE__ */ _parse(ZodRealError);
 const parseAsync = /* @__PURE__ */ _parseAsync(ZodRealError);
 const safeParse = /* @__PURE__ */ _safeParse(ZodRealError);
 const safeParseAsync = /* @__PURE__ */ _safeParseAsync(ZodRealError);
@@ -4875,7 +4875,7 @@ const ZodType = /*@__PURE__*/ $constructor("ZodType", (inst, def) => {
 		own(this, "~standard", value);
 	},
 	parse: function _parse(data, params) {
-		return parse$1(this, data, params, { callee: _parse });
+		return parse$2(this, data, params, { callee: _parse });
 	},
 	parseAsync: async function _parseAsync(data, params) {
 		return await parseAsync(this, data, params, { callee: _parseAsync });
@@ -5681,6 +5681,7 @@ const SessionFactSchema = object({
 	status: _enum(["active", "idle"]),
 	lights: _enum(["on", "off"]),
 	contextWindow: number().int().positive().optional(),
+	takesMessages: literal$1(true).optional(),
 	extra: Extra
 });
 const TokenCount = number().int().nonnegative();
@@ -6038,6 +6039,24 @@ const ChangesMessageSchema = object({
 	upsert: FactUpsertSchema,
 	remove: FactRemoveSchema
 });
+/** The longest message an owner sends their open session from the floor (protocol 0.7.0 on). */
+const MAX_OWNER_MESSAGE_LENGTH = 2e4;
+/**
+* Why an owner-message didn't reach its session (protocol 0.7.0 on), on its `unavailable` refusal:
+* `not-owner`, it came from someone other than the session's owner; `detached`, the session is seen
+* only through the wake hook, with no plugin in it to pass the message on; `no-submit`, its Claude
+* Code build can't take a message from a plugin; `ended`, the session has ended or moved on (a
+* /clear); `dropped`, Claude Code didn't let the message in (a hook or its own limits); `no-answer`,
+* the plugin in the session never said whether it took the message (the session may have closed).
+*/
+const OwnerMessageRefusalSchema = _enum([
+	"not-owner",
+	"detached",
+	"no-submit",
+	"ended",
+	"dropped",
+	"no-answer"
+]);
 /** A cap on the answers a machine gives: a room's per hour, the owner's per day, or the owner's tokens per day. */
 const CapSchema = _enum([
 	"room-hour",
@@ -6075,6 +6094,13 @@ const ReplyMessageSchema = discriminatedUnion("kind", [
 		type: literal$1("reply"),
 		v: Version,
 		id: RequestId,
+		kind: literal$1("owner-message"),
+		queued: literal$1(true).optional()
+	}),
+	object({
+		type: literal$1("reply"),
+		v: Version,
+		id: RequestId,
 		kind: literal$1("focus")
 	})
 ]);
@@ -6106,7 +6132,8 @@ const RefusalMessageSchema = discriminatedUnion("reason", [
 		v: Version,
 		id: RequestId,
 		reason: literal$1("unavailable"),
-		detail: string().min(1)
+		detail: string().min(1),
+		code: OwnerMessageRefusalSchema.optional()
 	})
 ]);
 /**
@@ -6477,6 +6504,15 @@ const RequestMessageSchema = discriminatedUnion("kind", [
 		type: literal$1("request"),
 		v: Version,
 		id: RequestId,
+		kind: literal$1("owner-message"),
+		session: string().min(1),
+		from: Account,
+		text: string().trim().min(1).max(MAX_OWNER_MESSAGE_LENGTH)
+	}),
+	object({
+		type: literal$1("request"),
+		v: Version,
+		id: RequestId,
 		kind: literal$1("focus"),
 		handoff: HandoffId
 	})
@@ -6686,9 +6722,9 @@ const OfficeServerMessageSchema = discriminatedUnion("type", [
 ]);
 /** Validates a message a data layer received from an office server. */
 function parseOfficeServerMessage(value) {
-	return parse(OfficeServerMessageSchema, value);
+	return parse$1(OfficeServerMessageSchema, value);
 }
-function parse(schema, value) {
+function parse$1(schema, value) {
 	if (typeof value === "object" && value !== null && "v" in value && typeof value.v === "number" && value.v !== 1) return {
 		ok: false,
 		kind: "unsupported-version",
@@ -11809,8 +11845,8 @@ function createLink({ url, hello, emit, minIntervalMs = 1e3, retryBaseMs = 1e3, 
 }
 //#endregion
 //#region src/data-layer/owner-answers.ts
-const TAKEN_WAIT_MS = 1e4;
-const POLL_MS = 100;
+const TAKEN_WAIT_MS$1 = 1e4;
+const POLL_MS$1 = 100;
 const LATE_MS = 6e4;
 /** What a withheld question says in place of its text. */
 const WITHHELD_QUESTION = "Held for its owner to check: the secret check found what may be a secret in this question, so it is answered in the terminal.";
@@ -11857,7 +11893,7 @@ function prepareQuestions(facts, patterns, waiting, log) {
 * not otherwise. With no word from it in `waitMs`, a question that has closed since gets a `closed`
 * reply, which says only that it has an answer, the floor's or the terminal's.
 */
-async function relayOwnerAnswer(request, { detached, facts, file, emit, take, sleep = wait, waitMs = TAKEN_WAIT_MS }) {
+async function relayOwnerAnswer(request, { detached, facts, file, emit, take, sleep = wait$1, waitMs = TAKEN_WAIT_MS$1 }) {
 	const refuse = (detail, gaveUp = false) => ({
 		message: {
 			type: "refusal",
@@ -11879,8 +11915,8 @@ async function relayOwnerAnswer(request, { detached, facts, file, emit, take, sl
 		answers: request.answers,
 		file
 	});
-	for (let waited = 0; waited < waitMs; waited += POLL_MS) {
-		await sleep(POLL_MS);
+	for (let waited = 0; waited < waitMs; waited += POLL_MS$1) {
+		await sleep(POLL_MS$1);
 		const taken = await takenFrom(take, file, request.question);
 		if (taken === null) continue;
 		if (taken) return {
@@ -11910,9 +11946,9 @@ async function relayOwnerAnswer(request, { detached, facts, file, emit, take, sl
 * After a request gave up: whether the hooks module still says, within `ms`, that it took the answer
 * (true), that it didn't (false), or nothing at all (null).
 */
-async function lateTake(question, file, take, { sleep = wait, ms = LATE_MS } = {}) {
-	for (let waited = 0; waited < ms; waited += POLL_MS) {
-		await sleep(POLL_MS);
+async function lateTake(question, file, take, { sleep = wait$1, ms = LATE_MS } = {}) {
+	for (let waited = 0; waited < ms; waited += POLL_MS$1) {
+		await sleep(POLL_MS$1);
 		const taken = await takenFrom(take, file, question);
 		if (taken !== null) return taken;
 	}
@@ -11926,6 +11962,72 @@ async function takenFrom(take, file, question) {
 		taken = JSON.parse(text);
 	} catch {}
 	return taken.question === question ? taken.taken === true : null;
+}
+const wait$1 = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+//#endregion
+//#region src/data-layer/owner-messages.ts
+const TAKEN_WAIT_MS = 1e4;
+const POLL_MS = 100;
+/** What the floor is told for each refusal. */
+const REFUSED = {
+	"not-owner": "Only the session's owner can send it messages.",
+	detached: "This session runs without Isoplan's plugin loaded, so it can't take messages from the floor. Type the message in its terminal.",
+	"no-submit": "This session's version of Claude Code can't take messages from Isoplan. Update Claude Code, or type the message in its terminal.",
+	ended: "This session has ended, or carried on as a new one, so the message wasn't sent.",
+	dropped: "Claude Code didn't let the message in. Type it in the session's terminal.",
+	"no-answer": "The session didn't say whether it took the message, and it may have closed. Check its terminal before sending it again."
+};
+/** A reply once the hooks module says the message went in; a refusal saying why not otherwise. */
+async function relayOwnerMessage(request, { detached, takes, owner, session, file, emit, take, sleep = wait, waitMs = TAKEN_WAIT_MS }) {
+	const refuse = (code) => ({
+		type: "refusal",
+		v: 1,
+		id: request.id,
+		reason: "unavailable",
+		detail: REFUSED[code],
+		code
+	});
+	if (request.from.id !== owner) return refuse("not-owner");
+	if (detached) return refuse("detached");
+	if (!takes) return refuse("no-submit");
+	emit({
+		type: "owner-message",
+		session,
+		text: request.text,
+		file
+	});
+	for (let waited = 0; waited < waitMs; waited += POLL_MS) {
+		await sleep(POLL_MS);
+		const taken = parse(await take(file));
+		if (!taken) continue;
+		if (taken.taken) return {
+			type: "reply",
+			v: 1,
+			id: request.id,
+			kind: "owner-message",
+			...taken.queued ? { queued: true } : {}
+		};
+		return refuse(taken.reason);
+	}
+	return refuse("no-answer");
+}
+function parse(text) {
+	if (text === null) return null;
+	let said;
+	try {
+		said = JSON.parse(text);
+	} catch {
+		return null;
+	}
+	if (said?.taken === true) return said.queued === true ? {
+		taken: true,
+		queued: true
+	} : { taken: true };
+	if (said?.taken === false && (said.reason === "no-submit" || said.reason === "ended" || said.reason === "dropped")) return {
+		taken: false,
+		reason: said.reason
+	};
+	return null;
 }
 const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 //#endregion
@@ -12263,8 +12365,9 @@ async function main(argv) {
 	const sessionId = value(argv, "--session");
 	const cwd = value(argv, "--cwd");
 	const detached = argv.includes("--detached");
+	const takesMessages = !detached && argv.includes("--messages");
 	if (!sessionId || !cwd) {
-		process.stderr.write("usage: node data-layer.js --session <id> --cwd <dir> [--detached]\n");
+		process.stderr.write("usage: node data-layer.js --session <id> --cwd <dir> [--detached] [--messages]\n");
 		return 2;
 	}
 	const here = path.dirname(fileURLToPath(import.meta.url));
@@ -12275,6 +12378,7 @@ async function main(argv) {
 	const titlesDir = path.join(claudeDir, "isoplan", "titles");
 	const titleFile = path.join(titlesDir, `${sessionId}.json`);
 	const answersDir = path.join(claudeDir, "isoplan", "answers", sessionId);
+	const messagesDir = path.join(claudeDir, "isoplan", "messages", sessionId);
 	const waitsDir = path.join(claudeDir, "isoplan", "waits", sessionId);
 	const windowFile = path.join(claudeDir, "isoplan", "windows", `${sessionId}.json`);
 	const modPatterns = path.join(here, "..", "secret-patterns.json");
@@ -12488,7 +12592,11 @@ async function main(argv) {
 		text: `not reporting to ${server}: it is plain ws:// to another machine; use wss://, or set "allowPlainWs": true in config.json`
 	});
 	if (!detached) {
-		for (const dir of [answersDir, waitsDir]) await fs.rm(dir, {
+		for (const dir of [
+			answersDir,
+			waitsDir,
+			messagesDir
+		]) await fs.rm(dir, {
 			recursive: true,
 			force: true
 		}).catch(() => {});
@@ -12574,6 +12682,22 @@ async function main(argv) {
 				}).finally(() => fs.rm(file, { force: true }).catch(() => {})).catch((err) => emit({
 					type: "log",
 					text: `couldn't pass the owner's answer on: ${String(err?.message ?? err)}`
+				}));
+				return;
+			}
+			if (message.type === "request" && message.kind === "owner-message") {
+				const file = path.join(messagesDir, `${randomUUID()}.json`);
+				fs.mkdir(messagesDir, { recursive: true }).then(async () => run.gate.current()?.send(await relayOwnerMessage(message, {
+					detached,
+					takes: takesMessages,
+					owner: account.id,
+					session: sessionId,
+					file,
+					emit,
+					take: takeFile
+				}))).finally(() => fs.rm(file, { force: true }).catch(() => {})).catch((err) => emit({
+					type: "log",
+					text: `couldn't pass the owner's message on: ${String(err?.message ?? err)}`
 				}));
 				return;
 			}
@@ -12877,13 +13001,20 @@ async function main(argv) {
 				title: title.title
 			}
 		} : read.facts;
-		const facts = contextWindow ? {
+		const sized = contextWindow ? {
 			...titled,
 			session: {
 				...titled.session,
 				contextWindow
 			}
 		} : titled;
+		const facts = takesMessages ? {
+			...sized,
+			session: {
+				...sized.session,
+				takesMessages: true
+			}
+		} : sized;
 		checkouts = read.checkouts ?? {};
 		answered = read.answered ?? answered;
 		const patterns = await loadPatterns(modPatterns, ownerPatterns, patternLog).catch((err) => {

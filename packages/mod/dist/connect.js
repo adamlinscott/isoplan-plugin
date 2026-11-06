@@ -5706,6 +5706,7 @@ const SessionFactSchema = object({
 	status: _enum(["active", "idle"]),
 	lights: _enum(["on", "off"]),
 	contextWindow: number().int().positive().optional(),
+	takesMessages: literal(true).optional(),
 	extra: Extra
 });
 const TokenCount = number().int().nonnegative();
@@ -6063,6 +6064,24 @@ const ChangesMessageSchema = object({
 	upsert: FactUpsertSchema,
 	remove: FactRemoveSchema
 });
+/** The longest message an owner sends their open session from the floor (protocol 0.7.0 on). */
+const MAX_OWNER_MESSAGE_LENGTH = 2e4;
+/**
+* Why an owner-message didn't reach its session (protocol 0.7.0 on), on its `unavailable` refusal:
+* `not-owner`, it came from someone other than the session's owner; `detached`, the session is seen
+* only through the wake hook, with no plugin in it to pass the message on; `no-submit`, its Claude
+* Code build can't take a message from a plugin; `ended`, the session has ended or moved on (a
+* /clear); `dropped`, Claude Code didn't let the message in (a hook or its own limits); `no-answer`,
+* the plugin in the session never said whether it took the message (the session may have closed).
+*/
+const OwnerMessageRefusalSchema = _enum([
+	"not-owner",
+	"detached",
+	"no-submit",
+	"ended",
+	"dropped",
+	"no-answer"
+]);
 /** A cap on the answers a machine gives: a room's per hour, the owner's per day, or the owner's tokens per day. */
 const CapSchema = _enum([
 	"room-hour",
@@ -6100,6 +6119,13 @@ const ReplyMessageSchema = discriminatedUnion("kind", [
 		type: literal("reply"),
 		v: Version,
 		id: RequestId,
+		kind: literal("owner-message"),
+		queued: literal(true).optional()
+	}),
+	object({
+		type: literal("reply"),
+		v: Version,
+		id: RequestId,
 		kind: literal("focus")
 	})
 ]);
@@ -6131,7 +6157,8 @@ const RefusalMessageSchema = discriminatedUnion("reason", [
 		v: Version,
 		id: RequestId,
 		reason: literal("unavailable"),
-		detail: string().min(1)
+		detail: string().min(1),
+		code: OwnerMessageRefusalSchema.optional()
 	})
 ]);
 /**
@@ -6497,6 +6524,15 @@ const RequestMessageSchema = discriminatedUnion("kind", [
 		session: string().min(1),
 		question: string().min(1),
 		answers: record(string(), string())
+	}),
+	object({
+		type: literal("request"),
+		v: Version,
+		id: RequestId,
+		kind: literal("owner-message"),
+		session: string().min(1),
+		from: Account,
+		text: string().trim().min(1).max(MAX_OWNER_MESSAGE_LENGTH)
 	}),
 	object({
 		type: literal("request"),

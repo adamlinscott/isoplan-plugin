@@ -35,6 +35,17 @@ export interface Host {
     cwd(): Promise<string>;
     /** The status line's figures; `context.window` is its `context_window_size`. Not in every Claude Code build: call it inside a try. */
     usage?(): Promise<{ context: { window: number } }>;
+    /** The engine's version (`2.1.312`) and the release it is built from (`2.1.312-dev` for a development build). Not in every Claude Code build: call it inside a try. */
+    version?(): Promise<{ version: string; base?: string }>;
+  };
+  /** Not in every Claude Code build (2.1.312 has it): call it inside a try, never read it as a value. */
+  prompt?: {
+    /**
+     * Submits a prompt the model reads as a user turn of its own, once the session is idle; it
+     * resolves once the prompt entered, or `{ drop }` when it didn't. `asUser`: read bare, as the
+     * person's own words, though the transcript still names the plugin. The prompt box is untouched.
+     */
+    submit?(input: { text: string; asUser?: true }): Promise<{ drop?: string }>;
   };
   process: {
     /** Streams a child's output; the loop is the child's life: `return()` or the module's unload ends it. */

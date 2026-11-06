@@ -30,6 +30,12 @@ const RUNNING = /* @__PURE__ */ new Set([
 ]);
 const ASK_TOOL = "AskUserQuestion";
 const SAFE_ID = /^[A-Za-z0-9_-]{1,200}$/;
+const SUBMIT_SINCE = [
+	2,
+	1,
+	312
+];
+const SUBMIT_WAIT_MS = 2e3;
 let running = null;
 let lead = null;
 let stop = null;
@@ -54,6 +60,7 @@ let superseded = null;
 let marking = Promise.resolve();
 let windowFile = null;
 let windowSent = null;
+let submitting = Promise.resolve();
 function register(on) {
 	on("session.start", async ($, e, next) => {
 		const result = await next(e);
@@ -135,6 +142,72 @@ function ownerAnswer($, line) {
 	};
 	$.fs.write(line.file, JSON.stringify(taken)).catch((err) => $.ui.log("isoplan: could not say whether the floor's answer was taken: " + message(err), { to: "debug" }));
 }
+function ownerMessage($, line) {
+	let said = false;
+	const say = (taken) => {
+		if (said) return;
+		said = true;
+		$.fs.write(line.file, JSON.stringify(taken)).catch((err) => $.ui.log("isoplan: could not say whether the floor's message was taken: " + message(err), { to: "debug" }));
+	};
+	const waiting = $.clock.after(SUBMIT_WAIT_MS, () => say({
+		taken: true,
+		queued: true
+	}));
+	const end = (taken) => {
+		waiting.cancel();
+		if (said && !taken.taken) $.ui.log(`isoplan: a message from the floor that was waiting its turn wasn't sent (${taken.reason})`, { to: "debug" });
+		say(taken);
+	};
+	submitting = submitting.then(async () => {
+		if (await $.session.id().catch(() => null) !== line.session) return end({
+			taken: false,
+			reason: "ended"
+		});
+		let submitted;
+		try {
+			submitted = $.prompt.submit({
+				text: line.text,
+				asUser: true
+			});
+		} catch {
+			return end({
+				taken: false,
+				reason: "no-submit"
+			});
+		}
+		try {
+			const r = await submitted;
+			if (r && typeof r.drop === "string") {
+				$.ui.log("isoplan: Claude Code didn't let a message from the floor in: " + r.drop, { to: "debug" });
+				return end({
+					taken: false,
+					reason: "dropped"
+				});
+			}
+			end({ taken: true });
+		} catch (err) {
+			$.ui.log("isoplan: a message from the floor couldn't be submitted: " + message(err), { to: "debug" });
+			end({
+				taken: false,
+				reason: "dropped"
+			});
+		}
+	}).catch(() => {});
+}
+async function submits($) {
+	try {
+		const { version, base } = await $.session.version();
+		const parts = /^(\d+)\.(\d+)\.(\d+)/.exec(base ?? version);
+		if (!parts) return false;
+		for (let i = 0; i < SUBMIT_SINCE.length; i++) {
+			const n = Number(parts[i + 1]);
+			if (n !== SUBMIT_SINCE[i]) return n > SUBMIT_SINCE[i];
+		}
+		return true;
+	} catch {
+		return false;
+	}
+}
 async function sendWindow($) {
 	const file = windowFile;
 	if (!file) return;
@@ -161,6 +234,7 @@ async function run($) {
 	const script = $.plugin.root.replace(/\\/g, "/") + "/dist/data-layer.js";
 	let failures = 0;
 	const since = await $.clock.now();
+	const messages = await submits($) ? ["--messages"] : [];
 	for (;;) {
 		if (!await isThere($, script)) {
 			updated = true;
@@ -199,7 +273,8 @@ async function run($) {
 					"--cwd",
 					cwd,
 					"--since",
-					String(since)
+					String(since),
+					...messages
 				],
 				cwd
 			});
@@ -298,6 +373,9 @@ function handle($, text) {
 			break;
 		case "owner-answer":
 			ownerAnswer($, line);
+			break;
+		case "owner-message":
+			ownerMessage($, line);
 			break;
 		case "window":
 			windowFile = line.file;

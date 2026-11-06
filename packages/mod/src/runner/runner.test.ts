@@ -567,11 +567,15 @@ test("runner: a session this machine doesn't report isn't answered for, whatever
   expect(t.sent).toEqual([{ type: "refusal", v: PROTOCOL_VERSION, id: "q1", reason: "unavailable", detail: "this machine doesn't report that session" }]);
 });
 
-test("runner: an owner's answer isn't the runner's; a handoff to take is logged", async () => {
+test("runner: an owner's answer or message isn't the runner's; a handoff to take is logged", async () => {
   const t = await setup();
   t.runner.take({ type: "request", v: PROTOCOL_VERSION, id: "o1", kind: "owner-answer", session: "claude-code:s", question: "q", answers: {} });
+  t.runner.take({ type: "request", v: PROTOCOL_VERSION, id: "o2", kind: "owner-message", session: "claude-code:s", from: { id: "claude:a", name: "Ada" }, text: "hi" });
   t.runner.take({ type: "handoff", v: PROTOCOL_VERSION, handoff: { id: "h-1", brief: "b", repos: [{ path: ".", remote: "origin", branch: "isoplan/handoff/h-1", commit: "a".repeat(40) }] } });
-  expect(t.sent).toEqual([{ type: "refusal", v: PROTOCOL_VERSION, id: "o1", reason: "unavailable", detail: "an owner's answer goes to the live session, not the runner" }]);
+  expect(t.sent).toEqual([
+    { type: "refusal", v: PROTOCOL_VERSION, id: "o1", reason: "unavailable", detail: "an owner's answer goes to the live session, not the runner" },
+    { type: "refusal", v: PROTOCOL_VERSION, id: "o2", reason: "unavailable", detail: "an owner's message goes to the live session, not the runner" },
+  ]);
   expect(t.logs).toEqual([expect.stringContaining("handoff h-1")]);
 });
 
