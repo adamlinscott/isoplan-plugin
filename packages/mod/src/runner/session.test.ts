@@ -14,7 +14,7 @@ import type { Spawn } from "./claude.js";
 import { createRegistry, registryPath, type ProcessRecord } from "./registry.js";
 import { loadPatterns, scan } from "./scan.js";
 import type { RepoFolders } from "./repo-folders.js";
-import { createDriver, drivenArgs, promptDescription, type DriveOffice, type DriveSettings } from "./session.js";
+import { createDriver, drivenArgs, promptDescription, type DriveOffice, type DriverOptions, type DriveSettings } from "./session.js";
 
 // Each test starts real (fake) claude processes, which is slow on Windows under load.
 vi.setConfig({ testTimeout: 30000 });
@@ -162,7 +162,7 @@ type Of<K extends Kind> = Extract<DrivenMessage, { kind: K }>;
 
 // `policy`: the drive-policy the office's server sends first on the connection, as a server that
 // drives sessions does; null for none yet. What it sends with it (holding) isn't kept in `sent`.
-async function setUp({ settings = {}, linger = false, records = [] as ProcessRecord[], spawn, policy: first = [] as string[] | null }: { settings?: Partial<DriveSettings>; linger?: boolean; records?: ProcessRecord[]; spawn?: Spawn; policy?: string[] | null } = {}) {
+async function setUp({ settings = {}, linger = false, records = [] as ProcessRecord[], spawn, policy: first = [] as string[] | null, setup }: { settings?: Partial<DriveSettings>; linger?: boolean; records?: ProcessRecord[]; spawn?: Spawn; policy?: string[] | null; setup?: DriverOptions["setup"] } = {}) {
   const root = tempRoot();
   const claudeDir = path.join(root, ".claude");
   const state = path.join(root, "state");
@@ -219,6 +219,7 @@ async function setUp({ settings = {}, linger = false, records = [] as ProcessRec
     env: { ...process.env, CLAUDE_CONFIG_DIR: claudeDir, FAKE_STATE: state, FAKE_KEY: AWS_KEY, ...(linger ? { FAKE_LINGER: "1" } : {}) },
     newId: () => ids.shift()!,
     ...(spawn ? { spawn } : {}),
+    ...(setup ? { setup } : {}),
   });
   const fakeLog = () => (fs.existsSync(path.join(state, "log.jsonl")) ? fs.readFileSync(path.join(state, "log.jsonl"), "utf8").trim().split("\n").map((l) => JSON.parse(l)) : []);
   // Every process the fake started ends with the test.
@@ -374,6 +375,25 @@ test("start: no folder of the room's sessions here is no-folder, a person other 
   // Only d3 started a process.
   await t.until(() => t.fakeLog().some((l) => l.argv));
   expect(t.fakeLog().filter((l) => l.argv)).toHaveLength(1);
+});
+
+test("install and sign in Claude Code: the runner's own person's go to its setup, someone else's are not-owner; what the setup says goes once the drive-policy has come", async () => {
+  const asked: string[] = [];
+  const t = await setUp({ setup: (m) => void asked.push(`${m.kind} ${m.id}`), policy: null });
+  t.driver.say({ type: "driven", v: 1, kind: "claude", claude: "missing" });
+  t.drive({ id: "c1", kind: "install-claude" });
+  t.driver.take(SERVER, { type: "drive", v: 1, id: "c2", by: { id: "claude:bob", name: "Bob" }, kind: "sign-in-claude" });
+  t.drive({ id: "c3", kind: "sign-in-claude" });
+  expect(asked).toEqual(["install-claude c1", "sign-in-claude c3"]);
+  t.policy([]);
+  await t.driver.settled();
+  t.sent.splice(0);
+  t.driver.take(SERVER, { type: "drive", v: 1, id: "c4", by: { id: "claude:bob", name: "Bob" }, kind: "install-claude" });
+  t.driver.say({ type: "driven", v: 1, kind: "claude", claude: "ready", id: "c1" });
+  expect(t.sent).toEqual([
+    { type: "driven", v: 1, kind: "refused", id: "c4", reason: "not-owner" },
+    { type: "driven", v: 1, kind: "claude", claude: "ready", id: "c1" },
+  ]);
 });
 
 test("instruct: the next instruction goes to the same process; one while a turn runs is busy; stop ends the process and its tree mid-turn", async () => {

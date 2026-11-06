@@ -5686,6 +5686,9 @@ const ZodURL = /*@__PURE__*/ $constructor("ZodURL", (inst, def) => {
 	$ZodURL.init(inst, def);
 	ZodStringFormat.init(inst, def);
 });
+function url(params) {
+	return /* @__PURE__ */ _url(ZodURL, params);
+}
 const ZodEmoji = /*@__PURE__*/ $constructor("ZodEmoji", (inst, def) => {
 	$ZodEmoji.init(inst, def);
 	ZodStringFormat.init(inst, def);
@@ -6526,6 +6529,19 @@ const MAX_PROMPT_LENGTH = 2e3;
 const MAX_DETAIL_LENGTH = 1e3;
 /** The longest folder a `handed-back`, a `folders` or a start names. */
 const MAX_FOLDER_LENGTH = 4096;
+/** The longest sign-in link a `driven` `claude` carries. */
+const MAX_SIGN_IN_URL_LENGTH = 4e3;
+/**
+* Claude Code for the terminal on the runner's machine (protocol 0.7.0, #180), as the runner finds
+* it the way it finds it for driven sessions: `ready`, found and signed in, or found with a sign-in
+* `claude auth status` couldn't say; `signed-out`, found, and `claude auth status` says it isn't
+* signed in; `missing`, no claude binary found.
+*/
+const ClaudeCliSchema = _enum([
+	"ready",
+	"signed-out",
+	"missing"
+]);
 /** A drive request's, an instruction's, a prompt's or a withheld text's id. */
 const DriveId = string().min(1).max(100);
 /** A driven session, by its id as its facts name it (`claude-code:<uuid>`). */
@@ -6567,6 +6583,10 @@ const HelloMessageSchema = object({
 * `drive-policy`, sends `driven` messages, and takes a handoff as a driven session (mode `driven`). The
 * server sends none of these to a runner that didn't say it. A machine with no claude binary still says
 * it, and refuses each start `no-claude`.
+* `claude` (protocol 0.7.0, #180): Claude Code for the terminal on this machine (ClaudeCli), which
+* driven sessions, a take into a terminal and a headless one all need. A runner that says it says it
+* on every hello, says `driven` `claude` whenever it changes, and takes the `install-claude` and
+* `sign-in-claude` drive requests; the server sends neither to a runner that didn't say it.
 */
 const RunnerHelloMessageSchema = object({
 	type: literal("runner"),
@@ -6576,7 +6596,8 @@ const RunnerHelloMessageSchema = object({
 	token: Token,
 	orca: boolean().optional(),
 	desktop: boolean().optional(),
-	drive: boolean().optional()
+	drive: boolean().optional(),
+	claude: ClaudeCliSchema.optional()
 });
 /** All of the session's facts. Sent on connect and on repair. */
 const FullMessageSchema = object({
@@ -6752,7 +6773,7 @@ const driven = {
 * withheld under that id (it was dropped, or the runner restarted since). `bypass-off`: the start asked for
 * `bypassPermissions` in a project whose office doesn't allow it (`drive-policy`). `no-folder`: this
 * machine has no folder for the room's project, or a start named a folder it didn't list in `folders` for that project, or that is no longer in it. `no-claude`: it has no claude binary. `busy`: the
-* session can't take this now, such as while a turn runs. `no-prompt`: an answer names a prompt the
+* session can't take this now, such as while a turn runs, or an install or sign-in of Claude Code runs already. `no-prompt`: an answer names a prompt the
 * session isn't waiting on (never raised by this runner, answered already, timed out or cancelled).
 * `cap-reached`: the project already has `limit` driven sessions running on this machine.
 * `unavailable` is anything else, saying what in `detail`. A runner never refuses `offline`: that is
@@ -6928,6 +6949,16 @@ discriminatedUnion("type", [
 			folder: Folder
 		}),
 		DrivenRefusedSchema,
+		object({
+			...driven,
+			kind: literal("claude"),
+			claude: ClaudeCliSchema,
+			doing: _enum(["installing", "signing-in"]).optional(),
+			progress: Detail.optional(),
+			url: url({ protocol: /^https$/ }).max(MAX_SIGN_IN_URL_LENGTH).optional(),
+			failed: Detail.optional(),
+			id: DriveId.optional()
+		}),
 		object({
 			...driven,
 			kind: literal("holding"),
@@ -7213,6 +7244,14 @@ discriminatedUnion("type", [
 			kind: literal("release"),
 			session: DrivenSessionId,
 			withheld: DriveId
+		}),
+		object({
+			...drive,
+			kind: literal("install-claude")
+		}),
+		object({
+			...drive,
+			kind: literal("sign-in-claude")
 		})
 	]),
 	object({

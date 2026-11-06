@@ -215,6 +215,8 @@ export interface DriverOptions {
   log: (text: string) => void;
   /** The id of the project a folder is in, for a driven take's cap. */
   projectOf: (folder: string) => Promise<string | null>;
+  /** Installs Claude Code, or signs it in, for a request whose `by` is the runner's own person (claude-setup.ts). */
+  setup?: (m: Extract<DriveMessage, { kind: "install-claude" | "sign-in-claude" }>) => void;
   spawn?: Spawn;
   env?: Record<string, string | undefined>;
   now?: () => number;
@@ -229,6 +231,8 @@ export interface Driver {
   linked(server: string): void;
   /** The office's link has dropped: its drive-policy no longer holds. */
   unlinked(server: string): void;
+  /** Sends a message that is no session's to every office whose connection's first drive-policy has come. */
+  say(message: DrivenMessage): void;
   /** How many sessions a process holds now, or is opening. */
   held(): number;
   /** Why this runner won't take a handoff as a driven session for `by`, or null. */
@@ -1191,6 +1195,7 @@ export function createDriver(o: DriverOptions): Driver {
         return;
       }
       if (m.by.id !== o.account.id) return refuse(server, m.id, "not-owner");
+      if (m.kind === "install-claude" || m.kind === "sign-in-claude") return o.setup ? o.setup(m) : refuse(server, m.id, "unavailable", { detail: "This runner can't install Claude Code." });
       if (m.kind === "start") {
         void start(server, m).catch((err: Error) => (o.log(`start ${m.id} failed: ${err?.stack ?? String(err)}`), refuse(server, m.id, "unavailable", { detail: NOT_STARTED })));
         return;
@@ -1211,6 +1216,9 @@ export function createDriver(o: DriverOptions): Driver {
     },
     unlinked(server) {
       policies.delete(server);
+    },
+    say(m) {
+      for (const server of offices.keys()) sendTo(server, m);
     },
     held: () => [...sessions.values()].filter((s) => s.child || s.opening).length,
     takeProblem: (by) => (by?.id === o.account.id ? null : NOT_YOURS_TAKE),

@@ -58,6 +58,7 @@ import { HOLD_OFF_MS, alive, holdOff, lockPath, readLock, refreshLock, releaseLo
 import { openLedger } from "./caps.js";
 import { createClaudeAnswerer, forkableId, forkEnv } from "./claude.js";
 import { claudeBinary } from "./claude-binary.js";
+import { createClaudeSetup } from "./claude-setup.js";
 import { anyRoomSince, askableMs, NOT_WANTED_CODE, supervise, UNPAIRED_CODE } from "./lifecycle.js";
 import { loadPrompts } from "./prompts.js";
 import { createRunGit, gitFailed, handoffBranch, handoffNote, HandoffGitError, prepare, pushHandoff, type Prepared } from "../handoff/git.js";
@@ -210,7 +211,11 @@ async function worker(): Promise<number> {
     hasDesktop = !!bin && (await desktopProblem(bin, forkEnv(process.env), process.platform, process.arch, os.hostname())) === null;
   };
   await checkDesktop().catch((err: Error) => log(`couldn't check whether the Claude app can take handoffs here: ${err.message}`));
-  setInterval(() => void checkDesktop().catch(() => {}), DESKTOP_CHECK_MS).unref();
+  // Claude Code for the terminal here (claude-setup.ts): each hello says it, and every office is told
+  // when the hourly check, an install or a sign-in from the floor finds it changed.
+  const claude = createClaudeSetup({ binary, send: (message) => driver?.say(message), scan: scanText, log, cwd: os.homedir(), env: forkEnv(process.env) });
+  await claude.check().catch((err: Error) => log(`couldn't check for Claude Code here: ${err.message}`));
+  setInterval(() => void checkDesktop().then(() => claude.check()).catch(() => {}), DESKTOP_CHECK_MS).unref();
   // A GitHub repo's current name, asked for before a remote first seen is used (remote-names.ts).
   const names = askingRemoteNames(claudeDir);
   const homeIo = machineHomeIo(first.workspaceRepos, names);
@@ -361,6 +366,11 @@ async function worker(): Promise<number> {
     scan: scanText,
     log,
     projectOf: async (folder) => (await homeIo.projectOf(await homeIo.resolve(folder), folder)).id,
+    // An install or sign-in ends with the Claude app's check again, for the next hello.
+    setup: (m) => {
+      claude.take(m);
+      void claude.settled().then(checkDesktop).catch(() => {});
+    },
   });
   driver = drive;
 
@@ -392,6 +402,7 @@ async function worker(): Promise<number> {
           ...(hasOrca ? { orca: true } : {}),
           ...(hasDesktop ? { desktop: true } : {}),
           drive: true,
+          claude: claude.state(),
         },
       });
     },
