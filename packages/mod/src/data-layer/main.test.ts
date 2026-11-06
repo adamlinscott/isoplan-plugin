@@ -309,3 +309,22 @@ test("a data layer never gives the session up to an older or equal holder, nor t
   expect(await fresh.exited).toBe(0);
   expect(fresh.lines()).toContainEqual({ type: "superseded", reason: "newer" });
 });
+
+test("the session's context window reaches the office only once the hooks module has written it where the window line says", async () => {
+  const o = await office();
+  o.state.repos = ["github.com/team/app"];
+  const v = versions(o.url);
+  const r = v.run("0.2.0");
+  const file = path.join(v.claudeDir, "isoplan", "windows", "s1.json");
+  await until(() => r.lines().some((l) => l.type === "window"));
+  expect(r.lines().find((l) => l.type === "window")).toEqual({ type: "window", file });
+  type Sent = { type: string; facts?: { session: Record<string, unknown> }; upsert?: { session?: Record<string, unknown> } };
+  const sent = () => (o.state.connections[0]?.messages ?? []) as Sent[];
+  await until(() => sent().some((m) => m.type === "full"));
+  await wait(1500);
+  expect(sent().find((m) => m.type === "full")!.facts!.session).not.toHaveProperty("contextWindow");
+  expect(sent().some((m) => m.upsert?.session && "contextWindow" in m.upsert.session)).toBe(false);
+
+  fs.writeFileSync(file, JSON.stringify({ contextWindow: 1000000 }));
+  await until(() => sent().some((m) => m.upsert?.session?.contextWindow === 1000000));
+});

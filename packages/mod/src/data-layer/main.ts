@@ -23,7 +23,9 @@
 // to the newest one, which the wake hook starts.
 // An agent's open question to its owner is reported too, secret-checked like a report, and
 // answerable from the floor while this data layer's hooks module marks that it waits for it
-// (src/data-layer/owner-answers.ts); a detached one's are read-only.
+// (src/data-layer/owner-answers.ts); a detached one's are read-only. The session fact carries the
+// session's context window once its hooks module has written the size to the file the `window`
+// line names; a detached one has no hooks module, so sends none.
 //
 //   node dist/data-layer.js --session <session id> --cwd <the session's folder> --detached
 //
@@ -65,7 +67,7 @@ import { fileURLToPath } from "node:url";
 import { PROTOCOL_VERSION, type Facts, type Project } from "@isoplan/protocol";
 import { installWake } from "../install/install.js";
 import { managedDir, newestDataLayer, normalPath, pluginDirsOf, pluginIdOf, pluginState, pluginsDir, type Place } from "../install/state.js";
-import type { DataLayerLine, TitleReply, WaitMark } from "../lines.js";
+import type { ContextWindow, DataLayerLine, TitleReply, WaitMark } from "../lines.js";
 import { claudeBinary, claudeCommand, findClaude } from "../runner/claude-binary.js";
 import { loadPatterns, type Pattern } from "../runner/scan.js";
 import { startRunner } from "../runner/start.js";
@@ -148,6 +150,8 @@ async function main(argv: string[]): Promise<number> {
   // marks the questions it waits on: this session's own folders, cleared as the data layer starts.
   const answersDir = path.join(claudeDir, "isoplan", "answers", sessionId);
   const waitsDir = path.join(claudeDir, "isoplan", "waits", sessionId);
+  // Where the hooks module writes the session's context window (a window line names it).
+  const windowFile = path.join(claudeDir, "isoplan", "windows", `${sessionId}.json`);
   const modPatterns = path.join(here, "..", "secret-patterns.json");
   const ownerPatterns = path.join(claudeDir, "isoplan", "secret-patterns.json");
   const machine = os.hostname();
@@ -308,6 +312,9 @@ async function main(argv: string[]): Promise<number> {
   if (!detached) {
     for (const dir of [answersDir, waitsDir]) await fs.rm(dir, { recursive: true, force: true }).catch(() => {});
     if (await fs.mkdir(waitsDir, { recursive: true }).then(() => true, () => false)) emit({ type: "waits", dir: waitsDir });
+    // The hooks module writes the size again for this run, so one from an earlier run is never sent.
+    await fs.rm(windowFile, { force: true }).catch(() => {});
+    if (await fs.mkdir(path.dirname(windowFile), { recursive: true }).then(() => true, () => false)) emit({ type: "window", file: windowFile });
   }
 
   // The pairing is the machine's, whichever folder the session is in. The list of repos each office
@@ -337,6 +344,7 @@ async function main(argv: string[]): Promise<number> {
   let checkouts: Record<string, string> = {};
   // Whether a question got an answer, from the latest read, so one that closed says how.
   let answered = (_id: string) => false;
+  let contextWindow: number | null = null; // the session's context window, once the hooks module wrote it
 
   const account = await accountOf({ readText: (p) => fs.readFile(p, "utf8").catch(() => null), run: io.run }, claudeJson, cwd);
   const openLink = (run: OfficeRun, home: Project, mayConnect: () => Promise<boolean>): Link =>
@@ -588,7 +596,10 @@ async function main(argv: string[]): Promise<number> {
       asked = ask.key;
       emit({ type: "title-ask", model: "haiku", system: TITLE_SYSTEM, prompt: ask.prompt, maxTokens: 40, key: ask.key, file: titleFile });
     }
-    const facts: Facts = read.facts.session.titleFrom === "branch" && title?.title ? { ...read.facts, session: { ...read.facts.session, title: title.title } } : read.facts;
+    // The size stays as last read while the file is missing or half written; there is none until it is written.
+    if (!detached) contextWindow = (await windowOf(windowFile)) ?? contextWindow;
+    const titled = read.facts.session.titleFrom === "branch" && title?.title ? { ...read.facts, session: { ...read.facts.session, title: title.title } } : read.facts;
+    const facts: Facts = contextWindow ? { ...titled, session: { ...titled.session, contextWindow } } : titled;
 
     checkouts = read.checkouts ?? {};
     answered = read.answered ?? answered;
@@ -658,6 +669,12 @@ async function waitsOf(dir: string, facts: Facts): Promise<Set<string>> {
     if (mark?.question === q.id && mark.waiting === true) out.add(q.id);
   }
   return out;
+}
+
+/** The context window the hooks module wrote, in tokens; null while there is none, or it isn't a whole positive number. */
+async function windowOf(file: string): Promise<number | null> {
+  const value = await fs.readFile(file, "utf8").then((text) => (JSON.parse(text) as Partial<ContextWindow>).contextWindow, () => null);
+  return Number.isInteger(value) && value! > 0 ? value! : null;
 }
 
 // A JSON file the hooks module wrote, which goes once it is read; null while it isn't there, or

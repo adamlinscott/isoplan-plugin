@@ -33,6 +33,8 @@ export interface Host {
   session: {
     id(): Promise<string>;
     cwd(): Promise<string>;
+    /** The status line's figures; `context.window` is its `context_window_size`. Not in every Claude Code build: call it inside a try. */
+    usage?(): Promise<{ context: { window: number } }>;
   };
   process: {
     /** Streams a child's output; the loop is the child's life: `return()` or the module's unload ends it. */

@@ -38,10 +38,14 @@
 // that says another reports the session (a `superseded` line: a newer version's after a reload, or
 // another window's) is started again only SUPERSEDED_RECHECK_MS later, and goes on if the session
 // is free by then.
+//
+// The session's context window, the size Claude Code gives the status line (`context_window_size`,
+// through $.session.usage), goes to the data layer through the file its `window` line names, as it
+// starts and on each tool call once it has changed (a /model switch), for the session's facts.
 
 import type { AskedMessage, ConflictMessage } from "@isoplan/protocol";
 import { endText, MAX_WAIT_MS } from "../ask/text.js";
-import type { AnswerTaken, DataLayerLine, FromOffice, OwnerAnswerLine, PairLine, StatusLine, TitleAskLine, WaitMark } from "../lines.js";
+import type { AnswerTaken, ContextWindow, DataLayerLine, FromOffice, OwnerAnswerLine, PairLine, StatusLine, TitleAskLine, WaitMark } from "../lines.js";
 import type { Host, On, ToolCallInput, ToolCallResult } from "./host.js";
 
 const RETRY_CAP_MS = 30000;
@@ -95,6 +99,8 @@ let shownStatus: string | undefined; // the status line, without the update note
 let updated = false; // a newer version of the plugin is on disk, loaded at /reload-plugins
 let superseded: "newer" | "window" | null = null; // the data layer said another reports this session now, and why
 let marking: Promise<unknown> = Promise.resolve(); // the marks, written in order
+let windowFile: string | null = null; // where the context window goes, as the data layer said
+let windowSent: number | null = null; // the size last written there
 
 export function register(on: On): void {
   on("session.start", async ($, e, next) => {
@@ -122,6 +128,7 @@ export function register(on: On): void {
     const r = await (e.tool === ASK_TOOL ? askBoth($, e, next) : next(e));
     try {
       void checkSession($);
+      void sendWindow($);
       if (!lead || r.deny || r.isError) return r;
       const agent = e.agentId ? "claude-code:" + e.agentId : lead;
       const waiting = notes.get(agent) ?? [];
@@ -178,6 +185,26 @@ function ownerAnswer($: Host, line: OwnerAnswerLine): void {
   answer?.(line.answers);
   const taken: AnswerTaken = { question: line.question, taken: !!answer };
   $.fs.write(line.file, JSON.stringify(taken)).catch((err) => $.ui.log("isoplan: could not say whether the floor's answer was taken: " + message(err), { to: "debug" }));
+}
+
+// Writes the session's context window where the data layer said, once it is known and has changed;
+// a host without $.session.usage, or without a size, writes nothing.
+async function sendWindow($: Host): Promise<void> {
+  const file = windowFile;
+  if (!file) return;
+  let size: number;
+  try {
+    size = (await $.session.usage!()).context.window; // throws when the host has no usage
+  } catch {
+    return;
+  }
+  if (!Number.isInteger(size) || size <= 0 || size === windowSent) return;
+  windowSent = size;
+  const window: ContextWindow = { contextWindow: size };
+  await $.fs.write(file, JSON.stringify(window)).catch((err) => {
+    windowSent = null;
+    $.ui.log("isoplan: could not write the session's context window: " + message(err), { to: "debug" });
+  });
 }
 
 // Restarts the data layer when the session's id is no longer the one it runs for.
@@ -326,6 +353,12 @@ function handle($: Host, text: string): void {
       break;
     case "owner-answer":
       ownerAnswer($, line);
+      break;
+    case "window":
+      // A data layer that started again has none yet.
+      windowFile = line.file;
+      windowSent = null;
+      void sendWindow($);
       break;
     case "waits":
       // A data layer that started again clears the marks: the waits still going are marked anew.

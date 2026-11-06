@@ -5839,6 +5839,7 @@ const SessionFactSchema = object({
 	lastActive: Time,
 	status: _enum(["active", "idle"]),
 	lights: _enum(["on", "off"]),
+	contextWindow: number().int().positive().optional(),
 	extra: Extra
 });
 const TokenCount = number().int().nonnegative();
