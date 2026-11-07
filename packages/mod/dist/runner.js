@@ -5979,6 +5979,8 @@ const ToolName = string().min(1).max(100);
 const Detail = string().min(1).max(MAX_DETAIL_LENGTH);
 /** A folder on the runner's machine, as the runner names it. */
 const Folder = string().min(1).max(MAX_FOLDER_LENGTH);
+/** A branch on a repo's remote, by its name under `refs/heads/`. */
+const BranchName = string().min(1).max(255);
 /** The text was longer than its field's limit, so the runner cut it to fit. */
 const Cut = literal$1(true).optional();
 /** The secret scan matched the text: it only says so, and its owner can release it by this id (drive `release`). */
@@ -6224,7 +6226,7 @@ const driven$2 = {
 * machine has no driven session by that id that it would act on, or, for a release, holds nothing
 * withheld under that id (it was dropped, or the runner restarted since). `bypass-off`: the start asked for
 * `bypassPermissions` in a project whose office doesn't allow it (`drive-policy`). `no-folder`: this
-* machine has no folder for the room's project, or a start named a folder it didn't list in `folders` for that project, or that is no longer in it. `no-claude`: it has no claude binary. `busy`: the
+* machine has no folder for the room's project, or a start named a folder it didn't list in `folders` for that project, or that is no longer in it, or a branch it didn't list for it. `no-claude`: it has no claude binary. `busy`: the
 * session can't take this now, such as while a turn runs, or an install or sign-in of Claude Code runs already. `no-prompt`: an answer names a prompt the
 * session isn't waiting on (never raised by this runner, answered already, timed out or cancelled).
 * `cap-reached`: the project already has `limit` driven sessions running on this machine.
@@ -6441,7 +6443,8 @@ const DrivenMessageSchema = discriminatedUnion("kind", [
 		kind: literal$1("folders"),
 		repos: array(object({
 			project: string().min(1),
-			folders: array(Folder).min(1).max(5)
+			folders: array(Folder).min(1).max(5),
+			branches: array(BranchName).max(100).optional()
 		})).max(100)
 	})
 ]);
@@ -6681,6 +6684,7 @@ const OfficeServerMessageSchema = discriminatedUnion("type", [
 			kind: literal$1("start"),
 			room: Room.optional(),
 			folder: Folder.optional(),
+			branch: BranchName.optional(),
 			project: ProjectSchema,
 			roomSessions: array(DrivenSessionId).max(20).optional(),
 			instruction: Instruction.optional(),
@@ -6691,6 +6695,11 @@ const OfficeServerMessageSchema = discriminatedUnion("type", [
 					code: "custom",
 					path: ["room"],
 					message: "a start names a room, or a folder"
+				});
+				if (message.branch !== void 0) context.addIssue({
+					code: "custom",
+					path: ["branch"],
+					message: "a start names a branch only with a folder"
 				});
 				return;
 			}
@@ -11880,11 +11889,12 @@ async function recentFolders(io, projectsDir, since) {
 	return (await sessionFolders(io, projectsDir, since)).map((f) => f.folder);
 }
 /**
-* The folders the machine's Claude Code sessions since `since` ran in, still there, the most recent
-* first, each once, with when each was last used. `cwds` keeps what each transcript says its folder
-* is between calls, so a transcript that names its folder is read once.
+* The folders the machine's Claude Code sessions since `since` ran in, still there (or, with `gone`,
+* those no longer there too), the most recent first, each once, with when each was last used. `cwds`
+* keeps what each transcript says its folder is between calls, so a transcript that names its folder
+* is read once.
 */
-async function sessionFolders(io, projectsDir, since, cwds) {
+async function sessionFolders(io, projectsDir, since, cwds, { gone = false } = {}) {
 	const transcripts = [];
 	const used = /* @__PURE__ */ new Set();
 	for (const dir of await io.listDir(projectsDir)) {
@@ -11914,7 +11924,7 @@ async function sessionFolders(io, projectsDir, since, cwds) {
 	for (const { cwd, at } of transcripts) {
 		if (seen.has(pathKey(cwd))) continue;
 		seen.add(pathKey(cwd));
-		if ((await io.stat(cwd))?.isDir) out.push({
+		if (gone || (await io.stat(cwd))?.isDir) out.push({
 			folder: cwd,
 			at
 		});
@@ -12927,6 +12937,7 @@ async function worktreeFor(run, clone, remote, branch, id, exempt, timeoutMs, ex
 	}
 	return { error: `${base} and the next eight names beside it are taken by other folders` };
 }
+/** The worktree, other than the main checkout, that has `branch` checked out, or null. */
 async function worktreeOn(run, clone, branch, timeoutMs) {
 	const listed = await run([
 		"worktree",
@@ -13791,36 +13802,206 @@ function createRegistry({ file, log, pid = process.pid, isAlive = alive, info = 
 	};
 }
 //#endregion
+//#region src/runner/checkouts.ts
+/** The main checkout of the repo at `where`: the folder holding its shared `.git`, or, for a bare repo's worktree, the worktree itself. */
+function mainCheckout(where) {
+	return /\/\.git$/.test(where.commonDir) ? dirname(where.commonDir) : where.toplevel;
+}
+/** `p`, from git's forward slashes, spelled as `like` is: with backslashes for a Windows path. */
+const spelledAs = (like, p) => isWindowsPath(like) ? normalize(p).replace(/\//g, "\\") : normalize(p);
+function createCheckouts({ file, resolve, isDir }) {
+	let known = null;
+	let changed = false;
+	let saving = Promise.resolve();
+	const load = () => known ??= fs.readFile(file, "utf8").then((text) => {
+		const parsed = JSON.parse(text);
+		if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
+		return Object.fromEntries(Object.entries(parsed).filter((e) => typeof e[1] === "string"));
+	}, () => ({}));
+	return {
+		async of(folder) {
+			const remembered = await load();
+			const key = pathKey(folder);
+			let main;
+			if (await isDir(folder)) {
+				const where = await resolve(folder);
+				if (!where) return folder;
+				main = spelledAs(folder, mainCheckout(where));
+				if (pathKey(main) === key) return folder;
+				if (remembered[key] !== main) {
+					remembered[key] = main;
+					changed = true;
+				}
+			} else main = remembered[key] ?? null;
+			return main && await isDir(main) ? main : null;
+		},
+		async keep(folders) {
+			const remembered = await load();
+			const wanted = new Set(folders.map(pathKey));
+			for (const key of Object.keys(remembered)) {
+				if (wanted.has(key)) continue;
+				delete remembered[key];
+				changed = true;
+			}
+			if (!changed) return;
+			changed = false;
+			const write = saving.then(async () => {
+				await fs.mkdir(path.dirname(file), { recursive: true });
+				const temp = `${file}.${process.pid}.tmp`;
+				await fs.writeFile(temp, JSON.stringify(remembered, null, 2) + "\n");
+				await fs.rename(temp, file).catch(async (err) => {
+					await fs.rm(temp, { force: true }).catch(() => {});
+					throw err;
+				});
+			});
+			saving = write.catch(() => {});
+			await write.catch((err) => {
+				changed = true;
+				throw err;
+			});
+		}
+	};
+}
+/** The branch names `git ls-remote --heads` printed; none that git would read as an option. */
+function parseHeads(stdout) {
+	const out = [];
+	for (const line of stdout.split(/\r?\n/)) {
+		const m = /^[0-9a-f]+\trefs\/heads\/(.+)$/.exec(line.trim());
+		if (m && !m[1].startsWith("-")) out.push(m[1]);
+	}
+	return out;
+}
+/** The branches on `checkout`'s origin, by name; null when its remote couldn't be asked. */
+function createRemoteBranches({ run, timeoutMs, refreshMs, log, now = Date.now }) {
+	const cache = /* @__PURE__ */ new Map();
+	const failing = /* @__PURE__ */ new Set();
+	return async (checkout) => {
+		const key = pathKey(checkout);
+		const hit = cache.get(key);
+		if (hit && now() - hit.at < await refreshMs()) return hit.branches;
+		const branches = (async () => {
+			const r = await run([
+				"ls-remote",
+				"--heads",
+				"origin"
+			], {
+				cwd: checkout,
+				timeoutMs: await timeoutMs()
+			});
+			if (r.code !== 0) {
+				if (!failing.has(key)) log(`couldn't list the branches on the remote of ${checkout} (${r.timedOut ? "git took too long" : `git ls-remote exited ${r.code}`}), so it is offered for new sessions with no branches; this is logged again only once it has worked`);
+				failing.add(key);
+				return null;
+			}
+			failing.delete(key);
+			return parseHeads(r.stdout);
+		})();
+		cache.set(key, {
+			at: now(),
+			branches
+		});
+		return branches;
+	};
+}
+/**
+* The folder a session on `branch` opens in: `checkout` when it is on that branch; else a worktree
+* already on it; else a new one beside the checkout, from the local branch of that name as it is, or,
+* with none, from origin's, fetched now and tracked. The error says why there is none.
+*/
+async function branchFolder(run, checkout, branch, timeoutMs) {
+	const git = (args) => run(args, {
+		cwd: checkout,
+		timeoutMs
+	});
+	const head = await git([
+		"symbolic-ref",
+		"-q",
+		"--short",
+		"HEAD"
+	]);
+	if (head.code === 0 && head.stdout.trim() === branch) return checkout;
+	const existing = await worktreeOn(run, checkout, branch, timeoutMs);
+	if (existing) return spelledAs(checkout, existing);
+	const base = `${normalize(checkout)}-branch-${branch.replace(/[^A-Za-z0-9._-]+/g, "-").replace(/[.-]+$/, "")}`;
+	for (let n = 1; n < 10; n++) {
+		const dir = spelledAs(checkout, n === 1 ? base : `${base}-${n}`);
+		if (await fs.stat(dir).then(() => true, () => false)) continue;
+		const local = (await git([
+			"rev-parse",
+			"--verify",
+			"-q",
+			`refs/heads/${branch}`
+		])).code === 0;
+		if (!local) {
+			const fetched = await git([
+				"fetch",
+				"origin",
+				`+refs/heads/${branch}:refs/remotes/origin/${branch}`
+			]);
+			if (fetched.code !== 0) return { error: `git fetch origin ${branch} in ${checkout} failed${fetched.timedOut ? " (it took too long)" : ""}:\n${fetched.stderr}` };
+		}
+		const made = await git(local ? [
+			"worktree",
+			"add",
+			dir,
+			branch
+		] : [
+			"worktree",
+			"add",
+			"--track",
+			"-b",
+			branch,
+			dir,
+			`origin/${branch}`
+		]);
+		return made.code === 0 ? dir : { error: `git worktree add ${dir} failed${made.timedOut ? " (it took too long)" : ""}:\n${made.stderr}` };
+	}
+	return { error: `${base} and the next eight names beside it are taken by other folders` };
+}
+//#endregion
 //#region src/runner/repo-folders.ts
-/** The folders `seen` holds, by repo, the most recently used first: each folder once, at most MAX_REPO_FOLDERS a repo and MAX_FOLDER_REPOS repos. */
+/** The repos `seen` is in, the most recently used first: each once, by its main checkout, at most MAX_FOLDER_REPOS, each with at most MAX_REPO_BRANCHES branches. */
 async function repoFolders(seen, o) {
 	const byRepo = /* @__PURE__ */ new Map();
 	const tried = /* @__PURE__ */ new Set();
 	const leftOut = /* @__PURE__ */ new Set();
+	const scanned = async (text, key, what, project) => {
+		const matched = await o.scan(text);
+		if (!matched) return true;
+		leftOut.add(key);
+		if (!o.leftOut.has(key)) o.log(`${what} of ${project} wasn't listed for starting sessions from the floor: it matches the secret pattern "${matched}"`);
+		return false;
+	};
 	for (const { folder } of [...seen].sort((a, b) => b.at - a.at)) {
-		const key = pathKey(folder);
+		if (byRepo.size >= 100) break;
+		const checkout = await o.checkout(folder).catch(() => null);
+		if (!checkout) continue;
+		const key = pathKey(checkout);
 		if (tried.has(key)) continue;
 		tried.add(key);
-		if (folder.length > 4096) continue;
-		const project = await o.home(folder).catch(() => null);
-		if (!project) continue;
-		const folders = byRepo.get(project) ?? [];
-		if (folders.length >= 5 || !byRepo.has(project) && byRepo.size >= 100) continue;
-		const matched = await o.scan(folder);
-		if (matched) {
-			leftOut.add(key);
-			if (!o.leftOut.has(key)) o.log(`a folder of ${project} wasn't listed for starting sessions from the floor: its path matches the secret pattern "${matched}"`);
-			continue;
+		if (checkout.length > 4096) continue;
+		const project = await o.home(checkout).catch(() => null);
+		if (!project || byRepo.has(project)) continue;
+		if (!await scanned(checkout, key, "a folder", project)) continue;
+		const repo = {
+			project,
+			folders: [checkout]
+		};
+		const branches = await o.branches(checkout, project).catch(() => null);
+		if (branches) {
+			repo.branches = [];
+			for (const branch of branches) {
+				if (repo.branches.length >= 100) break;
+				if (branch.length > 255) continue;
+				if (await scanned(branch, `${key}
+${branch}`, "a branch", project)) repo.branches.push(branch);
+			}
 		}
-		folders.push(folder);
-		byRepo.set(project, folders);
+		byRepo.set(project, repo);
 	}
 	o.leftOut.clear();
 	for (const key of leftOut) o.leftOut.add(key);
-	return [...byRepo].map(([project, folders]) => ({
-		project,
-		folders
-	}));
+	return [...byRepo.values()];
 }
 //#endregion
 //#region src/runner/session.ts
@@ -13864,6 +14045,8 @@ const KILL_WAIT_MS = 1e4;
 const NO_CLAUDE = "Claude Code for the terminal isn't installed on this computer, so no session can run here.";
 const NO_FOLDER = "This computer has no folder for this room: open Claude Code once in the room's repo here, then try again.";
 const NOT_LISTED = "That folder isn't one this computer offers for this repo any more, so nothing was started. Pick one of the folders it offers now.";
+const BRANCH_NOT_LISTED = "That branch isn't one this computer offers for this repo any more, so nothing was started. Pick one of the branches it offers now.";
+const NO_WORKTREE = "A separate folder for that branch couldn't be made on this computer, so nothing was started. Its runner log says why.";
 const NOT_STARTED = "Claude Code couldn't be started on this computer. Its runner log says why.";
 const BUSY = "The agent is still working on the last instruction. Wait for it to finish, or stop it.";
 const NOT_CLOSED = "Claude Code couldn't be closed for this session on this computer, so it is still running there. Try again in a moment.";
@@ -14605,9 +14788,24 @@ function createDriver(o) {
 		const office = offices.get(server);
 		let folder;
 		if (m.folder !== void 0) {
-			const own = listed.get(server)?.folders.get(project)?.get(pathKey(m.folder));
+			const repo = listed.get(server)?.repos.get(project);
+			const own = repo?.folders.get(pathKey(m.folder));
 			folder = own !== void 0 && await office.home(own).catch(() => null) === project ? own : null;
 			if (!folder) return refuse(server, m.id, "no-folder", { detail: NOT_LISTED });
+			if (m.branch !== void 0) {
+				if (!repo.branches.has(m.branch)) return refuse(server, m.id, "no-folder", { detail: BRANCH_NOT_LISTED });
+				const cap = capOf(await o.settings());
+				if (heldIn(project) >= cap) return refuse(server, m.id, "cap-reached", {
+					limit: cap,
+					detail: capReached(cap)
+				});
+				const made = await office.branchFolder(folder, m.branch).catch((err) => ({ error: err?.stack ?? String(err) }));
+				if (typeof made !== "string") {
+					o.log(`start ${m.id}: no folder for branch ${m.branch} of ${folder}: ${made.error}`);
+					return refuse(server, m.id, "unavailable", { detail: NO_WORKTREE });
+				}
+				folder = made;
+			}
 		} else {
 			folder = await office.folder(m.roomSessions ?? []);
 			if (!folder) return refuse(server, m.id, "no-folder", { detail: NO_FOLDER });
@@ -14892,7 +15090,10 @@ function createDriver(o) {
 			if (!again && listed.get(server)?.said === said) return;
 			listed.set(server, {
 				said,
-				folders: new Map(repos.map((r) => [r.project, new Map(r.folders.map((f) => [pathKey(f), f]))]))
+				repos: new Map(repos.map((r) => [r.project, {
+					folders: new Map(r.folders.map((f) => [pathKey(f), f])),
+					branches: new Set(r.branches ?? [])
+				}]))
 			});
 			sendTo(server, {
 				...driven,
@@ -14912,7 +15113,7 @@ function createDriver(o) {
 				foldersOut.then(() => {
 					if (policies.size) checkFoldersLater();
 				});
-			}, st.repoFoldersCheckMinutes * 6e4);
+			}, Math.min(st.repoFoldersCheckMinutes, st.branchRefreshMinutes) * 6e4);
 			foldersCheck.unref?.();
 		}, () => foldersCheck = null);
 	}
@@ -15234,6 +15435,17 @@ async function worker() {
 	const isDir = (p) => fs.stat(p).then((s) => s.isDirectory(), () => false);
 	const drives = [];
 	const transcriptFolders = /* @__PURE__ */ new Map();
+	const checkouts = createCheckouts({
+		file: path.join(isoplanDir, "runner", "checkouts.json"),
+		resolve: (dir) => homeIo.resolve(dir),
+		isDir
+	});
+	const remoteBranches = createRemoteBranches({
+		run: git,
+		timeoutMs: gitMs,
+		refreshMs: async () => (await settings()).branchRefreshMinutes * 6e4,
+		log
+	});
 	const runnerFor = (office, index) => {
 		const { server } = office;
 		const pairing = createPairing({
@@ -15279,19 +15491,24 @@ async function worker() {
 			},
 			repoFolders: async () => {
 				const since = Date.now() - (await settings()).cloneSearchDays * 864e5;
-				const seen = await sessionFolders(io, path.join(claudeDir, "projects"), since, transcriptFolders);
+				const seen = await sessionFolders(io, path.join(claudeDir, "projects"), since, transcriptFolders, { gone: true });
 				for (const r of registry.list()) if (r.kind === "driven" && r.folder) seen.push({
 					folder: r.folder,
 					at: Date.parse(r.lastActivity) || 0
 				});
-				return repoFolders(seen, {
+				const repos = await repoFolders(seen, {
+					checkout: checkouts.of,
 					home,
+					branches: async (checkout, project) => !project.startsWith("local:") && await homeIo.resolve(checkout) ? remoteBranches(checkout) : null,
 					scan: scanText,
 					log,
 					leftOut: foldersLeftOut
 				});
+				await checkouts.keep(seen.map((s) => s.folder)).catch((err) => log(`couldn't save which checkout each worktree belongs to: ${err.message}`));
+				return repos;
 			},
-			home
+			home,
+			branchFolder: async (folder, branch) => branchFolder(git, folder, branch, await gitMs())
 		};
 		return {
 			pairing,

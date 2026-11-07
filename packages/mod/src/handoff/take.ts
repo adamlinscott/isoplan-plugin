@@ -243,11 +243,12 @@ async function recentFolders(io: NodeIo, projectsDir: string, since: number): Pr
 }
 
 /**
- * The folders the machine's Claude Code sessions since `since` ran in, still there, the most recent
- * first, each once, with when each was last used. `cwds` keeps what each transcript says its folder
- * is between calls, so a transcript that names its folder is read once.
+ * The folders the machine's Claude Code sessions since `since` ran in, still there (or, with `gone`,
+ * those no longer there too), the most recent first, each once, with when each was last used. `cwds`
+ * keeps what each transcript says its folder is between calls, so a transcript that names its folder
+ * is read once.
  */
-export async function sessionFolders(io: Pick<NodeIo, "listDir" | "stat" | "read">, projectsDir: string, since: number, cwds?: Map<string, string>): Promise<{ folder: string; at: number }[]> {
+export async function sessionFolders(io: Pick<NodeIo, "listDir" | "stat" | "read">, projectsDir: string, since: number, cwds?: Map<string, string>, { gone = false }: { gone?: boolean } = {}): Promise<{ folder: string; at: number }[]> {
   const transcripts: { cwd: string; at: number }[] = [];
   const used = new Set<string>();
   for (const dir of await io.listDir(projectsDir)) {
@@ -272,7 +273,7 @@ export async function sessionFolders(io: Pick<NodeIo, "listDir" | "stat" | "read
   for (const { cwd, at } of transcripts) {
     if (seen.has(pathKey(cwd))) continue;
     seen.add(pathKey(cwd));
-    if ((await io.stat(cwd))?.isDir) out.push({ folder: cwd, at });
+    if (gone || (await io.stat(cwd))?.isDir) out.push({ folder: cwd, at });
   }
   return out;
 }
@@ -1062,8 +1063,8 @@ async function worktreeFor(run: RunGit, clone: string, remote: string, branch: s
   return { error: `${base} and the next eight names beside it are taken by other folders` };
 }
 
-// The worktree, other than the main checkout, that has `branch` checked out, or null.
-async function worktreeOn(run: RunGit, clone: string, branch: string, timeoutMs: number): Promise<string | null> {
+/** The worktree, other than the main checkout, that has `branch` checked out, or null. */
+export async function worktreeOn(run: RunGit, clone: string, branch: string, timeoutMs: number): Promise<string | null> {
   const listed = await run(["worktree", "list", "--porcelain"], { cwd: clone, timeoutMs });
   if (listed.code !== 0) return null;
   const blocks = listed.stdout.split(/\r?\n\r?\n/).slice(1).map((b) => b.split(/\r?\n/));

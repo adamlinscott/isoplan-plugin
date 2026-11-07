@@ -5978,6 +5978,8 @@ const ToolName = string().min(1).max(100);
 const Detail = string().min(1).max(MAX_DETAIL_LENGTH);
 /** A folder on the runner's machine, as the runner names it. */
 const Folder = string().min(1).max(MAX_FOLDER_LENGTH);
+/** A branch on a repo's remote, by its name under `refs/heads/`. */
+const BranchName = string().min(1).max(255);
 /** The text was longer than its field's limit, so the runner cut it to fit. */
 const Cut = literal$1(true).optional();
 /** The secret scan matched the text: it only says so, and its owner can release it by this id (drive `release`). */
@@ -6223,7 +6225,7 @@ const driven = {
 * machine has no driven session by that id that it would act on, or, for a release, holds nothing
 * withheld under that id (it was dropped, or the runner restarted since). `bypass-off`: the start asked for
 * `bypassPermissions` in a project whose office doesn't allow it (`drive-policy`). `no-folder`: this
-* machine has no folder for the room's project, or a start named a folder it didn't list in `folders` for that project, or that is no longer in it. `no-claude`: it has no claude binary. `busy`: the
+* machine has no folder for the room's project, or a start named a folder it didn't list in `folders` for that project, or that is no longer in it, or a branch it didn't list for it. `no-claude`: it has no claude binary. `busy`: the
 * session can't take this now, such as while a turn runs, or an install or sign-in of Claude Code runs already. `no-prompt`: an answer names a prompt the
 * session isn't waiting on (never raised by this runner, answered already, timed out or cancelled).
 * `cap-reached`: the project already has `limit` driven sessions running on this machine.
@@ -6426,7 +6428,8 @@ discriminatedUnion("type", [
 			kind: literal$1("folders"),
 			repos: array(object({
 				project: string().min(1),
-				folders: array(Folder).min(1).max(5)
+				folders: array(Folder).min(1).max(5),
+				branches: array(BranchName).max(100).optional()
 			})).max(100)
 		})
 	])
@@ -6651,6 +6654,7 @@ const OfficeServerMessageSchema = discriminatedUnion("type", [
 			kind: literal$1("start"),
 			room: Room.optional(),
 			folder: Folder.optional(),
+			branch: BranchName.optional(),
 			project: ProjectSchema,
 			roomSessions: array(DrivenSessionId).max(20).optional(),
 			instruction: Instruction.optional(),
@@ -6661,6 +6665,11 @@ const OfficeServerMessageSchema = discriminatedUnion("type", [
 					code: "custom",
 					path: ["room"],
 					message: "a start names a room, or a folder"
+				});
+				if (message.branch !== void 0) context.addIssue({
+					code: "custom",
+					path: ["branch"],
+					message: "a start names a branch only with a folder"
 				});
 				return;
 			}

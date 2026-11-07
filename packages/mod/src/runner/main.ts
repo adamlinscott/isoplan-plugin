@@ -70,6 +70,7 @@ import { answerOffices } from "./offices.js";
 import { createForkSlots, createRunner, PushFailed, type RunnerSettings } from "./runner.js";
 import { loadPatterns, scan } from "./scan.js";
 import { createRegistry, registryPath } from "./registry.js";
+import { branchFolder, createCheckouts, createRemoteBranches } from "./checkouts.js";
 import { repoFolders } from "./repo-folders.js";
 import { createDriver, type DriveOffice, type Driver, type DriveSettings } from "./session.js";
 import { runnerEnvPath } from "./environment.js";
@@ -231,6 +232,9 @@ async function worker(): Promise<number> {
   const drives: DriveOffice[] = [];
   // What each transcript says its folder is, read once, for every office's list of folders.
   const transcriptFolders = new Map<string, string>();
+  // Each repo's main checkout, remembered for its worktrees, and the branches on its remote (#84), for every office's list.
+  const checkouts = createCheckouts({ file: path.join(isoplanDir, "runner", "checkouts.json"), resolve: (dir) => homeIo.resolve(dir), isDir });
+  const remoteBranches = createRemoteBranches({ run: git, timeoutMs: gitMs, refreshMs: async () => (await settings()).branchRefreshMinutes * 60000, log });
 
   // The runner answering what one office asks, for that office alone; it outlives its office's link.
   const runnerFor = (office: Office, index: number) => {
@@ -275,14 +279,25 @@ async function worker(): Promise<number> {
         }
         return null;
       },
-      // The folders Claude Code sessions here ran in, within cloneSearchDays, and those of the sessions driven from here.
+      // The repos of the folders Claude Code sessions here ran in, within cloneSearchDays, gone or not, and those of the sessions driven from here.
       repoFolders: async () => {
         const since = Date.now() - (await settings()).cloneSearchDays * 86400000;
-        const seen = await sessionFolders(io, path.join(claudeDir, "projects"), since, transcriptFolders);
+        const seen = await sessionFolders(io, path.join(claudeDir, "projects"), since, transcriptFolders, { gone: true });
         for (const r of registry.list()) if (r.kind === "driven" && r.folder) seen.push({ folder: r.folder, at: Date.parse(r.lastActivity) || 0 });
-        return repoFolders(seen, { home, scan: scanText, log, leftOut: foldersLeftOut });
+        const repos = await repoFolders(seen, {
+          checkout: checkouts.of,
+          home,
+          // Only a git checkout of a repo with a remote has branches to offer: not a folder above several repos.
+          branches: async (checkout, project) => (!project.startsWith("local:") && (await homeIo.resolve(checkout)) ? remoteBranches(checkout) : null),
+          scan: scanText,
+          log,
+          leftOut: foldersLeftOut,
+        });
+        await checkouts.keep(seen.map((s) => s.folder)).catch((err: Error) => log(`couldn't save which checkout each worktree belongs to: ${err.message}`));
+        return repos;
       },
       home,
+      branchFolder: async (folder, branch) => branchFolder(git, folder, branch, await gitMs()),
     };
     const runner = createRunner({
       answerer,
