@@ -268,6 +268,8 @@ function versions(server = "ws://127.0.0.1:9/data-layer") {
   for (const version of ["0.2.0", "0.3.0"]) {
     fs.mkdirSync(path.join(folder(version), "dist"), { recursive: true });
     fs.mkdirSync(path.join(folder(version), ".claude-plugin"), { recursive: true });
+    // Never the runner's files: without them a copy that installs fails before it reaches the link
+    // handler and the login item, which point at this machine's real home and registry (systemPlaces).
     for (const file of ["data-layer.js", "wake.js", "hooks.js"]) fs.copyFileSync(path.join(modDir, "dist", file), path.join(folder(version), "dist", file));
     fs.copyFileSync(path.join(modDir, "config.json"), path.join(folder(version), "config.json"));
     fs.writeFileSync(path.join(folder(version), ".claude-plugin", "plugin.json"), JSON.stringify({ name: "isoplan", version }));

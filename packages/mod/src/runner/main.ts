@@ -492,7 +492,7 @@ async function worker(): Promise<number> {
   send = links.sender;
   live = links.live;
   const ended = await links.ended;
-  // Each session's link closes, and its log says so, before the worker exits.
+  // Each session's link closes, and its log says so, before the worker exits; one stuck in a pass is left after STOP_WAIT_MS (reporting.ts).
   await reporting.stop();
   return ended === "not-wanted" ? NOT_WANTED_CODE : ended === "unpaired" ? UNPAIRED_CODE : 0;
 }

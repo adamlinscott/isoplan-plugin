@@ -18028,8 +18028,9 @@ async function cwdOf(io, path, size) {
 	}
 	return null;
 }
+const STOP_WAIT_MS = 5e3;
 function watchSessions(o) {
-	const { claudeDir, io, isAlive = alive, pid = process.pid, gapMs = 250 } = o;
+	const { claudeDir, io, isAlive = alive, pid = process.pid, gapMs = 250, stopWaitMs = STOP_WAIT_MS } = o;
 	const projectsDir = path.join(claudeDir, "projects");
 	const seen = /* @__PURE__ */ new Map();
 	let first = true;
@@ -18100,14 +18101,19 @@ function watchSessions(o) {
 					queued: false,
 					endedAt: null,
 					holdOff: null,
-					notWanted: {}
+					notWanted: {},
+					held: false
 				});
 				Object.assign(s, {
 					file,
 					mtimeMs: st.mtimeMs,
 					size: st.size
 				});
-				if (s.running || s.queued || st.mtimeMs < now - windowMs || s.endedAt !== null && st.mtimeMs <= s.endedAt) continue;
+				if (s.running || s.queued || st.mtimeMs < now - windowMs) continue;
+				if (s.endedAt !== null && st.mtimeMs <= s.endedAt) {
+					if (s.held && !await heldByAnother(id, now, config)) s.held = false;
+					continue;
+				}
 				if (s.holdOff) {
 					if (!(s.holdOff.until <= now || !!s.holdOff.projects && await nowTaken(s.holdOff, config))) {
 						s.endedAt = st.mtimeMs;
@@ -18116,6 +18122,12 @@ function watchSessions(o) {
 					s.holdOff = null;
 				}
 				if (await heldByAnother(id, now, config)) {
+					s.held = true;
+					s.endedAt = st.mtimeMs;
+					continue;
+				}
+				if (s.held) {
+					s.held = false;
 					s.endedAt = st.mtimeMs;
 					continue;
 				}
@@ -18175,7 +18187,9 @@ function watchSessions(o) {
 			if (timer) clearTimeout(timer);
 			const running = [...seen.values()].flatMap((s) => s.running ?? []);
 			for (const r of running) r.stop();
-			await Promise.all(running.map((r) => r.done));
+			let timeout;
+			await Promise.race([Promise.all(running.map((r) => r.done)), new Promise((r) => timeout = setTimeout(r, stopWaitMs))]);
+			clearTimeout(timeout);
 		}
 	};
 }

@@ -6,15 +6,16 @@
 // per session to each office, as a data layer would. Not while the session's lock in
 // <claude dir>/isoplan/live names another live process that keeps it fresh (the plugin's data layer,
 // for its hooks module), while the transcript names no folder yet or the folder has gone, or while
-// Claude Code lists the plugin as uninstalled or disabled for the folder. A lock counts as fresh for
-// three of its holder's slowest passes (lockFreshMs).
+// Claude Code lists the plugin as uninstalled or disabled for the folder. The runner counts a lock as
+// fresh for three of its own slowest passes (lockFreshMs, from its config.json).
 //
 // A session it stopped reporting (quiet past `idleMinutes`, nothing to report, its link down five
-// minutes, or the plugin's data layer took its lock over), or that it found the plugin's data layer
-// reporting, is reported again once its transcript moves: so a session with the plugin that closes
-// goes unreachable, as it did before, and one whose plugin data layer crashed is taken at its next
-// turn. One that ended with a hold-off (no office wants its project, git can't place its folder, or
-// no office takes its repo) isn't reported again before the hold-off ends; one no office took is,
+// minutes, or the plugin's data layer took its lock over) is reported again once its transcript
+// moves; one it found the plugin's data layer reporting, once its transcript moves after a look that
+// found the lock let go. So a session with the plugin that closes goes unreachable, as it did
+// before, even when its last write and its lock letting go fall between two looks, and one whose
+// plugin data layer crashed is taken at its next turn. One that ended with a hold-off (no office
+// wants its project, git can't place its folder, or no office takes its repo) isn't reported again before the hold-off ends; one no office took is,
 // as its transcript moves, once a fresh copy of one office's list takes one of its repos: only of an
 // office it reported to or that config.json names now, never of one that didn't want it. The
 // offices that didn't want it are left alone, each until its own hold-off ends. The hold-offs live
@@ -32,6 +33,9 @@ import { alive, lockPath, readLock } from "../wake/lock.js";
 // On its first look, the gap between starting two sessions that are already quiet, so each is
 // mostly reported before the next starts; those still at work start at once.
 export const GAP_MS = 250;
+// How long stop() waits for its reports to end: one stuck in a pass (a slow git call or office)
+// is left behind, so the runner's worker still exits.
+export const STOP_WAIT_MS = 5000;
 
 /** One session for `report`: it reports it until `closed` settles, or until it should stop. */
 export interface ToReport {
@@ -56,6 +60,7 @@ export interface ReportingOptions {
   /** This process's pid, which its sessions' locks name. */
   pid?: number;
   gapMs?: number;
+  stopWaitMs?: number;
 }
 
 export interface Reporting {
@@ -65,7 +70,7 @@ export interface Reporting {
   reporting(): string[];
   /** Looks once (it looks by itself every `streamSeconds`). */
   look(): Promise<void>;
-  /** Stops reporting every session, and looking. */
+  /** Stops reporting every session, and looking; waits for the reports to end at most `stopWaitMs`. */
   stop(): Promise<void>;
 }
 
@@ -81,10 +86,12 @@ interface Seen {
   endedAt: number | null;
   holdOff: Ended["holdOff"] | null;
   notWanted: Record<string, number>;
+  /** Another process held its lock at the last look that checked. */
+  held: boolean;
 }
 
 export function watchSessions(o: ReportingOptions): Reporting {
-  const { claudeDir, io, isAlive = alive, pid = process.pid, gapMs = GAP_MS } = o;
+  const { claudeDir, io, isAlive = alive, pid = process.pid, gapMs = GAP_MS, stopWaitMs = STOP_WAIT_MS } = o;
   const projectsDir = path.join(claudeDir, "projects");
   const seen = new Map<string, Seen>();
   let first = true;
@@ -150,9 +157,14 @@ export function watchSessions(o: ReportingOptions): Reporting {
         const st = await io.stat(file);
         if (!st) continue;
         let s = seen.get(id);
-        if (!s) seen.set(id, (s = { file, mtimeMs: st.mtimeMs, size: st.size, cwd: null, running: null, queued: false, endedAt: null, holdOff: null, notWanted: {} }));
+        if (!s) seen.set(id, (s = { file, mtimeMs: st.mtimeMs, size: st.size, cwd: null, running: null, queued: false, endedAt: null, holdOff: null, notWanted: {}, held: false }));
         Object.assign(s, { file, mtimeMs: st.mtimeMs, size: st.size });
-        if (s.running || s.queued || st.mtimeMs < now - windowMs || (s.endedAt !== null && st.mtimeMs <= s.endedAt)) continue;
+        if (s.running || s.queued || st.mtimeMs < now - windowMs) continue;
+        if (s.endedAt !== null && st.mtimeMs <= s.endedAt) {
+          // The lock let go with no write after the one it was held at: the next write is taken.
+          if (s.held && !(await heldByAnother(id, now, config))) s.held = false;
+          continue;
+        }
         if (s.holdOff) {
           const ends = s.holdOff.until <= now || (!!s.holdOff.projects && (await nowTaken(s.holdOff, config)));
           if (!ends) {
@@ -162,6 +174,14 @@ export function watchSessions(o: ReportingOptions): Reporting {
           s.holdOff = null;
         }
         if (await heldByAnother(id, now, config)) {
+          s.held = true;
+          s.endedAt = st.mtimeMs;
+          continue;
+        }
+        if (s.held) {
+          // The lock let go and the transcript moved between two looks: the session most likely
+          // closed just after a turn, so this write is left too.
+          s.held = false;
           s.endedAt = st.mtimeMs;
           continue;
         }
@@ -220,7 +240,9 @@ export function watchSessions(o: ReportingOptions): Reporting {
       if (timer) clearTimeout(timer);
       const running = [...seen.values()].flatMap((s) => s.running ?? []);
       for (const r of running) r.stop();
-      await Promise.all(running.map((r) => r.done));
+      let timeout: ReturnType<typeof setTimeout> | undefined;
+      await Promise.race([Promise.all(running.map((r) => r.done)), new Promise((r) => (timeout = setTimeout(r, stopWaitMs)))]);
+      clearTimeout(timeout);
     },
   };
 }

@@ -123,10 +123,39 @@ test("a lock counts as fresh for three of its holder's slowest passes, which a l
   await w.look();
   expect(ids()).toEqual([]);
   age(130);
+  await w.look(); // the lock let go before the transcript moved
   await wait(20);
   m.write("s1");
   await w.look();
   expect(ids()).toEqual(["s1"]);
+});
+
+test("a session whose last write and lock letting go fall between two looks isn't reported: it closed just after a turn; its next write is", async () => {
+  const m = machine();
+  fs.mkdirSync(path.dirname(lockPath(m.claudeDir, "s1")), { recursive: true });
+  fs.writeFileSync(lockPath(m.claudeDir, "s1"), JSON.stringify({ pid: OTHER, detached: false }));
+  m.write("s1");
+  const { w, ids } = watch(m, { isAlive: (pid) => pid !== OTHER || fs.existsSync(lockPath(m.claudeDir, "s1")) });
+  await w.look();
+  await wait(20);
+  m.write("s1");
+  fs.rmSync(lockPath(m.claudeDir, "s1"));
+  await w.look();
+  await w.look();
+  expect(ids()).toEqual([]);
+  await wait(20);
+  m.write("s1");
+  await until(() => ids().includes("s1"));
+});
+
+test("stop waits for a report stuck in a pass at most stopWaitMs", async () => {
+  const m = machine();
+  m.write("s1");
+  const w = watchSessions({ claudeDir: m.claudeDir, io: nodeIo(), config: async () => m.config, report: () => new Promise<Ended>(() => {}), isOff: async () => false, log: () => {}, gapMs: 0, stopWaitMs: 200 });
+  await until(() => w.reporting().includes("s1"));
+  const started = Date.now();
+  await w.stop();
+  expect(Date.now() - started).toBeLessThan(2000);
 });
 
 test("a session that stopped being reported is reported again only once its transcript moves", async () => {

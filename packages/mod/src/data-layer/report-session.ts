@@ -54,7 +54,8 @@
 // One data layer reports a session: each takes <claude dir>/isoplan/live/<session>.json (src/wake/
 // lock.ts), the plugin's naming its own script, when its window's hooks module started (`--since`)
 // and that window's Claude Code process, the runner's `detached`, and each refreshes it each pass
-// while it holds it; a lock counts as fresh for three of its holder's slowest passes (lockFreshMs). The
+// while it holds it. The runner counts a lock as fresh for three of its own slowest passes
+// (lockFreshMs, from its config.json), the plugin's data layer for LOCK_FRESH_MS. The
 // runner's doesn't start while another holds it, and ends as soon as the plugin's takes it over.
 // The plugin's takes it regardless, and goes on without it if the folder can't be written. It takes
 // it back each pass, unless the plugin's data layer holding it, with a fresh lock, is the newest copy
