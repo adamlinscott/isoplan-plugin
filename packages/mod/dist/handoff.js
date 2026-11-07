@@ -8901,7 +8901,9 @@ async function handOverCommand(argv) {
 	const file = flag(argv, "--brief") || stop("Missing --brief <file>.");
 	const written = (await fs.readFile(file, "utf8").catch(() => stop(`There is no brief at ${file}: write it there first.`))).trim();
 	if (!written) stop(`The brief at ${file} is empty.`);
-	const taskPath = flag(argv, "--task");
+	if (argv.includes("--task") && flag(argv, "--task") === null) stop("hand-over --task needs the task file.");
+	const preparedTask = path.join(outDir(id), "task.md");
+	const taskPath = flag(argv, "--task") ?? await fs.access(preparedTask).then(() => preparedTask, () => null);
 	const task = taskPath === null ? null : (await fs.readFile(taskPath, "utf8").catch(() => stop(`There is no task at ${taskPath}: write it there first.`))).trim();
 	if (task === "") stop(`The task at ${taskPath} is empty.`);
 	if (task && task.length > 4e3) stop(`The task at ${taskPath} is ${task.length} characters long; a task can be at most ${MAX_TASK_LENGTH}. Shorten it and run hand-over again.`);

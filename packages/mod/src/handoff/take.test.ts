@@ -119,6 +119,14 @@ test("a spin-off: its task goes in task.md beside the brief, and the session's f
   expect(prompt).not.toContain(task);
 });
 
+test("a spin-off on a platform with no terminal to open: the failure names its task file too", async () => {
+  const t = await handedOver("h2u");
+  const taken = await takeHandoff({ handoff: { ...t.handoff, task: "Write the docs." }, mode: "terminal", session: SESSION }, { ...t.options, platform: "linux" });
+  const folder = path.join(t.claudeDir, "isoplan", "handoffs", "h2u");
+  expect(taken.failures).toEqual([{ step: "open", output: expect.stringContaining(`the brief is ${path.join(folder, "brief.md")}, and its task is ${path.join(folder, "task.md")}: open Claude Code there yourself.`) }]);
+  expect(t.opened).toEqual([]);
+});
+
 test("headless: a session claude agents doesn't list is reported, not taken", async () => {
   const t = await handedOver("h2b");
   const taken = await takeHandoff({ handoff: t.handoff, mode: "headless", session: SESSION }, { ...t.options, agents: async () => [] });

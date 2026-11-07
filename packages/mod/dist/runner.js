@@ -12648,7 +12648,7 @@ async function takeHandoff(message, o) {
 			configDir: o.env.CLAUDE_CONFIG_DIR ?? null
 		});
 		if (!l) {
-			await fail("open", `Opening a terminal isn't supported on ${o.platform} yet. The worktree is ${dir} and the brief is ${briefFile}: open Claude Code there yourself.`);
+			await fail("open", `Opening a terminal isn't supported on ${o.platform} yet. The worktree is ${dir} and the brief is ${briefFile}${taskFile ? `, and its task is ${taskFile}` : ""}: open Claude Code there yourself.`);
 			return done();
 		}
 		if (orca) {

@@ -31,8 +31,9 @@
 //
 // A spin-off (#91) is a hand-over with a task of its own: prepare `--spin-off` names a task file,
 // which the agent writes the task to as the person gave it, and asks for the brief written for that
-// task (prompts/spin-off.md); hand-over `--task <file>` sends it, at most MAX_TASK_LENGTH
-// characters, on the check and in the handoff, once it has cleared the secret scan with the brief.
+// task (prompts/spin-off.md); hand-over `--task <file>`, or that task file when --task is left out,
+// sends it, at most MAX_TASK_LENGTH characters, on the check and in the handoff, once it has
+// cleared the secret scan with the brief.
 // Nothing here stops or pauses the session handing over, a spin-off or not.
 //
 // `--to me` (or `myself`) hands the room to a new session of the person's own (isoplan-app/isoplan#109):
@@ -257,7 +258,10 @@ async function handOverCommand(argv: string[]): Promise<string> {
   const file = flag(argv, "--brief") || stop("Missing --brief <file>.");
   const written = (await fs.readFile(file, "utf8").catch(() => stop(`There is no brief at ${file}: write it there first.`))).trim();
   if (!written) stop(`The brief at ${file} is empty.`);
-  const taskPath = flag(argv, "--task");
+  if (argv.includes("--task") && flag(argv, "--task") === null) stop("hand-over --task needs the task file.");
+  // A task written at prepare --spin-off goes out with the brief even when --task wasn't given.
+  const preparedTask = path.join(outDir(id), "task.md");
+  const taskPath = flag(argv, "--task") ?? (await fs.access(preparedTask).then(() => preparedTask, () => null));
   const task = taskPath === null ? null : (await fs.readFile(taskPath, "utf8").catch(() => stop(`There is no task at ${taskPath}: write it there first.`))).trim();
   if (task === "") stop(`The task at ${taskPath} is empty.`);
   if (task && task.length > MAX_TASK_LENGTH) stop(`The task at ${taskPath} is ${task.length} characters long; a task can be at most ${MAX_TASK_LENGTH}. Shorten it and run hand-over again.`);
