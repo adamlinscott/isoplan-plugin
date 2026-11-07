@@ -12,6 +12,7 @@ import type { AddressInfo } from "node:net";
 import path from "node:path";
 import { afterEach, expect, test, vi } from "vitest";
 import { reportSession, sessionLog, startDetached, type ReportSessionOptions } from "./report-session.js";
+import type { DataLayerLine } from "../lines.js";
 import { WebSocketServer } from "ws";
 import { modDir, tempRoot } from "./fixture.js";
 
@@ -117,6 +118,42 @@ test("a session in a repo the office doesn't take opens no socket, and the runne
   expect(o.state.connections).toEqual([]);
   expect(fs.existsSync(lock)).toBe(false);
   expect(logged()).toContain("stopping: no office this reports to takes github.com/team/app, so it holds off until one does");
+});
+
+/** session() in a repo the office doesn't take, reported by the runner with `emit` in front of its log; its log. */
+async function notTaken(emit: (line: DataLayerLine, log: (line: DataLayerLine) => void) => void) {
+  const o = await office();
+  o.state.repos = ["github.com/team/other"];
+  const root = tempRoot();
+  const claudeDir = path.join(root, "claude");
+  const repo = session(claudeDir, root);
+  fs.writeFileSync(path.join(claudeDir, "isoplan", "config.json"), JSON.stringify({ server: o.url }));
+  const log = sessionLog(claudeDir, "s1");
+  const ended = await inRunner(claudeDir, repo, { emit: (line) => emit(line, log.emit) });
+  await log.flushed();
+  return { ended, logged: fs.readFileSync(path.join(claudeDir, "isoplan", "logs", "s1.log"), "utf8") };
+}
+
+test("an error during a pass that then holds off as not taken is logged and is why it ended, and the hold-off is kept (#104)", async () => {
+  const { ended, logged } = await notTaken((line, log) => {
+    if (line.type === "status" && line.state === "not-approved") throw new Error("boom: the status line broke");
+    log(line);
+  });
+  expect(ended.why).toMatch(/^something went wrong in reporting it: Error: boom: the status line broke/);
+  expect(ended.holdOff).toMatchObject({ projects: ["github.com/team/app"] });
+  expect(logged).toContain("stopping: no office this reports to takes github.com/team/app");
+  expect(logged).toContain("stopping: something went wrong in reporting it: Error: boom: the status line broke");
+});
+
+test("a throw in the loop after an earlier error ended the session is logged as well as the earlier one (#104)", async () => {
+  const { ended, logged } = await notTaken((line, log) => {
+    if (line.type === "status" && line.state === "not-approved") throw new Error("boom: the status line broke");
+    if (line.type === "log" && line.text.startsWith("stopping: no office")) throw new Error("boom: the log line broke");
+    log(line);
+  });
+  expect(ended.why).toMatch(/^something went wrong in reporting it: Error: boom: the status line broke/);
+  expect(logged).toContain("stopping: something went wrong in reporting it: Error: boom: the status line broke");
+  expect(logged).toContain("then, as it stopped, something else went wrong: Error: boom: the log line broke");
 });
 
 // #92: a session may be seen before Claude Code has written a line that names the session's folder.

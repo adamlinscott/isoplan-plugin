@@ -352,16 +352,16 @@ async function twoSessions() {
   return { o, m, of, logOf };
 }
 
-/** watchSessions as the worker runs it, with s1's report given `s1` in place of its own emit or shared pairing and list; how many times each session was started. */
-function runnerWith(m: ReturnType<typeof machine>, s1: { emit?: (line: DataLayerLine, emit: (line: DataLayerLine) => void) => void; shared?: ReportSessionOptions["shared"] }) {
+/** watchSessions as the worker runs it, with s1's report given `s1` in place of its own emit, isOff or shared pairing and list; how many times each session was started. */
+function runnerWith(m: ReturnType<typeof machine>, s1: { emit?: (line: DataLayerLine, emit: (line: DataLayerLine) => void) => void; isOff?: () => Promise<boolean>; shared?: ReportSessionOptions["shared"] }) {
   vi.stubEnv("CLAUDE_CONFIG_DIR", m.claudeDir);
   const starts: string[] = [];
   const report = async ({ sessionId, cwd, notWanted, closed }: ToReport) => {
     starts.push(sessionId);
     const log = sessionLog(m.claudeDir, sessionId);
-    const injected = sessionId === "s1" ? s1 : {};
+    const injected: typeof s1 = sessionId === "s1" ? s1 : {};
     const emit = injected.emit ? (line: DataLayerLine) => injected.emit!(line, log.emit) : log.emit;
-    const ended = await reportSession({ sessionId, cwd, by: "runner", appDir: modDir, emit, closed, notWanted, isOff: async () => false, ...(injected.shared && { shared: injected.shared }) });
+    const ended = await reportSession({ sessionId, cwd, by: "runner", appDir: modDir, emit, closed, notWanted, isOff: injected.isOff ?? (async () => false), ...(injected.shared && { shared: injected.shared }) });
     await log.flushed();
     return ended;
   };
@@ -415,6 +415,25 @@ test("a session whose report rejects in a promise nothing waits for ends alone, 
   of("s1")!.drop();
   await until(() => !w.reporting().includes("s1"));
   expect(logOf("s1")).toMatch(/stopping: something went wrong in reporting it: Error: boom: the list broke/);
+  expect(fs.existsSync(lockPath(m.claudeDir, "s1"))).toBe(false);
+  await wait(1500);
+  expect(w.reporting()).toEqual(["s2"]);
+  expect(of("s2")!.closed).toBe(false);
+});
+
+test("a session whose reporting loop itself throws ends alone, its links closed, its lock gone and its log saying why, while another session the runner reports goes on", async () => {
+  const { m, of, logOf } = await twoSessions();
+  // Asked as it starts and after each pass's wait: the loop awaits it, so its throw is the loop's own.
+  let asked = 0;
+  const { w } = runnerWith(m, {
+    isOff: async () => {
+      if (asked++ > 0) throw new Error("boom: the loop broke");
+      return false;
+    },
+  });
+  await until(() => !!of("s1") && !!of("s2"));
+  await until(() => of("s1")!.closed && !w.reporting().includes("s1"));
+  expect(logOf("s1")).toMatch(/stopping: something went wrong in reporting it: Error: boom: the loop broke/);
   expect(fs.existsSync(lockPath(m.claudeDir, "s1"))).toBe(false);
   await wait(1500);
   expect(w.reporting()).toEqual(["s2"]);

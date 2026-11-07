@@ -172,7 +172,8 @@ export interface Ended {
 
 /**
  * What keeps an error in reporting one session to that session, in the runner (#104): a throw in a
- * callback the session's links run, or the rejection of a promise nothing waits for, ends this
+ * callback the session's links run or in a link's own socket handlers and pacing timer (onError in
+ * link.ts), or the rejection of a promise nothing waits for, ends this
  * session alone at its next wait, and a throw in its own loop at once; either way its links close,
  * its lock goes and its log says why, the error's text checked for secrets first. In the plugin's
  * data layer it changes nothing: an error ends that process, and its one session, as before (main.ts).
@@ -235,16 +236,20 @@ function contained(patterns: () => Promise<Pattern[] | null>): Containment {
 export async function reportSession(o: ReportSessionOptions): Promise<Ended> {
   if (o.by !== "runner") return reporting(o, passThrough());
   const { dir: claudeDir } = claudePaths(process.env, os.homedir());
-  const c = contained(() => loadPatterns(path.join(o.appDir, "secret-patterns.json"), path.join(claudeDir, "isoplan", "secret-patterns.json"), () => {}));
+  const patterns = () => loadPatterns(path.join(o.appDir, "secret-patterns.json"), path.join(claudeDir, "isoplan", "secret-patterns.json"), () => {});
+  const c = contained(patterns);
   try {
     return await reporting(o, c);
   } catch (err) {
+    // An earlier error may have ended it already: this one is logged too.
+    const earlier = c.why();
     c.fail(err);
     for (const link of c.links()) link.close();
     await releaseLock(lockPath(claudeDir, o.sessionId), process.pid).catch(() => {});
     const why = await c.why()!;
     try {
       o.emit({ type: "log", text: `stopping: ${why}` });
+      if (earlier) o.emit({ type: "log", text: `then, as it stopped, something else went wrong: ${errorText(err, await patterns().catch(() => null))}` });
     } catch {
       // Its log can't be written: the runner's says it (reporting.ts).
       throw new Error(why);
@@ -446,6 +451,7 @@ async function reporting(o: ReportSessionOptions, c: Containment): Promise<Ended
       // Another repo's files, commands and checkouts go only to a server that welcomed them, and
       // only for its office's repos; the link applies this at every send, on every connection.
       filter: (f, projects) => forOffice(candidates?.workspace ? inRepos(f) : f, projects, checkouts),
+      onError: c.fail,
       answered: c.guard((id: string) => answered(id), false),
       // The owner released a withheld report on this office's floor: it goes to this office alone, now, not on the next pass.
       // The owner answered a question, or sent the session a message, from the floor: it goes to the
@@ -595,7 +601,7 @@ async function reporting(o: ReportSessionOptions, c: Containment): Promise<Ended
   const startedAt = Date.now();
   // Whether to go on to the next pass, once this one's wait is over; each reason not to is logged.
   const goOn = async () => {
-    // In the runner only `closed` ends the wait early: the runner stopped.
+    // In the runner only the runner stopping (`closed`), or an error that ended the session, ends the wait early.
     if (!(await wait(dormant && !pending ? DORMANT_MS : config.streamSeconds * 1000))) {
       const failure = c.why();
       return failure ? stopping(await failure) : inRunner ? stopping("the runner stopped") : false;
@@ -749,7 +755,13 @@ async function reporting(o: ReportSessionOptions, c: Containment): Promise<Ended
 
   for (const link of links()) link.close();
   await releaseLock(lock, process.pid).catch(() => {});
-  if (c.why()) return { why };
+  // An error that ended the session during a pass that then stopped for another reason is said too,
+  // and is why it ended; a hold-off that reason brings is kept.
+  const failure = c.why();
+  if (failure) {
+    const text = await failure;
+    if (why !== text) stopping(text);
+  }
   // The offices that didn't want the session, each until its hold-off ends: the runner reads no list
   // of theirs, and lists only of the offices configured now (reporting.ts).
   const notWanted = Object.fromEntries(runs.filter((r) => r.unwanted).map((r) => [r.office.server, r.unwantedUntil ?? Date.now() + HOLD_OFF_MS]));

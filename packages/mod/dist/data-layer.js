@@ -11564,7 +11564,7 @@ const same = (a, b) => a !== void 0 && JSON.stringify(a) === JSON.stringify(b);
 const STABLE_MS = 3e4;
 const OUTBOX_MAX = 100;
 const OUTBOX_MAX_AGE_MS = 36e5;
-function createLink({ url, hello, emit, minIntervalMs = 1e3, retryBaseMs = 1e3, retryCapMs = 3e4, notWantedRetryMs = 36e5, takenRetryMs = 36e5, onNotWanted, onPairingEnded, onMessage, onDrive, onOpen, onClose, filter = (facts) => facts, answered, pairing, pairPollMs = 5e3, admit, random = Math.random }) {
+function createLink({ url, hello, emit, minIntervalMs = 1e3, retryBaseMs = 1e3, retryCapMs = 3e4, notWantedRetryMs = 36e5, takenRetryMs = 36e5, onNotWanted, onPairingEnded, onMessage, onDrive, onOpen, onClose, filter = (facts) => facts, answered, pairing, pairPollMs = 5e3, admit, random = Math.random, onError }) {
 	const outbox = [];
 	let latest = null;
 	let socket = null;
@@ -11585,6 +11585,14 @@ function createLink({ url, hello, emit, minIntervalMs = 1e3, retryBaseMs = 1e3, 
 	let refusals = 0;
 	let projects = null;
 	let stable = null;
+	const contained = (fn) => (...args) => {
+		if (!onError) return fn(...args);
+		try {
+			fn(...args);
+		} catch (err) {
+			onError(err);
+		}
+	};
 	function connect() {
 		retry = null;
 		if (!admit) return proceed();
@@ -11630,7 +11638,7 @@ function createLink({ url, hello, emit, minIntervalMs = 1e3, retryBaseMs = 1e3, 
 		const ws = new WebSocket(url);
 		socket = ws;
 		sentToken = token;
-		ws.onopen = () => {
+		ws.onopen = contained(() => {
 			if (socket !== ws) return;
 			failures = 0;
 			isOpen = true;
@@ -11649,10 +11657,10 @@ function createLink({ url, hello, emit, minIntervalMs = 1e3, retryBaseMs = 1e3, 
 				state: "connected"
 			});
 			onOpen?.();
-		};
-		ws.onmessage = (event) => {
+		});
+		ws.onmessage = contained((event) => {
 			if (socket === ws) receive(event.data);
-		};
+		});
 		ws.onerror = () => {
 			if (socket !== ws) return;
 			dropped();
@@ -11746,7 +11754,7 @@ function createLink({ url, hello, emit, minIntervalMs = 1e3, retryBaseMs = 1e3, 
 		if (!changed) return;
 		const wait = sentAt + minIntervalMs - Date.now();
 		if (wait > 0) {
-			pacing = setTimeout(flush, wait);
+			pacing = setTimeout(contained(flush), wait);
 			return;
 		}
 		send({
@@ -12401,10 +12409,12 @@ function contained(patterns) {
 async function reportSession(o) {
 	if (o.by !== "runner") return reporting(o, passThrough());
 	const { dir: claudeDir } = claudePaths(process.env, os.homedir());
-	const c = contained(() => loadPatterns(path.join(o.appDir, "secret-patterns.json"), path.join(claudeDir, "isoplan", "secret-patterns.json"), () => {}));
+	const patterns = () => loadPatterns(path.join(o.appDir, "secret-patterns.json"), path.join(claudeDir, "isoplan", "secret-patterns.json"), () => {});
+	const c = contained(patterns);
 	try {
 		return await reporting(o, c);
 	} catch (err) {
+		const earlier = c.why();
 		c.fail(err);
 		for (const link of c.links()) link.close();
 		await releaseLock(lockPath(claudeDir, o.sessionId), process.pid).catch(() => {});
@@ -12413,6 +12423,10 @@ async function reportSession(o) {
 			o.emit({
 				type: "log",
 				text: `stopping: ${why}`
+			});
+			if (earlier) o.emit({
+				type: "log",
+				text: `then, as it stopped, something else went wrong: ${errorText(err, await patterns().catch(() => null))}`
 			});
 		} catch {
 			throw new Error(why);
@@ -12656,6 +12670,7 @@ async function reporting(o, c) {
 			run.gate.notWanted();
 		}),
 		filter: (f, projects) => forOffice(candidates?.workspace ? inRepos(f) : f, projects, checkouts),
+		onError: c.fail,
 		answered: c.guard((id) => answered(id), false),
 		onMessage: c.guard((message) => {
 			if (message.type === "request" && message.kind === "owner-answer") {
@@ -13067,7 +13082,11 @@ async function reporting(o, c) {
 	} while (await goOn());
 	for (const link of links()) link.close();
 	await releaseLock(lock, process.pid).catch(() => {});
-	if (c.why()) return { why };
+	const failure = c.why();
+	if (failure) {
+		const text = await failure;
+		if (why !== text) stopping(text);
+	}
 	const notWanted = Object.fromEntries(runs.filter((r) => r.unwanted).map((r) => [r.office.server, r.unwantedUntil ?? Date.now() + 36e5]));
 	const named = {
 		offices: offices.map((office) => office.server),

@@ -382,3 +382,28 @@ test("link: another repo's edits go only after this connection's welcome, and a 
   expect([l.projects(), edits(s.got.filter((m) => m.type === "full")[1]!)]).toEqual([null, ["a.md"]]);
   l.close();
 });
+
+test("link: a throw in its socket handlers goes to onError, and that handler sends nothing more (#104)", async () => {
+  const s = await server();
+  const errors: unknown[] = [];
+  // As it opens: the full's filter throws.
+  const { link: opening, lines } = link(s.url, { filter: () => { throw new Error("boom: on open"); }, onError: (err) => errors.push(err) });
+  opening.update(facts("active"));
+  await until(() => errors.length === 1);
+  expect(String(errors[0])).toBe("Error: boom: on open");
+  expect(types(s.got)).toEqual(["hello"]);
+  expect(lines.some((x) => x.type === "status" && x.state === "connected")).toBe(false);
+  opening.close();
+  // On a message: the welcome's flush throws.
+  s.got.length = 0;
+  const { link: l } = link(s.url, { minIntervalMs: 0, filter: (f, projects) => { if (projects) throw new Error("boom: on welcome"); return f; }, onError: (err) => errors.push(err) });
+  l.update(facts("active"));
+  await until(() => s.got.length === 2 && s.sockets.length === 2);
+  l.update(facts("idle", ["a.md"]));
+  await until(() => s.got.length === 3);
+  s.sockets[1]!.send(JSON.stringify({ type: "welcome", v: PROTOCOL_VERSION, projects: ["github.com/adam/isoplan"] }));
+  await until(() => errors.length === 2);
+  expect(String(errors[1])).toBe("Error: boom: on welcome");
+  expect(types(s.got)).toEqual(["hello", "full 0", "changes 1"]);
+  l.close();
+});
