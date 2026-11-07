@@ -35,15 +35,15 @@
 // The pipe's end passes the runner's JSON lines on on its stdout (src/lines.ts). Claude Code closes
 // the child's stdin at launch, so what goes the other way, a title, goes through a file the line
 // names, which the runner reads. While the runner can't be reached (a `runner` line, `down`) the
-// status line says the session isn't reaching the office until it is back; the pipe's end starts
-// the runner and tries again, and the runner reports the session afresh once it is through. A pipe's
+// status line says the session isn't reaching the office until it is back, or why the runner won't
+// start (`held`); the pipe's end starts the runner and tries again, and the runner reports the session afresh once it is through. A pipe's
 // end that ends is started again, backing off while it keeps failing; one running for a session
 // id the process has left (a /clear, a resume) is started again for the new id. It passes the
 // time this module started (`--since`), so the hooks module of a window that started later wins the
 // session. Once this copy's folder has gone (Claude Code cleans up a version some time after an
 // update), nothing is started again, and the status line asks for /reload-plugins. One told that
-// another has the session (a `superseded` line: a newer version's after a reload, or
-// another window's) is started again only SUPERSEDED_RECHECK_MS later, and goes on if the session
+// another has the session (a `superseded` line: a newer version's after a reload, another
+// window's, or an earlier version's data layer still running for it) is started again only SUPERSEDED_RECHECK_MS later, and goes on if the session
 // is free by then.
 //
 // The session's context window, the size Claude Code gives the status line (`context_window_size`,
@@ -116,7 +116,7 @@ const floorWaits = new Map<string, (answers: Record<string, string>) => void>();
 let waitsDir: string | null = null; // where the waits are marked, as the data layer said
 let shownStatus: string | undefined; // the status line, without the update note
 let updated = false; // a newer version of the plugin is on disk, loaded at /reload-plugins
-let superseded: "newer" | "window" | null = null; // the data layer said another reports this session now, and why
+let superseded: "newer" | "window" | "earlier" | null = null; // the data layer said another reports this session now, and why
 let marking: Promise<unknown> = Promise.resolve(); // the marks, written in order
 let windowFile: string | null = null; // where the context window goes, as the data layer said
 let windowSent: number | null = null; // the size last written there
@@ -357,7 +357,7 @@ async function run($: Host): Promise<void> {
     stop = null;
     if (superseded) {
       if (superseded === "newer") updated = true;
-      show($, superseded === "newer" ? undefined : "Isoplan: this session is reported from its other window");
+      show($, superseded === "newer" ? undefined : superseded === "earlier" ? EARLIER_TEXT : "Isoplan: this session is reported from its other window");
       superseded = null;
       failures = 0;
       await $.clock.sleep(SUPERSEDED_RECHECK_MS);
@@ -408,7 +408,7 @@ function handle($: Host, text: string): void {
       // Each office's part comes again once the runner reports the session afresh.
       offices.clear();
       pairings.clear();
-      show($, line.state === "down" ? RUNNER_DOWN_TEXT : statusText());
+      show($, line.state === "down" ? RUNNER_DOWN_TEXT[line.held ?? "starting"] : statusText());
       break;
     case "title-ask":
       writeTitle($, line);
@@ -471,7 +471,12 @@ function show($: Host, text: string | undefined): void {
 }
 
 const UPDATED_TEXT = "Isoplan updated: type /reload-plugins";
-const RUNNER_DOWN_TEXT = "Isoplan: this session isn't reaching the office until Isoplan's runner is back; starting it";
+const RUNNER_DOWN_TEXT = {
+  starting: "Isoplan: this session isn't reaching the office until Isoplan's runner is back; starting it",
+  "held-off": "Isoplan: this session isn't reaching the office: Isoplan's runner is holding off for up to an hour (runner.log says why)",
+  "not-installed": "Isoplan: this session isn't reaching the office: Isoplan's runner isn't installed; run the plugin's install script",
+};
+const EARLIER_TEXT = "Isoplan: this session is reported by an earlier version of the plugin still running for it";
 
 // The status line: each office's part that shows anything, or nothing at all.
 function statusText(): string | undefined {

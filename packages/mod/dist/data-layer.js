@@ -1,7 +1,7 @@
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { execFile, spawn } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
 import { statSync } from "node:fs";
@@ -8163,6 +8163,19 @@ async function writeLog(file, text) {
 //#endregion
 //#region src/pipe/pipe.ts
 const pipeInfoPath = (claudeDir) => path.join(claudeDir, "isoplan", "runner", "pipe.json");
+const newNonce = () => randomBytes(16).toString("hex");
+const proofOf = (token, nonce) => createHmac("sha256", token).update(nonce).digest("hex");
+/** The variables of a session's environment its hooks module's end passes on, which the runner reports that session by (report-session.ts). */
+const SESSION_ENV = [
+	"CLAUDE_CODE_PLUGIN_CACHE_DIR",
+	"CLAUDE_CODE_PLUGIN_DIRS",
+	"DISABLE_UPDATES",
+	"DISABLE_AUTOUPDATER",
+	"CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
+	"FORCE_AUTOUPDATE_PLUGINS"
+];
+/** Those of SESSION_ENV that `env` sets. */
+const sessionEnv = (env) => Object.fromEntries(SESSION_ENV.flatMap((name) => typeof env[name] === "string" ? [[name, env[name]]] : []));
 async function readPipeInfo(claudeDir) {
 	try {
 		const { address, token } = JSON.parse(await fs.readFile(pipeInfoPath(claudeDir), "utf8"));
@@ -8173,6 +8186,41 @@ async function readPipeInfo(claudeDir) {
 	} catch {
 		return null;
 	}
+}
+const PROOF_WAIT_MS = 5e3;
+/**
+* Connects to the pipe at `info.address` and has the runner prove it knows the token (see above).
+* Resolves the socket once it has, with every later line given to `onLine`; null when the pipe
+* can't be reached or doesn't prove it, and then nothing of the client's went to it.
+*/
+function openPipe(info, onLine) {
+	return new Promise((resolve) => {
+		const nonce = newNonce();
+		const want = Buffer.from(proofOf(info.token, nonce));
+		let proven = false;
+		const socket = net.connect(info.address);
+		const fail = () => {
+			clearTimeout(timer);
+			socket.destroy();
+			resolve(null);
+		};
+		const timer = setTimeout(fail, PROOF_WAIT_MS);
+		socket.once("connect", () => writeLine(socket, {
+			type: "hi",
+			v: 1,
+			nonce
+		}));
+		socket.on("error", () => {}).once("close", () => proven || fail());
+		readLines(socket, (value) => {
+			if (proven) return onLine(value);
+			const said = value;
+			const proof = said?.type === "proof" ? said.proof : void 0;
+			if (typeof proof !== "string" || Buffer.byteLength(proof) !== want.length || !timingSafeEqual(Buffer.from(proof), want)) return fail();
+			proven = true;
+			clearTimeout(timer);
+			resolve(socket);
+		});
+	});
 }
 /** Calls `onLine` with each whole line that comes in on `socket`, parsed; a line that isn't JSON is passed over. */
 function readLines(socket, onLine, maxBytes = 1 << 20) {
@@ -8201,45 +8249,42 @@ const writeLine = (socket, value) => {
 //#endregion
 //#region src/pipe/client.ts
 const sleepFor = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-/** Connects to the pipe at `address`, or null when it can't be reached. */
-function connect(address) {
-	return new Promise((resolve) => {
-		const socket = net.connect(address);
-		socket.once("connect", () => (socket.off("error", fail), resolve(socket)));
-		const fail = () => (socket.destroy(), resolve(null));
-		socket.once("error", fail);
-	});
-}
+const HELD = {
+	"held-off": "Isoplan's runner is holding off for now (runner.log says why), so this session isn't reported until it starts again",
+	"not-installed": "Isoplan's runner isn't installed here, so this session isn't reported; run the plugin's install script"
+};
 /** Relays the runner's lines for the session until it is superseded or should stop. */
 async function relay(o) {
 	const sleep = o.sleep ?? sleepFor;
 	const readInfo = o.readInfo ?? readPipeInfo;
 	let down = false;
+	let held = null;
 	while (o.goOn()) {
 		const info = await readInfo(o.claudeDir);
-		const socket = info && await connect(info.address);
+		let superseded = false;
+		const socket = info && await openPipe(info, (value) => {
+			const line = value;
+			if (!line || typeof line !== "object" || typeof line.type !== "string") return;
+			o.out(line);
+			if (line.type === "superseded") superseded = true;
+		});
 		if (socket && info) {
 			if (down) o.out({
 				type: "runner",
 				state: "up"
 			});
 			down = false;
-			if (await new Promise((resolve) => {
-				let superseded = false;
-				readLines(socket, (value) => {
-					const line = value;
-					if (!line || typeof line !== "object" || typeof line.type !== "string") return;
-					o.out(line);
-					if (line.type === "superseded") superseded = true;
-				});
-				socket.on("error", () => {}).on("close", () => resolve(superseded ? "superseded" : "closed"));
+			held = null;
+			await new Promise((resolve) => {
+				socket.on("close", () => resolve());
 				writeLine(socket, {
 					type: "hello",
 					v: 1,
 					token: info.token,
 					...o.hello
 				});
-			}) === "superseded") return "superseded";
+			});
+			if (superseded) return "superseded";
 			if (!o.goOn()) break;
 		}
 		if (!down) o.out({
@@ -8247,7 +8292,20 @@ async function relay(o) {
 			state: "down"
 		});
 		down = true;
-		await o.startRunner().catch(() => {});
+		const started = await o.startRunner().catch(() => null);
+		const now = started === "held-off" || started === "not-installed" ? started : null;
+		if (now !== held) {
+			o.out(now ? {
+				type: "runner",
+				state: "down",
+				held: now
+			} : {
+				type: "runner",
+				state: "down"
+			});
+			if (now) o.say?.(HELD[now]);
+			held = now;
+		}
 		await sleep(await o.retryMs());
 	}
 	return "stopped";
@@ -8296,6 +8354,7 @@ async function pipeMain(argv, appDir) {
 	}).started;
 	const io = nodeIo();
 	const version = await fs.readFile(path.join(appDir, ".claude-plugin", "plugin.json"), "utf8").then((text) => String(JSON.parse(text).version ?? "0.0.0")).catch(() => "0.0.0");
+	const said = sessionLog(claudeDir, session);
 	await relay({
 		claudeDir,
 		hello: {
@@ -8304,7 +8363,8 @@ async function pipeMain(argv, appDir) {
 			since: Number(value$1(argv, "--since")) || Date.now(),
 			messages: argv.includes("--messages"),
 			root: appDir,
-			version
+			version,
+			env: sessionEnv(process.env)
 		},
 		out,
 		goOn,
@@ -8312,8 +8372,10 @@ async function pipeMain(argv, appDir) {
 			claudeDir,
 			spawn: spawnHidden
 		}),
+		say: said.say,
 		retryMs: async () => (await loadConfig(io, path.join(appDir, "config.json"), path.join(claudeDir, "isoplan", "config.json"))).runnerRetrySeconds * 1e3
 	});
+	await said.flushed();
 	return 0;
 }
 /** Runs it as the process's whole job, from a script one folder below the plugin's folder. */

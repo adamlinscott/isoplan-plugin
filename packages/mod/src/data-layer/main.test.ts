@@ -391,27 +391,36 @@ test("the runner, reporting a session whose plugin is turned off for its folder,
   expect(fs.existsSync(path.join(claudeDir, "isoplan", "live", "s1.json"))).toBe(false);
 });
 
-test("while an earlier version's data layer holds the session's lock, fresh, the runner doesn't report it for the hooks module and tells that hooks module so; a stale lock counts for nothing", async () => {
+test("while a data layer of an earlier version holds the session's lock, fresh, the runner takes it over for a newer copy's hooks module, and otherwise doesn't report the session for it and tells that hooks module so; a stale lock counts for nothing", async () => {
   const v = versions();
   // A live process of its own stands in for the earlier version's data layer.
   const other = spawn(process.execPath, ["-e", "setTimeout(() => {}, 60000)"], { stdio: "ignore", windowsHide: true });
   children.push(other);
-  const lockOf = (ageMs: number) => {
+  const lockOf = (ageMs: number, version: string, since: number) => {
     fs.mkdirSync(path.dirname(v.lock), { recursive: true });
-    fs.writeFileSync(v.lock, JSON.stringify({ pid: other.pid, dataLayer: "C:/old/dist/data-layer.js", detached: false, since: Date.now(), parent: other.pid }));
+    fs.writeFileSync(v.lock, JSON.stringify({ pid: other.pid, dataLayer: path.join(v.claudeDir, "plugins", "cache", "isoplan", "isoplan", version, "dist", "data-layer.js"), detached: false, since, parent: other.pid }));
     const t = new Date(Date.now() - ageMs);
     fs.utimesSync(v.lock, t, t);
   };
-  lockOf(0);
-  const refused = v.hooked("0.3.0");
+  // Of the same copy, in a window that started later: left to it.
+  lockOf(0, "0.3.0", 10);
+  const refused = v.hooked("0.3.0", { since: 5 });
   const ended = await refused.done;
   expect(ended.why).toBe("an earlier version's data layer already reports this session");
-  expect(refused.lines()).toContainEqual({ type: "superseded", reason: "window" });
+  expect(refused.lines()).toContainEqual({ type: "superseded", reason: "earlier" });
   expect(v.holder()).toBe(other.pid);
 
+  // Of an older copy: taken over.
+  lockOf(0, "0.2.0", 10);
+  const over = v.hooked("0.3.0", { since: 5 });
+  await until(() => v.holder() === process.pid);
+  expect(over.lines().some((l) => l.type === "superseded")).toBe(false);
+  over.stop();
+  await over.done;
+
   // Not refreshed for five minutes: its pid may be another process's.
-  lockOf(5 * 60000);
-  const taken = v.hooked("0.3.0");
+  lockOf(5 * 60000, "0.3.0", 10);
+  const taken = v.hooked("0.3.0", { since: 5 });
   await until(() => v.holder() === process.pid);
   expect(taken.lines().some((l) => l.type === "superseded")).toBe(false);
 });

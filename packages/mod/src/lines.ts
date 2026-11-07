@@ -134,23 +134,27 @@ export interface UpdatedLine {
 }
 
 /**
- * Another hooks module has this session now, and this one's link to the runner ends (src/pipe/
- * server.ts): `newer`, a newer version's (a /reload-plugins), or `window`, this version's in a window
- * that started later, or an earlier version's data layer that reports the session. The hooks module
- * tries again a while later.
+ * Another has this session now, and this hooks module's link to the runner ends (src/pipe/
+ * server.ts): `newer`, a newer version's hooks module (a /reload-plugins); `window`, this version's in
+ * a window that started later; or `earlier`, the data layer process of an earlier version of the
+ * plugin, still running for the session, which the runner can't take it over from
+ * (src/data-layer/report-session.ts). The hooks module tries again a while later.
  */
 export interface SupersededLine {
   type: "superseded";
-  reason: "newer" | "window";
+  reason: "newer" | "window" | "earlier";
 }
 
 /**
  * Said by the pipe's end itself (src/pipe/client.ts): the runner can't be reached (`down`), so the
- * session isn't reaching the office while it starts the runner and tries again; or it is through again (`up`).
+ * session isn't reaching the office while it starts the runner and tries again; or it is through
+ * again (`up`). With `held`, the runner won't start: it is `held-off` for now (the office server
+ * didn't want it, or it kept crashing), or `not-installed`.
  */
 export interface RunnerLine {
   type: "runner";
   state: "down" | "up";
+  held?: "held-off" | "not-installed";
 }
 
 /** A problem worth a line in the debug log. */

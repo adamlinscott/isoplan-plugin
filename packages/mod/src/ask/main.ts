@@ -7,12 +7,12 @@
 // names an office server that gave the session its rights (#105), once per office that did. It asks
 // through the machine's runner, over the runner's pipe (src/pipe), which asks the office as this
 // session (machine.ts) only while this session's hooks module is connected to it, after its secret
-// scan of the question. With the runner out of reach, the agent is told to carry on.
+// scan of the question, once the runner has proved it is the runner (openPipe). With the runner out
+// of reach, the agent is told to carry on.
 
-import net from "node:net";
 import os from "node:os";
 import { claudePaths } from "../data-layer/identity.js";
-import { readLines, readPipeInfo, writeLine, type PipeAnswer, type PipeAsk } from "../pipe/pipe.js";
+import { openPipe, readPipeInfo, writeLine, type PipeAnswer, type PipeAsk } from "../pipe/pipe.js";
 
 const flag = (argv: string[], name: string) => {
   const i = argv.indexOf(name);
@@ -20,7 +20,8 @@ const flag = (argv: string[], name: string) => {
 };
 const flags = (argv: string[], name: string) => argv.flatMap((arg, i) => (arg === name && argv[i + 1] !== undefined ? [argv[i + 1]!] : []));
 
-const UNREACHABLE = "The room can't be asked right now: Isoplan's runner isn't running on this machine (it is being started). Carry on without the answer.";
+// No pipe.json, a pipe that didn't answer or prove it is the runner, or a runner that stopped mid-ask.
+const UNREACHABLE = "The room can't be asked right now: this session can't reach Isoplan's runner on this machine. Carry on without the answer.";
 
 async function readStdin(): Promise<string> {
   const chunks: Buffer[] = [];
@@ -38,15 +39,15 @@ async function main(argv: string[]): Promise<string> {
   const info = await readPipeInfo(claudeDir);
   if (!info) return UNREACHABLE;
   const request: PipeAsk = { type: "ask", v: 1, token: info.token, session, cwd, servers: flags(argv, "--server"), ...(flag(argv, "--key") ? { key: flag(argv, "--key")! } : {}), ...(ack ? { ack } : { question }) };
+  let said: string | null = null;
+  const socket = await openPipe(info, (value) => {
+    const answer = value as Partial<PipeAnswer>;
+    if (answer?.type === "answer" && typeof answer.text === "string") said = answer.text;
+  });
+  if (!socket) return UNREACHABLE;
   return new Promise((resolve) => {
-    let said: string | null = null;
-    const socket = net.connect(info.address);
-    socket.on("connect", () => writeLine(socket, request));
-    readLines(socket, (value) => {
-      const answer = value as Partial<PipeAnswer>;
-      if (answer?.type === "answer" && typeof answer.text === "string") said = answer.text;
-    });
-    socket.on("error", () => {}).on("close", () => resolve(said ?? UNREACHABLE));
+    socket.on("close", () => resolve(said ?? UNREACHABLE));
+    writeLine(socket, request);
   });
 }
 

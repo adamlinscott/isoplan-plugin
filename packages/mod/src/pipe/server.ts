@@ -1,13 +1,17 @@
 // The runner's end of the local pipe (pipe.ts): the worker serves it, and it is how each session's
 // hooks module reaches the runner (ADR 0007 step 2).
 //
-// A message without the worker's token is refused and its connection closed. A hooks module's end
+// A client may first say hi with a nonce, answered with its proof (pipe.ts), so it knows this is the
+// runner before it sends the token. A message without the worker's token is refused and its
+// connection closed. A hooks module's end
 // says hello for one session, and from then on that connection is that session's alone: it is sent
 // only that session's lines. One connection is registered per session: of two, the one from the
 // newer version of the plugin keeps it, and of one version the later window's (`since`); the other
 // is told it is `superseded` and closed, as a data layer was when another took its session, and its
-// hooks module tries again a minute later. An ask (the ask_room script) is answered only for a
-// session whose hooks module is registered now, so a process can't ask as a session that isn't its own.
+// hooks module tries again a minute later. An ask (the ask_room script) is answered only with the
+// token, and only for a session whose hooks module is registered now, as that hooks module's
+// session: in its folder, whatever folder the ask names. The token is the worker's alone, not the
+// session's, so it is the user's own processes that can ask, and only for a session that is open.
 //
 // `onChange` is called with a session's id whenever its registered connection changes or goes, so
 // the runner reports it again with the hooks module it has now (src/runner/reporting.ts).
@@ -15,7 +19,7 @@
 import { timingSafeEqual } from "node:crypto";
 import net, { type Socket } from "node:net";
 import type { DataLayerLine } from "../lines.js";
-import { newToken, pipeAddress, preparePipe, readLines, writeLine, writePipeInfo, type PipeAsk, type PipeHello } from "./pipe.js";
+import { newToken, pipeAddress, preparePipe, proofOf, readLines, sessionEnv, writeLine, writePipeInfo, type PipeAsk, type PipeHello, type PipeHi } from "./pipe.js";
 
 /** A session's registered hooks module, as the runner reports for it. */
 export interface Hooked {
@@ -25,6 +29,8 @@ export interface Hooked {
   messages: boolean;
   root: string;
   version: string;
+  /** The variables of the session's own environment it passed on (pipe.ts SESSION_ENV). */
+  env: Record<string, string>;
   /** Sends the hooks module one of its session's lines; a `superseded` closes the connection after it. */
   send(line: DataLayerLine): void;
   /** Settles once the connection has gone. */
@@ -79,7 +85,8 @@ export async function createPipeServer(o: PipeServerOptions): Promise<PipeServer
   const tokenBytes = Buffer.from(token);
   const registered = new Map<string, Hooked & { socket: Socket }>();
   const sockets = new Set<Socket>();
-  const hasToken = (m: { token?: unknown }) => typeof m.token === "string" && m.token.length === token.length && timingSafeEqual(Buffer.from(m.token), tokenBytes);
+  // By bytes: a token of as many characters, some of them not ASCII, is longer in bytes.
+  const hasToken = (m: { token?: unknown }) => typeof m.token === "string" && Buffer.byteLength(m.token) === tokenBytes.length && timingSafeEqual(Buffer.from(m.token), tokenBytes);
 
   const register = (socket: Socket, hello: PipeHello) => {
     let gone = () => {};
@@ -91,6 +98,7 @@ export async function createPipeServer(o: PipeServerOptions): Promise<PipeServer
       messages: hello.messages === true,
       root: hello.root,
       version: hello.version,
+      env: hello.env && typeof hello.env === "object" ? sessionEnv(hello.env) : {},
       socket,
       closed,
       send: (line) => {
@@ -115,7 +123,8 @@ export async function createPipeServer(o: PipeServerOptions): Promise<PipeServer
   };
 
   const answer = async (socket: Socket, request: PipeAsk) => {
-    const text = registered.has(request.session) ? await o.ask(request).catch((err: unknown) => `The room couldn't be asked: ${String((err as Error)?.message ?? err)}. Carry on without the answer.`) : NOT_CONNECTED;
+    const hooked = registered.get(request.session);
+    const text = hooked ? await o.ask({ ...request, cwd: hooked.cwd }).catch((err: unknown) => `The room couldn't be asked: ${String((err as Error)?.message ?? err)}. Carry on without the answer.`) : NOT_CONNECTED;
     writeLine(socket, { type: "answer", text });
     socket.end();
   };
@@ -124,9 +133,15 @@ export async function createPipeServer(o: PipeServerOptions): Promise<PipeServer
     sockets.add(socket);
     socket.on("close", () => sockets.delete(socket)).on("error", () => {});
     let said = false;
+    let greeted = false;
     readLines(socket, (value) => {
       const m = (value ?? {}) as Partial<PipeHello & PipeAsk>;
-      // One message per connection; any other, or one without the token, closes it.
+      const hi = m as Partial<PipeHi>;
+      if (!said && !greeted && hi.type === "hi" && typeof hi.nonce === "string" && hi.nonce.length <= 200) {
+        greeted = true;
+        return writeLine(socket, { type: "proof", proof: proofOf(token, hi.nonce) });
+      }
+      // One message per connection after the hi; any other, or one without the token, closes it.
       if (said || !hasToken(m)) return void socket.destroy();
       said = true;
       if (isHello(m)) return register(socket, m);

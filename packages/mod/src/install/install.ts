@@ -262,7 +262,7 @@ async function finishOptOut({ claudeDir, settings }: Paths): Promise<string[]> {
   return changes;
 }
 
-// The runner's state, the machine's pairing credential (pairing.json) and its locks (pairing.lock
+// The runner's state and its pipe's socket folder (pipe/, on macOS and Linux), the machine's pairing credential (pairing.json) and its locks (pairing.lock
 // while a pairing is under way, pairing.write.lock while the file is written), and the sessions'
 // traces: locks, logs, title files, released-report hashes, the hooks module's marks of the questions
 // it waits on (waits/), owner answers waiting for their session (answers/), taken and unsent
@@ -270,7 +270,7 @@ async function finishOptOut({ claudeDir, settings }: Paths): Promise<string[]> {
 // window (windows/), each office's list of repos and pairing lock (offices/),
 // the one list and lock a version before #105 kept (approved.json, pairing.lock), and the update
 // check's record and lock (src/update). Removed before the hooks.
-const WRITTEN = ["runner", "pairing.json", "pairing.lock", "pairing.write.lock", "live", "logs", "titles", "released", "waits", "answers", "handoffs", "windows", "offices", "approved.json", "update.json", "update.lock"];
+const WRITTEN = ["runner", "pipe", "pairing.json", "pairing.lock", "pairing.write.lock", "live", "logs", "titles", "released", "waits", "answers", "handoffs", "windows", "offices", "approved.json", "update.json", "update.lock"];
 // What a session's data layer writes as it runs, so may come back during an uninstall.
 const SESSION_TRACES = ["live", "titles", "released", "waits", "answers", "windows", "offices", "approved.json", "update.json", "update.lock"];
 

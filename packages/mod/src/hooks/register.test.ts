@@ -194,6 +194,21 @@ test("hooks: while the runner can't be reached the status line says the session 
   expect(h.spawned).toHaveLength(1);
 });
 
+test("hooks: a runner that won't start is said plainly, not as starting", async () => {
+  const h = await start([{ type: "runner", state: "down" }, { type: "runner", state: "down", held: "held-off" }, { type: "runner", state: "down", held: "not-installed" }], { stays: true });
+  await vi.waitFor(() => expect(h.status).toHaveLength(3));
+  expect(h.status.slice(1)).toEqual([
+    "Isoplan: this session isn't reaching the office: Isoplan's runner is holding off for up to an hour (runner.log says why)",
+    "Isoplan: this session isn't reaching the office: Isoplan's runner isn't installed; run the plugin's install script",
+  ]);
+});
+
+test("hooks: one an earlier version's data layer keeps the session from says so, not that it is another window", async () => {
+  const h = await start([{ type: "superseded", reason: "earlier" }]);
+  await vi.waitFor(() => expect(h.status.at(-1)).toBe("Isoplan: this session is reported by an earlier version of the plugin still running for it"));
+  expect(h.slept).toEqual([60000]);
+});
+
 test("hooks: a host with no $.fs.exists, or one that throws, still starts the data layer", async () => {
   const none = host([connected]);
   delete (none.$.fs as { exists?: unknown }).exists;

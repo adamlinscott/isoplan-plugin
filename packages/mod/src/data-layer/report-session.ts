@@ -51,11 +51,16 @@
 //
 // The runner reports a session once, with the hooks module the pipe has registered for it, if any
 // (src/pipe/server.ts decides between two windows). It still takes <claude dir>/isoplan/live/
-// <session>.json (src/wake/lock.ts), `detached`, and refreshes it each pass, only so the data layer
-// process of an earlier version (a session still on an older copy of the plugin) and the runner
-// never report one session at once: it doesn't start while such a data layer holds a fresh lock
-// (three of its own slowest passes, lockFreshMs, from its config.json), and ends as soon as one takes
-// it over, telling a hooks module it reported for that it is `superseded`.
+// <session>.json (src/wake/lock.ts) and refreshes it each pass, only so the data layer process of an
+// earlier version (a session still on an older copy of the plugin) and the runner never report one
+// session at once. Without a hooks module the lock says `detached`, and it doesn't start while such
+// a data layer holds a fresh lock (three of its own slowest passes, lockFreshMs, from its
+// config.json). For a hooks module it writes the lock as that hooks module's copy's data layer would
+// have (its dist/data-layer.js, `detached: false`, when its window started, and a live parent), the
+// shape an earlier version's data layer gives a session up to: so after a /reload-plugins, the new
+// hooks module's report takes the lock over from the old version's data layer (takesOver), which
+// leaves the session to it. Either way it ends as soon as such a data layer takes the lock back,
+// telling a hooks module it reported for that it is `superseded` (`earlier`).
 
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
@@ -65,13 +70,13 @@ import path from "node:path";
 import { PROTOCOL_VERSION, type Facts, type Project } from "@isoplan/protocol";
 import { installWake, type LinkHandlerPlace } from "../install/install.js";
 import type { LoginItemPlace } from "../install/login-item.js";
-import { managedDir, newestDataLayer, pluginDirsOf, pluginIdOf, pluginState, pluginsDir, type Place } from "../install/state.js";
+import { managedDir, newestDataLayer, normalPath, pluginDirsOf, pluginIdOf, pluginState, pluginsDir, type Place } from "../install/state.js";
 import type { ContextWindow, DataLayerLine, TitleReply, WaitMark } from "../lines.js";
 import { claudeBinary, claudeCommand, findClaude } from "../runner/claude-binary.js";
 import { errorText, loadPatterns, type Pattern } from "../runner/scan.js";
 import { startRunner, type StartOptions, type Started } from "../runner/start.js";
 import { checkForUpdate, commandEnv, gitChoices, START_GAP_MS, updatesOffBy } from "../update/update.js";
-import { alive, HOLD_OFF_MS, lockHolder, lockPath, readLock, refreshLock, releaseLock, takeLock } from "../wake/lock.js";
+import { alive, HOLD_OFF_MS, lockHolder, lockPath, readLock, refreshLock, releaseLock, takeLock, type LockBody } from "../wake/lock.js";
 import { approvedPath, cachedRepos, createApproved, createSessionGate, type Approved, type Dormancy, type SessionGate } from "./approved.js";
 import { forOffice } from "./attribution.js";
 import { candidatesOf, inRepos } from "./home.js";
@@ -125,6 +130,19 @@ export const LOCK_FRESH_MS = 3 * DORMANT_MS;
 /** The same for a holder whose passes `streamSeconds` makes slower: a pass may wait that long, and a slow office's list as long again. */
 export const lockFreshMs = (config: Pick<Config, "streamSeconds">) => Math.max(LOCK_FRESH_MS, 3 * 2 * config.streamSeconds * 1000);
 
+/**
+ * Whether a report for a hooks module takes the session's lock over from its holder: the data layer
+ * process of an earlier version (`detached: false`, not the runner's), of another copy of the plugin
+ * than the hooks module's `self` (its dist/data-layer.js), or of that copy in a window that started
+ * before `since`. Such a data layer gives the session up once it sees the lock in this shape.
+ */
+export function takesOver(held: LockBody | null, self: string, since: number, pid = process.pid): boolean {
+  if (!held?.pid || held.pid === pid) return false;
+  const { dataLayer, detached, runner, since: theirs } = held.extra;
+  if (detached !== false || runner === true || typeof dataLayer !== "string") return false;
+  return normalPath(dataLayer) !== normalPath(self) || (typeof theirs === "number" && since > theirs);
+}
+
 export interface ReportSessionOptions {
   sessionId: string;
   /** The session's folder. */
@@ -137,10 +155,14 @@ export interface ReportSessionOptions {
   appDir: string;
   /** With a hooks module: the plugin's folder it runs from, whose copy decides whether it is outdated, disabled or updated. */
   root?: string;
+  /** With a hooks module: when its window's hooks module started. */
+  since?: number;
+  /** With a hooks module: the variables of the session's own environment it passed on (src/pipe/pipe.ts SESSION_ENV), read in place of the runner's. */
+  env?: Record<string, string>;
   /** Lines for the hooks module, and the session's log (sessionLog). */
   emit(line: DataLayerLine): void;
-  /** Settles when it should end: the hooks module's connection went, or the runner stops. */
-  closed: Promise<void>;
+  /** Settles when it should end, with why, as its log says it: the hooks module's connection went, another hooks module has the session, or the runner stops. */
+  closed: Promise<string | void>;
   /** With a hooks module: it can submit a prompt. */
   takesMessages?: boolean;
   /** Whether Claude Code lists the plugin as uninstalled or disabled for the session; by default, for the hooks module's copy (or this one's). */
@@ -273,6 +295,8 @@ async function reporting(o: ReportSessionOptions, c: Containment): Promise<Ended
   const source = createClaudeCode({ ...io, claudeDir, home: os.homedir() });
 
   let downSince: number | null = Date.now(); // since when no office's link has been connected; null while one is
+  let closedFor: string | null = null; // why `closed` settled, once it has
+  void closed.then((reason) => void (closedFor = reason || null));
   const emit = o.emit;
   const wait = (ms: number) => {
     let timer: ReturnType<typeof setTimeout> | undefined;
@@ -290,21 +314,25 @@ async function reporting(o: ReportSessionOptions, c: Containment): Promise<Ended
   // Claude Code runs nothing of a plugin's when it is uninstalled or disabled, so this looks itself
   // (src/install/state.ts), before it takes the session's lock and on every pass: a session whose
   // plugin is uninstalled or disabled for it is reported no more.
-  const place: Place = { claudeDir, plugins: pluginsDir(claudeDir, process.env), managed: managedDir(process.platform), pluginDirs: pluginDirsOf(process.env) };
+  // The session's own environment where its hooks module passed it on: where its plugins are, and whether it updates.
+  const env: Record<string, string | undefined> = { ...process.env, ...(hooked ? o.env : {}) };
+  const place: Place = { claudeDir, plugins: pluginsDir(claudeDir, env), managed: managedDir(process.platform), pluginDirs: pluginDirsOf(env) };
   const project = o.project ?? cwd;
   // The copy of the plugin, by its dist/data-layer.js as Claude Code's records know it: the hooks module's, or the runner's own.
   const self = path.join(hooked && o.root ? path.join(o.root, "dist") : here, "data-layer.js");
   const isOff = o.isOff ?? (async () => (await pluginState(place, self, project).catch(() => "enabled")) !== "enabled");
   if (await isOff()) return end("Claude Code lists the Isoplan plugin as uninstalled or disabled here, so this session isn't reported");
   // The session's folder too, so /isoplan:repos (src/repos) looks at the folder this reports as.
-  const lockExtra = { detached: true, runner: true, cwd };
+  // For a hooks module, in the shape an earlier version's data layer gives the session up to (see above).
+  const since = o.since ?? Date.now();
+  const lockExtra = hooked ? { dataLayer: self, detached: false, since, parent: process.pid, runner: true, cwd } : { detached: true, runner: true, cwd };
   // The newest copy of the plugin installed for this session (state.ts): another one means the hooks
   // module's is outdated. The runner is kept up to date by its own start (src/runner/start.ts).
   const isOutdated = async () => hooked && (await newestDataLayer(place.plugins, self, project).catch(() => self)) !== self;
   let outdated = await isOutdated();
   // An earlier version's data layer holds the session's lock (see above): its hooks module is told.
   const takenOver = (reason: string) => {
-    if (hooked) emit({ type: "superseded", reason: "window" });
+    if (hooked) emit({ type: "superseded", reason: "earlier" });
     return stopping(reason);
   };
 
@@ -314,8 +342,12 @@ async function reporting(o: ReportSessionOptions, c: Containment): Promise<Ended
   let config: Config = await loadConfig(io, defaultsPath, userConfigPath);
   try {
     // A hold-off a detached data layer of an earlier version left counts for nothing: the runner keeps its own.
-    if ((await readLock(lock))?.pid === null) await fs.rm(lock, { force: true });
-    if (!(await takeLock(lock, process.pid, alive, false, Date.now(), { extra: lockExtra, freshMs: lockFreshMs(config) }))) {
+    const held = await readLock(lock);
+    if (held?.pid === null) await fs.rm(lock, { force: true });
+    // An earlier version's data layer this hooks module's copy replaces: the lock is taken from it, and it leaves.
+    const over = hooked && !outdated && takesOver(held, self, since);
+    if (over) emit({ type: "log", text: "an earlier version's data layer reported this session: the runner reports it now, for its hooks module, and that data layer leaves it" });
+    if (!(await takeLock(lock, process.pid, alive, over, Date.now(), { extra: lockExtra, freshMs: lockFreshMs(config) }))) {
       takenOver("an earlier version's data layer already reports this session");
       return { why };
     }
@@ -326,22 +358,22 @@ async function reporting(o: ReportSessionOptions, c: Containment): Promise<Ended
   const paths = { ...place, settings: path.join(claudeDir, "settings.json") };
   if (outdated) emit({ type: "updated" });
   // The update check (src/update), for a copy in Claude Code's plugin cache: there is nothing to
-  // update in a checkout or a folder loaded in place. One at a time in this process; the machine's
-  // lock and record keep sessions from checking together.
+  // update in a checkout or a folder loaded in place. One at a time for this session; the machine's
+  // update lock and record keep sessions from checking together.
   const pluginId = pluginIdOf(place.plugins, self);
   let checking = false;
   let checkedAt = Date.now(); // the timed checks count from the one at start
   const checkUpdate = (gapMs: number) => {
     if (!hooked || !pluginId || outdated || checking || !config.updateCheckHours) return;
     checkedAt = Date.now();
-    const off = updatesOffBy(process.env);
+    const off = updatesOffBy(env);
     if (off) return emit({ type: "log", text: `not checking for a newer version of the plugin: ${off} is set (FORCE_AUTOUPDATE_PLUGINS=1 turns plugin updates back on)` });
     checking = true;
     c.watch((async () => {
       if ((await pluginState(place, self).catch(() => "enabled")) !== "enabled") return emit({ type: "log", text: "not checking for a newer version of the plugin: it is disabled for this machine" });
       const binary = await claudeBinary(claudeDir, process.env, process.platform, os.homedir());
       if (!binary) return emit({ type: "log", text: "couldn't find the claude binary, so the plugin can't update itself" });
-      const checked = await checkForUpdate({ claudeDir, settings: paths.settings, plugins: place.plugins, id: pluginId, cwd: project, claude: claudeCommand(binary), env: commandEnv(process.env, await gitChoices(project)), gapMs });
+      const checked = await checkForUpdate({ claudeDir, settings: paths.settings, plugins: place.plugins, id: pluginId, cwd: project, claude: claudeCommand(binary), env: commandEnv(env, await gitChoices(project)), gapMs });
       for (const text of checked.said) emit({ type: "log", text: `update check: ${text}` });
     })()
       .catch((err: unknown) => emit({ type: "log", text: `couldn't check for a newer version of the plugin: ${String((err as Error)?.message ?? err)}` }))
@@ -558,10 +590,10 @@ async function reporting(o: ReportSessionOptions, c: Containment): Promise<Ended
   const startedAt = Date.now();
   // Whether to go on to the next pass, once this one's wait is over; each reason not to is logged.
   const goOn = async () => {
-    // Only `closed` (the runner stopping, or the hooks module's connection going), or an error that ended the session, ends the wait early.
+    // Only `closed` (the runner stopping, or the hooks module's connection going or changing), or an error that ended the session, ends the wait early.
     if (!(await wait(dormant && !pending ? DORMANT_MS : config.streamSeconds * 1000))) {
       const failure = c.why();
-      return stopping(failure ? await failure : hooked ? "its hooks module's link to the runner closed, or the runner stopped" : "the runner stopped");
+      return stopping(failure ? await failure : (closedFor ?? "the runner stopped"));
     }
     if (isUnwanted()) return stopping("no office this reports to wants this session's project or takes its repo, so it holds off");
     if ((await lockHolder(lock)) !== process.pid) return takenOver("another data layer reports this session now");

@@ -3,7 +3,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { createHash, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
+import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import http from "node:http";
 import fs$1, { realpath, statSync } from "node:fs";
 import { promisify } from "node:util";
@@ -16532,6 +16532,18 @@ const DORMANT_MS = 3e4;
 const LOCK_FRESH_MS = 3 * DORMANT_MS;
 /** The same for a holder whose passes `streamSeconds` makes slower: a pass may wait that long, and a slow office's list as long again. */
 const lockFreshMs = (config) => Math.max(LOCK_FRESH_MS, 6 * config.streamSeconds * 1e3);
+/**
+* Whether a report for a hooks module takes the session's lock over from its holder: the data layer
+* process of an earlier version (`detached: false`, not the runner's), of another copy of the plugin
+* than the hooks module's `self` (its dist/data-layer.js), or of that copy in a window that started
+* before `since`. Such a data layer gives the session up once it sees the lock in this shape.
+*/
+function takesOver(held, self, since, pid = process.pid) {
+	if (!held?.pid || held.pid === pid) return false;
+	const { dataLayer, detached, runner, since: theirs } = held.extra;
+	if (detached !== false || runner === true || typeof dataLayer !== "string") return false;
+	return normalPath(dataLayer) !== normalPath(self) || typeof theirs === "number" && since > theirs;
+}
 function contained(patterns) {
 	let why = null;
 	let failed = () => {};
@@ -16612,6 +16624,8 @@ async function reporting(o, c) {
 		home: os.homedir()
 	});
 	let downSince = Date.now();
+	let closedFor = null;
+	closed.then((reason) => void (closedFor = reason || null));
 	const emit = o.emit;
 	const wait = (ms) => {
 		let timer;
@@ -16632,17 +16646,29 @@ async function reporting(o, c) {
 		return false;
 	};
 	const end = (reason) => (stopping(reason), { why });
+	const env = {
+		...process.env,
+		...hooked ? o.env : {}
+	};
 	const place = {
 		claudeDir,
-		plugins: pluginsDir(claudeDir, process.env),
+		plugins: pluginsDir(claudeDir, env),
 		managed: managedDir(process.platform),
-		pluginDirs: pluginDirsOf(process.env)
+		pluginDirs: pluginDirsOf(env)
 	};
 	const project = o.project ?? cwd;
 	const self = path.join(hooked && o.root ? path.join(o.root, "dist") : here, "data-layer.js");
 	const isOff = o.isOff ?? (async () => await pluginState(place, self, project).catch(() => "enabled") !== "enabled");
 	if (await isOff()) return end("Claude Code lists the Isoplan plugin as uninstalled or disabled here, so this session isn't reported");
-	const lockExtra = {
+	const since = o.since ?? Date.now();
+	const lockExtra = hooked ? {
+		dataLayer: self,
+		detached: false,
+		since,
+		parent: process.pid,
+		runner: true,
+		cwd
+	} : {
 		detached: true,
 		runner: true,
 		cwd
@@ -16652,15 +16678,21 @@ async function reporting(o, c) {
 	const takenOver = (reason) => {
 		if (hooked) emit({
 			type: "superseded",
-			reason: "window"
+			reason: "earlier"
 		});
 		return stopping(reason);
 	};
 	const notWantedBefore = hooked ? {} : o.notWanted ?? {};
 	let config = await loadConfig(io, defaultsPath, userConfigPath);
 	try {
-		if ((await readLock(lock))?.pid === null) await fs.rm(lock, { force: true });
-		if (!await takeLock(lock, process.pid, alive, false, Date.now(), {
+		const held = await readLock(lock);
+		if (held?.pid === null) await fs.rm(lock, { force: true });
+		const over = hooked && !outdated && takesOver(held, self, since);
+		if (over) emit({
+			type: "log",
+			text: "an earlier version's data layer reported this session: the runner reports it now, for its hooks module, and that data layer leaves it"
+		});
+		if (!await takeLock(lock, process.pid, alive, over, Date.now(), {
 			extra: lockExtra,
 			freshMs: lockFreshMs(config)
 		})) {
@@ -16681,7 +16713,7 @@ async function reporting(o, c) {
 	const checkUpdate = (gapMs) => {
 		if (!hooked || !pluginId || outdated || checking || !config.updateCheckHours) return;
 		checkedAt = Date.now();
-		const off = updatesOffBy(process.env);
+		const off = updatesOffBy(env);
 		if (off) return emit({
 			type: "log",
 			text: `not checking for a newer version of the plugin: ${off} is set (FORCE_AUTOUPDATE_PLUGINS=1 turns plugin updates back on)`
@@ -16704,7 +16736,7 @@ async function reporting(o, c) {
 				id: pluginId,
 				cwd: project,
 				claude: claudeCommand(binary),
-				env: commandEnv(process.env, await gitChoices(project)),
+				env: commandEnv(env, await gitChoices(project)),
 				gapMs
 			});
 			for (const text of checked.said) emit({
@@ -16992,7 +17024,7 @@ async function reporting(o, c) {
 	const goOn = async () => {
 		if (!await wait(dormant && !pending ? DORMANT_MS : config.streamSeconds * 1e3)) {
 			const failure = c.why();
-			return stopping(failure ? await failure : hooked ? "its hooks module's link to the runner closed, or the runner stopped" : "the runner stopped");
+			return stopping(failure ? await failure : closedFor ?? "the runner stopped");
 		}
 		if (isUnwanted()) return stopping("no office this reports to wants this session's project or takes its repo, so it holds off");
 		if (await lockHolder(lock) !== process.pid) return takenOver("another data layer reports this session now");
@@ -17289,12 +17321,11 @@ async function takeReply(file) {
 		text: r.text
 	} : null;
 }
-//#endregion
-//#region src/sweep/find.ts
+const STOP_WAIT_MS = 5e3;
 const HEAD_BYTES = 65536;
 /** The first folder a transcript's lines name, from its first and last 64 KB. */
-async function cwdOf(io, path, size) {
-	for (const [start, end] of [[0, HEAD_BYTES], [Math.max(0, size - HEAD_BYTES), size]]) for (const text of (await io.read(path, start, end).catch(() => "")).split("\n")) {
+async function cwdOf(io, file, size) {
+	for (const [start, end] of [[0, HEAD_BYTES], [Math.max(0, size - HEAD_BYTES), size]]) for (const text of (await io.read(file, start, end).catch(() => "")).split("\n")) {
 		if (!text.includes("\"cwd\"")) continue;
 		try {
 			const cwd = JSON.parse(text).cwd;
@@ -17303,7 +17334,8 @@ async function cwdOf(io, path, size) {
 	}
 	return null;
 }
-const STOP_WAIT_MS = 5e3;
+/** Why a report for hooks module `from` stops when the session has `to` (either none), as its log says it. */
+const changed = (from, to) => !to ? "its hooks module's link to the runner closed" : !from ? "its hooks module connected to the runner, which reports it for that hooks module now" : "another hooks module has the session now (another window, or a reload)";
 function watchSessions(o) {
 	const { claudeDir, io, isAlive = alive, pid = process.pid, gapMs = 250, stopWaitMs = STOP_WAIT_MS } = o;
 	const projectsDir = path.join(claudeDir, "projects");
@@ -17314,7 +17346,7 @@ function watchSessions(o) {
 	let timer = null;
 	let said = "";
 	const start = (id, s, cwd, hooks = null) => {
-		let close = () => {};
+		let close = (_why) => {};
 		const closed = new Promise((resolve) => close = resolve);
 		const now = Date.now();
 		const notWanted = Object.fromEntries(Object.entries(s.notWanted).filter(([, until]) => until > now));
@@ -17353,9 +17385,10 @@ function watchSessions(o) {
 		}
 		return false;
 	};
-	/** Whether the session's lock names another live process that keeps it fresh. */
-	const heldByAnother = async (id, now, config) => {
+	/** Whether the session's lock names another live process that keeps it fresh, and that a report for `hooks` wouldn't take it over from. */
+	const heldByAnother = async (id, now, config, hooks) => {
 		const lock = await readLock(lockPath(claudeDir, id));
+		if (hooks?.root && hooks.since !== void 0 && takesOver(lock, path.join(hooks.root, "dist", "data-layer.js"), hooks.since, pid)) return false;
 		return !!lock?.pid && lock.pid !== pid && isAlive(lock.pid) && now - lock.mtimeMs < lockFreshMs(config);
 	};
 	const look = async () => {
@@ -17363,6 +17396,7 @@ function watchSessions(o) {
 		const now = Date.now();
 		const windowMs = Math.max(config.idleMinutes * 6e4, first ? config.lightsOffHours * 36e5 : 0);
 		const quiet = [];
+		const recent = [];
 		for (const dir of await io.listDir(projectsDir)) {
 			if (!dir.isDir) continue;
 			for (const entry of await io.listDir(path.join(projectsDir, dir.name))) {
@@ -17394,16 +17428,14 @@ function watchSessions(o) {
 				if (s.running) {
 					if (s.running.hooks !== hooks) {
 						rehooked.add(id);
-						s.running.stop();
+						s.running.stop(changed(s.running.hooks, hooks));
 					}
 					continue;
 				}
 				if (hooks) {
 					if (s.endedFor === hooks && s.endedAt !== null && st.mtimeMs <= s.endedAt) continue;
-					if (await heldByAnother(id, now, config)) {
+					if (await heldByAnother(id, now, config, hooks)) {
 						s.held = true;
-						s.endedAt = st.mtimeMs;
-						s.endedFor = hooks;
 						continue;
 					}
 					s.held = false;
@@ -17439,7 +17471,7 @@ function watchSessions(o) {
 					s.endedAt = st.mtimeMs;
 					continue;
 				}
-				if (first && st.mtimeMs < now - config.idleMinutes * 6e4) quiet.push([
+				if (first) (st.mtimeMs < now - config.idleMinutes * 6e4 ? quiet : recent).push([
 					id,
 					s,
 					s.cwd
@@ -17447,14 +17479,20 @@ function watchSessions(o) {
 				else start(id, s, s.cwd);
 			}
 		}
-		if (first && quiet.length) {
-			for (const [, s] of quiet) s.queued = true;
+		if (first && (recent.length || quiet.length)) {
+			for (const [, s] of [...recent, ...quiet]) s.queued = true;
+			const startQueued = ([id, s, cwd]) => {
+				if (!s.queued) return;
+				s.queued = false;
+				if (!stopped && !s.running) start(id, s, cwd);
+			};
+			const holdMs = 2 * config.runnerRetrySeconds * 1e3;
 			(async () => {
-				for (const [id, s, cwd] of quiet) {
+				await new Promise((r) => setTimeout(r, holdMs));
+				recent.forEach(startQueued);
+				for (const queued of quiet) {
 					await new Promise((r) => setTimeout(r, gapMs));
-					if (!s.queued) continue;
-					s.queued = false;
-					if (!stopped && !s.running) start(id, s, cwd);
+					startQueued(queued);
 				}
 			})();
 		}
@@ -17487,16 +17525,17 @@ function watchSessions(o) {
 		look: lookOnce,
 		rehook: (id) => {
 			const s = seen.get(id);
-			if (s?.running && s.running.hooks !== (o.hooked?.(id) ?? null)) {
+			const hooks = o.hooked?.(id) ?? null;
+			if (s?.running && s.running.hooks !== hooks) {
 				rehooked.add(id);
-				s.running.stop();
+				s.running.stop(changed(s.running.hooks, hooks));
 			} else lookOnce();
 		},
 		async stop() {
 			stopped = true;
 			if (timer) clearTimeout(timer);
 			const running = [...seen.values()].flatMap((s) => s.running ?? []);
-			for (const r of running) r.stop();
+			for (const r of running) r.stop("the runner stopped");
 			let timeout;
 			await Promise.race([Promise.all(running.map((r) => r.done)), new Promise((r) => timeout = setTimeout(r, stopWaitMs))]);
 			clearTimeout(timeout);
@@ -17770,13 +17809,14 @@ async function machinePairing(office, allowPlainWs, claudeDir, claudeJson, io) {
 //#endregion
 //#region src/pipe/pipe.ts
 const pipeInfoPath = (claudeDir) => path.join(claudeDir, "isoplan", "runner", "pipe.json");
-/** A new address for the worker's pipe: a named pipe with a random name on Windows, else the socket in this user's own folder. */
-function pipeAddress(claudeDir, platform = process.platform, random = () => randomBytes(16).toString("hex")) {
+/** A new address for a worker's pipe, its name random: a named pipe on Windows, else a socket in this user's own folder. */
+function pipeAddress(claudeDir, platform = process.platform, random = () => randomBytes(8).toString("hex")) {
 	if (platform === "win32") return `\\\\.\\pipe\\isoplan-runner-${random()}`;
-	return path.posix.join(claudeDir.replace(/\\/g, "/"), "isoplan", "pipe", "runner.sock");
+	return path.posix.join(claudeDir.replace(/\\/g, "/"), "isoplan", "pipe", `runner-${random()}.sock`);
 }
 const newToken = () => randomBytes(32).toString("hex");
-/** Makes the socket's folder, this user's alone (none on Windows), and clears a socket a crashed worker left. */
+const proofOf = (token, nonce) => createHmac("sha256", token).update(nonce).digest("hex");
+/** Makes the socket's folder, this user's alone (none on Windows). */
 async function preparePipe(address, platform = process.platform) {
 	if (platform === "win32") return;
 	const dir = path.dirname(address);
@@ -17785,8 +17825,18 @@ async function preparePipe(address, platform = process.platform) {
 		mode: 448
 	});
 	await fs.chmod(dir, 448);
-	await fs.rm(address, { force: true });
 }
+/** The variables of a session's environment its hooks module's end passes on, which the runner reports that session by (report-session.ts). */
+const SESSION_ENV = [
+	"CLAUDE_CODE_PLUGIN_CACHE_DIR",
+	"CLAUDE_CODE_PLUGIN_DIRS",
+	"DISABLE_UPDATES",
+	"DISABLE_AUTOUPDATER",
+	"CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
+	"FORCE_AUTOUPDATE_PLUGINS"
+];
+/** Those of SESSION_ENV that `env` sets. */
+const sessionEnv = (env) => Object.fromEntries(SESSION_ENV.flatMap((name) => typeof env[name] === "string" ? [[name, env[name]]] : []));
 /** Writes pipe.json whole (a reader never sees half of it), readable by this user alone. */
 async function writePipeInfo(claudeDir, info) {
 	const file = pipeInfoPath(claudeDir);
@@ -17843,7 +17893,7 @@ async function createPipeServer(o) {
 	const tokenBytes = Buffer.from(token);
 	const registered = /* @__PURE__ */ new Map();
 	const sockets = /* @__PURE__ */ new Set();
-	const hasToken = (m) => typeof m.token === "string" && m.token.length === token.length && timingSafeEqual(Buffer.from(m.token), tokenBytes);
+	const hasToken = (m) => typeof m.token === "string" && Buffer.byteLength(m.token) === tokenBytes.length && timingSafeEqual(Buffer.from(m.token), tokenBytes);
 	const register = (socket, hello) => {
 		let gone = () => {};
 		const closed = new Promise((resolve) => gone = resolve);
@@ -17854,6 +17904,7 @@ async function createPipeServer(o) {
 			messages: hello.messages === true,
 			root: hello.root,
 			version: hello.version,
+			env: hello.env && typeof hello.env === "object" ? sessionEnv(hello.env) : {},
 			socket,
 			closed,
 			send: (line) => {
@@ -17883,7 +17934,11 @@ async function createPipeServer(o) {
 		o.onChange(hello.session);
 	};
 	const answer = async (socket, request) => {
-		const text = registered.has(request.session) ? await o.ask(request).catch((err) => `The room couldn't be asked: ${String(err?.message ?? err)}. Carry on without the answer.`) : NOT_CONNECTED;
+		const hooked = registered.get(request.session);
+		const text = hooked ? await o.ask({
+			...request,
+			cwd: hooked.cwd
+		}).catch((err) => `The room couldn't be asked: ${String(err?.message ?? err)}. Carry on without the answer.`) : NOT_CONNECTED;
 		writeLine(socket, {
 			type: "answer",
 			text
@@ -17894,8 +17949,17 @@ async function createPipeServer(o) {
 		sockets.add(socket);
 		socket.on("close", () => sockets.delete(socket)).on("error", () => {});
 		let said = false;
+		let greeted = false;
 		readLines(socket, (value) => {
 			const m = value ?? {};
+			const hi = m;
+			if (!said && !greeted && hi.type === "hi" && typeof hi.nonce === "string" && hi.nonce.length <= 200) {
+				greeted = true;
+				return writeLine(socket, {
+					type: "proof",
+					proof: proofOf(token, hi.nonce)
+				});
+			}
 			if (said || !hasToken(m)) return void socket.destroy();
 			said = true;
 			if (isHello(m)) return register(socket, m);
@@ -17921,6 +17985,37 @@ async function createPipeServer(o) {
 			const closing = new Promise((resolve) => server.close(() => resolve()));
 			for (const socket of sockets) socket.destroy();
 			await closing;
+		}
+	};
+}
+//#endregion
+//#region src/runner/pair-links.ts
+function createPairLinks(now = Date.now) {
+	const last = /* @__PURE__ */ new Map();
+	const sessions = /* @__PURE__ */ new Map();
+	const fresh = (server) => {
+		const pair = last.get(server);
+		if (pair && !(Date.parse(pair.expires) > now())) last.delete(server);
+		return last.get(server);
+	};
+	return {
+		pair(line) {
+			last.set(line.server, line);
+			for (const { send, states } of sessions.values()) if (states.get(line.server) === "pairing") send(line);
+		},
+		sent(session, line, send) {
+			if (line.type !== "status") return;
+			let s = sessions.get(session);
+			if (s?.send !== send) sessions.set(session, s = {
+				send,
+				states: /* @__PURE__ */ new Map()
+			});
+			s.states.set(line.server, line.state);
+			const pair = line.state === "pairing" ? fresh(line.server) : void 0;
+			if (pair) send(pair);
+		},
+		ended(session, send) {
+			if (sessions.get(session)?.send === send) sessions.delete(session);
 		}
 	};
 }
@@ -18112,20 +18207,17 @@ async function worker() {
 		readText: (p) => fs.readFile(p, "utf8").catch(() => null),
 		run: io.run
 	}, claudeJson, os.homedir());
-	let pipe = null;
-	const lastPair = /* @__PURE__ */ new Map();
+	const pairLinks = createPairLinks();
 	const emitFor = (server) => (line) => {
 		if (line.type === "log") log(line.text);
 		else if (line.type === "error") log(`the office server at ${server} says: ${line.message} (${line.code})`);
 		else if (line.type === "pair") {
 			log(`to answer for this machine's rooms through ${line.server}, pair it: click ${line.url} on this computer and approve it in the office (it works until ${line.expires})`);
 			const label = offices.find((o) => o.server === line.server)?.label;
-			const pair = {
+			pairLinks.pair({
 				...line,
 				...label && { label }
-			};
-			lastPair.set(line.server, pair);
-			for (const hooked of pipe?.all() ?? []) hooked.send(pair);
+			});
 		}
 	};
 	const shared = new Map(answering.map((office) => {
@@ -18162,6 +18254,17 @@ async function worker() {
 	};
 	const isOff = async (folder) => await recordedState(paths, folder).catch(() => "enabled") !== "enabled";
 	const scanText = async (text) => scan(text, await loadPatterns(path.join(appDir, "secret-patterns.json"), path.join(isoplanDir, "secret-patterns.json"), log));
+	let rehook = (_session) => {};
+	const pipe = await createPipeServer({
+		claudeDir,
+		log,
+		onChange: (session) => rehook(session),
+		ask: (request) => askFromMachine({
+			...request,
+			appDir,
+			scan: scanText
+		})
+	}).catch((err) => (log(`the runner couldn't open its pipe for the sessions' hooks modules: ${err.message}`), null));
 	const reporting = watchSessions({
 		claudeDir,
 		io,
@@ -18180,16 +18283,17 @@ async function worker() {
 					by: "hooks",
 					appDir,
 					root: hooks.root,
+					since: hooks.since,
+					env: hooks.env,
 					takesMessages: hooks.messages,
 					emit: (line) => {
 						said.emit(line);
 						hooks.send(line);
-						const pair = line.type === "status" && line.state === "pairing" ? lastPair.get(line.server) : void 0;
-						if (pair) hooks.send(pair);
+						pairLinks.sent(sessionId, line, hooks.send);
 					},
-					closed: Promise.race([closed, hooks.closed]),
+					closed: Promise.race([closed, hooks.closed.then(() => "its hooks module's link to the runner closed")]),
 					shared: shares
-				});
+				}).finally(() => pairLinks.ended(sessionId, hooks.send));
 				return await reportSession({
 					sessionId,
 					cwd,
@@ -18209,16 +18313,7 @@ async function worker() {
 			}
 		}
 	});
-	pipe = await createPipeServer({
-		claudeDir,
-		log,
-		onChange: (session) => reporting.rehook(session),
-		ask: (request) => askFromMachine({
-			...request,
-			appDir,
-			scan: scanText
-		})
-	}).catch((err) => (log(`the runner couldn't open its pipe for the sessions' hooks modules: ${err.message}`), null));
+	rehook = reporting.rehook;
 	const registry = createRegistry({
 		file: registryPath(claudeDir),
 		log

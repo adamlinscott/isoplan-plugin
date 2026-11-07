@@ -11,7 +11,7 @@ import { afterEach, expect, test, vi } from "vitest";
 import type { DataLayerLine } from "../lines.js";
 import { modDir, tempRoot } from "../data-layer/fixture.js";
 import { relay } from "./client.js";
-import { pipeAddress, pipeInfoPath, readPipeInfo, writeLine } from "./pipe.js";
+import { openPipe, pipeAddress, pipeInfoPath, preparePipe, proofOf, readLines, readPipeInfo, writeLine, writePipeInfo } from "./pipe.js";
 import { createPipeServer, keeps, type PipeServer } from "./server.js";
 
 vi.setConfig({ testTimeout: 20000 });
@@ -39,30 +39,128 @@ async function runnerEnd(claudeDir = path.join(tempRoot(), "claude")) {
 }
 
 /** A hooks module's end for session `session`, in this process, until `stop`. */
-function hooksEnd(claudeDir: string, more: { session?: string; since?: number; version?: string } = {}) {
+function hooksEnd(claudeDir: string, more: { session?: string; since?: number; version?: string; started?: () => string; env?: Record<string, string> } = {}) {
   const out: DataLayerLine[] = [];
+  const said: string[] = [];
   let on = true;
   const started: number[] = [];
   const ended = relay({
     claudeDir,
-    hello: { session: more.session ?? "s1", cwd: "C:/w/repo", since: more.since ?? 1, messages: true, root: modDir, version: more.version ?? "0.12.0" },
+    hello: { session: more.session ?? "s1", cwd: "C:/w/repo", since: more.since ?? 1, messages: true, root: modDir, version: more.version ?? "0.12.0", ...(more.env && { env: more.env }) },
     out: (line) => void out.push(line),
     goOn: () => on,
-    startRunner: async () => void started.push(Date.now()),
+    startRunner: async () => (started.push(Date.now()), more.started?.() ?? "running"),
+    say: (text) => void said.push(text),
     retryMs: async () => 50,
   });
   closing.push(async () => {
     on = false;
   });
-  return { out, ended, started };
+  return { out, ended, started, said };
 }
 
-test("pipe: a named pipe with a random name on Windows; a socket in the user's own isoplan folder on macOS and Linux", () => {
+/** A connection to the pipe at `address` that says `first` and collects what comes back, until it closes. */
+function rawClient(address: string, first: unknown) {
+  const got: unknown[] = [];
+  const socket = net.connect(address);
+  readLines(socket, (value) => void got.push(value));
+  const closed = new Promise<void>((resolve) => socket.on("close", () => resolve()).on("error", () => {}));
+  socket.on("connect", () => writeLine(socket, first));
+  return { socket, got, closed };
+}
+
+test("pipe: each worker's pipe has a name of its own: a named pipe on Windows, a socket in the user's own isoplan folder on macOS and Linux", () => {
   const dir = "C:\\Users\\ada\\.claude";
   expect(pipeAddress(dir, "win32", () => "abc")).toBe("\\\\.\\pipe\\isoplan-runner-abc");
-  expect(pipeAddress(dir, "win32")).not.toBe(pipeAddress(dir, "win32"));
-  expect(pipeAddress("/Users/ada/.claude", "darwin")).toBe("/Users/ada/.claude/isoplan/pipe/runner.sock");
-  expect(pipeAddress("/home/ada/.claude", "linux")).toBe("/home/ada/.claude/isoplan/pipe/runner.sock");
+  expect(pipeAddress("/Users/ada/.claude", "darwin", () => "abc")).toBe("/Users/ada/.claude/isoplan/pipe/runner-abc.sock");
+  expect(pipeAddress("/home/ada/.claude", "linux", () => "abc")).toBe("/home/ada/.claude/isoplan/pipe/runner-abc.sock");
+  for (const platform of ["win32", "darwin", "linux"] as const) expect(pipeAddress("/home/ada/.claude", platform)).not.toBe(pipeAddress("/home/ada/.claude", platform));
+  // Short enough for a Unix socket's path (104 bytes on macOS) under a usual home.
+  expect(pipeAddress("/Users/someone-long/.claude", "darwin").length).toBeLessThan(104);
+});
+
+test("pipe: a worker's pipe that closes leaves the next worker's alone (a runner replaced mid-session)", async () => {
+  const before = await runnerEnd();
+  const after = await runnerEnd(before.claudeDir);
+  expect(after.server.address).not.toBe(before.server.address);
+  await before.server.close();
+  const info = (await readPipeInfo(before.claudeDir))!;
+  expect(info.address).toBe(after.server.address);
+  expect(await openPipe(info, () => {})).not.toBeNull();
+});
+
+test("pipe: the runner proves it knows the token before a client sends it; a pipe that can't is dropped, and is sent nothing", async () => {
+  const { claudeDir, server } = await runnerEnd();
+  const info = (await readPipeInfo(claudeDir))!;
+  const hi = rawClient(info.address, { type: "hi", v: 1, nonce: "n-1" });
+  await until(() => hi.got.length > 0);
+  expect(hi.got).toEqual([{ type: "proof", proof: proofOf(info.token, "n-1") }]);
+  hi.socket.destroy();
+
+  // A pipe of another user's under the name pipe.json gives, which answers without the token.
+  const impostor = await runnerEnd(path.join(tempRoot(), "other"));
+  const heard: unknown[] = [];
+  const stray = net.createServer((socket) => {
+    socket.on("error", () => {});
+    readLines(socket, (value) => {
+      heard.push(value);
+      writeLine(socket, { type: "proof", proof: "0".repeat(64) });
+    });
+  });
+  const strayAddress = pipeAddress(path.join(tempRoot(), "stray"));
+  await preparePipe(strayAddress);
+  await new Promise<void>((resolve) => stray.listen(strayAddress, resolve));
+  closing.push(() => new Promise((resolve) => stray.close(resolve)));
+  expect(await openPipe({ address: strayAddress, token: info.token }, () => {})).toBeNull();
+  // Another runner's, with another token.
+  expect(await openPipe({ address: impostor.server.address, token: info.token }, () => {})).toBeNull();
+  expect(heard).toEqual([{ type: "hi", v: 1, nonce: expect.stringMatching(/^[0-9a-f]{32}$/) }]);
+
+  // A hooks module's end that pipe.json sends there says hello to it never, and the runner is down for it.
+  const lost = path.join(tempRoot(), "lost");
+  await writePipeInfo(lost, { address: strayAddress, token: info.token });
+  const end = hooksEnd(lost);
+  await until(() => end.started.length >= 2);
+  expect(heard.length).toBeGreaterThan(1);
+  expect(heard.every((m) => (m as { type: string }).type === "hi")).toBe(true);
+  expect(end.out).toEqual([{ type: "runner", state: "down" }]);
+  expect(server.hooked("s1")).toBeNull();
+});
+
+test("pipe: a token of 64 characters, some not ASCII, is refused without taking the runner down", async () => {
+  const { claudeDir, server } = await runnerEnd();
+  const info = (await readPipeInfo(claudeDir))!;
+  const odd = rawClient(info.address, { type: "hello", v: 1, token: "é" + "0".repeat(63), session: "s1", cwd: "C:/w", since: 1, messages: true, root: "C:/p", version: "0.12.0" });
+  await odd.closed;
+  expect(server.hooked("s1")).toBeNull();
+  hooksEnd(claudeDir);
+  await until(() => !!server.hooked("s1"));
+});
+
+test("pipe: a runner that won't start is said with a line of its own, and in the session's log, each time that changes", async () => {
+  const claudeDir = path.join(tempRoot(), "claude");
+  let result = "held-off";
+  const end = hooksEnd(claudeDir, { started: () => result });
+  await until(() => end.started.length >= 3);
+  expect(end.out).toEqual([
+    { type: "runner", state: "down" },
+    { type: "runner", state: "down", held: "held-off" },
+  ]);
+  expect(end.said).toEqual(["Isoplan's runner is holding off for now (runner.log says why), so this session isn't reported until it starts again"]);
+  result = "not-installed";
+  await until(() => end.out.length === 3);
+  expect(end.out[2]).toEqual({ type: "runner", state: "down", held: "not-installed" });
+  result = "started";
+  await until(() => end.out.length === 4);
+  expect(end.out[3]).toEqual({ type: "runner", state: "down" });
+  expect(end.said).toHaveLength(2);
+});
+
+test("pipe: the session's own plugin folders and update switches go with its hello", async () => {
+  const { claudeDir, server } = await runnerEnd();
+  hooksEnd(claudeDir, { env: { CLAUDE_CODE_PLUGIN_DIRS: "C:/p", DISABLE_AUTOUPDATER: "1" } });
+  await until(() => !!server.hooked("s1"));
+  expect(server.hooked("s1")!.env).toEqual({ CLAUDE_CODE_PLUGIN_DIRS: "C:/p", DISABLE_AUTOUPDATER: "1" });
 });
 
 test("pipe: of two hooks modules for a session, a newer version's keeps it, and of one version the later window's", () => {
@@ -148,9 +246,9 @@ test("pipe: when the runner goes, the hooks module's end says so once, starts it
 });
 
 /** dist/ask.js run as the hooks module runs it, for session s1, in the config folder `claudeDir`. */
-const askScript = (claudeDir: string, question: string) =>
+const askScript = (claudeDir: string, question: string, cwd = "C:/w/repo") =>
   new Promise<string>((resolve) => {
-    const child = execFile(process.execPath, [path.join(modDir, "dist", "ask.js"), "--session", "s1", "--cwd", "C:/w/repo", "--server", "ws://office/data-layer", "--key", "toolu_1"], { env: { ...process.env, CLAUDE_CONFIG_DIR: claudeDir }, windowsHide: true }, (_err, stdout) => resolve(stdout.trim()));
+    const child = execFile(process.execPath, [path.join(modDir, "dist", "ask.js"), "--session", "s1", "--cwd", cwd, "--server", "ws://office/data-layer", "--key", "toolu_1"], { env: { ...process.env, CLAUDE_CONFIG_DIR: claudeDir }, windowsHide: true }, (_err, stdout) => resolve(stdout.trim()));
     child.stdin!.end(question);
   });
 
@@ -162,6 +260,9 @@ test("pipe: the ask_room script asks through the runner only for a session whose
   await until(() => !!server.hooked("s1"));
   expect(await askScript(claudeDir, "Why?")).toBe("answered: Why?");
   expect(asked).toEqual([{ type: "ask", v: 1, token: (await readPipeInfo(claudeDir))!.token, session: "s1", cwd: "C:/w/repo", servers: ["ws://office/data-layer"], key: "toolu_1", question: "Why?" }]);
+  // Asked as the session its hooks module registered, in that session's folder, whatever folder the ask names.
+  expect(await askScript(claudeDir, "Where?", "C:/elsewhere")).toBe("answered: Where?");
+  expect(asked.at(-1)).toMatchObject({ cwd: "C:/w/repo" });
   await server.close();
-  expect(await askScript(claudeDir, "Why?")).toMatch(/^The room can't be asked right now: Isoplan's runner isn't running on this machine/);
+  expect(await askScript(claudeDir, "Why?")).toBe("The room can't be asked right now: this session can't reach Isoplan's runner on this machine. Carry on without the answer.");
 });

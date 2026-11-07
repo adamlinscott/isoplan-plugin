@@ -17,11 +17,12 @@ import type { DataLayerLine } from "../lines.js";
 import { loadConfig } from "../data-layer/config.js";
 import { claudePaths } from "../data-layer/identity.js";
 import { nodeIo } from "../data-layer/io.js";
-import { spawnHidden, startMachine, systemPlaces } from "../data-layer/report-session.js";
+import { sessionLog, spawnHidden, startMachine, systemPlaces } from "../data-layer/report-session.js";
 import { managedDir, newestDataLayer, pluginDirsOf, pluginsDir, type Place } from "../install/state.js";
 import { startRunner } from "../runner/start.js";
 import { alive } from "../wake/lock.js";
 import { relay } from "./client.js";
+import { sessionEnv } from "./pipe.js";
 
 // How often it checks that its parent is still there.
 const PARENT_CHECK_MS = 5000;
@@ -62,14 +63,18 @@ export async function pipeMain(argv: string[], appDir: string): Promise<number> 
     .readFile(path.join(appDir, ".claude-plugin", "plugin.json"), "utf8")
     .then((text) => String((JSON.parse(text) as { version?: unknown }).version ?? "0.0.0"))
     .catch(() => "0.0.0");
+  const said = sessionLog(claudeDir, session);
   await relay({
     claudeDir,
-    hello: { session, cwd, since: Number(value(argv, "--since")) || Date.now(), messages: argv.includes("--messages"), root: appDir, version },
+    // The session's own plugin folders and update switches go with it: the runner's environment isn't the session's.
+    hello: { session, cwd, since: Number(value(argv, "--since")) || Date.now(), messages: argv.includes("--messages"), root: appDir, version, env: sessionEnv(process.env) },
     out,
     goOn,
     startRunner: () => startRunner({ claudeDir, spawn: spawnHidden }),
+    say: said.say,
     retryMs: async () => (await loadConfig(io, path.join(appDir, "config.json"), path.join(claudeDir, "isoplan", "config.json"))).runnerRetrySeconds * 1000,
   });
+  await said.flushed();
   return 0;
 }
 

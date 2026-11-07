@@ -1,6 +1,7 @@
-import net from "node:net";
 import os from "node:os";
+import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import fs from "node:fs/promises";
+import net from "node:net";
 import path from "node:path";
 //#region ../../node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/core/util.js
 function getEnumValues(entries) {
@@ -6774,6 +6775,8 @@ function claudePaths(env, home) {
 //#endregion
 //#region src/pipe/pipe.ts
 const pipeInfoPath = (claudeDir) => path.join(claudeDir, "isoplan", "runner", "pipe.json");
+const newNonce = () => randomBytes(16).toString("hex");
+const proofOf = (token, nonce) => createHmac("sha256", token).update(nonce).digest("hex");
 async function readPipeInfo(claudeDir) {
 	try {
 		const { address, token } = JSON.parse(await fs.readFile(pipeInfoPath(claudeDir), "utf8"));
@@ -6784,6 +6787,41 @@ async function readPipeInfo(claudeDir) {
 	} catch {
 		return null;
 	}
+}
+const PROOF_WAIT_MS = 5e3;
+/**
+* Connects to the pipe at `info.address` and has the runner prove it knows the token (see above).
+* Resolves the socket once it has, with every later line given to `onLine`; null when the pipe
+* can't be reached or doesn't prove it, and then nothing of the client's went to it.
+*/
+function openPipe(info, onLine) {
+	return new Promise((resolve) => {
+		const nonce = newNonce();
+		const want = Buffer.from(proofOf(info.token, nonce));
+		let proven = false;
+		const socket = net.connect(info.address);
+		const fail = () => {
+			clearTimeout(timer);
+			socket.destroy();
+			resolve(null);
+		};
+		const timer = setTimeout(fail, PROOF_WAIT_MS);
+		socket.once("connect", () => writeLine(socket, {
+			type: "hi",
+			v: 1,
+			nonce
+		}));
+		socket.on("error", () => {}).once("close", () => proven || fail());
+		readLines(socket, (value) => {
+			if (proven) return onLine(value);
+			const said = value;
+			const proof = said?.type === "proof" ? said.proof : void 0;
+			if (typeof proof !== "string" || Buffer.byteLength(proof) !== want.length || !timingSafeEqual(Buffer.from(proof), want)) return fail();
+			proven = true;
+			clearTimeout(timer);
+			resolve(socket);
+		});
+	});
 }
 /** Calls `onLine` with each whole line that comes in on `socket`, parsed; a line that isn't JSON is passed over. */
 function readLines(socket, onLine, maxBytes = 1 << 20) {
@@ -6816,7 +6854,7 @@ const flag = (argv, name) => {
 	return i >= 0 && argv[i + 1] !== void 0 ? argv[i + 1] : null;
 };
 const flags = (argv, name) => argv.flatMap((arg, i) => arg === name && argv[i + 1] !== void 0 ? [argv[i + 1]] : []);
-const UNREACHABLE = "The room can't be asked right now: Isoplan's runner isn't running on this machine (it is being started). Carry on without the answer.";
+const UNREACHABLE = "The room can't be asked right now: this session can't reach Isoplan's runner on this machine. Carry on without the answer.";
 async function readStdin() {
 	const chunks = [];
 	for await (const chunk of process.stdin) chunks.push(chunk);
@@ -6841,15 +6879,15 @@ async function main(argv) {
 		...flag(argv, "--key") ? { key: flag(argv, "--key") } : {},
 		...ack ? { ack } : { question }
 	};
+	let said = null;
+	const socket = await openPipe(info, (value) => {
+		const answer = value;
+		if (answer?.type === "answer" && typeof answer.text === "string") said = answer.text;
+	});
+	if (!socket) return UNREACHABLE;
 	return new Promise((resolve) => {
-		let said = null;
-		const socket = net.connect(info.address);
-		socket.on("connect", () => writeLine(socket, request));
-		readLines(socket, (value) => {
-			const answer = value;
-			if (answer?.type === "answer" && typeof answer.text === "string") said = answer.text;
-		});
-		socket.on("error", () => {}).on("close", () => resolve(said ?? UNREACHABLE));
+		socket.on("close", () => resolve(said ?? UNREACHABLE));
+		writeLine(socket, request);
 	});
 }
 try {

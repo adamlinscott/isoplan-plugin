@@ -14,12 +14,15 @@
 //
 // Any other top-level transcript written within `idleMinutes` (on its first look, within
 // `lightsOffHours`, so a runner just started fills the office back in) is reported without a hooks
-// module. Not while the transcript names no folder yet or the folder has gone, or while Claude Code
+// module. On its first look none starts before twice `runnerRetrySeconds` has passed: the hooks
+// modules of a runner that started again say hello within one, and their sessions are reported for
+// them from the start, not without them first. Not while the transcript names no folder yet or the folder has gone, or while Claude Code
 // lists the plugin as uninstalled or disabled for the folder.
 //
 // Either way, not while the session's lock in <claude dir>/isoplan/live names another live process
 // that keeps it fresh: the data layer process of an earlier version of the plugin, for a session
-// still on that version. The runner counts a lock as fresh for three of its own slowest passes
+// still on that version; except one a hooks module's report takes the lock over from (takesOver in
+// report-session.ts), and one that lets it go is reported for its hooks module at the next look. The runner counts a lock as fresh for three of its own slowest passes
 // (lockFreshMs, from its config.json).
 //
 // A session it stopped reporting without a hooks module (quiet past `idleMinutes`, nothing to
@@ -38,8 +41,7 @@ import path from "node:path";
 import { approvedFiles, freshRepos, readApproved } from "../data-layer/approved-file.js";
 import { officesOf, type Config } from "../data-layer/config.js";
 import type { NodeIo } from "../data-layer/io.js";
-import { lockFreshMs, type Ended } from "../data-layer/report-session.js";
-import { cwdOf } from "../sweep/find.js";
+import { lockFreshMs, takesOver, type Ended } from "../data-layer/report-session.js";
 import { alive, lockPath, readLock } from "../wake/lock.js";
 
 // On its first look, the gap between starting two sessions that are already quiet, so each is
@@ -55,14 +57,17 @@ export interface ToReport<H = unknown> {
   cwd: string;
   /** The offices that didn't want it, each until when. */
   notWanted: Record<string, number>;
-  closed: Promise<void>;
+  /** Settles when it should stop, with why. */
+  closed: Promise<string>;
   /** The session's hooks module, connected to the runner's pipe, to report it for; none without. */
   hooks?: H;
 }
 
-/** A connected hooks module, as `hooked` gives it: its session's folder. */
+/** A connected hooks module, as `hooked` gives it: its session's folder, and the plugin's folder it runs from and when its window started. */
 export interface HookedSession {
   cwd: string;
+  root?: string;
+  since?: number;
 }
 
 export interface ReportingOptions<H extends HookedSession = HookedSession> {
@@ -102,7 +107,7 @@ interface Seen {
   mtimeMs: number;
   size: number;
   cwd: string | null;
-  running: { stop: () => void; done: Promise<void>; hooks: unknown } | null;
+  running: { stop: (why: string) => void; done: Promise<void>; hooks: unknown } | null;
   /** The hooks module the last report was for (null for none), once it ended. */
   endedFor: unknown;
   /** Waiting its turn on the first look. */
@@ -114,6 +119,28 @@ interface Seen {
   /** Another process held its lock at the last look that checked. */
   held: boolean;
 }
+
+const HEAD_BYTES = 65536;
+
+/** The first folder a transcript's lines name, from its first and last 64 KB. */
+export async function cwdOf(io: NodeIo, file: string, size: number): Promise<string | null> {
+  for (const [start, end] of [[0, HEAD_BYTES], [Math.max(0, size - HEAD_BYTES), size]] as const) {
+    for (const text of (await io.read(file, start, end).catch(() => "")).split("\n")) {
+      if (!text.includes('"cwd"')) continue;
+      try {
+        const cwd = (JSON.parse(text) as { cwd?: unknown }).cwd;
+        if (typeof cwd === "string" && cwd) return cwd;
+      } catch {
+        // A line cut by the window's edge.
+      }
+    }
+  }
+  return null;
+}
+
+/** Why a report for hooks module `from` stops when the session has `to` (either none), as its log says it. */
+const changed = (from: unknown, to: unknown) =>
+  !to ? "its hooks module's link to the runner closed" : !from ? "its hooks module connected to the runner, which reports it for that hooks module now" : "another hooks module has the session now (another window, or a reload)";
 
 export function watchSessions<H extends HookedSession>(o: ReportingOptions<H>): Reporting {
   const { claudeDir, io, isAlive = alive, pid = process.pid, gapMs = GAP_MS, stopWaitMs = STOP_WAIT_MS } = o;
@@ -127,8 +154,8 @@ export function watchSessions<H extends HookedSession>(o: ReportingOptions<H>): 
   let said = ""; // a lasting problem is logged once
 
   const start = (id: string, s: Seen, cwd: string, hooks: H | null = null) => {
-    let close = () => {};
-    const closed = new Promise<void>((resolve) => (close = resolve));
+    let close = (_why: string) => {};
+    const closed = new Promise<string>((resolve) => (close = resolve));
     const now = Date.now();
     const notWanted = Object.fromEntries(Object.entries(s.notWanted).filter(([, until]) => until > now));
     const done = o
@@ -166,9 +193,10 @@ export function watchSessions<H extends HookedSession>(o: ReportingOptions<H>): 
     return false;
   };
 
-  /** Whether the session's lock names another live process that keeps it fresh. */
-  const heldByAnother = async (id: string, now: number, config: Config) => {
+  /** Whether the session's lock names another live process that keeps it fresh, and that a report for `hooks` wouldn't take it over from. */
+  const heldByAnother = async (id: string, now: number, config: Config, hooks?: H) => {
     const lock = await readLock(lockPath(claudeDir, id));
+    if (hooks?.root && hooks.since !== undefined && takesOver(lock, path.join(hooks.root, "dist", "data-layer.js"), hooks.since, pid)) return false;
     return !!lock?.pid && lock.pid !== pid && isAlive(lock.pid) && now - lock.mtimeMs < lockFreshMs(config);
   };
 
@@ -177,6 +205,7 @@ export function watchSessions<H extends HookedSession>(o: ReportingOptions<H>): 
     const now = Date.now();
     const windowMs = Math.max(config.idleMinutes * 60000, first ? config.lightsOffHours * 3600000 : 0);
     const quiet: [string, Seen, string][] = [];
+    const recent: [string, Seen, string][] = []; // on the first look, those to start once the hooks modules have said hello
     for (const dir of await io.listDir(projectsDir)) {
       if (!dir.isDir) continue;
       for (const entry of await io.listDir(path.join(projectsDir, dir.name))) {
@@ -194,17 +223,16 @@ export function watchSessions<H extends HookedSession>(o: ReportingOptions<H>): 
           // Reported for another hooks module than the session has now: stopped, and reported again for this one.
           if (s.running.hooks !== hooks) {
             rehooked.add(id);
-            s.running.stop();
+            s.running.stop(changed(s.running.hooks, hooks));
           }
           continue;
         }
         if (hooks) {
           // Its hooks module's report ended by itself: not again before the transcript moves.
           if (s.endedFor === hooks && s.endedAt !== null && st.mtimeMs <= s.endedAt) continue;
-          if (await heldByAnother(id, now, config)) {
+          // Looked at again each look, so it starts as soon as the lock lets go.
+          if (await heldByAnother(id, now, config, hooks)) {
             s.held = true;
-            s.endedAt = st.mtimeMs;
-            s.endedFor = hooks;
             continue;
           }
           s.held = false;
@@ -244,18 +272,24 @@ export function watchSessions<H extends HookedSession>(o: ReportingOptions<H>): 
           s.endedAt = st.mtimeMs;
           continue;
         }
-        if (first && st.mtimeMs < now - config.idleMinutes * 60000) quiet.push([id, s, s.cwd]);
+        if (first) (st.mtimeMs < now - config.idleMinutes * 60000 ? quiet : recent).push([id, s, s.cwd]);
         else start(id, s, s.cwd);
       }
     }
-    if (first && quiet.length) {
-      for (const [, s] of quiet) s.queued = true;
+    if (first && (recent.length || quiet.length)) {
+      for (const [, s] of [...recent, ...quiet]) s.queued = true;
+      const startQueued = ([id, s, cwd]: [string, Seen, string]) => {
+        if (!s.queued) return; // its hooks module connected meanwhile, and it was started for that
+        s.queued = false;
+        if (!stopped && !s.running) start(id, s, cwd);
+      };
+      const holdMs = 2 * config.runnerRetrySeconds * 1000;
       void (async () => {
-        for (const [id, s, cwd] of quiet) {
+        await new Promise((r) => setTimeout(r, holdMs));
+        recent.forEach(startQueued);
+        for (const queued of quiet) {
           await new Promise((r) => setTimeout(r, gapMs));
-          if (!s.queued) continue; // its hooks module connected meanwhile, and it was started for that
-          s.queued = false;
-          if (!stopped && !s.running) start(id, s, cwd);
+          startQueued(queued);
         }
       })();
     }
@@ -291,16 +325,17 @@ export function watchSessions<H extends HookedSession>(o: ReportingOptions<H>): 
     look: lookOnce,
     rehook: (id) => {
       const s = seen.get(id);
-      if (s?.running && s.running.hooks !== (o.hooked?.(id) ?? null)) {
+      const hooks = o.hooked?.(id) ?? null;
+      if (s?.running && s.running.hooks !== hooks) {
         rehooked.add(id);
-        s.running.stop();
+        s.running.stop(changed(s.running.hooks, hooks));
       } else void lookOnce();
     },
     async stop() {
       stopped = true;
       if (timer) clearTimeout(timer);
       const running = [...seen.values()].flatMap((s) => s.running ?? []);
-      for (const r of running) r.stop();
+      for (const r of running) r.stop("the runner stopped");
       let timeout: ReturnType<typeof setTimeout> | undefined;
       await Promise.race([Promise.all(running.map((r) => r.done)), new Promise((r) => (timeout = setTimeout(r, stopWaitMs)))]);
       clearTimeout(timeout);

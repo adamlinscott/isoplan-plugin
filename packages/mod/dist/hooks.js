@@ -311,7 +311,7 @@ async function run($) {
 		stop = null;
 		if (superseded) {
 			if (superseded === "newer") updated = true;
-			show($, superseded === "newer" ? void 0 : "Isoplan: this session is reported from its other window");
+			show($, superseded === "newer" ? void 0 : superseded === "earlier" ? EARLIER_TEXT : "Isoplan: this session is reported from its other window");
 			superseded = null;
 			failures = 0;
 			await $.clock.sleep(SUPERSEDED_RECHECK_MS);
@@ -351,7 +351,7 @@ function handle($, text) {
 		case "runner":
 			offices.clear();
 			pairings.clear();
-			show($, line.state === "down" ? RUNNER_DOWN_TEXT : statusText());
+			show($, line.state === "down" ? RUNNER_DOWN_TEXT[line.held ?? "starting"] : statusText());
 			break;
 		case "title-ask":
 			writeTitle($, line);
@@ -405,7 +405,12 @@ function show($, text) {
 	$.ui.status(updated ? [text, UPDATED_TEXT].filter(Boolean).join(" · ") : text);
 }
 const UPDATED_TEXT = "Isoplan updated: type /reload-plugins";
-const RUNNER_DOWN_TEXT = "Isoplan: this session isn't reaching the office until Isoplan's runner is back; starting it";
+const RUNNER_DOWN_TEXT = {
+	starting: "Isoplan: this session isn't reaching the office until Isoplan's runner is back; starting it",
+	"held-off": "Isoplan: this session isn't reaching the office: Isoplan's runner is holding off for up to an hour (runner.log says why)",
+	"not-installed": "Isoplan: this session isn't reaching the office: Isoplan's runner isn't installed; run the plugin's install script"
+};
+const EARLIER_TEXT = "Isoplan: this session is reported by an earlier version of the plugin still running for it";
 function statusText() {
 	const parts = [...offices.values()].filter(Boolean);
 	return parts.length ? `Isoplan: ${parts.join(" · ")}` : void 0;

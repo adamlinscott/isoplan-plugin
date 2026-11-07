@@ -141,7 +141,7 @@ function hooksModule(claudeDir: string, repo: string) {
       if (line.type === "waits") fs.writeFileSync(path.join(line.dir, "toolu_q1.json"), JSON.stringify({ question: "toolu_q1", waiting: true }));
     },
     goOn: () => on,
-    startRunner: async () => {},
+    startRunner: async () => "running",
     retryMs: async () => 100,
   });
   return { out, of: <T extends DataLayerLine["type"]>(type: T) => out.filter((l): l is Extract<DataLayerLine, { type: T }> => l.type === type) };

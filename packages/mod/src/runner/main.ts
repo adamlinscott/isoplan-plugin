@@ -17,8 +17,8 @@
 // (lifecycle.ts). After MAX_FAST_FAILURES quick crashes in a row it gives up and lets the lock go.
 // The worker holds one link to each office server in config.json (#105), opened with a runner hello
 // carrying the machine's pairing token with that server when it signs people in, under the machine's
-// Claude account (src/data-layer/pairing.ts; a link to approve goes to the log, and to each session's
-// status line through its hooks module), and stays up while any session on the machine is inside its
+// Claude account (src/data-layer/pairing.ts; a link to approve goes to the log, and to the status
+// line of each session waiting for it, through its hooks module, pair-links.ts), and stays up while any session on the machine is inside its
 // lights-off window. Each office's link answers for that office alone: only for sessions in a repo
 // it takes, from the same list the data layers read (src/data-layer/approved.ts). The forks, their
 // cap (`maxForks`, one for the machine), the ledger and its caps are shared by every office. When a
@@ -85,8 +85,8 @@ import { managedDir, pluginDirsOf, pluginsDir } from "../install/state.js";
 import { recordedState } from "../install/install.js";
 import { reportSession, sessionLog } from "../data-layer/report-session.js";
 import { askFromMachine } from "../ask/machine.js";
-import { createPipeServer, type Hooked, type PipeServer } from "../pipe/server.js";
-import type { PairLine } from "../lines.js";
+import { createPipeServer, type Hooked } from "../pipe/server.js";
+import { createPairLinks } from "./pair-links.js";
 import { startPlaces, startWhere } from "./start-where.js";
 import { runnerEnvPath } from "./environment.js";
 import { applyClaudeDir, LOCK_REFRESH_MS, RUNNER_FRESH_MS, runnerCode, runnerLockPath } from "./start.js";
@@ -185,19 +185,16 @@ async function worker(): Promise<number> {
   await settings(); // a broken runner.json of the plugin's is a crash to see at once
   const answering = offices.filter((o) => !o.plainRefused);
   const account = await accountOf({ readText: (p) => fs.readFile(p, "utf8").catch(() => null), run: io.run }, claudeJson, os.homedir());
-  let pipe: PipeServer | null = null;
-  // Each office's last link to pair the machine, for a session that reaches its pairing state later.
-  const lastPair = new Map<string, PairLine>();
+  // The machine's links to pair it, to the sessions waiting for them.
+  const pairLinks = createPairLinks();
   const emitFor = (server: string): Parameters<typeof createLink>[0]["emit"] => (line) => {
     if (line.type === "log") log(line.text);
     else if (line.type === "error") log(`the office server at ${server} says: ${line.message} (${line.code})`);
     else if (line.type === "pair") {
       log(`to answer for this machine's rooms through ${line.server}, pair it: click ${line.url} on this computer and approve it in the office (it works until ${line.expires})`);
-      // The machine's one pairing: its link is in every connected session's status line.
+      // The machine's one pairing: its link is in the status line of each session waiting for it.
       const label = offices.find((o) => o.server === line.server)?.label;
-      const pair = { ...line, ...(label && { label }) };
-      lastPair.set(line.server, pair);
-      for (const hooked of pipe?.all() ?? []) hooked.send(pair);
+      pairLinks.pair({ ...line, ...(label && { label }) });
     }
   };
   // Each office's pairing and list of repos (src/data-layer/approved.ts), one of each for the
@@ -222,10 +219,20 @@ async function worker(): Promise<number> {
     }),
   );
   // Every session on the machine is reported from here (reporting.ts), started first, so a runner
-  // started again has them on the floor again at once.
+  // started again has them on the floor again at once (those of hooks modules, once they say hello).
   const paths = { claudeDir, settings: path.join(claudeDir, "settings.json"), plugins: pluginsDir(claudeDir, process.env), managed: managedDir(process.platform), pluginDirs: pluginDirsOf(process.env) };
   const isOff = async (folder: string) => (await recordedState(paths, folder).catch(() => "enabled" as const)) !== "enabled";
   const scanText = async (text: string) => scan(text, await loadPatterns(path.join(appDir, "secret-patterns.json"), path.join(isoplanDir, "secret-patterns.json"), log));
+  // Each session's hooks module reaches the runner here (src/pipe/server.ts), opened before the first
+  // look, so the hooks modules of a runner started again can say hello before it. A worker that can't
+  // serve the pipe still reports every session, without their hooks modules.
+  let rehook = (_session: string) => {};
+  const pipe = await createPipeServer({
+    claudeDir,
+    log,
+    onChange: (session) => rehook(session),
+    ask: (request) => askFromMachine({ ...request, appDir, scan: scanText }),
+  }).catch((err: Error) => (log(`the runner couldn't open its pipe for the sessions' hooks modules: ${err.message}`), null));
   const reporting = watchSessions<Hooked>({
     claudeDir,
     io,
@@ -245,17 +252,17 @@ async function worker(): Promise<number> {
             by: "hooks",
             appDir,
             root: hooks.root,
+            since: hooks.since,
+            env: hooks.env,
             takesMessages: hooks.messages,
             emit: (line) => {
               said.emit(line);
               hooks.send(line);
-              // The machine's pairing showed its link before this session got to it: the link goes with it.
-              const pair = line.type === "status" && line.state === "pairing" ? lastPair.get(line.server) : undefined;
-              if (pair) hooks.send(pair);
+              pairLinks.sent(sessionId, line, hooks.send);
             },
-            closed: Promise.race([closed, hooks.closed]),
+            closed: Promise.race([closed, hooks.closed.then(() => "its hooks module's link to the runner closed")]),
             shared: shares,
-          });
+          }).finally(() => pairLinks.ended(sessionId, hooks.send));
         return await reportSession({ sessionId, cwd, by: "runner", appDir, emit: said.emit, closed, notWanted, isOff: () => isOff(cwd), shared: shares });
       } catch (err) {
         said.say(`stopping: something went wrong: ${String((err as Error)?.stack ?? err)}`);
@@ -265,15 +272,7 @@ async function worker(): Promise<number> {
       }
     },
   });
-
-  // Each session's hooks module reaches the runner here (src/pipe/server.ts). A worker that can't
-  // serve the pipe still reports every session, without their hooks modules.
-  pipe = await createPipeServer({
-    claudeDir,
-    log,
-    onChange: (session) => reporting.rehook(session),
-    ask: (request) => askFromMachine({ ...request, appDir, scan: scanText }),
-  }).catch((err: Error) => (log(`the runner couldn't open its pipe for the sessions' hooks modules: ${err.message}`), null));
+  rehook = reporting.rehook;
 
   // Every process it starts is recorded; what an earlier run left that is Isoplan's ends now. Only a
   // worker whose supervisor holds the runner's lock gets here.
