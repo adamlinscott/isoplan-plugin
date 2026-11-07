@@ -538,6 +538,7 @@ function fit(m: DrivenMessage): DrivenMessage {
   limit("command", MAX_COMMAND_LENGTH);
   limit("folder", MAX_FOLDER_LENGTH);
   limit("detail", MAX_DETAIL_LENGTH);
+  limit("note", MAX_DETAIL_LENGTH);
   limit("description", MAX_PROMPT_LENGTH);
   limit("text", m.kind === "reply" ? MAX_REPLY_LENGTH : m.kind === "output" ? MAX_OUTPUT_LENGTH : MAX_DETAIL_LENGTH);
   if (m.kind === "holding") out.sessions = m.sessions.map((s) => ({ ...s, room: cutStart(s.room, MAX_ROOM_ID_LENGTH).text, session: s.session.slice(0, MAX_DRIVEN_SESSION_ID_LENGTH) }));

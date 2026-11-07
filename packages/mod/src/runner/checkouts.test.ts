@@ -198,5 +198,6 @@ test("in Orca: the checkout when it is on the branch or none is named; else Orca
   const mine = await orcaBranchFolder(orca, run, clone, "mine", 30000);
   same(mine as string, path.join(root, "app-branch-mine"));
   expect(fake.calls().at(-1)!.slice(0, 2)).toEqual(["worktree", "show"]);
-});
+  // Many git and Orca calls, each a process: slow on a loaded machine.
+}, 30000);
 

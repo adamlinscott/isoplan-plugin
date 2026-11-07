@@ -4,7 +4,7 @@ import fs from "node:fs";
 import type { AddressInfo } from "node:net";
 import path from "node:path";
 import { PassThrough } from "node:stream";
-import { MAX_TOOL_NAME_LENGTH, PROTOCOL_VERSION, type DriveMessage, type DrivenMessage, type RunnerHelloMessage } from "@isoplan/protocol";
+import { MAX_DETAIL_LENGTH, MAX_TOOL_NAME_LENGTH, PROTOCOL_VERSION, type DriveMessage, type DrivenMessage, type RunnerHelloMessage } from "@isoplan/protocol";
 import { afterEach, expect, test, vi } from "vitest";
 import { WebSocketServer, type WebSocket as ServerSocket } from "ws";
 import { modDir, tempRoot } from "../data-layer/fixture.js";
@@ -339,7 +339,7 @@ test("start elsewhere: in a listed folder, on a listed branch, it opens where as
 test("start elsewhere: one that didn't open is refused unavailable with why, one that opened with something left to do says it, and either through the secret scan; a runner that can't is unavailable", async () => {
   const answers = [
     { opened: false, problem: "Orca wasn't found on sam-laptop, so nothing was started." },
-    { opened: true, problem: "The Claude app didn't open on the session." },
+    { opened: true, problem: `The Claude app didn't open on the session: ${"x".repeat(2000)}` },
     { opened: false, problem: `git said ${AWS_KEY}` },
   ];
   const t = await setUp({ policy: null, elsewhere: async () => answers.shift()! });
@@ -356,10 +356,12 @@ test("start elsewhere: one that didn't open is refused unavailable with why, one
   await t.until(() => answered().length === 3);
   expect(answered()).toEqual([
     { type: "driven", v: 1, kind: "refused", id: "d1", reason: "unavailable", detail: "Orca wasn't found on sam-laptop, so nothing was started." },
-    { type: "driven", v: 1, kind: "opened", id: "d2", session: `claude-code:${UUIDS[1]}`, room: `room:claude-code:${UUIDS[1]}`, mode: "desktop", note: "The Claude app didn't open on the session." },
+    { type: "driven", v: 1, kind: "opened", id: "d2", session: `claude-code:${UUIDS[1]}`, room: `room:claude-code:${UUIDS[1]}`, mode: "desktop", note: expect.stringMatching(/^The Claude app didn't open on the session: x+/) },
     { type: "driven", v: 1, kind: "refused", id: "d3", reason: "unavailable", detail: expect.stringContaining("held back on this computer") },
   ]);
   expect(JSON.stringify(t.sent)).not.toContain(AWS_KEY);
+  // Cut to the protocol's limit, so the server takes it.
+  expect(t.of("opened")[0]!.note!.length).toBeLessThanOrEqual(MAX_DETAIL_LENGTH);
   // Someone other than the runner's own person opens nothing.
   t.driver.take(SERVER, { type: "drive", v: PROTOCOL_VERSION, by: { id: "github:999", name: "Eve" }, id: "d4", kind: "start", folder: t.folder, project: PROJECT, permissions: "auto", instruction: "x", mode: "headless" } as DriveMessage);
   await t.until(() => answered().length === 4);
