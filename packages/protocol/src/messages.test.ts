@@ -1,5 +1,6 @@
 import { describe, expect, test } from "vitest";
 import {
+  MAX_BRANCH_LENGTH,
   MAX_DETAIL_LENGTH,
   MAX_DRIVE_ID_LENGTH,
   MAX_FOLDER_LENGTH,
@@ -10,6 +11,7 @@ import {
   MAX_OUTPUT_LENGTH,
   MAX_PROMPT_LENGTH,
   MAX_REPLY_LENGTH,
+  MAX_REPO_BRANCHES,
   MAX_REPO_FOLDERS,
   MAX_ROOM_SESSIONS,
   MAX_SUMMARY_LENGTH,
@@ -204,6 +206,7 @@ const valid = {
   "handoff as a driven session": { type: "handoff", v, handoff, mode: "driven", session: "0b5c4d3e-0000-4000-8000-000000000001", by: sam, room, permissions: "auto" },
   "drive start": { type: "drive", v, kind: "start", id: "d1", by: adam, room, project: isoplan, roomSessions: ["claude-code:s1"], instruction: "Fix the failing test in src/a.ts.", permissions: "auto" },
   "drive start in a folder": { type: "drive", v, kind: "start", id: "d8", by: adam, folder: "C:\\Users\\adam\\isoplan", project: isoplan, instruction: "Add a dark mode.", permissions: "auto" },
+  "drive start on a branch": { type: "drive", v, kind: "start", id: "d9", by: adam, folder: "/Users/sam/code/isoplan", branch: "feat/dark-mode", project: isoplan, permissions: "auto" },
   "drive instruct": { type: "drive", v, kind: "instruct", id: "i2", by: adam, session: driving, text: "Now run the whole suite." },
   "drive stop": { type: "drive", v, kind: "stop", id: "d3", by: adam, session: driving },
   "drive hand-back": { type: "drive", v, kind: "hand-back", id: "d4", by: adam, session: driving },
@@ -229,6 +232,7 @@ const valid = {
   "driven refused at the cap": { type: "driven", v, kind: "refused", id: "d1", reason: "cap-reached", limit: 4 },
   "driven refused unavailable": { type: "driven", v, kind: "refused", id: "d1", reason: "unavailable", detail: "Claude Code isn't signed in on this machine." },
   "driven folders": { type: "driven", v, kind: "folders", repos: [{ project: isoplan.id, folders: ["/Users/sam/code/isoplan", "/Users/sam/code/isoplan-wt"] }] },
+  "driven folders with branches": { type: "driven", v, kind: "folders", repos: [{ project: isoplan.id, folders: ["/Users/sam/code/isoplan"], branches: ["main", "feat/dark-mode"] }] },
   "driven holding": { type: "driven", v, kind: "holding", sessions: [{ session: driving, room, held: true, permissions: "auto", turn: "i2" }] },
   "driven claude installing": { type: "driven", v, kind: "claude", claude: "missing", doing: "installing", progress: "Downloading Claude Code...", id: "c1" },
   "driven claude signing in": { type: "driven", v, kind: "claude", claude: "signed-out", doing: "signing-in", url: "https://claude.ai/oauth/authorize?code=true", id: "c2" },
@@ -290,6 +294,7 @@ const parsers = {
   "handoff as a driven session": parseOfficeServerMessage,
   "drive start": parseOfficeServerMessage,
   "drive start in a folder": parseOfficeServerMessage,
+  "drive start on a branch": parseOfficeServerMessage,
   "drive instruct": parseOfficeServerMessage,
   "drive stop": parseOfficeServerMessage,
   "drive hand-back": parseOfficeServerMessage,
@@ -316,6 +321,7 @@ const parsers = {
   "driven refused unavailable": parseDataLayerMessage,
   "driven holding": parseDataLayerMessage,
   "driven folders": parseDataLayerMessage,
+  "driven folders with branches": parseDataLayerMessage,
   "driven claude installing": parseDataLayerMessage,
   "driven claude signing in": parseDataLayerMessage,
   "driven claude failed": parseDataLayerMessage,
@@ -377,6 +383,7 @@ const broken: Record<keyof typeof valid, [unknown, string]> = {
   "handoff as a driven session": [{ ...valid["handoff as a driven session"], room: undefined }, "room"],
   "drive start": [{ ...valid["drive start"], permissions: "default" }, "permissions"],
   "drive start in a folder": [{ ...valid["drive start in a folder"], folder: "" }, "folder"],
+  "drive start on a branch": [{ ...valid["drive start on a branch"], branch: "" }, "branch"],
   "drive instruct": [{ ...valid["drive instruct"], text: "x".repeat(MAX_INSTRUCTION_LENGTH + 1) }, "text"],
   "drive stop": [{ ...valid["drive stop"], by: undefined }, "by"],
   "drive hand-back": [{ ...valid["drive hand-back"], session: "" }, "session"],
@@ -403,6 +410,7 @@ const broken: Record<keyof typeof valid, [unknown, string]> = {
   "driven refused unavailable": [{ ...valid["driven refused unavailable"], detail: undefined }, "detail"],
   "driven holding": [{ ...valid["driven holding"], sessions: [{ ...valid["driven holding"].sessions[0], held: "yes" }] }, "sessions[0].held"],
   "driven folders": [{ ...valid["driven folders"], repos: [{ project: isoplan.id, folders: [] }] }, "repos[0].folders"],
+  "driven folders with branches": [{ ...valid["driven folders with branches"], repos: [{ project: isoplan.id, folders: ["/Users/sam/code/isoplan"], branches: [""] }] }, "repos[0].branches"],
   "driven claude installing": [{ ...valid["driven claude installing"], doing: "updating" }, "doing"],
   "driven claude signing in": [{ ...valid["driven claude signing in"], url: "http://claude.ai/oauth/authorize" }, "url"],
   "driven claude failed": [{ ...valid["driven claude failed"], claude: "gone" }, "claude"],
@@ -668,6 +676,9 @@ describe("driven sessions", () => {
     ["the folders listed for a repo", parseDataLayerMessage, (n: number) => ({ ...valid["driven folders"], repos: [{ project: isoplan.id, folders: Array.from({ length: n }, (_, i) => `/Users/sam/code/isoplan-${i}`) }] }), MAX_REPO_FOLDERS, "folders"],
     ["a folder listed", parseDataLayerMessage, (n: number) => ({ ...valid["driven folders"], repos: [{ project: isoplan.id, folders: [long(n)] }] }), MAX_FOLDER_LENGTH, "folders"],
     ["the repos folders are listed for", parseDataLayerMessage, (n: number) => ({ ...valid["driven folders"], repos: Array.from({ length: n }, (_, i) => ({ project: `github.com/sam/repo-${i}`, folders: ["/Users/sam/code/x"] })) }), MAX_FOLDER_REPOS, "repos"],
+    ["the branches listed for a repo", parseDataLayerMessage, (n: number) => ({ ...valid["driven folders with branches"], repos: [{ project: isoplan.id, folders: ["/Users/sam/code/isoplan"], branches: Array.from({ length: n }, (_, i) => `feat/${i}`) }] }), MAX_REPO_BRANCHES, "branches"],
+    ["a branch listed", parseDataLayerMessage, (n: number) => ({ ...valid["driven folders with branches"], repos: [{ project: isoplan.id, folders: ["/Users/sam/code/isoplan"], branches: [long(n)] }] }), MAX_BRANCH_LENGTH, "branches"],
+    ["a start's branch", parseOfficeServerMessage, (n: number) => ({ ...valid["drive start on a branch"], branch: long(n) }), MAX_BRANCH_LENGTH, "branch"],
     ["the sessions a runner holds", parseDataLayerMessage, (n: number) => ({ ...valid["driven holding"], sessions: sessions(n).map((session) => ({ ...valid["driven holding"].sessions[0], session })) }), MAX_HOLDING, "sessions"],
   ] as const)("%s at its limit parses, and one past it doesn't", (_, parse, make, limit, path) => {
     expect(parse(make(limit))).toEqual({ ok: true, message: make(limit) });
@@ -731,12 +742,13 @@ describe("driven sessions", () => {
     expect(parseDataLayerMessage({ ...valid["driven refused"], limit: 4 })).toEqual({ ok: true, message: valid["driven refused"] });
   });
 
-  test("a start names a room or a folder, and a start in a folder names no room or room sessions", () => {
+  test("a start names a room or a folder, a start in a folder names no room or room sessions, and only a start in a folder names a branch", () => {
     const { room: _, ...noRoom } = valid["drive start"];
     for (const [message, path] of [
       [noRoom, "room"],
       [{ ...valid["drive start in a folder"], room }, "room"],
       [{ ...valid["drive start in a folder"], roomSessions: ["claude-code:s1"] }, "roomSessions"],
+      [{ ...valid["drive start"], branch: "main" }, "branch"],
     ] as const) {
       const result = parseOfficeServerMessage(message);
       expect(result).toMatchObject({ ok: false, kind: "invalid" });
@@ -747,6 +759,12 @@ describe("driven sessions", () => {
   test("a start in a Windows folder keeps its backslashes", () => {
     const result = parseOfficeServerMessage(valid["drive start in a folder"]);
     expect(result.ok && result.message.type === "drive" && result.message.kind === "start" && result.message.folder).toBe(String.raw`C:\Users\adam\isoplan`);
+  });
+
+  test("an older runner's folders, with no branches, and a remote with no branches, parse", () => {
+    expect(parseDataLayerMessage(valid["driven folders"])).toEqual({ ok: true, message: valid["driven folders"] });
+    const none = { ...valid["driven folders"], repos: [{ project: isoplan.id, folders: ["/Users/sam/code/isoplan"], branches: [] }] };
+    expect(parseDataLayerMessage(none)).toEqual({ ok: true, message: none });
   });
 
   test("a runner with no folder for any repo says so with an empty list", () => {
