@@ -4,43 +4,15 @@
 //   node dist/ask.js --session <id> --cwd <folder> [--server <address>] --ack <question>  the agent was shown that question's end
 //
 // `--key` is the tool call's id, so asking again under it is the same question (ask.ts). `--server`
-// names an office server that gave the session its rights (#105), one of config.json's, once per
-// office that did. It asks in the office the session took its handoff through (handoff/taken-office.ts)
-// when that is one of them, else in the first of them in config.json's order whose list takes the
-// session's repo; without `--server`, in the first office of all whose list does.
-// It speaks to the office server as that session, on a short link of its own (handoff/connection.ts),
-// and asks the room that session's person was handed (ask.ts). The server decides whether they may.
-//
-// When the office signs people in, the hello carries this machine's pairing token, as the data
-// layer's and the runner's do (data-layer/pairing.ts), so the server admits it as the paired person.
-// A token past its time is renewed with the machine's credential, and a hello refused as
-// `token-expired` is sent once more with a fresh one. The script never pairs the machine itself:
-// with no credential it sends no token, and the session's own data layer shows the link to pair.
-// Refused as not paired, ended or forged, the agent is told so plainly (ask.ts).
+// names an office server that gave the session its rights (#105), once per office that did. It asks
+// through the machine's runner, over the runner's pipe (src/pipe), which asks the office as this
+// session (machine.ts) only while this session's hooks module is connected to it, after its secret
+// scan of the question, once the runner has proved it is the runner (openPipe). With the runner out
+// of reach, the agent is told to carry on.
 
-import fs from "node:fs/promises";
 import os from "node:os";
-import path from "node:path";
-import { fileURLToPath } from "node:url";
-import { MAX_QUESTION_LENGTH, PROTOCOL_VERSION, type HelloMessage, type Project } from "@isoplan/protocol";
-import { loadConfig, loadSettings, officesOf, type Office } from "../data-layer/config.js";
-import { approvedPath } from "../data-layer/approved.js";
-import { commandHome, machineHomeIo } from "../data-layer/home.js";
-import { cachedRemoteNames } from "../data-layer/remote-names.js";
-import { accountOf, claudePaths } from "../data-layer/identity.js";
-import { nodeIo } from "../data-layer/io.js";
-import { createPairing, pairingEntry, pairingLockPath, pairingPath, pairingWriteLockPath, postJson, readPairing } from "../data-layer/pairing.js";
-import { openSideLink } from "../handoff/connection.js";
-import { takenOffice } from "../handoff/taken-office.js";
-import { askOffices, askRoom, MAX_WAIT_MS, TokenExpired, type AskSettings } from "./ask.js";
-
-const CONNECT_MS = 20000;
-
-const here = path.dirname(fileURLToPath(import.meta.url));
-const modDir = path.join(here, "..");
-const { dir: claudeDir, json: claudeJson } = claudePaths(process.env, os.homedir());
-const isoplanDir = path.join(claudeDir, "isoplan");
-const io = nodeIo();
+import { claudePaths } from "../data-layer/identity.js";
+import { openPipe, readPipeInfo, writeLine, type PipeAnswer, type PipeAsk } from "../pipe/pipe.js";
 
 const flag = (argv: string[], name: string) => {
   const i = argv.indexOf(name);
@@ -48,51 +20,8 @@ const flag = (argv: string[], name: string) => {
 };
 const flags = (argv: string[], name: string) => argv.flatMap((arg, i) => (arg === name && argv[i + 1] !== undefined ? [argv[i + 1]!] : []));
 
-const readText = (p: string) => fs.readFile(p, "utf8").catch(() => null);
-
-// The session's hello, as its own data layer says it, with the machine's token when it has one.
-async function hello(session: string, cwd: string, token: string | undefined, project: Project): Promise<HelloMessage> {
-  const machine = os.hostname();
-  return {
-    type: "hello",
-    v: PROTOCOL_VERSION,
-    source: "claude-code",
-    account: await accountOf({ readText, run: io.run }, claudeJson, cwd),
-    machine: { name: machine },
-    session: `claude-code:${session}`,
-    project,
-    ...(token ? { token } : {}),
-  };
-}
-
-// This machine's pairing with `server`, as the data layer keeps it, under the machine's Claude account.
-async function machinePairing(office: Office, allowPlainWs: boolean) {
-  const { server } = office;
-  const account = await accountOf({ readText, run: io.run }, claudeJson, os.homedir());
-  const file = pairingPath(claudeDir);
-  const pairing = createPairing({
-    file,
-    lock: pairingLockPath(claudeDir, office),
-    writeLock: pairingWriteLockPath(claudeDir),
-    server,
-    account,
-    machine: os.hostname(),
-    emit: () => {},
-    allowPlainWs,
-    legacy: !!office.legacy,
-    // Pairing is the data layer's to start, where the person sees its link; this script never asks for one.
-    post: (url, body) => (new URL(url).pathname.endsWith("/pair") ? Promise.reject(new Error("pairing is left to the session's data layer")) : postJson(url, body)),
-  });
-  return {
-    // A token only from a credential this machine already holds; none otherwise.
-    async token(): Promise<string | undefined> {
-      if (!pairingEntry(await readPairing(file), server, account.id)?.credential) return undefined;
-      return (await pairing.token().catch(() => undefined)) ?? undefined;
-    },
-    expired: (sent: string | undefined) => pairing.refused("token-expired", sent).catch(() => {}),
-    close: () => pairing.close().catch(() => {}),
-  };
-}
+// No pipe.json, a pipe that didn't answer or prove it is the runner, or a runner that stopped mid-ask.
+const UNREACHABLE = "The room can't be asked right now: this session can't reach Isoplan's runner on this machine. Carry on without the answer.";
 
 async function readStdin(): Promise<string> {
   const chunks: Buffer[] = [];
@@ -103,54 +32,23 @@ async function readStdin(): Promise<string> {
 async function main(argv: string[]): Promise<string> {
   const session = flag(argv, "--session");
   const cwd = flag(argv, "--cwd");
-  const ack = flag(argv, "--ack");
-  const key = flag(argv, "--key") ?? undefined;
-  const granted = flags(argv, "--server");
+  const ack = flag(argv, "--ack") ?? undefined;
   if (!session || !cwd) return "usage: ask.js --session <id> --cwd <folder> [--key <id>], with the question on stdin; or --ack <question>";
-  const question = ack ? "" : (await readStdin()).trim();
-  if (!ack && !question) return "Give the question to ask the room.";
-  if (question.length > MAX_QUESTION_LENGTH) return `That question is too long to ask the room: keep it under ${MAX_QUESTION_LENGTH} characters.`;
-  const settings = await loadSettings<AskSettings>(io, path.join(modDir, "runner.json"), path.join(isoplanDir, "runner.json"));
-  const config = await loadConfig(io, path.join(modDir, "config.json"), path.join(isoplanDir, "config.json"));
-  const offices = askOffices(officesOf(config), granted, await takenOffice(claudeDir, session));
-  if (!offices.length) return `The room can't be asked: ${granted.join(", ")} isn't one of the office servers in config.json. Carry on without the answer.`;
-  // Nothing of a repo the office doesn't take is sent, its id included (#91): the session's data layer keeps each office's list.
-  let found: Awaited<ReturnType<typeof commandHome>> = { refused: "" };
-  let office = offices[0]!;
-  for (const each of offices) {
-    found = each.plainRefused
-      ? { refused: `config.json's server ${each.server} is plain ws:// to another machine.` }
-      : await commandHome(cwd, machineHomeIo(config.workspaceRepos, cachedRemoteNames(claudeDir)), { file: approvedPath(claudeDir, each.server), server: each.server, maxAgeMs: config.approvedMaxAgeMinutes * 60000 });
-    office = each;
-    if ("home" in found) break;
-  }
-  if ("refused" in found) return `The room can't be asked: ${found.refused} Carry on without the answer.`;
-  const { server } = office;
-  const pairing = await machinePairing(office, config.allowPlainWs);
-  // One bound for the whole wait, a retry after an expired token included.
-  const deadline = Date.now() + MAX_WAIT_MS;
-  try {
-    for (let tries = 0; ; tries++) {
-      const token = await pairing.token();
-      const said = await hello(session, cwd, token, found.home);
-      const link = await openSideLink(server, said, CONNECT_MS);
-      try {
-        if (ack) {
-          link.send({ type: "asked-ack", v: PROTOCOL_VERSION, question: ack });
-          return `acked ${ack}`;
-        }
-        // Named so an answer from this person's own session reads as that (#109).
-        return await askRoom(link, question, settings, { key, deadline, me: said.account.name || undefined });
-      } catch (err) {
-        if (!(err instanceof TokenExpired) || tries > 0) throw err;
-        await pairing.expired(token);
-      } finally {
-        await link.close();
-      }
-    }
-  } finally {
-    await pairing.close();
-  }
+  const question = ack ? undefined : await readStdin();
+  const { dir: claudeDir } = claudePaths(process.env, os.homedir());
+  const info = await readPipeInfo(claudeDir);
+  if (!info) return UNREACHABLE;
+  const request: PipeAsk = { type: "ask", v: 1, token: info.token, session, cwd, servers: flags(argv, "--server"), ...(flag(argv, "--key") ? { key: flag(argv, "--key")! } : {}), ...(ack ? { ack } : { question }) };
+  let said: string | null = null;
+  const socket = await openPipe(info, (value) => {
+    const answer = value as Partial<PipeAnswer>;
+    if (answer?.type === "answer" && typeof answer.text === "string") said = answer.text;
+  });
+  if (!socket) return UNREACHABLE;
+  return new Promise((resolve) => {
+    socket.on("close", () => resolve(said ?? UNREACHABLE));
+    writeLine(socket, request);
+  });
 }
 
 try {
@@ -158,3 +56,4 @@ try {
 } catch (err) {
   process.stdout.write(`The room couldn't be asked: ${(err as Error)?.message ?? String(err)}. Carry on without the answer.\n`);
 }
+process.exit();

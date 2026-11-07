@@ -1335,6 +1335,7 @@ async function finishOptOut({ claudeDir, settings }) {
 }
 const WRITTEN = [
 	"runner",
+	"pipe",
 	"pairing.json",
 	"pairing.lock",
 	"pairing.write.lock",

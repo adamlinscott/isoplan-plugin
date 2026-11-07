@@ -1,9 +1,11 @@
 // The data layer's loop (report-session.ts) against a stand-in office server, with a throwaway
 // Claude config folder: as the runner runs it, in this process, so it installs nothing and starts
 // no runner: what it sends for a session in a repo the office doesn't take, and when the copy of the
-// office's list is too old (isoplan-app/isoplan#91); and as the plugin's data layer ships
-// (dist/data-layer.js, rebuilt with every change), what a copy in the plugin cache does once Claude
-// Code has installed a newer one (isoplan-app/isoplan#96).
+// office's list is too old (isoplan-app/isoplan#91); and as the runner reports a session for its
+// hooks module (ADR 0007 step 2): what it does for a copy in the plugin cache once Claude Code has
+// installed a newer one (isoplan-app/isoplan#96), beside an earlier version's data layer, and with
+// the files the hooks module writes back. dist/data-layer.js (rebuilt with every change) is run as
+// an earlier version's wake hook starts it.
 
 import { execFileSync, spawn, type ChildProcess } from "node:child_process";
 import fs from "node:fs";
@@ -330,27 +332,34 @@ function versions(server = "ws://127.0.0.1:9/data-layer") {
     const exited = new Promise<number | null>((resolve) => child.on("exit", (c) => resolve((code = c))));
     return { pid: child.pid!, hasExited: () => code !== undefined, lines: () => out.split("\n").filter(Boolean).map((l) => JSON.parse(l) as { type: string; text?: string }), exited };
   };
-  // A lock as another window's plugin data layer writes it, by this test's own (live) pid.
-  const held = (version: string, since: number, ageMs = 0) => {
-    fs.mkdirSync(path.dirname(lock), { recursive: true });
-    fs.writeFileSync(lock, JSON.stringify({ pid: process.pid, dataLayer: path.join(folder(version), "dist", "data-layer.js"), detached: false, since, parent: process.pid }));
-    const t = new Date(Date.now() - ageMs);
-    fs.utimesSync(lock, t, t);
+  // Session s1 reported as the runner reports it for a hooks module of `version`, in this process, until the test ends.
+  const hooked = (version: string, extra: Partial<ReportSessionOptions> = {}) => {
+    vi.stubEnv("CLAUDE_CONFIG_DIR", claudeDir);
+    vi.stubEnv("CLAUDE_CODE_PLUGIN_CACHE_DIR", "");
+    // No update check runs against a real Claude Code here.
+    vi.stubEnv("DISABLE_AUTOUPDATER", "1");
+    vi.stubEnv("FORCE_AUTOUPDATE_PLUGINS", "");
+    const out: DataLayerLine[] = [];
+    let stop = () => {};
+    const closed = new Promise<void>((resolve) => (stop = resolve));
+    const done = reportSession({ sessionId: "s1", cwd: repo, by: "hooks", appDir: modDir, root: folder(version), emit: (line) => void out.push(line), closed, ...extra });
+    reporting.push({ stop, done });
+    return { lines: () => out as (DataLayerLine & { text?: string })[], done, stop };
   };
-  return { claudeDir, lock, run, held, holder: () => (fs.existsSync(lock) ? (JSON.parse(fs.readFileSync(lock, "utf8")).pid as number) : null) };
+  return { claudeDir, lock, run, hooked, holder: () => (fs.existsSync(lock) ? (JSON.parse(fs.readFileSync(lock, "utf8")).pid as number) : null) };
 }
 
-test("a copy in the plugin cache that an update left behind says so, installs nothing and checks for nothing; started --detached by an older wake hook, it ends at once, saying why in the session's log", async () => {
+test("for a hooks module on a copy an update left behind, the runner says so once, installs nothing and checks for nothing; dist/data-layer.js started --detached by an older wake hook ends at once, saying why in the session's log", async () => {
   const v = versions();
-  const loaded = v.run("0.2.0");
+  const loaded = v.hooked("0.2.0");
   await until(() => loaded.lines().some((l) => l.type === "updated"));
   await wait(1500);
   expect(fs.existsSync(path.join(v.claudeDir, "isoplan", "wake.json"))).toBe(false);
   expect(fs.existsSync(path.join(v.claudeDir, "isoplan", "update.json"))).toBe(false);
   expect(loaded.lines().filter((l) => l.type === "updated")).toHaveLength(1);
-  children.splice(0).forEach((c) => c.kill());
+  loaded.stop();
+  await loaded.done;
 
-  fs.rmSync(path.join(v.claudeDir, "isoplan", "live"), { recursive: true, force: true }); // the killed one's lock
   const detached = v.run("0.3.0", "--detached");
   expect(await detached.exited).toBe(0);
   expect(fs.existsSync(v.lock)).toBe(false);
@@ -382,58 +391,38 @@ test("the runner, reporting a session whose plugin is turned off for its folder,
   expect(fs.existsSync(path.join(claudeDir, "isoplan", "live", "s1.json"))).toBe(false);
 });
 
-test("after /reload-plugins the old version's data layer leaves the session to the new one's, and of one version the later start keeps it", async () => {
-  // A session the office takes, so each data layer makes a pass every second.
-  const o = await office();
-  o.state.repos = ["github.com/team/app"];
-  const v = versions(o.url);
-  const old = v.run("0.2.0");
-  await until(() => fs.existsSync(v.lock) && v.holder() === old.pid);
-  const reloaded = v.run("0.3.0");
-  expect(await old.exited).toBe(0);
-  expect(old.lines().some((l) => l.text?.includes("a reload started reports this session now"))).toBe(true);
-  expect(old.lines().at(-1)).toEqual({ type: "superseded", reason: "newer" });
-  await wait(2500);
-  expect(reloaded.hasExited()).toBe(false);
-  expect(v.holder()).toBe(reloaded.pid);
-  expect(reloaded.lines().some((l) => l.type === "updated")).toBe(false);
-  // The old version started again (its hooks module wasn't unloaded) leaves at once, without taking the session.
-  const restarted = v.run("0.2.0");
-  expect(await restarted.exited).toBe(0);
-  expect(restarted.lines()).toContainEqual({ type: "superseded", reason: "newer" });
-  expect(v.holder()).toBe(reloaded.pid);
-
-  // A reload with no new version, or the session opened in a second window: the later start keeps it.
-  const again = v.run("0.3.0");
-  expect(await reloaded.exited).toBe(0);
-  expect(reloaded.lines().at(-1)).toEqual({ type: "superseded", reason: "window" });
-  await wait(2500);
-  expect(again.hasExited()).toBe(false);
-  expect(v.holder()).toBe(again.pid);
-});
-
-test("a data layer never gives the session up to an older or equal holder, nor to one whose lock went stale", async () => {
+test("while a data layer of an earlier version holds the session's lock, fresh, the runner takes it over for a newer copy's hooks module, and otherwise doesn't report the session for it and tells that hooks module so; a stale lock counts for nothing", async () => {
   const v = versions();
-  const gaveUp = (r: ReturnType<typeof v.run>) => r.lines().some((l) => l.type === "superseded");
-  // Outdated (0.2.0 here), but the holder is no newer: an older or equal window's data layer that started first.
-  v.held("0.2.0", Date.now() - 60000);
-  const equal = v.run("0.2.0");
-  await until(() => v.holder() === equal.pid);
-  expect(gaveUp(equal)).toBe(false);
-  children.splice(0).forEach((c) => c.kill());
+  // A live process of its own stands in for the earlier version's data layer.
+  const other = spawn(process.execPath, ["-e", "setTimeout(() => {}, 60000)"], { stdio: "ignore", windowsHide: true });
+  children.push(other);
+  const lockOf = (ageMs: number, version: string, since: number) => {
+    fs.mkdirSync(path.dirname(v.lock), { recursive: true });
+    fs.writeFileSync(v.lock, JSON.stringify({ pid: other.pid, dataLayer: path.join(v.claudeDir, "plugins", "cache", "isoplan", "isoplan", version, "dist", "data-layer.js"), detached: false, since, parent: other.pid }));
+    const t = new Date(Date.now() - ageMs);
+    fs.utimesSync(v.lock, t, t);
+  };
+  // Of the same copy, in a window that started later: left to it.
+  lockOf(0, "0.3.0", 10);
+  const refused = v.hooked("0.3.0", { since: 5 });
+  const ended = await refused.done;
+  expect(ended.why).toBe("an earlier version's data layer already reports this session");
+  expect(refused.lines()).toContainEqual({ type: "superseded", reason: "earlier" });
+  expect(v.holder()).toBe(other.pid);
 
-  // The newest copy and a later window, but its lock hasn't been refreshed for five minutes: its pid may be another process's.
-  v.held("0.3.0", Date.now() + 60000, 5 * 60000);
-  const stale = v.run("0.2.0");
-  await until(() => v.holder() === stale.pid);
-  expect(gaveUp(stale)).toBe(false);
-  children.splice(0).forEach((c) => c.kill());
+  // Of an older copy: taken over.
+  lockOf(0, "0.2.0", 10);
+  const over = v.hooked("0.3.0", { since: 5 });
+  await until(() => v.holder() === process.pid);
+  expect(over.lines().some((l) => l.type === "superseded")).toBe(false);
+  over.stop();
+  await over.done;
 
-  // The same holder, fresh: it is given the session.
-  v.held("0.3.0", Date.now() + 60000);
-  const fresh = v.run("0.2.0");
-  expect(await fresh.exited).toBe(0);
-  expect(fresh.lines()).toContainEqual({ type: "superseded", reason: "newer" });
+  // Not refreshed for five minutes: its pid may be another process's.
+  lockOf(5 * 60000, "0.3.0", 10);
+  const taken = v.hooked("0.3.0", { since: 5 });
+  await until(() => v.holder() === process.pid);
+  expect(taken.lines().some((l) => l.type === "superseded")).toBe(false);
 });
 
 test("the session's context window reaches the office only once the hooks module has written it where the window line says", async () => {
@@ -441,10 +430,10 @@ test("the session's context window reaches the office only once the hooks module
   o.state.repos = ["github.com/team/app"];
   const v = versions(o.url);
   const file = path.join(v.claudeDir, "isoplan", "windows", "s1.json");
-  // One left by an earlier run: the data layer deletes it as it starts, so it is never sent.
+  // One left by an earlier run: the runner deletes it as it starts reporting for the hooks module, so it is never sent.
   fs.mkdirSync(path.dirname(file), { recursive: true });
   fs.writeFileSync(file, JSON.stringify({ contextWindow: 200000 }));
-  const r = v.run("0.2.0");
+  const r = v.hooked("0.2.0");
   await until(() => r.lines().some((l) => l.type === "window"));
   expect(r.lines().find((l) => l.type === "window")).toEqual({ type: "window", file });
   type Sent = { type: string; facts?: { session: Record<string, unknown> }; upsert?: { session?: Record<string, unknown> } };
@@ -452,7 +441,7 @@ test("the session's context window reaches the office only once the hooks module
   await until(() => sent().some((m) => m.type === "full"));
   await wait(1500);
   expect(sent().find((m) => m.type === "full")!.facts!.session).not.toHaveProperty("contextWindow");
-  // Started without --messages, the session doesn't say it takes messages from the floor.
+  // Without messages, the session doesn't say it takes messages from the floor.
   expect(sent().find((m) => m.type === "full")!.facts!.session).not.toHaveProperty("takesMessages");
   expect(sent().some((m) => m.upsert?.session && "contextWindow" in m.upsert.session)).toBe(false);
 
@@ -475,7 +464,7 @@ test("a session whose hooks module can submit says it takes messages; its owner'
   const o = await office();
   o.state.repos = ["github.com/team/app"];
   const v = versions(o.url);
-  const r = v.run("0.2.0", "--messages");
+  const r = v.hooked("0.2.0", { takesMessages: true });
   type Sent = { type: string; id?: string; code?: string; account?: { id: string }; facts?: { session: Record<string, unknown> } };
   const sent = () => (o.state.connections[0]?.messages ?? []) as Sent[];
   await until(() => sent().some((m) => m.type === "full"));
@@ -501,7 +490,7 @@ test("a session whose hooks module can submit says it takes messages; its owner'
 test("several messages the owner sends back to back reach the hooks module in the order they were sent", async () => {
   const o = await office();
   o.state.repos = ["github.com/team/app"];
-  const r = versions(o.url).run("0.2.0", "--messages");
+  const r = versions(o.url).hooked("0.2.0", { takesMessages: true });
   const sent = () => (o.state.connections[0]?.messages ?? []) as { type: string; account?: { id: string } }[];
   await until(() => sent().some((m) => m.type === "full"));
   const owner = sent().find((m) => m.type === "hello")!.account!;

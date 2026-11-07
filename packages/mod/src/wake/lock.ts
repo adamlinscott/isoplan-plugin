@@ -1,6 +1,7 @@
 // One data layer per session: <claude dir>/isoplan/live/<session id>.json holds `{ pid }` of the
-// one reporting it, the plugin's data layer for its hooks module or the machine's runner. The
-// runner's doesn't start while another live pid keeps it fresh; the plugin's takes it over from the
+// one reporting it: the machine's runner, or the data layer process of an earlier version of the
+// plugin (ADR 0007 step 2 removed it; a session on an older copy still runs one). The runner
+// doesn't start while another live pid keeps it fresh; such a data layer takes it over from the
 // runner, which notices on its next pass and stops (src/data-layer/report-session.ts). A lock whose
 // pid has gone is stale and is taken over. The same takeLock and its hold-offs keep the runner's own
 // lock (src/runner/start.ts) and the pairing's (src/data-layer/pairing.ts).

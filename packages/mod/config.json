@@ -19,5 +19,6 @@
   "approvedRefreshMinutes": 5,
   "approvedMaxAgeMinutes": 15,
   "updateCheckHours": 6,
-  "factsWaitSeconds": 60
+  "factsWaitSeconds": 60,
+  "runnerRetrySeconds": 2
 }

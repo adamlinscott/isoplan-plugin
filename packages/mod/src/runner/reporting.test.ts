@@ -1,8 +1,8 @@
-// The runner reporting the sessions no hooks module reports (reporting.ts, ADR 0007 step 1): which
-// sessions it takes and when it takes one again, with a stand-in for the reporting itself; then,
-// with the data layer's own reporting (report-session.ts) and a stand-in office server, that a
-// session reaches the office from the runner alone, again at once after a runner restart, and is
-// handed over to the plugin's data layer as it takes the session's lock.
+// The runner reporting every session (reporting.ts, ADR 0007): which sessions it takes and when it
+// takes one again, with or without a connected hooks module, with a stand-in for the reporting
+// itself; then, with the data layer's own reporting (report-session.ts) and a stand-in office server,
+// that a session reaches the office from the runner alone, again at once after a runner restart, and
+// is handed over to an earlier version's data layer as it takes the session's lock.
 
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
@@ -16,7 +16,7 @@ import type { Config } from "../data-layer/config.js";
 import { defaults, modDir, tempRoot } from "../data-layer/fixture.js";
 import { nodeIo, type NodeIo } from "../data-layer/io.js";
 import type { DataLayerLine } from "../lines.js";
-import { reportSession, sessionLog, type Ended, type ReportSessionOptions } from "../data-layer/report-session.js";
+import { hookedEnv, reportSession, sessionLog, takesOver, type Ended, type ReportSessionOptions } from "../data-layer/report-session.js";
 import { lockPath } from "../wake/lock.js";
 import { watchSessions, type Reporting, type ToReport } from "./reporting.js";
 
@@ -48,7 +48,8 @@ function machine(settings: Partial<Config> = {}) {
   const claudeDir = path.join(root, "claude");
   const repo = path.join(root, "app");
   fs.mkdirSync(repo, { recursive: true });
-  const config: Config = { ...defaults, streamSeconds: 0.05, ...settings };
+  // No wait on the first look for hooks modules to say hello, unless a test asks for one.
+  const config: Config = { ...defaults, streamSeconds: 0.05, runnerRetrySeconds: 0, ...settings };
   const transcript = (id: string) => path.join(claudeDir, "projects", "-app", `${id}.jsonl`);
   const write = (id: string, cwd: string | null = repo, ageMinutes = 0) => {
     fs.mkdirSync(path.dirname(transcript(id)), { recursive: true });
@@ -59,15 +60,19 @@ function machine(settings: Partial<Config> = {}) {
   return { claudeDir, repo, config, transcript, write };
 }
 
+/** A connected hooks module, as the runner's pipe gives it. */
+type Hooks = { cwd: string; name: string; root?: string; since?: number; env?: Record<string, string> };
+
 /** watchSessions with a stand-in report: each session it starts is kept, and ends when told (or when the runner stops). */
-function watch(m: ReturnType<typeof machine>, o: { isOff?: (folder: string) => Promise<boolean>; isAlive?: (pid: number) => boolean; gapMs?: number; io?: NodeIo } = {}) {
-  const started: { id: string; notWanted: Record<string, number>; end: (ended?: Ended) => void }[] = [];
-  const report = (s: ToReport) =>
+function watch(m: ReturnType<typeof machine>, o: { isOff?: (folder: string) => Promise<boolean>; isAlive?: (pid: number) => boolean; gapMs?: number; io?: NodeIo; hooked?: Map<string, Hooks> } = {}) {
+  const started: { id: string; notWanted: Record<string, number>; hooks?: Hooks; cwd: string; end: (ended?: Ended) => void; stoppedFor?: string }[] = [];
+  const report = (s: ToReport<Hooks>) =>
     new Promise<Ended>((resolve) => {
-      started.push({ id: s.sessionId, notWanted: s.notWanted, end: (ended = { why: "done" }) => resolve(ended) });
-      void s.closed.then(() => resolve({ why: "stopped" }));
+      const entry: (typeof started)[number] = { id: s.sessionId, notWanted: s.notWanted, hooks: s.hooks, cwd: s.cwd, end: (ended = { why: "done" }) => resolve(ended) };
+      started.push(entry);
+      void s.closed.then((why) => ((entry.stoppedFor = why), resolve({ why: "stopped" })));
     });
-  const w = watchSessions({ claudeDir: m.claudeDir, io: o.io ?? nodeIo(), config: async () => m.config, report, isOff: o.isOff ?? (async () => false), log: () => {}, gapMs: o.gapMs ?? 0, ...(o.isAlive && { isAlive: o.isAlive }) });
+  const w = watchSessions({ claudeDir: m.claudeDir, io: o.io ?? nodeIo(), config: async () => m.config, report, isOff: o.isOff ?? (async () => false), log: () => {}, gapMs: o.gapMs ?? 0, ...(o.isAlive && { isAlive: o.isAlive }), ...(o.hooked && { hooked: (id: string) => o.hooked!.get(id) ?? null }) });
   watching.push(w);
   return { w, started, ids: () => started.map((s) => s.id) };
 }
@@ -106,6 +111,225 @@ test("a session whose lock another live process keeps fresh isn't reported (the 
   await wait(20);
   m.write("s1");
   await until(() => ids().includes("s1"));
+});
+
+test("a session whose hooks module is connected is reported for it at once, however long ago it was written; one that connects, changes or goes stops the report under way, which starts again for the one it has now, and with none only once the transcript moves", async () => {
+  const m = machine();
+  const hooked = new Map<string, Hooks>();
+  m.write("s1", m.repo, 25 * 60); // quiet past lightsOffHours
+  m.write("s2");
+  const { w, started } = watch(m, { hooked });
+  await until(() => started.some((s) => s.id === "s2"));
+  await w.look();
+  expect(started.map((s) => s.id)).toEqual(["s2"]);
+
+  // The hooks module of s1 connects, in the folder it is in now; and s2's, while the runner reports s2 without one.
+  const first: Hooks = { cwd: path.join(m.repo, "sub"), name: "first" };
+  hooked.set("s1", first);
+  hooked.set("s2", { cwd: m.repo, name: "s2's" });
+  w.rehook("s1");
+  w.rehook("s2");
+  await until(() => started.filter((s) => s.hooks).length === 2);
+  expect(started.map((s) => [s.id, s.hooks?.name ?? null])).toEqual([
+    ["s2", null],
+    ["s1", "first"],
+    ["s2", "s2's"],
+  ]);
+  expect(started[1]!.cwd).toBe(first.cwd);
+  // Each report that stopped says why, for its log.
+  expect(started[0]!.stoppedFor).toBe("its hooks module connected to the runner, which reports it for that hooks module now");
+
+  // Another window's takes s1: reported again, for that one.
+  hooked.set("s1", { cwd: m.repo, name: "later" });
+  w.rehook("s1");
+  await until(() => started.some((s) => s.hooks?.name === "later"));
+  expect(started[1]!.stoppedFor).toBe("another hooks module has the session now (another window, or a reload)");
+
+  // Its hooks module goes: the report stops, and s1 is reported again only once its transcript moves.
+  hooked.delete("s1");
+  w.rehook("s1");
+  await until(() => !w.reporting().includes("s1"));
+  expect(started.find((s) => s.hooks?.name === "later")!.stoppedFor).toBe("its hooks module's link to the runner closed");
+  await w.look();
+  await w.look();
+  expect(started.filter((s) => s.id === "s1")).toHaveLength(2);
+  await wait(20);
+  m.write("s1");
+  await until(() => started.filter((s) => s.id === "s1").length === 3);
+  expect(started.at(-1)!.hooks).toBeUndefined();
+});
+
+test("a hooks module's report that ended by itself starts again only once the transcript moves; while an earlier version's data layer holds the lock, none starts, and once it lets go one starts at the next look, with no write", async () => {
+  const m = machine();
+  const hooked = new Map<string, Hooks>([["s1", { cwd: m.repo, name: "h" }]]);
+  let holderAlive = true;
+  fs.mkdirSync(path.dirname(lockPath(m.claudeDir, "s1")), { recursive: true });
+  fs.writeFileSync(lockPath(m.claudeDir, "s1"), JSON.stringify({ pid: OTHER, detached: false }));
+  m.write("s1");
+  const { w, started } = watch(m, { hooked, isAlive: (pid) => pid !== OTHER || holderAlive });
+  await w.look();
+  await w.look();
+  expect(started).toEqual([]);
+  holderAlive = false;
+  await w.look();
+  expect(started).toHaveLength(1);
+  expect(started[0]!.hooks?.name).toBe("h");
+
+  started[0]!.end({ why: "the plugin is off here" });
+  await until(() => !w.reporting().includes("s1"));
+  await w.look();
+  await w.look();
+  expect(started).toHaveLength(1);
+  await wait(20);
+  m.write("s1");
+  await until(() => started.length === 2);
+});
+
+test("a hooks module's report takes the lock over from an earlier version's data layer of another copy, or of its own copy in an earlier window; never from the runner's own or a detached one", async () => {
+  const self = path.join(modDir, "dist", "data-layer.js");
+  const lock = (extra: Record<string, unknown>) => ({ pid: OTHER, until: null, mtimeMs: Date.now(), extra });
+  expect(takesOver(lock({ dataLayer: "C:/cache/isoplan/0.11.1/dist/data-layer.js", detached: false, since: 9 }), self, 1)).toBe(true);
+  expect(takesOver(lock({ dataLayer: self, detached: false, since: 1 }), self, 2)).toBe(true);
+  expect(takesOver(lock({ dataLayer: self, detached: false, since: 3 }), self, 2)).toBe(false);
+  expect(takesOver(lock({ detached: false }), self, 2)).toBe(false);
+  expect(takesOver(lock({ dataLayer: "C:/old/dist/data-layer.js", detached: true }), self, 2)).toBe(false);
+  expect(takesOver(lock({ dataLayer: "C:/old/dist/data-layer.js", detached: false, runner: true }), self, 2)).toBe(false);
+
+  // The runner starts that report at once, while the earlier one still holds the lock.
+  const m = machine();
+  fs.mkdirSync(path.dirname(lockPath(m.claudeDir, "s1")), { recursive: true });
+  fs.writeFileSync(lockPath(m.claudeDir, "s1"), JSON.stringify({ pid: OTHER, dataLayer: "C:/old/dist/data-layer.js", detached: false, since: 1, parent: OTHER }));
+  m.write("s1");
+  const hooked = new Map<string, Hooks>([["s1", { cwd: m.repo, name: "h", root: modDir, since: 2 }]]);
+  const { started } = watch(m, { hooked, isAlive: () => true });
+  await until(() => started.length === 1);
+  expect(started[0]!.hooks?.name).toBe("h");
+});
+
+test("an outdated hooks module (a newer copy is installed for its session) doesn't take the lock over, so the runner starts no report for it while an earlier version's data layer holds it, as the report itself wouldn't", async () => {
+  const m = machine();
+  const plugins = path.join(tempRoot(), "plugin-cache");
+  const copyOf = (version: string) => {
+    const folder = path.join(plugins, "cache", "isoplan", "isoplan", version);
+    for (const file of ["dist/data-layer.js", "dist/wake.js", "dist/hooks.js"]) {
+      fs.mkdirSync(path.dirname(path.join(folder, file)), { recursive: true });
+      fs.writeFileSync(path.join(folder, file), "");
+    }
+    fs.mkdirSync(path.join(folder, ".claude-plugin"), { recursive: true });
+    fs.writeFileSync(path.join(folder, ".claude-plugin", "plugin.json"), JSON.stringify({ name: "isoplan", version }));
+    return folder;
+  };
+  const old = copyOf("0.2.0");
+  const now = copyOf("0.3.0");
+  fs.writeFileSync(path.join(plugins, "installed_plugins.json"), JSON.stringify({ version: 2, plugins: { "isoplan@isoplan": [{ scope: "user", installPath: now, version: "0.3.0" }] } }));
+  fs.mkdirSync(path.dirname(lockPath(m.claudeDir, "s1")), { recursive: true });
+  fs.writeFileSync(lockPath(m.claudeDir, "s1"), JSON.stringify({ pid: OTHER, dataLayer: "C:/old/dist/data-layer.js", detached: false, since: 1, parent: OTHER }));
+  m.write("s1");
+  const env = { CLAUDE_CODE_PLUGIN_CACHE_DIR: plugins };
+  const hooked = new Map<string, Hooks>([["s1", { cwd: m.repo, name: "outdated", root: old, since: 2, env }]]);
+  const { w, started } = watch(m, { hooked, isAlive: () => true });
+  await w.look();
+  await w.look();
+  expect(started).toEqual([]);
+  // The newest copy's hooks module does take it over.
+  hooked.set("s1", { cwd: m.repo, name: "newest", root: now, since: 2, env });
+  w.rehook("s1");
+  await until(() => started.length === 1);
+  expect(started[0]!.hooks?.name).toBe("newest");
+});
+
+test("an earlier version's data layer that took the lock back from a hooks module's report keeps the session until it lets go: a hooks module that connects again doesn't take it over again", async () => {
+  const m = machine();
+  let holderAlive = true;
+  fs.mkdirSync(path.dirname(lockPath(m.claudeDir, "s1")), { recursive: true });
+  fs.writeFileSync(lockPath(m.claudeDir, "s1"), JSON.stringify({ pid: OTHER, dataLayer: "C:/old/dist/data-layer.js", detached: false, since: 1, parent: OTHER }));
+  m.write("s1");
+  const hooked = new Map<string, Hooks>([["s1", { cwd: m.repo, name: "first", root: modDir, since: 2 }]]);
+  const { w, started } = watch(m, { hooked, isAlive: (pid) => pid !== OTHER || holderAlive });
+  await until(() => started.length === 1);
+  // That data layer takes the lock back (the lock names it again): the report ends, and the hooks module connects again later.
+  started[0]!.end({ why: "another data layer reports this session now" });
+  await until(() => !w.reporting().includes("s1"));
+  hooked.set("s1", { cwd: m.repo, name: "again", root: modDir, since: 2 });
+  w.rehook("s1");
+  await w.look();
+  await w.look();
+  expect(started).toHaveLength(1);
+  // Once it has gone, the session is reported for the hooks module at the next look.
+  holderAlive = false;
+  await w.look();
+  expect(started.map((s) => s.hooks?.name)).toEqual(["first", "again"]);
+});
+
+test("a hooks module's report goes by the session's own SESSION_ENV alone: one the session doesn't set isn't taken from the runner's", () => {
+  vi.stubEnv("DISABLE_UPDATES", "1");
+  vi.stubEnv("CLAUDE_CODE_PLUGIN_CACHE_DIR", "C:/runner/cache");
+  const env = hookedEnv({ FORCE_AUTOUPDATE_PLUGINS: "1" });
+  expect(env.DISABLE_UPDATES).toBeUndefined();
+  expect(env.CLAUDE_CODE_PLUGIN_CACHE_DIR).toBeUndefined();
+  expect(env.FORCE_AUTOUPDATE_PLUGINS).toBe("1");
+  expect(env.PATH ?? env.Path).toBe(process.env.PATH ?? process.env.Path);
+});
+
+test("a hooks module's report writes the lock in the shape an earlier version's data layer gives the session up to, taking it from one", async () => {
+  const m = machine();
+  vi.stubEnv("CLAUDE_CONFIG_DIR", m.claudeDir);
+  const file = lockPath(m.claudeDir, "s1");
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  // An earlier version's data layer, live (this test's parent stands in for it), of another copy.
+  fs.writeFileSync(file, JSON.stringify({ pid: process.ppid, dataLayer: "C:/old/dist/data-layer.js", detached: false, since: 1, parent: process.ppid, cwd: m.repo }));
+  let close = () => {};
+  const closed = new Promise<void>((resolve) => (close = resolve));
+  const said: DataLayerLine[] = [];
+  const ended = reportSession({ sessionId: "s1", cwd: m.repo, by: "hooks", appDir: modDir, root: modDir, since: 5, emit: (line) => void said.push(line), closed, isOff: async () => false });
+  // Read as the runner moves it aside to take it, it may be missing for a moment.
+  const read = () => {
+    try {
+      return JSON.parse(fs.readFileSync(file, "utf8")) as { pid?: number };
+    } catch {
+      return null;
+    }
+  };
+  await until(() => read()?.pid === process.pid);
+  expect(JSON.parse(fs.readFileSync(file, "utf8"))).toEqual({ pid: process.pid, dataLayer: path.join(modDir, "dist", "data-layer.js"), detached: false, since: 5, parent: process.pid, runner: true, cwd: m.repo });
+  expect(said).toContainEqual({ type: "log", text: "an earlier version's data layer reported this session: the runner reports it now, for its hooks module, and that data layer leaves it" });
+  close();
+  await ended;
+  expect(said.filter((l) => l.type === "superseded")).toEqual([]);
+});
+
+test("a hooks module's report goes by the session's own environment, as its hooks module passed it on: its plugin cache, and whether updates are off", async () => {
+  const m = machine();
+  vi.stubEnv("CLAUDE_CONFIG_DIR", m.claudeDir);
+  const plugins = path.join(tempRoot(), "plugin-cache");
+  const root = path.join(plugins, "cache", "isoplan", "isoplan", "0.12.0");
+  let close = () => {};
+  const closed = new Promise<void>((resolve) => (close = resolve));
+  const said: DataLayerLine[] = [];
+  const ended = reportSession({ sessionId: "s1", cwd: m.repo, by: "hooks", appDir: modDir, root, since: 1, env: { CLAUDE_CODE_PLUGIN_CACHE_DIR: plugins, DISABLE_UPDATES: "1" }, emit: (line) => void said.push(line), closed, isOff: async () => false });
+  await until(() => said.some((l) => l.type === "log" && l.text.startsWith("not checking")));
+  expect(said).toContainEqual({ type: "log", text: "not checking for a newer version of the plugin: DISABLE_UPDATES is set (FORCE_AUTOUPDATE_PLUGINS=1 turns plugin updates back on)" });
+  close();
+  await ended;
+});
+
+test("on its first look, a runner started again holds its reports without a hooks module for twice runnerRetrySeconds, so a hooks module saying hello meanwhile has its session reported for it from the start", async () => {
+  const m = machine({ runnerRetrySeconds: 0.3 });
+  m.write("s1");
+  m.write("s2");
+  const hooked = new Map<string, Hooks>();
+  const { w, started } = watch(m, { hooked });
+  await w.look();
+  expect(started).toEqual([]);
+  hooked.set("s1", { cwd: m.repo, name: "h" });
+  w.rehook("s1");
+  await until(() => started.length === 2);
+  expect(started.map((s) => [s.id, s.hooks?.name ?? null])).toEqual([
+    ["s1", "h"],
+    ["s2", null],
+  ]);
+  await wait(700);
+  expect(started).toHaveLength(2);
 });
 
 test("a lock counts as fresh for three of its holder's slowest passes, which a long streamSeconds makes longer", async () => {

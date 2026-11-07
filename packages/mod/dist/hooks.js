@@ -67,7 +67,7 @@ function register(on) {
 		pairSaid.clear();
 		if (!started) {
 			started = true;
-			run($).catch((err) => $.ui.log("isoplan: the data layer loop failed: " + message(err), { to: "debug" }));
+			run($).catch((err) => $.ui.log("isoplan: the loop keeping the link to the runner failed: " + message(err), { to: "debug" }));
 		} else checkSession($);
 		return result;
 	});
@@ -231,7 +231,7 @@ async function checkSession($) {
 	if (id && running && id !== running) stop?.();
 }
 async function run($) {
-	const script = $.plugin.root.replace(/\\/g, "/") + "/dist/data-layer.js";
+	const script = $.plugin.root.replace(/\\/g, "/") + "/dist/pipe.js";
 	let failures = 0;
 	const since = await $.clock.now();
 	const messages = await submits($) ? ["--messages"] : [];
@@ -294,7 +294,7 @@ async function run($) {
 					break;
 				}
 				if (piece.value.stream === "stderr") {
-					$.ui.log("isoplan: data layer: " + piece.value.text.trim(), { to: "debug" });
+					$.ui.log("isoplan: link to the runner: " + piece.value.text.trim(), { to: "debug" });
 					continue;
 				}
 				buffer += piece.value.text;
@@ -306,12 +306,12 @@ async function run($) {
 				}
 			}
 		} catch (err) {
-			$.ui.log("isoplan: the data layer could not run: " + message(err), { to: "debug" });
+			$.ui.log("isoplan: the link to the runner could not run: " + message(err), { to: "debug" });
 		}
 		stop = null;
 		if (superseded) {
 			if (superseded === "newer") updated = true;
-			show($, superseded === "newer" ? void 0 : "Isoplan: this session is reported from its other window");
+			show($, superseded === "newer" ? void 0 : superseded === "earlier" ? EARLIER_TEXT : "Isoplan: this session is reported from its other window");
 			superseded = null;
 			failures = 0;
 			await $.clock.sleep(SUPERSEDED_RECHECK_MS);
@@ -323,7 +323,7 @@ async function run($) {
 		}
 		failures = await $.clock.now() - startedAt >= STABLE_MS ? 1 : failures + 1;
 		const delay = Math.min(RETRY_CAP_MS, 1e3 * failures);
-		show($, !began ? "Isoplan needs Node.js on PATH (couldn't start `node`)" : `Isoplan: the data layer stopped${code === null ? "" : ` (node exited with code ${code})`}; restarting in ${Math.round(delay / 1e3)}s`);
+		show($, !began ? "Isoplan needs Node.js on PATH (couldn't start `node`)" : `Isoplan: the link to Isoplan's runner stopped${code === null ? "" : ` (node exited with code ${code})`}; restarting in ${Math.round(delay / 1e3)}s`);
 		await $.clock.sleep(delay);
 	}
 }
@@ -332,7 +332,7 @@ function handle($, text) {
 	try {
 		line = JSON.parse(text);
 	} catch {
-		$.ui.log("isoplan: data layer: " + text, { to: "debug" });
+		$.ui.log("isoplan: link to the runner: " + text, { to: "debug" });
 		return;
 	}
 	switch (line.type) {
@@ -347,6 +347,11 @@ function handle($, text) {
 			break;
 		case "superseded":
 			superseded = line.reason;
+			break;
+		case "runner":
+			offices.clear();
+			pairings.clear();
+			show($, line.state === "down" ? RUNNER_DOWN_TEXT[line.held ?? "starting"] : statusText());
 			break;
 		case "title-ask":
 			writeTitle($, line);
@@ -400,6 +405,12 @@ function show($, text) {
 	$.ui.status(updated ? [text, UPDATED_TEXT].filter(Boolean).join(" · ") : text);
 }
 const UPDATED_TEXT = "Isoplan updated: type /reload-plugins";
+const RUNNER_DOWN_TEXT = {
+	starting: "Isoplan: this session isn't reaching the office until Isoplan's runner is back; starting it",
+	"held-off": "Isoplan: this session isn't reaching the office: Isoplan's runner is holding off for up to an hour (runner.log says why)",
+	"not-installed": "Isoplan: this session isn't reaching the office: Isoplan's runner isn't installed; run the plugin's install script"
+};
+const EARLIER_TEXT = "Isoplan: this session is reported by an earlier version of the plugin still running for it";
 function statusText() {
 	const parts = [...offices.values()].filter(Boolean);
 	return parts.length ? `Isoplan: ${parts.join(" · ")}` : void 0;

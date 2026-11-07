@@ -112,7 +112,7 @@ test("uninstall: takes out the hooks and everything the plugin wrote, and keeps 
   const s = setup({ model: "opus", hooks: { Stop: [other] } });
   await s.install();
   const dir = path.join(s.claudeDir, "isoplan");
-  for (const file of ["live/s1.json", "logs/runner.log", "titles/s1.json", "released/s1.json", "pairing.json", "pairing.lock", "pairing.write.lock", "update.json", "update.lock", "waits/s1/q1.json", "answers/s1/q1.json", "windows/s1.json", "handoffs/h1/taken.json", "handoffs/out/h2/brief.md", "handoffs/sessions/s1.json", "offices/0123456789ab/approved.json", "offices/0123456789ab/pairing.lock", "offices/0123456789ab/released/s1.json", "approved.json", "runner/ledger.json", "runner/environment.json", "config.json", "runner.json", "secret-patterns.json"]) {
+  for (const file of ["live/s1.json", "logs/runner.log", "titles/s1.json", "released/s1.json", "pairing.json", "pairing.lock", "pairing.write.lock", "update.json", "update.lock", "waits/s1/q1.json", "answers/s1/q1.json", "windows/s1.json", "handoffs/h1/taken.json", "handoffs/out/h2/brief.md", "handoffs/sessions/s1.json", "offices/0123456789ab/approved.json", "offices/0123456789ab/pairing.lock", "offices/0123456789ab/released/s1.json", "approved.json", "runner/ledger.json", "runner/environment.json", "pipe/runner-0123456789abcdef.sock", "config.json", "runner.json", "secret-patterns.json"]) {
     fs.mkdirSync(path.dirname(path.join(dir, file)), { recursive: true });
     fs.writeFileSync(path.join(dir, file), "{}");
   }
@@ -162,7 +162,7 @@ test("uninstall: with confirm, a session's files written again during it keep th
   const live = path.join(s.claudeDir, "isoplan", "live");
   let asked = 0;
   // A session's data layer takes its lock again while the uninstall runs, after live/ went.
-  const confirm = async () => (++asked === 7 && fs.mkdirSync(live, { recursive: true }), true);
+  const confirm = async () => (++asked === 8 && fs.mkdirSync(live, { recursive: true }), true);
   const first = await uninstall(s.paths, { confirm });
   expect(first.isDone).toBe(false);
   expect(first.changes[first.changes.length - 1]).toMatch(/wrote its files again; the hook stays/);

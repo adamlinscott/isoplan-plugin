@@ -40,6 +40,8 @@ export interface Config {
   updateCheckHours: number;
   /** How long the runner, reporting a session whose transcript has nothing to report yet, waits for it before it stops. */
   factsWaitSeconds: number;
+  /** How often a session's hooks module tries the runner's pipe again while it can't be reached (src/pipe/client.ts). */
+  runnerRetrySeconds: number;
 }
 
 export interface ConfigIo {
