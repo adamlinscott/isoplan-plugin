@@ -137,3 +137,38 @@ test("a local branch of that name is used as it is, its own commits kept; a bran
   expect(git(made as string, "rev-parse", "HEAD")).toBe(tip);
   expect(await branchFolder(run, clone, "nowhere", 30000)).toMatchObject({ error: expect.stringContaining("git fetch origin nowhere") });
 });
+
+test("a worktree on the branch whose folder was deleted by hand is pruned, and a new one is made and returned", async () => {
+  const root = tempRoot();
+  const { clone } = remoteAndClone(root, "app");
+  const { clone: other } = remoteAndClone(root, "other");
+  git(other, "push", "-q", "origin", "main:feat/x");
+  const wt = path.join(root, "gone");
+  git(clone, "fetch", "-q", "origin");
+  git(clone, "worktree", "add", "-q", "--track", "-b", "feat/x", wt, "origin/feat/x");
+  fs.rmSync(wt, { recursive: true, force: true });
+  const made = await branchFolder(run, clone, "feat/x", 30000);
+  expect(typeof made).toBe("string");
+  same(made as string, path.join(root, "app-branch-feat-x"));
+  expect(git(made as string, "rev-parse", "--abbrev-ref", "HEAD")).toBe("feat/x");
+});
+
+test("none of the repo's hooks runs when a worktree is made for a branch", async () => {
+  const root = tempRoot();
+  const { clone } = remoteAndClone(root, "app");
+  const { clone: other } = remoteAndClone(root, "other");
+  git(other, "push", "-q", "origin", "main:feat/dark");
+  const ran = path.join(root, "hook-ran");
+  const hooks = path.join(clone, ".githooks");
+  fs.mkdirSync(hooks);
+  const marker = ran.split(path.sep).join("/");
+  fs.writeFileSync(path.join(hooks, "post-checkout"), `#!/bin/sh\necho ran > "${marker}"\n`, { mode: 0o755 });
+  // Relative, as husky sets it: without the override the hook would be the branch's own.
+  git(clone, "config", "core.hooksPath", ".githooks");
+  git(clone, "worktree", "add", "-q", path.join(root, "control"), "-b", "control");
+  expect(fs.existsSync(ran)).toBe(true);
+  fs.rmSync(ran);
+  const made = await branchFolder(run, clone, "feat/dark", 30000);
+  expect(typeof made).toBe("string");
+  expect(fs.existsSync(ran)).toBe(false);
+});

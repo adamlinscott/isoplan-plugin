@@ -76,3 +76,16 @@ test("a folder with no checkout to list, or whose checkout is in no repo the off
   o.checkout = async (folder) => (folder.endsWith("gone") ? null : folder);
   expect(await repoFolders([{ folder: "/Users/ada/wt-gone", at: 3 }, { folder: "/Users/ada/notes", at: 2 }, { folder: "/Users/ada/app", at: 1 }], o)).toEqual([{ project: APP, folders: ["/Users/ada/app"] }]);
 });
+
+test("every repo's remote is asked at once: two slow ones hold the list up by one wait, not two, and the order is kept", async () => {
+  const o = options({ homes: { "/code/app": APP, "/code/api": API } });
+  const delay = 300;
+  o.branches = (checkout) => new Promise((done) => setTimeout(() => done([pathKey(checkout).endsWith("app") ? "main" : "dev"]), delay));
+  const started = Date.now();
+  const repos = await repoFolders([{ folder: "/code/app", at: 2 }, { folder: "/code/api", at: 1 }], o);
+  expect(Date.now() - started).toBeLessThan(delay * 1.8);
+  expect(repos).toEqual([
+    { project: APP, folders: ["/code/app"], branches: ["main"] },
+    { project: API, folders: ["/code/api"], branches: ["dev"] },
+  ]);
+});

@@ -13921,7 +13921,10 @@ async function branchFolder(run, checkout, branch, timeoutMs) {
 	]);
 	if (head.code === 0 && head.stdout.trim() === branch) return checkout;
 	const existing = await worktreeOn(run, checkout, branch, timeoutMs);
-	if (existing) return spelledAs(checkout, existing);
+	const isDir = (p) => fs.stat(p).then((s) => s.isDirectory(), () => false);
+	if (existing && await isDir(existing)) return spelledAs(checkout, existing);
+	if (existing) await git(["worktree", "prune"]);
+	const hooksOff = await noHooks();
 	const base = `${normalize(checkout)}-branch-${branch.replace(/[^A-Za-z0-9._-]+/g, "-").replace(/[.-]+$/, "")}`;
 	for (let n = 1; n < 10; n++) {
 		const dir = spelledAs(checkout, n === 1 ? base : `${base}-${n}`);
@@ -13934,13 +13937,14 @@ async function branchFolder(run, checkout, branch, timeoutMs) {
 		])).code === 0;
 		if (!local) {
 			const fetched = await git([
+				...hooksOff,
 				"fetch",
 				"origin",
 				`+refs/heads/${branch}:refs/remotes/origin/${branch}`
 			]);
 			if (fetched.code !== 0) return { error: `git fetch origin ${branch} in ${checkout} failed${fetched.timedOut ? " (it took too long)" : ""}:\n${fetched.stderr}` };
 		}
-		const made = await git(local ? [
+		const made = await git([...hooksOff, ...local ? [
 			"worktree",
 			"add",
 			dir,
@@ -13953,7 +13957,7 @@ async function branchFolder(run, checkout, branch, timeoutMs) {
 			branch,
 			dir,
 			`origin/${branch}`
-		]);
+		]]);
 		return made.code === 0 ? dir : { error: `git worktree add ${dir} failed${made.timedOut ? " (it took too long)" : ""}:\n${made.stderr}` };
 	}
 	return { error: `${base} and the next eight names beside it are taken by other folders` };
@@ -13972,6 +13976,7 @@ async function repoFolders(seen, o) {
 		if (!o.leftOut.has(key)) o.log(`${what} of ${project} wasn't listed for starting sessions from the floor: it matches the secret pattern "${matched}"`);
 		return false;
 	};
+	const chosen = [];
 	for (const { folder } of [...seen].sort((a, b) => b.at - a.at)) {
 		if (byRepo.size >= 100) break;
 		const checkout = await o.checkout(folder).catch(() => null);
@@ -13987,17 +13992,23 @@ async function repoFolders(seen, o) {
 			project,
 			folders: [checkout]
 		};
-		const branches = await o.branches(checkout, project).catch(() => null);
-		if (branches) {
-			repo.branches = [];
-			for (const branch of branches) {
-				if (repo.branches.length >= 100) break;
-				if (branch.length > 255) continue;
-				if (await scanned(branch, `${key}
-${branch}`, "a branch", project)) repo.branches.push(branch);
-			}
-		}
 		byRepo.set(project, repo);
+		chosen.push({
+			repo,
+			key
+		});
+	}
+	const listed = await Promise.all(chosen.map(({ repo }) => o.branches(repo.folders[0], repo.project).catch(() => null)));
+	for (const [i, { repo, key }] of chosen.entries()) {
+		const branches = listed[i];
+		if (!branches) continue;
+		repo.branches = [];
+		for (const branch of branches) {
+			if (repo.branches.length >= 100) break;
+			if (branch.length > 255) continue;
+			if (await scanned(branch, `${key}
+${branch}`, "a branch", repo.project)) repo.branches.push(branch);
+		}
 	}
 	o.leftOut.clear();
 	for (const key of leftOut) o.leftOut.add(key);

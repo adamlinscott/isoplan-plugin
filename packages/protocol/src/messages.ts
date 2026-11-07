@@ -508,7 +508,8 @@ export const DrivenMessageSchema = z.discriminatedUnion("kind", [
   // From protocol 0.9.0 (isoplan-plugin#84) a runner lists each repo once, by its main checkout, and
   // with `branches`: the branches on the remote the project id comes from (`git ls-remote --heads`),
   // by name, at most MAX_REPO_BRANCHES, each passed by the secret scan. Absent when the runner is older,
-  // or couldn't reach the remote, or the repo has none; empty when the remote has no branches. It is
+  // the repo has no remote or isn't a git checkout, or its remote couldn't be reached; empty when the
+  // remote has no branches. It is
   // also sent unasked every few minutes when the list changed. Only these are branches a start may name.
   z.object({
     ...driven,

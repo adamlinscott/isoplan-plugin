@@ -584,10 +584,11 @@ export async function recordOrca(folder: string, terminal: string | null, worktr
   await fs.writeFile(path.join(folder, "orca.json"), JSON.stringify({ about: "The Orca terminal and worktree this handoff was opened in on this machine, for the floor's Focus this session.", terminal, worktree }, null, 2) + "\n");
 }
 
-// An empty folder as core.hooksPath, so no hook of the repo's runs while the handoff's branch is
-// checked out: they would be the sender's, from that branch.
+// An empty folder as core.hooksPath, so no hook of the repo's runs while the handoff's branch, or a
+// branch started from the floor (runner/checkouts.ts), is checked out: they would be whoever pushed
+// it, from that branch.
 let emptyHooks: Promise<string> | null = null;
-const noHooks = async () => ["-c", `core.hooksPath=${await (emptyHooks ??= fs.mkdtemp(path.join(os.tmpdir(), "isoplan-no-hooks-")))}`];
+export const noHooks = async () => ["-c", `core.hooksPath=${await (emptyHooks ??= fs.mkdtemp(path.join(os.tmpdir(), "isoplan-no-hooks-")))}`];
 
 /** Takes the handoff on this machine; never throws. */
 export async function takeHandoff(message: Pick<HandoffMessage, "handoff" | "mode" | "session" | "by" | "room" | "permissions">, o: TakeOptions): Promise<TakenMessage> {

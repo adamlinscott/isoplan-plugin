@@ -11,14 +11,16 @@
 //   once older than branchRefreshMinutes. One that fails is logged when it starts failing, not on
 //   every check, and its repo is offered with no branches.
 // - A branch other than the one the checkout is on opens in a worktree of it: one already on it
-//   anywhere, else a new one beside the checkout, `<checkout>-branch-<branch, / as ->`. The checkout's
-//   own branch is never switched.
+//   anywhere (one whose folder was deleted by hand is pruned first), else a new one beside the
+//   checkout, `<checkout>-branch-<branch>`, characters other than letters, digits, . _ - as -. The
+//   checkout's own branch is never switched, and none of the repo's hooks runs while the branch is
+//   checked out: they would be whoever pushed it, from that branch.
 
 import fs from "node:fs/promises";
 import path from "node:path";
 import { dirname, isWindowsPath, normalize, pathKey, type Where } from "../data-layer/git.js";
 import type { RunGit } from "../handoff/git.js";
-import { worktreeOn } from "../handoff/take.js";
+import { noHooks, worktreeOn } from "../handoff/take.js";
 
 /** The main checkout of the repo at `where`: the folder holding its shared `.git`, or, for a bare repo's worktree, the worktree itself. */
 export function mainCheckout(where: Where): string {
@@ -146,7 +148,11 @@ export async function branchFolder(run: RunGit, checkout: string, branch: string
   const head = await git(["symbolic-ref", "-q", "--short", "HEAD"]);
   if (head.code === 0 && head.stdout.trim() === branch) return checkout;
   const existing = await worktreeOn(run, checkout, branch, timeoutMs);
-  if (existing) return spelledAs(checkout, existing);
+  const isDir = (p: string) => fs.stat(p).then((s) => s.isDirectory(), () => false);
+  if (existing && (await isDir(existing))) return spelledAs(checkout, existing);
+  // A worktree on the branch whose folder was deleted by hand: git still holds the branch for it until pruned.
+  if (existing) await git(["worktree", "prune"]);
+  const hooksOff = await noHooks();
   const main = normalize(checkout);
   const base = `${main}-branch-${branch.replace(/[^A-Za-z0-9._-]+/g, "-").replace(/[.-]+$/, "")}`;
   for (let n = 1; n < 10; n++) {
@@ -154,10 +160,10 @@ export async function branchFolder(run: RunGit, checkout: string, branch: string
     if (await fs.stat(dir).then(() => true, () => false)) continue;
     const local = (await git(["rev-parse", "--verify", "-q", `refs/heads/${branch}`])).code === 0;
     if (!local) {
-      const fetched = await git(["fetch", "origin", `+refs/heads/${branch}:refs/remotes/origin/${branch}`]);
+      const fetched = await git([...hooksOff, "fetch", "origin", `+refs/heads/${branch}:refs/remotes/origin/${branch}`]);
       if (fetched.code !== 0) return { error: `git fetch origin ${branch} in ${checkout} failed${fetched.timedOut ? " (it took too long)" : ""}:\n${fetched.stderr}` };
     }
-    const made = await git(local ? ["worktree", "add", dir, branch] : ["worktree", "add", "--track", "-b", branch, dir, `origin/${branch}`]);
+    const made = await git([...hooksOff, ...(local ? ["worktree", "add", dir, branch] : ["worktree", "add", "--track", "-b", branch, dir, `origin/${branch}`])]);
     return made.code === 0 ? dir : { error: `git worktree add ${dir} failed${made.timedOut ? " (it took too long)" : ""}:\n${made.stderr}` };
   }
   return { error: `${base} and the next eight names beside it are taken by other folders` };

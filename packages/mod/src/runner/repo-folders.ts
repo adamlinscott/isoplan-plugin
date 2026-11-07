@@ -56,6 +56,7 @@ export async function repoFolders(seen: FolderSeen[], o: RepoFoldersOptions): Pr
     if (!o.leftOut.has(key)) o.log(`${what} of ${project} wasn't listed for starting sessions from the floor: it matches the secret pattern "${matched}"`);
     return false;
   };
+  const chosen: { repo: RepoFolders; key: string }[] = [];
   for (const { folder } of [...seen].sort((a, b) => b.at - a.at)) {
     if (byRepo.size >= MAX_FOLDER_REPOS) break;
     const checkout = await o.checkout(folder).catch(() => null);
@@ -68,17 +69,21 @@ export async function repoFolders(seen: FolderSeen[], o: RepoFoldersOptions): Pr
     if (!project || byRepo.has(project)) continue;
     if (!(await scanned(checkout, key, "a folder", project))) continue;
     const repo: RepoFolders = { project, folders: [checkout] };
-    const branches = await o.branches(checkout, project).catch(() => null);
-    if (branches) {
-      repo.branches = [];
-      for (const branch of branches) {
-        if (repo.branches.length >= MAX_REPO_BRANCHES) break;
-        if (branch.length > MAX_BRANCH_LENGTH) continue;
-        if (await scanned(branch, `${key}
-${branch}`, "a branch", project)) repo.branches.push(branch);
-      }
-    }
     byRepo.set(project, repo);
+    chosen.push({ repo, key });
+  }
+  // Every repo's remote is asked at once, so one slow or unreachable remote holds up the list only by its own wait.
+  const listed = await Promise.all(chosen.map(({ repo }) => o.branches(repo.folders[0]!, repo.project).catch(() => null)));
+  for (const [i, { repo, key }] of chosen.entries()) {
+    const branches = listed[i];
+    if (!branches) continue;
+    repo.branches = [];
+    for (const branch of branches) {
+      if (repo.branches.length >= MAX_REPO_BRANCHES) break;
+      if (branch.length > MAX_BRANCH_LENGTH) continue;
+      if (await scanned(branch, `${key}
+${branch}`, "a branch", repo.project)) repo.branches.push(branch);
+    }
   }
   o.leftOut.clear();
   for (const key of leftOut) o.leftOut.add(key);

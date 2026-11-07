@@ -977,7 +977,8 @@ export function createDriver(o: DriverOptions): Driver {
       if (!folder) return refuse(server, m.id, "no-folder", { detail: NOT_LISTED });
       if (m.branch !== undefined) {
         if (!repo!.branches.has(m.branch)) return refuse(server, m.id, "no-folder", { detail: BRANCH_NOT_LISTED });
-        // No worktree is made for a start the cap would refuse anyway.
+        // A start the cap refuses now makes no worktree. One made for a start refused later (the cap
+        // reached meanwhile, or the session not opening) is kept, and the next start on that branch reuses it.
         const cap = capOf(await o.settings());
         if (heldIn(project) >= cap) return refuse(server, m.id, "cap-reached", { limit: cap, detail: capReached(cap) });
         const made = await office.branchFolder(folder, m.branch).catch((err: Error) => ({ error: err?.stack ?? String(err) }));
