@@ -15,6 +15,7 @@ import {
   MAX_REPO_FOLDERS,
   MAX_ROOM_SESSIONS,
   MAX_SUMMARY_LENGTH,
+  MAX_TASK_LENGTH,
   MAX_TOOL_NAME_LENGTH,
   MAX_WORKFLOW_DESCRIPTION_LENGTH,
   MAX_WORKFLOW_LABEL_LENGTH,
@@ -485,6 +486,21 @@ test("an owner-message has a text of 1 to MAX_OWNER_MESSAGE_LENGTH characters on
   for (const text of ["   ", "x".repeat(MAX_OWNER_MESSAGE_LENGTH + 1)]) expect(parseOfficeServerMessage({ ...request, text })).toMatchObject({ ok: false, kind: "invalid" });
   expect(parseDataLayerMessage({ ...valid["reply owner-message"], queued: false })).toMatchObject({ ok: false, kind: "invalid" });
   expect(parseDataLayerMessage({ ...valid["refusal of an owner-message"], code: "busy" })).toMatchObject({ ok: false, kind: "invalid" });
+});
+
+test("a spin-off's task is 1 to MAX_TASK_LENGTH characters once trimmed, on its handoff, its check and the floor's write-brief", () => {
+  const task = "Write the docs pages for session management.";
+  const messages = [
+    [parseDataLayerMessage, { ...valid["hand-over"], handoff: { ...handoff, task } }, (t: string) => ({ ...valid["hand-over"], handoff: { ...handoff, task: t } })],
+    [parseDataLayerMessage, { ...valid["hand-over-check"], task }, (t: string) => ({ ...valid["hand-over-check"], task: t })],
+    [parseOfficeServerMessage, { ...valid["request write-brief"], task }, (t: string) => ({ ...valid["request write-brief"], task: t })],
+    [parseOfficeServerMessage, { ...valid.handoff, handoff: { ...handoff, task } }, (t: string) => ({ ...valid.handoff, handoff: { ...handoff, task: t } })],
+  ] as const;
+  for (const [parse, message, withTask] of messages) {
+    expect(parse(message)).toEqual({ ok: true, message });
+    expect(parse(withTask("x".repeat(MAX_TASK_LENGTH)))).toMatchObject({ ok: true });
+    for (const t of ["   ", "x".repeat(MAX_TASK_LENGTH + 1)]) expect(parse(withTask(t))).toMatchObject({ ok: false, kind: "invalid" });
+  }
 });
 
 test("a withheld report parses with its hold id, and not without one", () => {

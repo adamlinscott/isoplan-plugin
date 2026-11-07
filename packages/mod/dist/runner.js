@@ -5913,15 +5913,20 @@ const HandoffRepoSchema = object({
 	branch: string().min(1),
 	commit: string().regex(/^([0-9a-f]{40}|[0-9a-f]{64})$/, "a full commit hash")
 });
+/** A spin-off's task: what the new session is to do, as the person handing over typed it. */
+const Task = string().trim().min(1).max(4e3);
 /**
 * What the receiver gets: the brief, and every repo pushed for it, each on the handoff's own branch,
 * `isoplan/handoff/<id>`. Repos that push to the same remote can't share one, so each after the
 * first has `isoplan/handoff/<id>--<its path, as lowercase letters, digits and dashes>`.
+* `task` (protocol 0.10.0): the handoff is a spin-off, a new task of its own for the new session,
+* and the brief is written for that task; without it, the new session carries on this work.
 */
 const HandoffSchema = object({
 	id: HandoffId,
 	brief: string().min(1),
-	repos: array(HandoffRepoSchema).min(1)
+	repos: array(HandoffRepoSchema).min(1),
+	task: Task.optional()
 }).superRefine((handoff, context) => {
 	handoff.repos.forEach((repo, i) => {
 		const own = `isoplan/handoff/${handoff.id}`;
@@ -6151,13 +6156,15 @@ const HandOverMessageSchema = object({
 });
 /**
 * The sender's session asks, before it pushes, whether a hand-over with this id to `to` would be
-* taken: the server answers hand-over-ready, or an error saying why not.
+* taken: the server answers hand-over-ready, or an error saying why not. `task` (protocol 0.10.0):
+* the hand-over will be a spin-off with this task, the same as its handoff's `task`.
 */
 const HandOverCheckMessageSchema = object({
 	type: literal$1("hand-over-check"),
 	v: Version,
 	to: string().min(1),
-	handoff: HandoffId
+	handoff: HandoffId,
+	task: Task.optional()
 });
 /** The receiver's session asks for the handoff a take code stands for. */
 const TakeMessageSchema = object({
@@ -6522,7 +6529,8 @@ const RequestMessageSchema = discriminatedUnion("kind", [
 		session: string().min(1),
 		room: string().min(1),
 		handoff: HandoffId,
-		to: Account
+		to: Account,
+		task: Task.optional()
 	}),
 	object({
 		type: literal$1("request"),
@@ -11126,7 +11134,8 @@ async function loadPrompts(dir) {
 	return {
 		instructions: await read("instructions.md"),
 		question: await read("question.md"),
-		brief: await read("brief.md")
+		brief: await read("brief.md"),
+		spinOff: await read("spin-off.md")
 	};
 }
 /** `template` with each {{key}} replaced by its value; an unknown key is left as it is. */
@@ -12267,14 +12276,16 @@ async function trustFolder(claudeJson, dir, platform) {
 	await fs.writeFile(temp, JSON.stringify(config, null, 2) + (text.endsWith("\n") ? "\n" : ""), { mode: 384 });
 	await fs.rename(temp, claudeJson);
 }
-/** The first thing the new session is told. */
-function takePrompt(id, brief, setupLog, failedRepos = []) {
+/**
+* The first thing the new session is told. A spin-off's (`task`, the file holding its task) leads
+* with the task; the task's own text stays in its file, out of the launcher's command line.
+*/
+function takePrompt(id, brief, setupLog, failedRepos = [], task = null) {
 	return [
-		`Isoplan handoff ${id}: you are taking this work over.`,
-		`Read its brief in ${brief} first.`,
+		...task ? [`Isoplan spin-off ${id}: you are starting a new task of your own, in ${task}. Read it first, then its brief in ${brief}, which says what the task needs from the work it came from; that session carries on with its own work.`] : [`Isoplan handoff ${id}: you are taking this work over.`, `Read its brief in ${brief} first.`],
 		...setupLog ? [`The worktree's setup script failed; the end of its output is in ${setupLog}.`] : [],
 		...failedRepos.length ? [`These repos in this folder couldn't be put on the handoff's branch, so check them first: ${failedRepos.join(", ")}.`] : [],
-		"Then say where things stand and what you would do next, and wait for me before changing anything."
+		task ? "Then say what you take the task to be and what you would do first, and wait for me before changing anything." : "Then say where things stand and what you would do next, and wait for me before changing anything."
 	].join(" ");
 }
 /**
@@ -12469,6 +12480,8 @@ async function takeHandoff(message, o) {
 		await fs.mkdir(folder, { recursive: true });
 		const briefFile = path.join(folder, "brief.md");
 		await fs.writeFile(briefFile, handoff.brief + "\n");
+		const taskFile = handoff.task ? path.join(folder, "task.md") : null;
+		if (taskFile) await fs.writeFile(taskFile, handoff.task + "\n");
 		let setupLog = null;
 		let setup = null;
 		if (clone) {
@@ -12525,7 +12538,7 @@ async function takeHandoff(message, o) {
 			const problem = await o.driven.prepare({
 				session: id,
 				folder: dir,
-				prompt: takePrompt(handoff.id, briefFile, setupLog, failedRepos),
+				prompt: takePrompt(handoff.id, briefFile, setupLog, failedRepos, taskFile),
 				name,
 				addDir: folder,
 				room: message.room,
@@ -12540,7 +12553,7 @@ async function takeHandoff(message, o) {
 			return done(`claude-code:${id}`);
 		}
 		const argv = sessionArgv(bin, {
-			prompt: takePrompt(handoff.id, briefFile, setupLog, failedRepos),
+			prompt: takePrompt(handoff.id, briefFile, setupLog, failedRepos, taskFile),
 			session: id,
 			name,
 			folder,
@@ -12635,7 +12648,7 @@ async function takeHandoff(message, o) {
 			configDir: o.env.CLAUDE_CONFIG_DIR ?? null
 		});
 		if (!l) {
-			await fail("open", `Opening a terminal isn't supported on ${o.platform} yet. The worktree is ${dir} and the brief is ${briefFile}: open Claude Code there yourself.`);
+			await fail("open", `Opening a terminal isn't supported on ${o.platform} yet. The worktree is ${dir} and the brief is ${briefFile}${taskFile ? `, and its task is ${taskFile}` : ""}: open Claude Code there yourself.`);
 			return done();
 		}
 		if (orca) {
@@ -13379,7 +13392,11 @@ function createRunner({ answerer, ledger, settings, prompts, scan, send, log, is
 				room,
 				usage: expected
 			});
-			const text = isBrief ? fill(p.brief, {
+			const text = isBrief ? request.task ? fill(p.spinOff, {
+				to: request.to.name || request.to.id,
+				task: request.task,
+				untracked: untrackedLine(brief.files)
+			}) : fill(p.brief, {
 				to: request.to.name || request.to.id,
 				untracked: untrackedLine(brief.files)
 			}) : fill(p.question, {

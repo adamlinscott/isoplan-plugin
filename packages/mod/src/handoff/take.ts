@@ -33,7 +33,8 @@
 //    script runs.
 // 5. Claude Code in the worktree, under the session id the server chose, so that session alone may
 //    join the room, told to read the brief, which is in brief.md in the handoff's folder
-//    (<claude dir>/isoplan/handoffs/<id>/). As the receiver chose on the floor, and only as they
+//    (<claude dir>/isoplan/handoffs/<id>/). A spin-off's task (#91) is in task.md there, and the
+//    session is told to read that first. As the receiver chose on the floor, and only as they
 //    said: a handoff that doesn't say is refused.
 //    - `terminal`: a terminal window, the only thing here that opens one, and only for that click
 //      (Windows: `start`, a Windows Terminal tab where that is the default; Mac: Terminal.app);
@@ -524,14 +525,19 @@ export async function trustFolder(claudeJson: string, dir: string, platform: Nod
   await fs.rename(temp, claudeJson);
 }
 
-/** The first thing the new session is told. */
-export function takePrompt(id: string, brief: string, setupLog: string | null, failedRepos: string[] = []): string {
+/**
+ * The first thing the new session is told. A spin-off's (`task`, the file holding its task) leads
+ * with the task; the task's own text stays in its file, out of the launcher's command line.
+ */
+export function takePrompt(id: string, brief: string, setupLog: string | null, failedRepos: string[] = [], task: string | null = null): string {
+  const opening = task
+    ? [`Isoplan spin-off ${id}: you are starting a new task of your own, in ${task}. Read it first, then its brief in ${brief}, which says what the task needs from the work it came from; that session carries on with its own work.`]
+    : [`Isoplan handoff ${id}: you are taking this work over.`, `Read its brief in ${brief} first.`];
   return [
-    `Isoplan handoff ${id}: you are taking this work over.`,
-    `Read its brief in ${brief} first.`,
+    ...opening,
     ...(setupLog ? [`The worktree's setup script failed; the end of its output is in ${setupLog}.`] : []),
     ...(failedRepos.length ? [`These repos in this folder couldn't be put on the handoff's branch, so check them first: ${failedRepos.join(", ")}.`] : []),
-    "Then say where things stand and what you would do next, and wait for me before changing anything.",
+    task ? "Then say what you take the task to be and what you would do first, and wait for me before changing anything." : "Then say where things stand and what you would do next, and wait for me before changing anything.",
   ].join(" ");
 }
 
@@ -689,6 +695,8 @@ export async function takeHandoff(message: Pick<HandoffMessage, "handoff" | "mod
     await fs.mkdir(folder, { recursive: true });
     const briefFile = path.join(folder, "brief.md");
     await fs.writeFile(briefFile, handoff.brief + "\n");
+    const taskFile = handoff.task ? path.join(folder, "task.md") : null;
+    if (taskFile) await fs.writeFile(taskFile, handoff.task + "\n");
 
     // A new session is spawned, so the setup script always runs, when there is a repo to read it from.
     let setupLog: string | null = null;
@@ -740,7 +748,7 @@ export async function takeHandoff(message: Pick<HandoffMessage, "handoff" | "mod
         await fail("open", dropped);
         return done();
       }
-      const problem = await o.driven!.prepare({ session: id, folder: dir, prompt: takePrompt(handoff.id, briefFile, setupLog, failedRepos), name, addDir: folder, room: message.room!, by: message.by!, permissions: message.permissions ?? "auto" });
+      const problem = await o.driven!.prepare({ session: id, folder: dir, prompt: takePrompt(handoff.id, briefFile, setupLog, failedRepos, taskFile), name, addDir: folder, room: message.room!, by: message.by!, permissions: message.permissions ?? "auto" });
       if (problem) {
         await fail("open", `${problem} The worktree is ${dir}.`);
         return done();
@@ -748,7 +756,7 @@ export async function takeHandoff(message: Pick<HandoffMessage, "handoff" | "mod
       o.log(`handoff ${handoff.id}: Claude Code session ${id} opens in ${dir}, run from the floor`);
       return done(`claude-code:${id}`);
     }
-    const argv = sessionArgv(bin, { prompt: takePrompt(handoff.id, briefFile, setupLog, failedRepos), session: id, name, folder, headless, ...(desktop ? { print: { maxTurns: s.desktopReadMaxTurns } } : {}) });
+    const argv = sessionArgv(bin, { prompt: takePrompt(handoff.id, briefFile, setupLog, failedRepos, taskFile), session: id, name, folder, headless, ...(desktop ? { print: { maxTurns: s.desktopReadMaxTurns } } : {}) });
     if (desktop) {
       const budgetMs = s.desktopTakeBudgetMinutes * 60000;
       const left = () => budgetMs - (Date.now() - startedAt);
@@ -828,7 +836,7 @@ export async function takeHandoff(message: Pick<HandoffMessage, "handoff" | "mod
     }
     const l = launch(o.platform, { folder, dir, argv, title: name, configDir: o.env.CLAUDE_CONFIG_DIR ?? null });
     if (!l) {
-      await fail("open", `Opening a terminal isn't supported on ${o.platform} yet. The worktree is ${dir} and the brief is ${briefFile}: open Claude Code there yourself.`);
+      await fail("open", `Opening a terminal isn't supported on ${o.platform} yet. The worktree is ${dir} and the brief is ${briefFile}${taskFile ? `, and its task is ${taskFile}` : ""}: open Claude Code there yourself.`);
       return done();
     }
     if (orca) {

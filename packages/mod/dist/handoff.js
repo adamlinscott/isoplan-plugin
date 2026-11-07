@@ -5912,15 +5912,22 @@ const HandoffRepoSchema = object({
 	branch: string().min(1),
 	commit: string().regex(/^([0-9a-f]{40}|[0-9a-f]{64})$/, "a full commit hash")
 });
+/** The longest task a handoff of its own task (a spin-off) carries (protocol 0.10.0). */
+const MAX_TASK_LENGTH = 4e3;
+/** A spin-off's task: what the new session is to do, as the person handing over typed it. */
+const Task = string().trim().min(1).max(MAX_TASK_LENGTH);
 /**
 * What the receiver gets: the brief, and every repo pushed for it, each on the handoff's own branch,
 * `isoplan/handoff/<id>`. Repos that push to the same remote can't share one, so each after the
 * first has `isoplan/handoff/<id>--<its path, as lowercase letters, digits and dashes>`.
+* `task` (protocol 0.10.0): the handoff is a spin-off, a new task of its own for the new session,
+* and the brief is written for that task; without it, the new session carries on this work.
 */
 const HandoffSchema = object({
 	id: HandoffId,
 	brief: string().min(1),
-	repos: array(HandoffRepoSchema).min(1)
+	repos: array(HandoffRepoSchema).min(1),
+	task: Task.optional()
 }).superRefine((handoff, context) => {
 	handoff.repos.forEach((repo, i) => {
 		const own = `isoplan/handoff/${handoff.id}`;
@@ -6150,13 +6157,15 @@ const HandOverMessageSchema = object({
 });
 /**
 * The sender's session asks, before it pushes, whether a hand-over with this id to `to` would be
-* taken: the server answers hand-over-ready, or an error saying why not.
+* taken: the server answers hand-over-ready, or an error saying why not. `task` (protocol 0.10.0):
+* the hand-over will be a spin-off with this task, the same as its handoff's `task`.
 */
 const HandOverCheckMessageSchema = object({
 	type: literal("hand-over-check"),
 	v: Version,
 	to: string().min(1),
-	handoff: HandoffId
+	handoff: HandoffId,
+	task: Task.optional()
 });
 /** The receiver's session asks for the handoff a take code stands for. */
 const TakeMessageSchema = object({
@@ -6492,7 +6501,8 @@ const RequestMessageSchema = discriminatedUnion("kind", [
 		session: string().min(1),
 		room: string().min(1),
 		handoff: HandoffId,
-		to: Account
+		to: Account,
+		task: Task.optional()
 	}),
 	object({
 		type: literal("request"),
@@ -7473,7 +7483,8 @@ async function loadPrompts(dir) {
 	return {
 		instructions: await read("instructions.md"),
 		question: await read("question.md"),
-		brief: await read("brief.md")
+		brief: await read("brief.md"),
+		spinOff: await read("spin-off.md")
 	};
 }
 /** `template` with each {{key}} replaced by its value; an unknown key is left as it is. */
@@ -8842,17 +8853,26 @@ async function prepareCommand(argv) {
 	const id = newHandoffId();
 	const folder = outDir(id);
 	await fs.mkdir(folder, { recursive: true });
-	const brief = fill((await loadPrompts(path.join(modDir, "prompts"))).brief, {
+	const spinOff = argv.includes("--spin-off");
+	const taskFile = path.join(folder, "task.md");
+	const prompts = await loadPrompts(path.join(modDir, "prompts"));
+	const values = {
 		to: toSelf(to) ? "a new Claude Code session of this same person's" : to,
 		untracked: untrackedLine(prepared.files)
-	});
+	};
+	const brief = spinOff ? fill(prompts.spinOff, {
+		...values,
+		task: `The task as written in ${taskFile}.`
+	}) : fill(prompts.brief, values);
 	const repos = prepared.repos.filter((r) => r.path !== ".").length ? [`Repos, by path in this folder: ${prepared.repos.map((r) => `${r.path} (${repoBranch(id, r)}${r.from ? `, from ${r.from}` : ""})`).join(", ")}`] : [];
 	const left = prepared.left.length ? [`Left out: ${prepared.left.map((l) => `${l.path} (${l.why})`).join("; ")}`] : [];
 	if (prepared.notInOffice.length) left.push(`Left out, not in the office (named here only, never sent): ${prepared.notInOffice.join(", ")}`);
 	const offices = several ? [`Office: ${office.label} (pass --office "${office.label}" to hand-over)`] : [];
+	const task = spinOff ? [`Task file: ${taskFile} (write the new task there first, as it was given)`] : [];
 	return [
 		`Handoff id: ${id}`,
 		`Brief file: ${path.join(folder, "brief.md")}`,
+		...task,
 		...offices,
 		`Branch: ${handoffBranch(id)}${prepared.from ? `, made from ${prepared.from}` : ""}`,
 		...repos,
@@ -8881,6 +8901,12 @@ async function handOverCommand(argv) {
 	const file = flag(argv, "--brief") || stop("Missing --brief <file>.");
 	const written = (await fs.readFile(file, "utf8").catch(() => stop(`There is no brief at ${file}: write it there first.`))).trim();
 	if (!written) stop(`The brief at ${file} is empty.`);
+	if (argv.includes("--task") && flag(argv, "--task") === null) stop("hand-over --task needs the task file.");
+	const preparedTask = path.join(outDir(id), "task.md");
+	const taskPath = flag(argv, "--task") ?? await fs.access(preparedTask).then(() => preparedTask, () => null);
+	const task = taskPath === null ? null : (await fs.readFile(taskPath, "utf8").catch(() => stop(`There is no task at ${taskPath}: write it there first.`))).trim();
+	if (task === "") stop(`The task at ${taskPath} is empty.`);
+	if (task && task.length > 4e3) stop(`The task at ${taskPath} is ${task.length} characters long; a task can be at most ${MAX_TASK_LENGTH}. Shorten it and run hand-over again.`);
 	const cwd = sessionDir();
 	const s = await settings();
 	const timeoutMs = s.gitTimeoutSeconds * 1e3;
@@ -8900,11 +8926,14 @@ async function handOverCommand(argv) {
 	const patterns = await loadPatterns(path.join(modDir, "secret-patterns.json"), path.join(isoplanDir, "secret-patterns.json"), () => {});
 	const matched = scan(brief, patterns);
 	if (matched) stop(`The brief wasn't sent: it matches the secret pattern "${matched}". Take that out of ${file} and run hand-over again.`);
+	const taskMatched = task ? scan(task, patterns) : null;
+	if (taskMatched) stop(`The task wasn't sent: it matches the secret pattern "${taskMatched}". Take that out of ${taskPath} and run hand-over again.`);
 	const { link, answer: ready } = await exchange(office.server, cwd, {
 		type: "hand-over-check",
 		v: 1,
 		to,
-		handoff: id
+		handoff: id,
+		...task ? { task } : {}
 	}, (m) => m.type === "hand-over-ready" && m.handoff === id, "Nothing was pushed. ", home);
 	try {
 		if (ready.type === "error") stop(`Nothing was pushed. ${said(ready)}`);
@@ -8929,7 +8958,8 @@ async function handOverCommand(argv) {
 			handoff: {
 				id,
 				brief,
-				repos: sent
+				repos: sent,
+				...task ? { task } : {}
 			}
 		});
 		const answer = await link.next((m) => m.type === "handed-over" && m.handoff === id, ANSWER_MS);
@@ -8941,8 +8971,10 @@ async function handOverCommand(argv) {
 			force: true
 		}).catch(() => {});
 		const inRepos = sent.some((r) => r.path !== ".") ? ` in ${sent.map((r) => r.branch === branch ? r.path : `${r.path} (as ${r.branch})`).join(", ")}` : "";
-		if (toSelf(to)) return `Handed over to a new session of yours, on ${branch}${inRepos}. Open it from its room on the floor with Take handoff, or copy its prompt there into a session you have.`;
-		return `Handed over to ${name}, on ${branch}${inRepos}. They will see a Take handoff button in the room on the floor.`;
+		const what = task ? "Spun off, with its new task," : "Handed over";
+		const carryOn = task ? " This session carries on with its own work." : "";
+		if (toSelf(to)) return `${what} to a new session of yours, on ${branch}${inRepos}. Open it from the floor with Take handoff, or copy its prompt there into a session you have.${carryOn}`;
+		return `${what} to ${name}, on ${branch}${inRepos}. They will see a Take handoff button on the floor.${carryOn}`;
 	} finally {
 		await link.close();
 	}
@@ -9033,6 +9065,20 @@ async function takeCommand(argv) {
 			remote
 		}, process.platform, timeoutMs) : null;
 		const setupNote = setup ? [`The repo's worktree setup script has NOT been run here: \`${setup}\` (from isoplan.json). Run it only if this folder isn't set up yet.`] : [];
+		if (handoff.task) return [
+			`You have taken Isoplan spin-off ${handoff.id}: a new task of your own, and this session is in its room now.`,
+			checkout,
+			...setupNote,
+			"To ask the session it came from a question, use the Isoplan ask_room tool; it carries on with its own work.",
+			"",
+			"Your task:",
+			"",
+			handoff.task,
+			"",
+			"The brief, written for that task:",
+			"",
+			handoff.brief
+		].join("\n");
 		return [
 			`You have taken Isoplan handoff ${handoff.id}, and this session is in its room now.`,
 			checkout,

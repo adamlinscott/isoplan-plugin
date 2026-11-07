@@ -154,6 +154,19 @@ test("runner: a brief is scanned too, and carries the repos the handoff pushed",
   expect(t.sent[1]).toEqual({ type: "reply", v: PROTOCOL_VERSION, id: "b1", kind: "write-brief", handoff: { id: "h-1", brief: 'Goal: ship. Set password: "hunter2hunter2" first.', repos } });
 });
 
+test("runner: a spin-off's brief is asked for that task, and its reply doesn't repeat the task", async () => {
+  const repos: HandoffRepo[] = [{ path: ".", remote: "origin", branch: "isoplan/handoff/h-1", commit: "a".repeat(40) }];
+  const t = await setup({ push: async () => repos });
+  t.runner.take({ ...brief("b1"), task: "Write the docs pages for session management." } as RequestMessage);
+  await t.asked(1);
+  expect(t.asks[0]!.ask.request).toContain("for Bob, who is starting a new task of its own");
+  expect(t.asks[0]!.ask.request).toContain("The new task:\n\nWrite the docs pages for session management.");
+  expect(t.asks[0]!.ask.request).not.toContain("who is taking this work over");
+  t.asks[0]!.settle(ok("Docs need: the session states."));
+  await t.runner.settled();
+  expect(t.sent).toEqual([{ type: "reply", v: PROTOCOL_VERSION, id: "b1", kind: "write-brief", handoff: { id: "h-1", brief: "Docs need: the session states.", repos } }]);
+});
+
 test("runner: a brief is asked for with the untracked files named, ends with the note, and is pushed only once it clears the scan", async () => {
   const repos: HandoffRepo[] = [{ path: ".", remote: "origin", branch: "isoplan/handoff/h-1", commit: "a".repeat(40) }];
   const pushed: string[] = [];

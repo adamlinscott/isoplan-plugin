@@ -22,7 +22,8 @@
 // A request id seen before isn't run again: one still running is left to finish, and one that
 // finished gets the same answer again, so a server that asks twice doesn't pay twice.
 //
-// A brief (#48) is asked for with the session's untracked files named (`prepareBrief`), and ends
+// A brief (#48) is asked for with the session's untracked files named (`prepareBrief`), written for
+// the request's `task` when it has one (a spin-off, spin-off.md), and ends
 // with the runner's note of what was pushed. When the fork can't write it (it failed, or a cap is
 // reached), the reply still goes, marked `fallback` (and with the `cap`, when one is why, or
 // `noClaude`, when the machine has no claude binary), with the
@@ -225,7 +226,9 @@ export function createRunner({ answerer, ledger, settings, prompts, scan, send, 
     } else {
       const reservation = ledger.reserve({ at: now(), room, usage: expected });
       const text = isBrief
-        ? fill(p.brief, { to: request.to.name || request.to.id, untracked: untrackedLine(brief.files) })
+        ? request.task
+          ? fill(p.spinOff, { to: request.to.name || request.to.id, task: request.task, untracked: untrackedLine(brief.files) })
+          : fill(p.brief, { to: request.to.name || request.to.id, untracked: untrackedLine(brief.files) })
         : fill(p.question, { from: request.from.name || request.from.id, question: request.question });
       const free = await forks.take(s.maxForks);
       if (dropping.has(id)) {
