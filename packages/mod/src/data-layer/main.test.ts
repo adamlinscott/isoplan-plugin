@@ -50,8 +50,14 @@ async function office() {
   return { state, url: `ws://127.0.0.1:${(server.address() as AddressInfo).port}/data-layer` };
 }
 
-/** A repo with a remote, and session s1 in it with a fresh transcript; the repo's folder. */
-function session(claudeDir: string, root: string): string {
+type Lines = (repo: string, now: string) => object[];
+const turn: Lines = (repo, now) => [{ type: "user", cwd: repo, timestamp: now, message: { role: "user", content: "hi" } }, { type: "assistant", cwd: repo, timestamp: now, message: { role: "assistant", content: [{ type: "text", text: "ok" }] } }];
+// What a transcript holds as the first prompt's hooks run: bookkeeping lines, none naming a folder (#92).
+const bookkeeping: Lines = (_repo, now) => [{ type: "session-owner" }, { type: "queue-operation", operation: "enqueue", timestamp: now }, { type: "queue-operation", operation: "dequeue", timestamp: now }];
+const jsonl = (lines: object[]) => lines.map((l) => JSON.stringify(l)).join("\n") + "\n";
+
+/** A repo with a remote, and session s1 in it with a fresh transcript (`lines`, by default a prompt and a reply); the repo's folder. */
+function session(claudeDir: string, root: string, lines = turn): string {
   const repo = path.join(root, "app");
   fs.mkdirSync(repo);
   execFileSync("git", ["init", "-q"], { cwd: repo });
@@ -59,16 +65,16 @@ function session(claudeDir: string, root: string): string {
   const now = new Date().toISOString();
   const transcript = path.join(claudeDir, "projects", repo.replace(/[^a-zA-Z0-9]/g, "-"), "s1.jsonl");
   fs.mkdirSync(path.dirname(transcript), { recursive: true });
-  fs.writeFileSync(transcript, [{ type: "user", cwd: repo, timestamp: now, message: { role: "user", content: "hi" } }, { type: "assistant", cwd: repo, timestamp: now, message: { role: "assistant", content: [{ type: "text", text: "ok" }] } }].map((l) => JSON.stringify(l)).join("\n") + "\n");
+  fs.writeFileSync(transcript, jsonl(lines(repo, now)));
   fs.mkdirSync(path.join(claudeDir, "isoplan"), { recursive: true });
   return repo;
 }
 
 /** session(), and the data layer started for it, detached. */
-function start(url: string, config: Record<string, unknown> = {}) {
+function start(url: string, config: Record<string, unknown> = {}, lines = turn) {
   const root = tempRoot();
   const claudeDir = path.join(root, "claude");
-  const repo = session(claudeDir, root);
+  const repo = session(claudeDir, root, lines);
   fs.writeFileSync(path.join(claudeDir, "isoplan", "config.json"), JSON.stringify({ server: url, ...config }));
   const child = spawn(process.execPath, [path.join(modDir, "dist", "data-layer.js"), "--session", "s1", "--cwd", repo, "--detached"], {
     cwd: repo,
@@ -78,7 +84,9 @@ function start(url: string, config: Record<string, unknown> = {}) {
   });
   children.push(child);
   const exited = new Promise<number | null>((resolve) => child.on("exit", resolve));
-  return { claudeDir, exited, lock: path.join(claudeDir, "isoplan", "live", "s1.json") };
+  const transcript = path.join(claudeDir, "projects", repo.replace(/[^a-zA-Z0-9]/g, "-"), "s1.jsonl");
+  const logged = () => fs.readFileSync(path.join(claudeDir, "isoplan", "logs", "s1.log"), "utf8");
+  return { claudeDir, repo, transcript, exited, logged, lock: path.join(claudeDir, "isoplan", "live", "s1.json") };
 }
 
 const wait = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -93,10 +101,33 @@ async function until(check: () => boolean, ms = 15000) {
 test("a session in a repo the office doesn't take opens no socket, and its detached data layer holds off, naming the repo for the wake hook", async () => {
   const o = await office();
   o.state.repos = ["github.com/team/other"];
-  const { exited, lock } = start(o.url);
+  const { exited, lock, logged } = start(o.url);
   await exited;
   expect(o.state.connections).toEqual([]);
   expect(JSON.parse(fs.readFileSync(lock, "utf8"))).toMatchObject({ pid: 0, reason: "not-approved", projects: ["github.com/team/app"] });
+  expect(logged()).toContain("stopping: no office this reports to takes github.com/team/app, so it holds off until one does");
+});
+
+// #92: the wake hook runs as the first prompt goes in, before Claude Code has written a line that names the session's folder.
+test("a detached data layer started before its session's transcript has anything to report waits for it, and reports the session once it has", async () => {
+  const o = await office();
+  o.state.repos = ["github.com/team/app"];
+  const { repo, transcript, lock } = start(o.url, {}, bookkeeping);
+  await wait(1500);
+  expect(o.state.connections).toEqual([]);
+  expect(JSON.parse(fs.readFileSync(lock, "utf8"))).toMatchObject({ detached: true });
+  fs.appendFileSync(transcript, jsonl(turn(repo, new Date().toISOString())));
+  await until(() => o.state.connections[0]?.messages.some((m) => m.type === "full") ?? false);
+});
+
+test("a detached data layer whose session's transcript has nothing to report within factsWaitSeconds stops, saying why, and lets the session go", async () => {
+  const o = await office();
+  o.state.repos = ["github.com/team/app"];
+  const { exited, lock, logged } = start(o.url, { factsWaitSeconds: 1 }, bookkeeping);
+  await exited;
+  expect(o.state.connections).toEqual([]);
+  expect(logged()).toContain("stopping: the session's transcript had nothing to report within 1 seconds");
+  expect(fs.existsSync(lock)).toBe(false);
 });
 
 test("an approved session connects; once its copy of the list is past its maximum age and can't be checked, its link closes and no other socket opens, reconnects included", async () => {

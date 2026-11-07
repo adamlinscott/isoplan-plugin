@@ -38,6 +38,8 @@ export interface Config {
   approvedMaxAgeMinutes: number;
   /** How often the plugin looks for a newer version of itself and installs it (src/update); 0 turns that off. */
   updateCheckHours: number;
+  /** How long a detached data layer started before its session's transcript has anything to report waits for it, before it stops. */
+  factsWaitSeconds: number;
 }
 
 export interface ConfigIo {

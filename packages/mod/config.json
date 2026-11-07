@@ -18,5 +18,6 @@
   "workspaceRepos": 12,
   "approvedRefreshMinutes": 5,
   "approvedMaxAgeMinutes": 15,
-  "updateCheckHours": 6
+  "updateCheckHours": 6,
+  "factsWaitSeconds": 60
 }

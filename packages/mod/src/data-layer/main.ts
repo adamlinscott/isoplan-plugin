@@ -39,7 +39,11 @@
 // It lives only while the session is at work, since the wake hook starts another on the session's
 // next turn: it exits once the session has been quiet longer than `idleMinutes`, once its link has
 // been down five minutes in a row (src/data-layer/detached.ts), once the session has nothing to
-// report, or when the server says the project isn't wanted. It can't watch the session's own
+// report, or when the server says the project isn't wanted. Started before the session's transcript
+// has anything to report (the wake hook runs as the first prompt goes in, and Claude Code may not
+// have written it yet), it waits up to `factsWaitSeconds` for it first. Each way it stops is said
+// in its log, an error nothing caught included (#92). The runner starts one too, the way the wake
+// hook does, for each session it drives from the floor (src/runner/reported.ts). It can't watch the session's own
 // process (the hook's parent may be a short-lived shell), so a closed session shows as quiet until
 // its data layer exits, then unreachable.
 //
@@ -65,6 +69,7 @@
 
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import { appendFileSync, mkdirSync } from "node:fs";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -256,10 +261,16 @@ async function main(argv: string[]): Promise<number> {
   try {
     if (!(await takeLock(lock, process.pid, alive, !detached, Date.now(), { extra: lockExtra }))) {
       process.stderr.write(`another data layer already reports session ${sessionId}\n`);
+      emit({ type: "log", text: "stopping: another data layer already reports this session" });
+      await logging;
       return 0;
     }
   } catch (err) {
-    if (detached) return 0;
+    if (detached) {
+      emit({ type: "log", text: `stopping: couldn't take the session lock: ${String((err as Error)?.message ?? err)}` });
+      await logging;
+      return 0;
+    }
     emit({ type: "log", text: `couldn't take the session lock, so going on without it: ${String((err as Error)?.message ?? err)}` });
   }
 
@@ -514,6 +525,16 @@ async function main(argv: string[]): Promise<number> {
     }
   };
   let pending = false; // an office's list hasn't answered yet
+  const startedAt = Date.now();
+  const stopping = (why: string) => (emit({ type: "log", text: `stopping: ${why}` }), false);
+  // Whether to go on to the next pass, once this one's wait is over; each reason not to is logged.
+  const goOn = async () => {
+    if (!(await wait(dormant && !pending ? DORMANT_MS : config.streamSeconds * 1000))) return false;
+    if (isUnwanted()) return stopping("no office this reports to wants this session's project or takes its repo, so it holds off");
+    if (detached && (await lockHolder(lock)) !== process.pid) return stopping("another data layer reports this session now");
+    if (await isOff()) return stopping("Claude Code lists the Isoplan plugin as uninstalled or disabled here now");
+    return true;
+  };
 
   do {
     const now = Date.now();
@@ -572,6 +593,7 @@ async function main(argv: string[]): Promise<number> {
       // these repos, or the hold ends; one with no list stops once that has lasted LINK_DOWN_MS.
       if (detached && dormant === "not-approved") {
         notApproved = candidates.projects.map((p) => p.id.toLowerCase());
+        stopping(`no office this reports to takes ${notApproved.join(", ") || cwd}, so it holds off until one does`);
         break;
       }
       const why = detached ? detachedStop({ now, lastActive: new Date(now).toISOString(), idleMinutes: config.idleMinutes, downSince }) : null;
@@ -597,6 +619,13 @@ async function main(argv: string[]): Promise<number> {
       if (detached) {
         // A folder git can't place won't be placed on the next turn either: the wake hook holds off.
         isPlaceless = isFirstPass && !(await resolve(cwd));
+        if (isPlaceless) {
+          stopping(`git can't place ${cwd}, so it holds off`);
+          break;
+        }
+        // Started before the transcript has anything to report: it waits for it, for a while (#92).
+        if (!factsSession && Date.now() - startedAt < config.factsWaitSeconds * 1000) continue;
+        stopping(factsSession ? "the session has nothing to report now (lights off with no reply, aged out, or its transcript gone)" : `the session's transcript had nothing to report within ${config.factsWaitSeconds} seconds`);
         break;
       }
       for (const run of taking) {
@@ -649,7 +678,7 @@ async function main(argv: string[]): Promise<number> {
       break;
     }
     // A dormant session waits longer between passes: there is nothing to send, only the list to check.
-  } while ((await wait(dormant && !pending ? DORMANT_MS : config.streamSeconds * 1000)) && !isUnwanted() && (!detached || (await lockHolder(lock)) === process.pid) && !(await isOff()));
+  } while (await goOn());
 
   for (const link of links()) link.close();
   // The offices that didn't want the session, each until its hold-off ends; the wake hook reads no
@@ -735,6 +764,24 @@ async function takeReply(file: string): Promise<TitleReply | null> {
   return typeof r.key === "string" && typeof r.text === "string" ? { key: r.key, text: r.text } : null;
 }
 
-process.exitCode = await main(process.argv.slice(2));
+// Detached, nobody reads stderr: an error nothing caught is said in the session's log as it exits (#92).
+function crashed(err: unknown): never {
+  const argv = process.argv.slice(2);
+  const sessionId = value(argv, "--session");
+  const said = String((err as Error)?.stack ?? err);
+  if (argv.includes("--detached") && sessionId && /^[\w-]+$/.test(sessionId)) {
+    try {
+      const file = path.join(claudePaths(process.env, os.homedir()).dir, "isoplan", "logs", `${sessionId}.log`);
+      mkdirSync(path.dirname(file), { recursive: true });
+      appendFileSync(file, `${new Date().toISOString()} stopping: something went wrong: ${said}\n`);
+    } catch {
+      // Nowhere to say it.
+    }
+  }
+  process.stderr.write(`${said}\n`);
+  process.exit(1);
+}
+process.on("uncaughtException", crashed).on("unhandledRejection", crashed);
+process.exitCode = await main(process.argv.slice(2)).catch(crashed);
 // The link's timers would keep the process up; it is done.
 process.exit();
