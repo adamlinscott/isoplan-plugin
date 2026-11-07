@@ -25,7 +25,7 @@ const SERVER = "wss://office.example";
 const ADA = { id: "claude:ada", name: "Ada" };
 const PROJECT = { id: "github.com/ada/app", name: "app" };
 const UUIDS = ["11111111-1111-4111-8111-111111111111", "22222222-2222-4222-8222-222222222222", "33333333-3333-4333-8333-333333333333"];
-const SETTINGS: DriveSettings = { drivenIdleMinutes: 30, drivenPerProject: 4, drivenCloseSeconds: 5, drivenStartSeconds: 20, drivenPromptMinutes: 10, repoFoldersCheckMinutes: 5 };
+const SETTINGS: DriveSettings = { drivenIdleMinutes: 30, drivenPerProject: 4, drivenCloseSeconds: 5, drivenStartSeconds: 20, drivenPromptMinutes: 10, repoFoldersCheckMinutes: 5, branchRefreshMinutes: 5 };
 
 // A stand-in for `claude -p --input-format stream-json --output-format stream-json`, shaped as the
 // probe in session.ts found it: it logs its argv and folder, then answers each user line with a
@@ -150,6 +150,7 @@ const listsNone = (server: string, send: (m: DrivenMessage) => boolean, folder: 
   folder,
   repoFolders: async () => [],
   home: async () => null,
+  branchFolder: async () => ({ error: "none" }),
 });
 
 const cleanups: (() => void)[] = [];
@@ -187,7 +188,8 @@ async function setUp({ settings = {}, linger = false, records = [] as ProcessRec
   const all: DrivenMessage[] = [];
   // What the office's repoFolders lists, and the folders its home says are no longer in their repo;
   // how long each listing takes, and when each began and ended.
-  const listing = { repos: [] as RepoFolders[], gone: new Set<string>(), ms: 0, calls: [] as [number, number][] };
+  // The folder each branch opens in, by "<folder> <branch>", or why there is none; and each asked for.
+  const listing = { repos: [] as RepoFolders[], gone: new Set<string>(), ms: 0, calls: [] as [number, number][], branchFolders: new Map<string, string | { error: string }>(), branchAsked: [] as string[] };
   // What the driver sent while the office's link was down, which the link drops.
   const dropped: DrivenMessage[] = [];
   const link = { up: true };
@@ -208,6 +210,7 @@ async function setUp({ settings = {}, linger = false, records = [] as ProcessRec
           return listing.repos;
         },
         home: async (f) => (listing.gone.has(f) ? null : (listing.repos.find((r) => r.folders.includes(f))?.project ?? null)),
+        branchFolder: async (f, branch) => (listing.branchAsked.push(`${f} ${branch}`), listing.branchFolders.get(`${f} ${branch}`) ?? { error: "no worktree" }),
       },
     ],
     registry,
@@ -268,6 +271,42 @@ test("folders: with the connection's first drive-policy they go right after hold
   t.driver.linked(SERVER);
   t.policy([]);
   await t.until(() => t.folders.length === 3);
+});
+
+test("folders: a check every branchRefreshMinutes, when that is sooner, sends them on its own when the branches changed", async () => {
+  const t = await setUp({ settings: { branchRefreshMinutes: 0.002 }, policy: null });
+  t.listing.repos = [{ project: PROJECT.id, folders: [t.folder], branches: ["main"] }];
+  t.policy([]);
+  await t.until(() => t.folders.length === 1);
+  t.listing.repos = [{ project: PROJECT.id, folders: [t.folder], branches: ["main", "feat/dark"] }];
+  await t.until(() => t.folders.length === 2);
+  expect(t.folders[1]!.repos).toEqual([{ project: PROJECT.id, folders: [t.folder], branches: ["main", "feat/dark"] }]);
+});
+
+test("start on a branch: a listed one opens in the folder the office gives for it; one not listed is no-folder, and one with no folder for it unavailable, with nothing started", async () => {
+  const t = await setUp({ policy: null });
+  const worktree = path.join(t.root, "app-branch-feat-dark");
+  fs.mkdirSync(worktree);
+  t.listing.repos = [{ project: PROJECT.id, folders: [t.folder], branches: ["main", "feat/dark", "feat/broken"] }];
+  t.listing.branchFolders.set(`${t.folder} feat/dark`, worktree);
+  t.listing.branchFolders.set(`${t.folder} feat/broken`, { error: "git worktree add failed" });
+  t.policy([]);
+  await t.until(() => t.folders.length === 1);
+  t.drive({ id: "d1", kind: "start", folder: t.folder, branch: "feat/dark", project: PROJECT, permissions: "auto", instruction: "first" });
+  await t.until(() => t.of("turn-ended").length === 1);
+  expect(fs.realpathSync(t.fakeLog()[0].cwd)).toBe(fs.realpathSync(worktree));
+  expect(t.registry.list()[0]!.folder).toBe(worktree);
+  t.drive({ id: "d2", kind: "start", folder: t.folder, branch: "feat/gone", project: PROJECT, permissions: "auto" });
+  t.drive({ id: "d3", kind: "start", folder: t.folder, branch: "feat/broken", project: PROJECT, permissions: "auto" });
+  await t.until(() => t.of("refused").length === 2);
+  expect(t.of("refused").map((m) => [m.id, m.reason]).sort()).toEqual([
+    ["d2", "no-folder"],
+    ["d3", "unavailable"],
+  ]);
+  expect(t.of("refused").find((m) => m.id === "d2")!.detail).toContain("isn't one this computer offers");
+  expect(t.listing.branchAsked).toEqual([`${t.folder} feat/dark`, `${t.folder} feat/broken`]);
+  expect(t.logs.some((l) => l.includes("git worktree add failed"))).toBe(true);
+  expect(t.fakeLog().filter((l) => l.argv)).toHaveLength(1);
 });
 
 test("folders: a listing slower than the check waits for the next check, so checks never pile up", async () => {

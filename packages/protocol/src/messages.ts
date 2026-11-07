@@ -120,6 +120,10 @@ export const MAX_FOLDER_LENGTH = 4096;
 export const MAX_REPO_FOLDERS = 5;
 /** The most repos a `folders` message lists. */
 export const MAX_FOLDER_REPOS = 100;
+/** The most remote branches a `folders` message lists for one repo (protocol 0.9.0). */
+export const MAX_REPO_BRANCHES = 100;
+/** The longest branch name a `folders` or a start names. */
+export const MAX_BRANCH_LENGTH = 255;
 /** The most room sessions a start names. */
 export const MAX_ROOM_SESSIONS = 20;
 /** The most driven sessions a `holding` message lists. */
@@ -147,6 +151,8 @@ const ToolName = z.string().min(1).max(MAX_TOOL_NAME_LENGTH);
 const Detail = z.string().min(1).max(MAX_DETAIL_LENGTH);
 /** A folder on the runner's machine, as the runner names it. */
 const Folder = z.string().min(1).max(MAX_FOLDER_LENGTH);
+/** A branch on a repo's remote, by its name under `refs/heads/`. */
+const BranchName = z.string().min(1).max(MAX_BRANCH_LENGTH);
 /** The text was longer than its field's limit, so the runner cut it to fit. */
 const Cut = z.literal(true).optional();
 /** The secret scan matched the text: it only says so, and its owner can release it by this id (drive `release`). */
@@ -375,7 +381,7 @@ const driven = { type: z.literal("driven"), v: Version };
  * machine has no driven session by that id that it would act on, or, for a release, holds nothing
  * withheld under that id (it was dropped, or the runner restarted since). `bypass-off`: the start asked for
  * `bypassPermissions` in a project whose office doesn't allow it (`drive-policy`). `no-folder`: this
- * machine has no folder for the room's project, or a start named a folder it didn't list in `folders` for that project, or that is no longer in it. `no-claude`: it has no claude binary. `busy`: the
+ * machine has no folder for the room's project, or a start named a folder it didn't list in `folders` for that project, or that is no longer in it, or a branch it didn't list for it. `no-claude`: it has no claude binary. `busy`: the
  * session can't take this now, such as while a turn runs, or an install or sign-in of Claude Code runs already. `no-prompt`: an answer names a prompt the
  * session isn't waiting on (never raised by this runner, answered already, timed out or cancelled).
  * `cap-reached`: the project already has `limit` driven sessions running on this machine.
@@ -499,11 +505,17 @@ export const DrivenMessageSchema = z.discriminatedUnion("kind", [
   // first drive-policy, after `holding`, and again whenever it changes; each one replaces the
   // last. Every folder has passed the secret scan: one it matched, or one too long to send, is left
   // out. Only these are folders a start may name.
+  // From protocol 0.9.0 (isoplan-plugin#84) a runner lists each repo once, by its main checkout, and
+  // with `branches`: the branches on the remote the project id comes from (`git ls-remote --heads`),
+  // by name, at most MAX_REPO_BRANCHES, each passed by the secret scan. Absent when the runner is older,
+  // the repo has no remote or isn't a git checkout, or its remote couldn't be reached; empty when the
+  // remote has no branches. It is
+  // also sent unasked every few minutes when the list changed. Only these are branches a start may name.
   z.object({
     ...driven,
     kind: z.literal("folders"),
     repos: z
-      .array(z.object({ project: z.string().min(1), folders: z.array(Folder).min(1).max(MAX_REPO_FOLDERS) }))
+      .array(z.object({ project: z.string().min(1), folders: z.array(Folder).min(1).max(MAX_REPO_FOLDERS), branches: z.array(BranchName).max(MAX_REPO_BRANCHES).optional() }))
       .max(MAX_FOLDER_REPOS),
   }),
 ]);
@@ -752,12 +764,17 @@ export const DriveMessageSchema = z.discriminatedUnion("kind", [
   // the folders the runner's last `folders` listed for `project`, with nothing from any room passed
   // in. Its room is its own, `room:<session>`, the one a session that says hello alone is given,
   // which `started`, `held` and `holding` name. A folder it didn't list for that project, or that is no longer in it, is refused `no-folder`.
+  // With `branch` too (protocol 0.9.0, only with `folder`): one of the `branches` the runner listed
+  // for that repo. The branch the folder is on opens the folder; another opens in a git worktree of
+  // that branch beside it, so the folder's own branch is never switched. A branch it didn't list is
+  // refused `no-folder`. A runner from before 0.9.0 ignores `branch` and opens the folder as it is.
   z
     .object({
       ...drive,
       kind: z.literal("start"),
       room: Room.optional(),
       folder: Folder.optional(),
+      branch: BranchName.optional(),
       project: ProjectSchema,
       roomSessions: z.array(DrivenSessionId).max(MAX_ROOM_SESSIONS).optional(),
       instruction: Instruction.optional(),
@@ -766,6 +783,7 @@ export const DriveMessageSchema = z.discriminatedUnion("kind", [
     .superRefine((message, context) => {
       if (message.folder === undefined) {
         if (message.room === undefined) context.addIssue({ code: "custom", path: ["room"], message: "a start names a room, or a folder" });
+        if (message.branch !== undefined) context.addIssue({ code: "custom", path: ["branch"], message: "a start names a branch only with a folder" });
         return;
       }
       for (const key of ["room", "roomSessions"] as const) {

@@ -243,11 +243,12 @@ async function recentFolders(io: NodeIo, projectsDir: string, since: number): Pr
 }
 
 /**
- * The folders the machine's Claude Code sessions since `since` ran in, still there, the most recent
- * first, each once, with when each was last used. `cwds` keeps what each transcript says its folder
- * is between calls, so a transcript that names its folder is read once.
+ * The folders the machine's Claude Code sessions since `since` ran in, still there (or, with `gone`,
+ * those no longer there too), the most recent first, each once, with when each was last used. `cwds`
+ * keeps what each transcript says its folder is between calls, so a transcript that names its folder
+ * is read once.
  */
-export async function sessionFolders(io: Pick<NodeIo, "listDir" | "stat" | "read">, projectsDir: string, since: number, cwds?: Map<string, string>): Promise<{ folder: string; at: number }[]> {
+export async function sessionFolders(io: Pick<NodeIo, "listDir" | "stat" | "read">, projectsDir: string, since: number, cwds?: Map<string, string>, { gone = false }: { gone?: boolean } = {}): Promise<{ folder: string; at: number }[]> {
   const transcripts: { cwd: string; at: number }[] = [];
   const used = new Set<string>();
   for (const dir of await io.listDir(projectsDir)) {
@@ -272,7 +273,7 @@ export async function sessionFolders(io: Pick<NodeIo, "listDir" | "stat" | "read
   for (const { cwd, at } of transcripts) {
     if (seen.has(pathKey(cwd))) continue;
     seen.add(pathKey(cwd));
-    if ((await io.stat(cwd))?.isDir) out.push({ folder: cwd, at });
+    if (gone || (await io.stat(cwd))?.isDir) out.push({ folder: cwd, at });
   }
   return out;
 }
@@ -583,10 +584,11 @@ export async function recordOrca(folder: string, terminal: string | null, worktr
   await fs.writeFile(path.join(folder, "orca.json"), JSON.stringify({ about: "The Orca terminal and worktree this handoff was opened in on this machine, for the floor's Focus this session.", terminal, worktree }, null, 2) + "\n");
 }
 
-// An empty folder as core.hooksPath, so no hook of the repo's runs while the handoff's branch is
-// checked out: they would be the sender's, from that branch.
+// An empty folder as core.hooksPath, so no hook of the repo's runs while the handoff's branch, or a
+// branch started from the floor (runner/checkouts.ts), is checked out: they would be whoever pushed
+// it, from that branch.
 let emptyHooks: Promise<string> | null = null;
-const noHooks = async () => ["-c", `core.hooksPath=${await (emptyHooks ??= fs.mkdtemp(path.join(os.tmpdir(), "isoplan-no-hooks-")))}`];
+export const noHooks = async () => ["-c", `core.hooksPath=${await (emptyHooks ??= fs.mkdtemp(path.join(os.tmpdir(), "isoplan-no-hooks-")))}`];
 
 /** Takes the handoff on this machine; never throws. */
 export async function takeHandoff(message: Pick<HandoffMessage, "handoff" | "mode" | "session" | "by" | "room" | "permissions">, o: TakeOptions): Promise<TakenMessage> {
@@ -1062,8 +1064,8 @@ async function worktreeFor(run: RunGit, clone: string, remote: string, branch: s
   return { error: `${base} and the next eight names beside it are taken by other folders` };
 }
 
-// The worktree, other than the main checkout, that has `branch` checked out, or null.
-async function worktreeOn(run: RunGit, clone: string, branch: string, timeoutMs: number): Promise<string | null> {
+/** The worktree, other than the main checkout, that has `branch` checked out, or null. */
+export async function worktreeOn(run: RunGit, clone: string, branch: string, timeoutMs: number): Promise<string | null> {
   const listed = await run(["worktree", "list", "--porcelain"], { cwd: clone, timeoutMs });
   if (listed.code !== 0) return null;
   const blocks = listed.stdout.split(/\r?\n\r?\n/).slice(1).map((b) => b.split(/\r?\n/));

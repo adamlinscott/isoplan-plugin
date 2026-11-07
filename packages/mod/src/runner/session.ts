@@ -60,6 +60,11 @@
 //   the folder is one the office was last told of for the start's project and is still in that repo
 //   (`office.home`); otherwise it is refused `no-folder`. The server's path is checked against
 //   what this runner listed, never used unchecked.
+// - From #84 each repo is listed once, by its main checkout, with the branches on its remote
+//   (repo-folders.ts, checkouts.ts), and the check runs at least every `branchRefreshMinutes`, so
+//   the office's list stays current. A start with `branch` too is refused `no-folder` unless that
+//   branch was listed for the repo; it opens in the checkout when the checkout is on that branch, and
+//   otherwise in a worktree of it (`office.branchFolder`), never switching the checkout's branch.
 // - A turn is named by the instruction that started it; one at a time (`busy`). Each tool use is
 //   sent as `tool` with a short summary of what for; the turn's `result` text as `reply`; then
 //   `turn-ended`. The turn's full output (instruction, the agent's words, tools and their results) is
@@ -170,6 +175,8 @@ export interface DriveSettings {
   drivenPromptMinutes: number;
   /** How often the folders a new session can start in are checked again, and sent when they changed. */
   repoFoldersCheckMinutes: number;
+  /** How often, at most, the branches on each repo's remote are listed again, and the folders sent when they changed. */
+  branchRefreshMinutes: number;
 }
 
 /** One office server's side of the driver. */
@@ -184,6 +191,8 @@ export interface DriveOffice {
   repoFolders(): Promise<RepoFolders[]>;
   /** The project id, lower-cased, of the repo the office takes that `folder` is in; null when it is gone or the office takes none. */
   home(folder: string): Promise<string | null>;
+  /** The folder a session on `branch` of the checkout `folder` opens in: the checkout when it is on it, else a worktree of it; or why there is none. */
+  branchFolder(folder: string, branch: string): Promise<string | { error: string }>;
 }
 
 /** A handoff taken as a driven session, once its worktree is ready. */
@@ -292,6 +301,8 @@ const KILL_WAIT_MS = 10000;
 const NO_CLAUDE = "Claude Code for the terminal isn't installed on this computer, so no session can run here.";
 const NO_FOLDER = "This computer has no folder for this room: open Claude Code once in the room's repo here, then try again.";
 const NOT_LISTED = "That folder isn't one this computer offers for this repo any more, so nothing was started. Pick one of the folders it offers now.";
+const BRANCH_NOT_LISTED = "That branch isn't one this computer offers for this repo any more, so nothing was started. Pick one of the branches it offers now.";
+const NO_WORKTREE = "A separate folder for that branch couldn't be made on this computer, so nothing was started. Its runner log says why.";
 const NOT_STARTED = "Claude Code couldn't be started on this computer. Its runner log says why.";
 const BUSY = "The agent is still working on the last instruction. Wait for it to finish, or stop it.";
 const NOT_CLOSED = "Claude Code couldn't be closed for this session on this computer, so it is still running there. Try again in a moment.";
@@ -527,8 +538,8 @@ export function createDriver(o: DriverOptions): Driver {
   const policies = new Map<string, Set<string>>();
   const takes = new Map<string, PreparedTake & { server: string; project: string }>();
   const starts = new Set<string>();
-  // Office -> what its last `folders` said: the message as sent, and each project's folders, pathKey -> the folder as listed.
-  const listed = new Map<string, { said: string; folders: Map<string, Map<string, string>> }>();
+  // Office -> what its last `folders` said: the message as sent, and for each project its folders, pathKey -> the folder as listed, and its branches.
+  const listed = new Map<string, { said: string; repos: Map<string, { folders: Map<string, string>; branches: Set<string> }> }>();
   let foldersOut = Promise.resolve();
   let foldersCheck: ReturnType<typeof setTimeout> | "arming" | null = null;
   let closed = false;
@@ -960,9 +971,23 @@ export function createDriver(o: DriverOptions): Driver {
     let folder: string | null;
     if (m.folder !== undefined) {
       // Only a folder this runner listed for the project, still in its repo, spelled as listed: never the server's path unchecked.
-      const own = listed.get(server)?.folders.get(project)?.get(pathKey(m.folder));
+      const repo = listed.get(server)?.repos.get(project);
+      const own = repo?.folders.get(pathKey(m.folder));
       folder = own !== undefined && (await office.home(own).catch(() => null)) === project ? own : null;
       if (!folder) return refuse(server, m.id, "no-folder", { detail: NOT_LISTED });
+      if (m.branch !== undefined) {
+        if (!repo!.branches.has(m.branch)) return refuse(server, m.id, "no-folder", { detail: BRANCH_NOT_LISTED });
+        // A start the cap refuses now makes no worktree. One made for a start refused later (the cap
+        // reached meanwhile, or the session not opening) is kept, and the next start on that branch reuses it.
+        const cap = capOf(await o.settings());
+        if (heldIn(project) >= cap) return refuse(server, m.id, "cap-reached", { limit: cap, detail: capReached(cap) });
+        const made = await office.branchFolder(folder, m.branch).catch((err: Error) => ({ error: err?.stack ?? String(err) }));
+        if (typeof made !== "string") {
+          o.log(`start ${m.id}: no folder for branch ${m.branch} of ${folder}: ${made.error}`);
+          return refuse(server, m.id, "unavailable", { detail: NO_WORKTREE });
+        }
+        folder = made;
+      }
     } else {
       folder = await office.folder(m.roomSessions ?? []);
       if (!folder) return refuse(server, m.id, "no-folder", { detail: NO_FOLDER });
@@ -1144,14 +1169,14 @@ export function createDriver(o: DriverOptions): Driver {
           if (!policies.has(server)) return;
           const said = JSON.stringify(repos);
           if (!again && listed.get(server)?.said === said) return;
-          listed.set(server, { said, folders: new Map(repos.map((r) => [r.project, new Map(r.folders.map((f) => [pathKey(f), f]))])) });
+          listed.set(server, { said, repos: new Map(repos.map((r) => [r.project, { folders: new Map(r.folders.map((f) => [pathKey(f), f])), branches: new Set(r.branches ?? []) }])) });
           sendTo(server, { ...driven, kind: "folders", repos });
         })
         .catch((err: Error) => o.log(`couldn't list the folders new sessions can start in for ${server}: ${err?.stack ?? String(err)}`)),
     );
   }
 
-  // Checks the folders again every repoFoldersCheckMinutes while any office's connection has had its first drive-policy.
+  // Checks the folders again every repoFoldersCheckMinutes, or branchRefreshMinutes when sooner, while any office's connection has had its first drive-policy.
   function checkFoldersLater(): void {
     if (foldersCheck || closed) return;
     foldersCheck = "arming";
@@ -1165,7 +1190,7 @@ export function createDriver(o: DriverOptions): Driver {
           void foldersOut.then(() => {
             if (policies.size) checkFoldersLater();
           });
-        }, st.repoFoldersCheckMinutes * 60000);
+        }, Math.min(st.repoFoldersCheckMinutes, st.branchRefreshMinutes) * 60000);
         foldersCheck.unref?.();
       },
       () => (foldersCheck = null),
