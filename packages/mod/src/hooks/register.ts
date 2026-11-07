@@ -1,5 +1,9 @@
-// Isoplan's hooks module: Claude Code loads it through hooks/hooks.json. It draws nothing. It
-// starts the data layer (dist/data-layer.js) for the session and keeps it running, shows the link
+// Isoplan's hooks module: Claude Code loads it through hooks/hooks.json. It draws nothing. The
+// machine's runner reports the session (ADR 0007); this module does only what has to run inside
+// Claude Code, and reaches the runner through its end of the runner's local pipe (dist/pipe.js,
+// src/pipe), which it starts for the session and keeps running: Claude Code gives a hooks module no
+// sockets of its own. "The data layer" below is the runner reporting the session, whose lines come
+// through that pipe. It shows the link
 // to each office in one status line, by the office's label (`Isoplan: internal ✓ · dev ✓`, #105),
 // leaving out an office that doesn't take the repo, with "Isoplan updated: type /reload-plugins" beside it once the data layer says
 // a newer version of the plugin is on disk (src/update), writes the room titles the data layer asks for on the owner's own login,
@@ -12,7 +16,7 @@
 // turned asking off. With rights from more than one office it asks in the office the session took its
 // handoff through, else in the first of them in config.json's order (dist/ask.js decides). A tool can't be taken away again, so once the rights go (turned off, the
 // handoff dismissed, another session id) it answers that asking is off, without running anything. The tool asks the room's lead a question through the office server
-// (dist/ask.js), with no one typing anything; the script waits only as long as runner.json says,
+// (dist/ask.js, which asks through the runner), with no one typing anything; the script waits only as long as runner.json says,
 // then tells the agent to carry on. The end of a question that comes after that arrives as an
 // `asked` line and is kept until it goes on a tool result of the agent that asked, or of the lead
 // once that agent has stopped; only then is it acked
@@ -28,14 +32,17 @@
 // layer's `waits` line names, so the data layer offers the question to the floor only while this
 // hook really waits for it: not one asked before the plugin loaded, nor one this hook never saw.
 //
-// The data layer talks back as JSON lines on stdout (src/lines.ts). Claude Code closes the child's
-// stdin at launch, so what goes the other way, a title, goes through a file the line names. A data
-// layer that ends is started again, backing off while it keeps failing; one running for a session
+// The pipe's end passes the runner's JSON lines on on its stdout (src/lines.ts). Claude Code closes
+// the child's stdin at launch, so what goes the other way, a title, goes through a file the line
+// names, which the runner reads. While the runner can't be reached (a `runner` line, `down`) the
+// status line says the session isn't reaching the office until it is back; the pipe's end starts
+// the runner and tries again, and the runner reports the session afresh once it is through. A pipe's
+// end that ends is started again, backing off while it keeps failing; one running for a session
 // id the process has left (a /clear, a resume) is started again for the new id. It passes the
-// time this module started (`--since`), so the data layers of a window that started later win the
+// time this module started (`--since`), so the hooks module of a window that started later wins the
 // session. Once this copy's folder has gone (Claude Code cleans up a version some time after an
-// update), nothing is started again, and the status line asks for /reload-plugins. A data layer
-// that says another reports the session (a `superseded` line: a newer version's after a reload, or
+// update), nothing is started again, and the status line asks for /reload-plugins. One told that
+// another has the session (a `superseded` line: a newer version's after a reload, or
 // another window's) is started again only SUPERSEDED_RECHECK_MS later, and goes on if the session
 // is free by then.
 //
@@ -46,8 +53,8 @@
 // A message the owner sends the session from the floor (#77) comes as an `owner-message` line, and
 // is submitted with $.prompt.submit as a turn of its own, read as the owner's own words: once the
 // session is idle, after any message before it, never touching the draft in the prompt box. Only a
-// Claude Code build that has $.prompt.submit (SUBMIT_SINCE on, by $.session.version) starts the data
-// layer with `--messages`, so only its session says on the floor that it takes messages. Whether each
+// Claude Code build that has $.prompt.submit (SUBMIT_SINCE on, by $.session.version) starts the pipe's
+// end with `--messages`, so only its session says on the floor that it takes messages. Whether each
 // went in, or waits its turn (it hasn't gone in after SUBMIT_WAIT_MS), or why not, goes back through
 // the file the line names. One for a session id the process has left (a /clear) is not submitted.
 
@@ -81,7 +88,7 @@ const SUBMIT_SINCE = [2, 1, 312];
 // A message not in after this long waits for the running turn, or an earlier message, to end.
 const SUBMIT_WAIT_MS = 2000;
 
-let running: string | null = null; // the session id the data layer runs for
+let running: string | null = null; // the session id the pipe's end runs for
 let lead: string | null = null; // that session's lead, as the facts name it
 let stop: (() => void) | null = null; // ends the current run, for a new session id
 let started = false;
@@ -121,7 +128,7 @@ export function register(on: On): void {
     pairSaid.clear();
     if (!started) {
       started = true;
-      void run($).catch((err) => $.ui.log("isoplan: the data layer loop failed: " + message(err), { to: "debug" }));
+      void run($).catch((err) => $.ui.log("isoplan: the loop keeping the link to the runner failed: " + message(err), { to: "debug" }));
     } else void checkSession($);
     return result;
   });
@@ -276,14 +283,14 @@ async function sendWindow($: Host): Promise<void> {
   });
 }
 
-// Restarts the data layer when the session's id is no longer the one it runs for.
+// Restarts the pipe's end when the session's id is no longer the one it runs for.
 async function checkSession($: Host): Promise<void> {
   const id = await $.session.id().catch(() => null);
   if (id && running && id !== running) stop?.();
 }
 
 async function run($: Host): Promise<void> {
-  const script = $.plugin.root.replace(/\\/g, "/") + "/dist/data-layer.js";
+  const script = $.plugin.root.replace(/\\/g, "/") + "/dist/pipe.js";
   let failures = 0;
   const since = await $.clock.now();
   const messages = (await submits($)) ? ["--messages"] : [];
@@ -303,7 +310,7 @@ async function run($: Host): Promise<void> {
       toolAdded = false;
       mayAsk.clear();
     }
-    // A data layer that starts names its offices again.
+    // A pipe's end that starts has its offices named again.
     offices.clear();
     running = session;
     lead = `claude-code:${session}:lead`;
@@ -333,7 +340,7 @@ async function run($: Host): Promise<void> {
           break;
         }
         if (piece.value.stream === "stderr") {
-          $.ui.log("isoplan: data layer: " + piece.value.text.trim(), { to: "debug" });
+          $.ui.log("isoplan: link to the runner: " + piece.value.text.trim(), { to: "debug" });
           continue;
         }
         buffer += piece.value.text;
@@ -345,7 +352,7 @@ async function run($: Host): Promise<void> {
         }
       }
     } catch (err) {
-      $.ui.log("isoplan: the data layer could not run: " + message(err), { to: "debug" });
+      $.ui.log("isoplan: the link to the runner could not run: " + message(err), { to: "debug" });
     }
     stop = null;
     if (superseded) {
@@ -368,19 +375,19 @@ async function run($: Host): Promise<void> {
       $,
       !began
         ? "Isoplan needs Node.js on PATH (couldn't start `node`)"
-        : `Isoplan: the data layer stopped${code === null ? "" : ` (node exited with code ${code})`}; restarting in ${Math.round(delay / 1000)}s`,
+        : `Isoplan: the link to Isoplan's runner stopped${code === null ? "" : ` (node exited with code ${code})`}; restarting in ${Math.round(delay / 1000)}s`,
     );
     await $.clock.sleep(delay);
   }
 }
 
-// One line from the data layer.
+// One line from the runner, or the pipe's end.
 function handle($: Host, text: string): void {
   let line: DataLayerLine;
   try {
     line = JSON.parse(text);
   } catch {
-    $.ui.log("isoplan: data layer: " + text, { to: "debug" });
+    $.ui.log("isoplan: link to the runner: " + text, { to: "debug" });
     return;
   }
   switch (line.type) {
@@ -396,6 +403,12 @@ function handle($: Host, text: string): void {
       break;
     case "superseded":
       superseded = line.reason;
+      break;
+    case "runner":
+      // Each office's part comes again once the runner reports the session afresh.
+      offices.clear();
+      pairings.clear();
+      show($, line.state === "down" ? RUNNER_DOWN_TEXT : statusText());
       break;
     case "title-ask":
       writeTitle($, line);
@@ -458,6 +471,7 @@ function show($: Host, text: string | undefined): void {
 }
 
 const UPDATED_TEXT = "Isoplan updated: type /reload-plugins";
+const RUNNER_DOWN_TEXT = "Isoplan: this session isn't reaching the office until Isoplan's runner is back; starting it";
 
 // The status line: each office's part that shows anything, or nothing at all.
 function statusText(): string | undefined {

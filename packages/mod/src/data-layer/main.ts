@@ -1,68 +1,34 @@
-// The data layer: the process the hooks module spawns for one Claude Code session, which reports it
-// (report-session.ts) and writes JSON lines to stdout for the hooks module (src/lines.ts).
+// dist/data-layer.js: kept only so older code finds what it expects (ADR 0007 step 2). The machine's
+// runner reports every session now (src/runner/reporting.ts), and a hooks module reaches it through
+// the runner's pipe (src/pipe); no data layer process runs any more.
 //
-//   node dist/data-layer.js --session <session id> --cwd <the session's folder> [--project <dir>] [--since <ms>] [--messages]
+//   node dist/data-layer.js --session <id> --cwd <dir> [--since <ms>] [--messages]   the pipe's end (src/pipe/main.ts)
+//   node dist/data-layer.js --detached --session <id> [--project <dir>]              the machine's part of a start, then done
 //
-// Claude Code ends it with the session; as a backstop it also ends when stdout breaks or its parent
-// process has gone. On POSIX an orphan is re-parented, so a changed ppid means gone even if the old
-// pid is reused.
-//
-// The machine's runner reports every session without a hooks module itself (src/runner/reporting.ts,
-// ADR 0007). A wake hook or runner of an earlier version may still start this with `--detached`
-// (before a session loads the new version): it puts this version's wake hook and runner in place,
-// starts that runner, which reports the session, says so in the session's log, and ends
-// (startDetached).
+// - A hooks module of an earlier version still loaded in a session (a checkout rebuilt under it)
+//   spawns this for its session: it gets the pipe's end, which sends it the same lines.
+// - A wake hook or runner of an earlier version may start it `--detached`: it puts this version's
+//   wake hook and runner in place, starts that runner, says so in the session's log, and ends
+//   (startDetached).
+// - An earlier version's data layer counts a copy of the plugin as whole only once it holds this
+//   file (state.ts), so without it an old data layer would take itself for the newest copy and put
+//   its older runner back.
 
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { reportSession, spawnHidden, startDetached, systemPlaces } from "./report-session.js";
-import { alive } from "../wake/lock.js";
+import { spawnHidden, startDetached, systemPlaces } from "./report-session.js";
+import { runPipe } from "../pipe/main.js";
 
-const value = (argv: string[], flag: string) => {
+const argv = process.argv.slice(2);
+const value = (flag: string) => {
   const i = argv.indexOf(flag);
   return i >= 0 && argv[i + 1] && !argv[i + 1]!.startsWith("--") ? argv[i + 1]! : null;
 };
 
-async function main(argv: string[]): Promise<number> {
-  const sessionId = value(argv, "--session");
-  const cwd = value(argv, "--cwd");
+if (argv.includes("--detached")) {
   // dist/data-layer.js sits one folder below the mod's config.json.
   const appDir = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
-  if (argv.includes("--detached")) {
-    await startDetached({ sessionId, project: value(argv, "--project") ?? cwd, appDir, spawn: spawnHidden, ...systemPlaces() });
-    return 0;
-  }
-  if (!sessionId || !cwd) {
-    process.stderr.write("usage: node data-layer.js --session <id> --cwd <dir> [--project <dir>] [--since <ms>] [--messages]\n");
-    return 2;
-  }
-  const parent = process.ppid;
-  let isOut = true;
-  const closed = new Promise<void>((resolve) => process.stdout.on("error", () => resolve()));
-  void closed.then(() => (isOut = false));
-  await reportSession({
-    sessionId,
-    cwd,
-    project: value(argv, "--project") ?? cwd,
-    by: "hooks",
-    appDir,
-    emit: (line) => {
-      if (isOut) process.stdout.write(JSON.stringify(line) + "\n");
-    },
-    closed,
-    goOn: () => process.ppid === parent && alive(parent),
-    takesMessages: argv.includes("--messages"),
-    since: Number(value(argv, "--since")) || Date.now(),
-  });
-  return 0;
+  await startDetached({ sessionId: value("--session"), project: value("--project") ?? value("--cwd"), appDir, spawn: spawnHidden, ...systemPlaces() }).catch(() => {});
+  process.exit(0);
 }
-
-process.on("uncaughtException", crash).on("unhandledRejection", crash);
-process.exitCode = await main(process.argv.slice(2)).catch(crash);
-// The link's timers would keep the process up; it is done.
-process.exit();
-
-function crash(err: unknown): never {
-  process.stderr.write(`${String((err as Error)?.stack ?? err)}\n`);
-  process.exit(1);
-}
+await runPipe(import.meta.url);

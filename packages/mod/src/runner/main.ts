@@ -11,14 +11,14 @@
 // plugin update deletes. The copy holds the defaults it reads beside it: config.json, runner.json,
 // secret-patterns.json and prompts/.
 //
-// Install, the plugin's data layer and the wake hook start the supervisor, detached (start.ts). It
+// Install, a session's hooks module (through its end of the pipe, src/pipe) and the wake hook start the supervisor, detached (start.ts). It
 // takes <claude dir>/isoplan/runner/lock.json, so a second one exits at once, writes the code it
 // runs into it and keeps it fresh, and runs the worker, starting it again after a crash
 // (lifecycle.ts). After MAX_FAST_FAILURES quick crashes in a row it gives up and lets the lock go.
 // The worker holds one link to each office server in config.json (#105), opened with a runner hello
 // carrying the machine's pairing token with that server when it signs people in, under the machine's
-// Claude account (src/data-layer/pairing.ts; a link to approve goes to the log, and the data layers
-// show the same one in Claude Code), and stays up while any session on the machine is inside its
+// Claude account (src/data-layer/pairing.ts; a link to approve goes to the log, and to each session's
+// status line through its hooks module), and stays up while any session on the machine is inside its
 // lights-off window. Each office's link answers for that office alone: only for sessions in a repo
 // it takes, from the same list the data layers read (src/data-layer/approved.ts). The forks, their
 // cap (`maxForks`, one for the machine), the ledger and its caps are shared by every office. When a
@@ -32,9 +32,12 @@
 // answers is <claude dir>/isoplan/runner/ledger.json, and it logs to
 // <claude dir>/isoplan/logs/runner.log.
 //
-// The worker reports every Claude Code session on the machine that no hooks module reports
-// (reporting.ts, ADR 0007): headless ones, those it drives, and those without the plugin, each on a
-// link of its own to each office, as a data layer would, sharing the runner's pairing and list.
+// The worker reports every Claude Code session on the machine (reporting.ts, ADR 0007): headless
+// ones, those it drives, those without the plugin, and those whose hooks module is connected to its
+// pipe (src/pipe/server.ts), each on a link of its own to each office, sharing the runner's pairing
+// and list. A hooks module gets its session's lines down the pipe, and the ask_room script asks the
+// room through it (src/ask/machine.ts), only for a session whose hooks module is connected. Its
+// address and token are in <claude dir>/isoplan/runner/pipe.json, which the worker writes as it starts.
 //
 // The worker also drives its person's sessions from the floor (session.ts; its hello says `drive`),
 // for every office through one driver, and records every process it starts for that, and every
@@ -81,6 +84,9 @@ import { watchSessions } from "./reporting.js";
 import { managedDir, pluginDirsOf, pluginsDir } from "../install/state.js";
 import { recordedState } from "../install/install.js";
 import { reportSession, sessionLog } from "../data-layer/report-session.js";
+import { askFromMachine } from "../ask/machine.js";
+import { createPipeServer, type Hooked, type PipeServer } from "../pipe/server.js";
+import type { PairLine } from "../lines.js";
 import { startPlaces, startWhere } from "./start-where.js";
 import { runnerEnvPath } from "./environment.js";
 import { applyClaudeDir, LOCK_REFRESH_MS, RUNNER_FRESH_MS, runnerCode, runnerLockPath } from "./start.js";
@@ -147,7 +153,7 @@ async function supervisor(): Promise<number> {
   });
   clearInterval(refresh);
   if (stopped === "done" || stopped === "unpaired") {
-    // Unpaired, it doesn't hold off: the plugin's data layers pair the machine again, and the next
+    // Unpaired, it doesn't hold off: the sessions' links pair the machine again, and the next
     // start, from one of them, the wake hook or the login item, picks up the new credential. While
     // the worker reports sessions it doesn't end, and their shared pairing pairs the machine again.
     log(`runner ${process.pid} stopped: ${stopped === "done" ? "no room on this machine is lit" : "the office server says this machine's pairing has ended"}`);
@@ -179,10 +185,20 @@ async function worker(): Promise<number> {
   await settings(); // a broken runner.json of the plugin's is a crash to see at once
   const answering = offices.filter((o) => !o.plainRefused);
   const account = await accountOf({ readText: (p) => fs.readFile(p, "utf8").catch(() => null), run: io.run }, claudeJson, os.homedir());
+  let pipe: PipeServer | null = null;
+  // Each office's last link to pair the machine, for a session that reaches its pairing state later.
+  const lastPair = new Map<string, PairLine>();
   const emitFor = (server: string): Parameters<typeof createLink>[0]["emit"] => (line) => {
     if (line.type === "log") log(line.text);
     else if (line.type === "error") log(`the office server at ${server} says: ${line.message} (${line.code})`);
-    else if (line.type === "pair") log(`to answer for this machine's rooms through ${line.server}, pair it: click ${line.url} on this computer and approve it in the office (it works until ${line.expires})`);
+    else if (line.type === "pair") {
+      log(`to answer for this machine's rooms through ${line.server}, pair it: click ${line.url} on this computer and approve it in the office (it works until ${line.expires})`);
+      // The machine's one pairing: its link is in every connected session's status line.
+      const label = offices.find((o) => o.server === line.server)?.label;
+      const pair = { ...line, ...(label && { label }) };
+      lastPair.set(line.server, pair);
+      for (const hooked of pipe?.all() ?? []) hooked.send(pair);
+    }
   };
   // Each office's pairing and list of repos (src/data-layer/approved.ts), one of each for the
   // machine: the runner answers only for sessions in a repo the office takes, and the sessions it
@@ -205,21 +221,42 @@ async function worker(): Promise<number> {
       return [server, { pairing, approved }] as const;
     }),
   );
-  // Every session on the machine that no hooks module reports is reported from here (reporting.ts),
-  // started first, so a runner started again has them on the floor again at once.
+  // Every session on the machine is reported from here (reporting.ts), started first, so a runner
+  // started again has them on the floor again at once.
   const paths = { claudeDir, settings: path.join(claudeDir, "settings.json"), plugins: pluginsDir(claudeDir, process.env), managed: managedDir(process.platform), pluginDirs: pluginDirsOf(process.env) };
   const isOff = async (folder: string) => (await recordedState(paths, folder).catch(() => "enabled" as const)) !== "enabled";
-  const reporting = watchSessions({
+  const scanText = async (text: string) => scan(text, await loadPatterns(path.join(appDir, "secret-patterns.json"), path.join(isoplanDir, "secret-patterns.json"), log));
+  const reporting = watchSessions<Hooked>({
     claudeDir,
     io,
     config,
     isOff,
     log,
-    report: async ({ sessionId, cwd, notWanted, closed }) => {
+    hooked: (id) => pipe?.hooked(id) ?? null,
+    report: async ({ sessionId, cwd, notWanted, closed, hooks }) => {
       const said = sessionLog(claudeDir, sessionId);
-      said.say(`the runner reports this session, in ${cwd}`);
+      said.say(hooks ? `the runner reports this session for its hooks module, in ${cwd}` : `the runner reports this session, in ${cwd}`);
+      const shares = (office: Office) => shared.get(office.server) ?? null;
       try {
-        return await reportSession({ sessionId, cwd, by: "runner", appDir, emit: said.emit, closed, notWanted, isOff: () => isOff(cwd), shared: (office) => shared.get(office.server) ?? null });
+        if (hooks)
+          return await reportSession({
+            sessionId,
+            cwd,
+            by: "hooks",
+            appDir,
+            root: hooks.root,
+            takesMessages: hooks.messages,
+            emit: (line) => {
+              said.emit(line);
+              hooks.send(line);
+              // The machine's pairing showed its link before this session got to it: the link goes with it.
+              const pair = line.type === "status" && line.state === "pairing" ? lastPair.get(line.server) : undefined;
+              if (pair) hooks.send(pair);
+            },
+            closed: Promise.race([closed, hooks.closed]),
+            shared: shares,
+          });
+        return await reportSession({ sessionId, cwd, by: "runner", appDir, emit: said.emit, closed, notWanted, isOff: () => isOff(cwd), shared: shares });
       } catch (err) {
         said.say(`stopping: something went wrong: ${String((err as Error)?.stack ?? err)}`);
         throw err;
@@ -228,6 +265,15 @@ async function worker(): Promise<number> {
       }
     },
   });
+
+  // Each session's hooks module reaches the runner here (src/pipe/server.ts). A worker that can't
+  // serve the pipe still reports every session, without their hooks modules.
+  pipe = await createPipeServer({
+    claudeDir,
+    log,
+    onChange: (session) => reporting.rehook(session),
+    ask: (request) => askFromMachine({ ...request, appDir, scan: scanText }),
+  }).catch((err: Error) => (log(`the runner couldn't open its pipe for the sessions' hooks modules: ${err.message}`), null));
 
   // Every process it starts is recorded; what an earlier run left that is Isoplan's ends now. Only a
   // worker whose supervisor holds the runner's lock gets here.
@@ -255,7 +301,6 @@ async function worker(): Promise<number> {
     log(`handoff git: ${err.detail}`);
     return new PushFailed(gitFailed(err));
   };
-  const scanText = async (text: string) => scan(text, await loadPatterns(path.join(appDir, "secret-patterns.json"), path.join(isoplanDir, "secret-patterns.json"), log));
   // Orca's CLI, as the runner starts: the office offers a take into Orca only where it is.
   const orca = () => findOrca(process.env, process.platform, os.homedir());
   const hasOrca = (await orca()) !== null;
@@ -470,7 +515,7 @@ async function worker(): Promise<number> {
         onOpen: () => drive.linked(office.server),
         onClose: () => drive.unlinked(office.server),
         onNotWanted: said.notWanted,
-        // A revoked or lapsed pairing closes this link: its data layers pair the machine again.
+        // A revoked or lapsed pairing closes this link: the sessions' links pair the machine again.
         onPairingEnded: said.unpaired,
         hello: {
           type: "runner",
@@ -487,7 +532,7 @@ async function worker(): Promise<number> {
     },
     paired: async (office) => !!pairingEntry(await readPairing(pairingPath(claudeDir)), office.server, account.id)?.credential,
     // Nor while it reports sessions: their links, and the pairing they share, would end with it.
-    idle: () => answerers.every((a) => a.runner.idle()) && reporting.reporting().length === 0,
+    idle: () => answerers.every((a) => a.runner.idle()) && reporting.reporting().length === 0 && !pipe?.all().length,
     lit: async () => anyRoomSince(io, path.join(claudeDir, "projects"), Date.now() - askableMs(await config().catch(() => first))),
     keep: async () => drive.held() > 0 || (await settings()).startAtLogin,
     gone,
@@ -500,6 +545,7 @@ async function worker(): Promise<number> {
   const ended = await links.ended;
   // Each session's link closes, and its log says so, before the worker exits; one stuck in a pass is left after STOP_WAIT_MS (reporting.ts).
   await reporting.stop();
+  await pipe?.close();
   return ended === "not-wanted" ? NOT_WANTED_CODE : ended === "unpaired" ? UNPAIRED_CODE : 0;
 }
 

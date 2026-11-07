@@ -1,6 +1,8 @@
-// What the data layer writes to stdout, one JSON object per line, for the hooks module that
-// spawned it. The hooks module can't write to the process once it has started (its stdin closes at
-// launch), so anything it sends back goes through a file the line names.
+// What the runner sends a session's hooks module, one JSON object per line: down the runner's pipe
+// (src/pipe), and on to the hooks module on the stdout of the pipe's end it spawned (`dist/pipe.js`).
+// The hooks module can't write to that process once it has started (its stdin closes at launch), so
+// anything it sends back goes through a file the line names, which the runner reads. "The data
+// layer" below is the runner reporting the session (src/data-layer/report-session.ts).
 
 import type { AskedMessage, AskRightsMessage, ConflictMessage, ErrorMessage } from "@isoplan/protocol";
 
@@ -132,13 +134,23 @@ export interface UpdatedLine {
 }
 
 /**
- * The plugin's data layer of another window took over this session, and this one stops: `newer`, a
- * newer version's (a /reload-plugins started it), or `window`, this version's in a window that
- * started later. The hooks module tries again a while later.
+ * Another hooks module has this session now, and this one's link to the runner ends (src/pipe/
+ * server.ts): `newer`, a newer version's (a /reload-plugins), or `window`, this version's in a window
+ * that started later, or an earlier version's data layer that reports the session. The hooks module
+ * tries again a while later.
  */
 export interface SupersededLine {
   type: "superseded";
   reason: "newer" | "window";
+}
+
+/**
+ * Said by the pipe's end itself (src/pipe/client.ts): the runner can't be reached (`down`), so the
+ * session isn't reaching the office while it starts the runner and tries again; or it is through again (`up`).
+ */
+export interface RunnerLine {
+  type: "runner";
+  state: "down" | "up";
 }
 
 /** A problem worth a line in the debug log. */
@@ -159,7 +171,7 @@ export interface TitleReply {
  * waiting, and `ask-rights` whether the session may ask its room (#49), each with the office server
  * it came from (#105), which the room is asked through.
  */
-export type DataLayerLine = StatusLine | TitleAskLine | PairLine | WaitsLine | WindowLine | OwnerAnswerLine | UpdatedLine | SupersededLine | OwnerMessageLine | LogLine | ConflictMessage | ErrorMessage | FromOffice<AskedMessage> | FromOffice<AskRightsMessage>;
+export type DataLayerLine = StatusLine | TitleAskLine | PairLine | WaitsLine | WindowLine | OwnerAnswerLine | UpdatedLine | SupersededLine | RunnerLine | OwnerMessageLine | LogLine | ConflictMessage | ErrorMessage | FromOffice<AskedMessage> | FromOffice<AskRightsMessage>;
 
 /** A server's message, with the data-layer address of the office server that sent it; none from a data layer before #105. */
 export type FromOffice<M> = M & { server?: string };

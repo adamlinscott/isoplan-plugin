@@ -1,8 +1,8 @@
-// The runner reporting the sessions no hooks module reports (reporting.ts, ADR 0007 step 1): which
-// sessions it takes and when it takes one again, with a stand-in for the reporting itself; then,
-// with the data layer's own reporting (report-session.ts) and a stand-in office server, that a
-// session reaches the office from the runner alone, again at once after a runner restart, and is
-// handed over to the plugin's data layer as it takes the session's lock.
+// The runner reporting every session (reporting.ts, ADR 0007): which sessions it takes and when it
+// takes one again, with or without a connected hooks module, with a stand-in for the reporting
+// itself; then, with the data layer's own reporting (report-session.ts) and a stand-in office server,
+// that a session reaches the office from the runner alone, again at once after a runner restart, and
+// is handed over to an earlier version's data layer as it takes the session's lock.
 
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
@@ -59,15 +59,18 @@ function machine(settings: Partial<Config> = {}) {
   return { claudeDir, repo, config, transcript, write };
 }
 
+/** A connected hooks module, as the runner's pipe gives it. */
+type Hooks = { cwd: string; name: string };
+
 /** watchSessions with a stand-in report: each session it starts is kept, and ends when told (or when the runner stops). */
-function watch(m: ReturnType<typeof machine>, o: { isOff?: (folder: string) => Promise<boolean>; isAlive?: (pid: number) => boolean; gapMs?: number; io?: NodeIo } = {}) {
-  const started: { id: string; notWanted: Record<string, number>; end: (ended?: Ended) => void }[] = [];
-  const report = (s: ToReport) =>
+function watch(m: ReturnType<typeof machine>, o: { isOff?: (folder: string) => Promise<boolean>; isAlive?: (pid: number) => boolean; gapMs?: number; io?: NodeIo; hooked?: Map<string, Hooks> } = {}) {
+  const started: { id: string; notWanted: Record<string, number>; hooks?: Hooks; cwd: string; end: (ended?: Ended) => void }[] = [];
+  const report = (s: ToReport<Hooks>) =>
     new Promise<Ended>((resolve) => {
-      started.push({ id: s.sessionId, notWanted: s.notWanted, end: (ended = { why: "done" }) => resolve(ended) });
+      started.push({ id: s.sessionId, notWanted: s.notWanted, hooks: s.hooks, cwd: s.cwd, end: (ended = { why: "done" }) => resolve(ended) });
       void s.closed.then(() => resolve({ why: "stopped" }));
     });
-  const w = watchSessions({ claudeDir: m.claudeDir, io: o.io ?? nodeIo(), config: async () => m.config, report, isOff: o.isOff ?? (async () => false), log: () => {}, gapMs: o.gapMs ?? 0, ...(o.isAlive && { isAlive: o.isAlive }) });
+  const w = watchSessions({ claudeDir: m.claudeDir, io: o.io ?? nodeIo(), config: async () => m.config, report, isOff: o.isOff ?? (async () => false), log: () => {}, gapMs: o.gapMs ?? 0, ...(o.isAlive && { isAlive: o.isAlive }), ...(o.hooked && { hooked: (id: string) => o.hooked!.get(id) ?? null }) });
   watching.push(w);
   return { w, started, ids: () => started.map((s) => s.id) };
 }
@@ -106,6 +109,75 @@ test("a session whose lock another live process keeps fresh isn't reported (the 
   await wait(20);
   m.write("s1");
   await until(() => ids().includes("s1"));
+});
+
+test("a session whose hooks module is connected is reported for it at once, however long ago it was written; one that connects, changes or goes stops the report under way, which starts again for the one it has now, and with none only once the transcript moves", async () => {
+  const m = machine();
+  const hooked = new Map<string, Hooks>();
+  m.write("s1", m.repo, 25 * 60); // quiet past lightsOffHours
+  m.write("s2");
+  const { w, started } = watch(m, { hooked });
+  await until(() => started.some((s) => s.id === "s2"));
+  await w.look();
+  expect(started.map((s) => s.id)).toEqual(["s2"]);
+
+  // The hooks module of s1 connects, in the folder it is in now; and s2's, while the runner reports s2 without one.
+  const first: Hooks = { cwd: path.join(m.repo, "sub"), name: "first" };
+  hooked.set("s1", first);
+  hooked.set("s2", { cwd: m.repo, name: "s2's" });
+  w.rehook("s1");
+  w.rehook("s2");
+  await until(() => started.filter((s) => s.hooks).length === 2);
+  expect(started.map((s) => [s.id, s.hooks?.name ?? null])).toEqual([
+    ["s2", null],
+    ["s1", "first"],
+    ["s2", "s2's"],
+  ]);
+  expect(started[1]!.cwd).toBe(first.cwd);
+
+  // Another window's takes s1: reported again, for that one.
+  hooked.set("s1", { cwd: m.repo, name: "later" });
+  w.rehook("s1");
+  await until(() => started.some((s) => s.hooks?.name === "later"));
+
+  // Its hooks module goes: the report stops, and s1 is reported again only once its transcript moves.
+  hooked.delete("s1");
+  w.rehook("s1");
+  await until(() => !w.reporting().includes("s1"));
+  await w.look();
+  await w.look();
+  expect(started.filter((s) => s.id === "s1")).toHaveLength(2);
+  await wait(20);
+  m.write("s1");
+  await until(() => started.filter((s) => s.id === "s1").length === 3);
+  expect(started.at(-1)!.hooks).toBeUndefined();
+});
+
+test("a hooks module's report that ended by itself starts again only once the transcript moves; while an earlier version's data layer holds the lock, none starts", async () => {
+  const m = machine();
+  const hooked = new Map<string, Hooks>([["s1", { cwd: m.repo, name: "h" }]]);
+  let holderAlive = true;
+  fs.mkdirSync(path.dirname(lockPath(m.claudeDir, "s1")), { recursive: true });
+  fs.writeFileSync(lockPath(m.claudeDir, "s1"), JSON.stringify({ pid: OTHER, detached: false }));
+  m.write("s1");
+  const { w, started } = watch(m, { hooked, isAlive: (pid) => pid !== OTHER || holderAlive });
+  await w.look();
+  await w.look();
+  expect(started).toEqual([]);
+  holderAlive = false;
+  await wait(20);
+  m.write("s1");
+  await until(() => started.length === 1);
+  expect(started[0]!.hooks?.name).toBe("h");
+
+  started[0]!.end({ why: "the plugin is off here" });
+  await until(() => !w.reporting().includes("s1"));
+  await w.look();
+  await w.look();
+  expect(started).toHaveLength(1);
+  await wait(20);
+  m.write("s1");
+  await until(() => started.length === 2);
 });
 
 test("a lock counts as fresh for three of its holder's slowest passes, which a long streamSeconds makes longer", async () => {

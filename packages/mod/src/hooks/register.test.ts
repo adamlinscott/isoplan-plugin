@@ -112,11 +112,11 @@ const call = (h: ReturnType<typeof host>, e: Partial<ToolCallInput>, result: Too
 
 const connected: DataLayerLine = { type: "status", server: "ws://127.0.0.1:4747/data-layer", label: "dev", state: "connected" };
 
-test("hooks: starts the data layer for its session and shows the link's state, then that it stopped", async () => {
+test("hooks: starts its end of the runner's pipe for its session and shows the link's state, then that it stopped", async () => {
   const h = await start([connected]);
   await stopped(h);
-  expect(h.spawned).toEqual([["node", "C:/plugins/isoplan/dist/data-layer.js", "--session", "s1", "--cwd", "C:/w/repo", "--since", "0"]]);
-  expect(h.status).toEqual(["Isoplan: dev ✓", "Isoplan: the data layer stopped (node exited with code 0); restarting in 1s"]);
+  expect(h.spawned).toEqual([["node", "C:/plugins/isoplan/dist/pipe.js", "--session", "s1", "--cwd", "C:/w/repo", "--since", "0"]]);
+  expect(h.status).toEqual(["Isoplan: dev ✓", "Isoplan: the link to Isoplan's runner stopped (node exited with code 0); restarting in 1s"]);
 });
 
 test("hooks: the status line names each office by its label, leaving out one that doesn't take the repo", async () => {
@@ -162,7 +162,7 @@ test("hooks: once a newer version is on disk, the status line says to reload, be
     "Isoplan: dev ✓",
     "Isoplan: dev ✓ · Isoplan updated: type /reload-plugins",
     "Isoplan: dev can't be reached; retrying in 2s · Isoplan updated: type /reload-plugins",
-    "Isoplan: the data layer stopped (node exited with code 0); restarting in 1s · Isoplan updated: type /reload-plugins",
+    "Isoplan: the link to Isoplan's runner stopped (node exited with code 0); restarting in 1s · Isoplan updated: type /reload-plugins",
   ]);
   // Before any other status, the note stands alone.
   vi.resetModules();
@@ -185,6 +185,13 @@ test("hooks: one that gives the session to its other window says so, not that th
   const h = await start([{ type: "superseded", reason: "window" }]);
   await vi.waitFor(() => expect(h.status.at(-1)).toBe("Isoplan: this session is reported from its other window"));
   expect(h.slept).toEqual([60000]);
+});
+
+test("hooks: while the runner can't be reached the status line says the session isn't reaching the office; once it is back, each office shows afresh", async () => {
+  const h = await start([connected, { type: "runner", state: "down" }, { type: "runner", state: "up" }, connected], { stays: true });
+  await vi.waitFor(() => expect(h.status).toHaveLength(4));
+  expect(h.status).toEqual(["Isoplan: dev ✓", "Isoplan: this session isn't reaching the office until Isoplan's runner is back; starting it", undefined, "Isoplan: dev ✓"]);
+  expect(h.spawned).toHaveLength(1);
 });
 
 test("hooks: a host with no $.fs.exists, or one that throws, still starts the data layer", async () => {

@@ -1,20 +1,32 @@
-// The runner reports every Claude Code session on the machine that no hooks module reports (ADR
-// 0007 step 1): headless ones, those the runner drives from the floor, and sessions without the
-// plugin. It looks at <claude dir>/projects every `streamSeconds`, and for each top-level transcript
-// written within `idleMinutes` (on its first look, within `lightsOffHours`, so a runner just started
-// fills the office back in) it reports the session in its own process (report-session.ts), one link
-// per session to each office, as a data layer would. Not while the session's lock in
-// <claude dir>/isoplan/live names another live process that keeps it fresh (the plugin's data layer,
-// for its hooks module), while the transcript names no folder yet or the folder has gone, or while
-// Claude Code lists the plugin as uninstalled or disabled for the folder. The runner counts a lock as
-// fresh for three of its own slowest passes (lockFreshMs, from its config.json).
+// The runner reports every Claude Code session on the machine (ADR 0007): headless ones, those the
+// runner drives from the floor, sessions without the plugin, and those whose hooks module is
+// connected to the runner's pipe (src/pipe). It looks at <claude dir>/projects every `streamSeconds`,
+// and reports each session in its own process (report-session.ts), one link per session to each
+// office.
 //
-// A session it stopped reporting (quiet past `idleMinutes`, nothing to report, its link down five
-// minutes, or the plugin's data layer took its lock over) is reported again once its transcript
-// moves; one it found the plugin's data layer reporting, once its transcript moves after a look that
-// found the lock let go. So a session with the plugin that closes goes unreachable, as it did
-// before, even when its last write and its lock letting go fall between two looks, and one whose
-// plugin data layer crashed is taken at its next turn. One that ended with a hold-off (no office
+// A session whose hooks module is connected (`hooked`) is reported for that hooks module as soon as
+// its transcript is there, however long ago it was written, and as long as the connection lasts.
+// When the session's hooks module connects, changes (another window, a reload) or goes, the report
+// under way stops and the session is reported again for the one it has now (`rehook`); with none,
+// only once its transcript moves, so a session with the plugin that closes goes unreachable, as
+// before. A hooks module's report that ended by itself (the plugin turned off, say) starts again
+// once the transcript moves.
+//
+// Any other top-level transcript written within `idleMinutes` (on its first look, within
+// `lightsOffHours`, so a runner just started fills the office back in) is reported without a hooks
+// module. Not while the transcript names no folder yet or the folder has gone, or while Claude Code
+// lists the plugin as uninstalled or disabled for the folder.
+//
+// Either way, not while the session's lock in <claude dir>/isoplan/live names another live process
+// that keeps it fresh: the data layer process of an earlier version of the plugin, for a session
+// still on that version. The runner counts a lock as fresh for three of its own slowest passes
+// (lockFreshMs, from its config.json).
+//
+// A session it stopped reporting without a hooks module (quiet past `idleMinutes`, nothing to
+// report, its link down five minutes, or an earlier version's data layer took its lock over) is
+// reported again once its transcript moves; one it found such a data layer reporting, once its
+// transcript moves after a look that found the lock let go, even when its last write and its lock
+// letting go fall between two looks. One that ended with a hold-off (no office
 // wants its project, git can't place its folder, or no office takes its repo) isn't reported again before the hold-off ends; one no office took is,
 // as its transcript moves, once a fresh copy of one office's list takes one of its repos: only of an
 // office it reported to or that config.json names now, never of one that didn't want it. The
@@ -38,21 +50,30 @@ export const GAP_MS = 250;
 export const STOP_WAIT_MS = 5000;
 
 /** One session for `report`: it reports it until `closed` settles, or until it should stop. */
-export interface ToReport {
+export interface ToReport<H = unknown> {
   sessionId: string;
   cwd: string;
   /** The offices that didn't want it, each until when. */
   notWanted: Record<string, number>;
   closed: Promise<void>;
+  /** The session's hooks module, connected to the runner's pipe, to report it for; none without. */
+  hooks?: H;
 }
 
-export interface ReportingOptions {
+/** A connected hooks module, as `hooked` gives it: its session's folder. */
+export interface HookedSession {
+  cwd: string;
+}
+
+export interface ReportingOptions<H extends HookedSession = HookedSession> {
   claudeDir: string;
   io: NodeIo;
   /** config.json as it is now. */
   config: () => Promise<Config>;
-  /** Reports one session in this process (reportSession, `by: "runner"`). */
-  report: (session: ToReport) => Promise<Ended>;
+  /** Reports one session in this process (reportSession). */
+  report: (session: ToReport<H>) => Promise<Ended>;
+  /** The session's connected hooks module, or null. */
+  hooked?: (sessionId: string) => H | null;
   /** Whether Claude Code lists the plugin as uninstalled or disabled for a folder. */
   isOff: (folder: string) => Promise<boolean>;
   log: (text: string) => void;
@@ -70,6 +91,8 @@ export interface Reporting {
   reporting(): string[];
   /** Looks once (it looks by itself every `streamSeconds`). */
   look(): Promise<void>;
+  /** The session's hooks module connected, changed or went: it is reported again for the one it has now. */
+  rehook(sessionId: string): void;
   /** Stops reporting every session, and looking; waits for the reports to end at most `stopWaitMs`. */
   stop(): Promise<void>;
 }
@@ -79,7 +102,9 @@ interface Seen {
   mtimeMs: number;
   size: number;
   cwd: string | null;
-  running: { stop: () => void; done: Promise<void> } | null;
+  running: { stop: () => void; done: Promise<void>; hooks: unknown } | null;
+  /** The hooks module the last report was for (null for none), once it ended. */
+  endedFor: unknown;
   /** Waiting its turn on the first look. */
   queued: boolean;
   /** The transcript's write time as it last ended, or was left; it is reported again once the transcript is written after that. */
@@ -90,22 +115,24 @@ interface Seen {
   held: boolean;
 }
 
-export function watchSessions(o: ReportingOptions): Reporting {
+export function watchSessions<H extends HookedSession>(o: ReportingOptions<H>): Reporting {
   const { claudeDir, io, isAlive = alive, pid = process.pid, gapMs = GAP_MS, stopWaitMs = STOP_WAIT_MS } = o;
   const projectsDir = path.join(claudeDir, "projects");
   const seen = new Map<string, Seen>();
+  // The sessions whose report stopped for a change of hooks module, to look again once it has ended.
+  const rehooked = new Set<string>();
   let first = true;
   let stopped = false;
   let timer: ReturnType<typeof setTimeout> | null = null;
   let said = ""; // a lasting problem is logged once
 
-  const start = (id: string, s: Seen, cwd: string) => {
+  const start = (id: string, s: Seen, cwd: string, hooks: H | null = null) => {
     let close = () => {};
     const closed = new Promise<void>((resolve) => (close = resolve));
     const now = Date.now();
     const notWanted = Object.fromEntries(Object.entries(s.notWanted).filter(([, until]) => until > now));
     const done = o
-      .report({ sessionId: id, cwd, notWanted, closed })
+      .report({ sessionId: id, cwd, notWanted, closed, ...(hooks && { hooks }) })
       .then(
         (ended) => {
           if (ended.holdOff) {
@@ -118,9 +145,12 @@ export function watchSessions(o: ReportingOptions): Reporting {
       .finally(async () => {
         // The write time first: a look between the two would start it again at once.
         s.endedAt = (await io.stat(s.file))?.mtimeMs ?? s.mtimeMs;
+        s.endedFor = hooks;
         s.running = null;
+        // Stopped for another hooks module (or none): reported again for it at once.
+        if (rehooked.delete(id) && !stopped) void lookOnce();
       });
-    s.running = { stop: close, done };
+    s.running = { stop: close, done, hooks };
   };
 
   /** Whether a fresh copy of an office's list takes one of the repos a hold-off names (see above). */
@@ -157,9 +187,32 @@ export function watchSessions(o: ReportingOptions): Reporting {
         const st = await io.stat(file);
         if (!st) continue;
         let s = seen.get(id);
-        if (!s) seen.set(id, (s = { file, mtimeMs: st.mtimeMs, size: st.size, cwd: null, running: null, queued: false, endedAt: null, holdOff: null, notWanted: {}, held: false }));
+        if (!s) seen.set(id, (s = { file, mtimeMs: st.mtimeMs, size: st.size, cwd: null, running: null, endedFor: null, queued: false, endedAt: null, holdOff: null, notWanted: {}, held: false }));
         Object.assign(s, { file, mtimeMs: st.mtimeMs, size: st.size });
-        if (s.running || s.queued || st.mtimeMs < now - windowMs) continue;
+        const hooks = o.hooked?.(id) ?? null;
+        if (s.running) {
+          // Reported for another hooks module than the session has now: stopped, and reported again for this one.
+          if (s.running.hooks !== hooks) {
+            rehooked.add(id);
+            s.running.stop();
+          }
+          continue;
+        }
+        if (hooks) {
+          // Its hooks module's report ended by itself: not again before the transcript moves.
+          if (s.endedFor === hooks && s.endedAt !== null && st.mtimeMs <= s.endedAt) continue;
+          if (await heldByAnother(id, now, config)) {
+            s.held = true;
+            s.endedAt = st.mtimeMs;
+            s.endedFor = hooks;
+            continue;
+          }
+          s.held = false;
+          s.queued = false;
+          start(id, s, hooks.cwd, hooks);
+          continue;
+        }
+        if (s.queued || st.mtimeMs < now - windowMs) continue;
         if (s.endedAt !== null && st.mtimeMs <= s.endedAt) {
           // The lock let go with no write after the one it was held at: the next write is taken.
           if (s.held && !(await heldByAnother(id, now, config))) s.held = false;
@@ -200,6 +253,7 @@ export function watchSessions(o: ReportingOptions): Reporting {
       void (async () => {
         for (const [id, s, cwd] of quiet) {
           await new Promise((r) => setTimeout(r, gapMs));
+          if (!s.queued) continue; // its hooks module connected meanwhile, and it was started for that
           s.queued = false;
           if (!stopped && !s.running) start(id, s, cwd);
         }
@@ -235,6 +289,13 @@ export function watchSessions(o: ReportingOptions): Reporting {
     },
     reporting: () => [...seen].filter(([, s]) => s.running).map(([id]) => id),
     look: lookOnce,
+    rehook: (id) => {
+      const s = seen.get(id);
+      if (s?.running && s.running.hooks !== (o.hooked?.(id) ?? null)) {
+        rehooked.add(id);
+        s.running.stop();
+      } else void lookOnce();
+    },
     async stop() {
       stopped = true;
       if (timer) clearTimeout(timer);
