@@ -74,7 +74,7 @@ import type { LoginItemPlace } from "../install/login-item.js";
 import { managedDir, newestDataLayer, normalPath, pluginDirsOf, pluginIdOf, pluginState, pluginsDir, type Place } from "../install/state.js";
 import type { ContextWindow, DataLayerLine, TitleReply, WaitMark } from "../lines.js";
 import { claudeBinary, claudeCommand, findClaude } from "../runner/claude-binary.js";
-import { loadPatterns, type Pattern } from "../runner/scan.js";
+import { errorText, loadPatterns, type Pattern } from "../runner/scan.js";
 import { startRunner, type StartOptions, type Started } from "../runner/start.js";
 import { checkForUpdate, commandEnv, gitChoices, START_GAP_MS, updatesOffBy } from "../update/update.js";
 import { alive, HOLD_OFF_MS, lockHolder, lockPath, readLock, refreshLock, releaseLock, takeLock } from "../wake/lock.js";
@@ -87,7 +87,7 @@ import { detachedStop } from "./detached.js";
 import { createGit, pathKey, type Where } from "./git.js";
 import { accountOf, claudePaths, projectOf } from "./identity.js";
 import { nodeIo } from "./io.js";
-import { createLink, type Link } from "./link.js";
+import { createLink, type Link, type ServerAsk } from "./link.js";
 import { lateTake, prepareQuestions, relayOwnerAnswer } from "./owner-answers.js";
 import { relayOwnerMessage } from "./owner-messages.js";
 import { createPairing, pairingLockPath, pairingPath, pairingWriteLockPath, type Pairing } from "./pairing.js";
@@ -170,8 +170,95 @@ export interface Ended {
   holdOff?: { until: number; projects?: string[]; offices: string[]; notWanted: Record<string, number> };
 }
 
+/**
+ * What keeps an error in reporting one session to that session, in the runner (#104): a throw in a
+ * callback the session's links run or in a link's own socket handlers and pacing timer (onError in
+ * link.ts), or the rejection of a promise nothing waits for, ends this
+ * session alone at its next wait, and a throw in its own loop at once; either way its links close,
+ * its lock goes and its log says why, the error's text checked for secrets first. In the plugin's
+ * data layer it changes nothing: an error ends that process, and its one session, as before (main.ts).
+ */
+interface Containment {
+  /** Settles once an error has ended the session. */
+  failed: Promise<void>;
+  /** Why it ended; null while no error has ended it. */
+  why(): Promise<string> | null;
+  fail(err: unknown): void;
+  /** `fn`, whose throw ends the session (`fallback` is returned in its place) rather than reaching the process. */
+  guard<A extends unknown[], R = void>(fn: (...args: A) => R, fallback?: R): (...args: A) => R;
+  /** A promise nothing waits for, whose rejection ends the session. */
+  watch(promise: Promise<unknown>): void;
+  /** The session's links, set once they are made. */
+  links: () => Link[];
+}
+
+const passThrough = (): Containment => ({
+  failed: new Promise(() => {}),
+  why: () => null,
+  fail: (err) => {
+    throw err;
+  },
+  guard: (fn) => fn,
+  watch: (promise) => void promise,
+  links: () => [],
+});
+
+function contained(patterns: () => Promise<Pattern[] | null>): Containment {
+  let why: Promise<string> | null = null;
+  let failed = () => {};
+  const c: Containment = {
+    failed: new Promise<void>((resolve) => (failed = resolve)),
+    why: () => why,
+    fail(err) {
+      if (why) return;
+      why = patterns()
+        .catch(() => null)
+        .then((p) => `something went wrong in reporting it: ${errorText(err, p)}`);
+      failed();
+    },
+    guard:
+      (fn, fallback) =>
+      (...args) => {
+        try {
+          return fn(...args);
+        } catch (err) {
+          c.fail(err);
+          return fallback!;
+        }
+      },
+    watch: (promise) => void promise.catch((err: unknown) => c.fail(err)),
+    links: () => [],
+  };
+  return c;
+}
+
 /** Reports the session until it should end. */
 export async function reportSession(o: ReportSessionOptions): Promise<Ended> {
+  if (o.by !== "runner") return reporting(o, passThrough());
+  const { dir: claudeDir } = claudePaths(process.env, os.homedir());
+  const patterns = () => loadPatterns(path.join(o.appDir, "secret-patterns.json"), path.join(claudeDir, "isoplan", "secret-patterns.json"), () => {});
+  const c = contained(patterns);
+  try {
+    return await reporting(o, c);
+  } catch (err) {
+    // An earlier error may have ended it already: this one is logged too.
+    const earlier = c.why();
+    c.fail(err);
+    for (const link of c.links()) link.close();
+    await releaseLock(lockPath(claudeDir, o.sessionId), process.pid).catch(() => {});
+    const why = await c.why()!;
+    try {
+      o.emit({ type: "log", text: `stopping: ${why}` });
+      if (earlier) o.emit({ type: "log", text: `then, as it stopped, something else went wrong: ${errorText(err, await patterns().catch(() => null))}` });
+    } catch {
+      // Its log can't be written: the runner's says it (reporting.ts).
+      throw new Error(why);
+    }
+    return { why };
+  }
+}
+
+async function reporting(o: ReportSessionOptions, c: Containment): Promise<Ended> {
   const { sessionId, cwd, closed } = o;
   const inRunner = o.by === "runner";
   // Only the plugin's own hooks module can submit a prompt.
@@ -211,7 +298,7 @@ export async function reportSession(o: ReportSessionOptions): Promise<Ended> {
   const wait = (ms: number) => {
     let timer: ReturnType<typeof setTimeout> | undefined;
     const timeUp = new Promise<boolean>((resolve) => (timer = setTimeout(() => resolve(o.goOn?.() ?? true), ms)));
-    return Promise.race([timeUp, closed.then(() => false)]).finally(() => clearTimeout(timer));
+    return Promise.race([timeUp, closed.then(() => false), c.failed.then(() => false)]).finally(() => clearTimeout(timer));
   };
   let why = "it was stopped"; // why it ends, once it does
   const stopping = (reason: string) => {
@@ -292,7 +379,7 @@ export async function reportSession(o: ReportSessionOptions): Promise<Ended> {
     const off = updatesOffBy(process.env);
     if (off) return emit({ type: "log", text: `not checking for a newer version of the plugin: ${off} is set (FORCE_AUTOUPDATE_PLUGINS=1 turns plugin updates back on)` });
     checking = true;
-    void (async () => {
+    c.watch((async () => {
       if ((await pluginState(place, self).catch(() => "enabled")) !== "enabled") return emit({ type: "log", text: "not checking for a newer version of the plugin: it is disabled for this machine" });
       const binary = await claudeBinary(claudeDir, process.env, process.platform, os.homedir());
       if (!binary) return emit({ type: "log", text: "couldn't find the claude binary, so the plugin can't update itself" });
@@ -300,10 +387,10 @@ export async function reportSession(o: ReportSessionOptions): Promise<Ended> {
       for (const text of checked.said) emit({ type: "log", text: `update check: ${text}` });
     })()
       .catch((err: unknown) => emit({ type: "log", text: `couldn't check for a newer version of the plugin: ${String((err as Error)?.message ?? err)}` }))
-      .finally(() => (checking = false));
+      .finally(() => (checking = false)));
   };
   // After the wake hook's install, which writes settings.json too: neither then loses the other's change.
-  void installing.then(() => checkUpdate(START_GAP_MS));
+  c.watch(installing.then(() => checkUpdate(START_GAP_MS)));
   // The offices are read once: a link that moved servers mid-session would leave a room behind.
   // Plain ws:// to another machine would send facts and the machine's credential unencrypted.
   const offices = officesOf(config);
@@ -357,21 +444,22 @@ export async function reportSession(o: ReportSessionOptions): Promise<Ended> {
       pairing: run.pairing,
       admit: mayConnect,
       // The list may have changed: it is read again, and the link opens afresh once it has.
-      onNotWanted: () => {
+      onNotWanted: c.guard(() => {
         run.unwanted = inRunner;
         run.gate.notWanted();
-      },
+      }),
       // Another repo's files, commands and checkouts go only to a server that welcomed them, and
       // only for its office's repos; the link applies this at every send, on every connection.
       filter: (f, projects) => forOffice(candidates?.workspace ? inRepos(f) : f, projects, checkouts),
-      answered: (id) => answered(id),
+      onError: c.fail,
+      answered: c.guard((id: string) => answered(id), false),
       // The owner released a withheld report on this office's floor: it goes to this office alone, now, not on the next pass.
       // The owner answered a question, or sent the session a message, from the floor: it goes to the
       // hooks module, and the reply to the office it came from.
-      onMessage: (message) => {
+      onMessage: c.guard((message: ServerAsk) => {
         if (message.type === "request" && message.kind === "owner-answer") {
           const file = path.join(answersDir, `${randomUUID()}.json`);
-          void fs
+          c.watch(fs
             .mkdir(answersDir, { recursive: true })
             .then(async () => {
               const relayed = await relayOwnerAnswer(message, { detached: inRunner, facts: () => run.sent, file, emit, take: takeFile });
@@ -385,23 +473,23 @@ export async function reportSession(o: ReportSessionOptions): Promise<Ended> {
             })
             // A word that came later still, or not at all, is left over: it goes.
             .finally(() => fs.rm(file, { force: true }).catch(() => {}))
-            .catch((err: unknown) => emit({ type: "log", text: `couldn't pass the owner's answer on: ${String((err as Error)?.message ?? err)}` }));
+            .catch((err: unknown) => emit({ type: "log", text: `couldn't pass the owner's answer on: ${String((err as Error)?.message ?? err)}` })));
           return;
         }
         if (message.type === "request" && message.kind === "owner-message") {
           const file = path.join(messagesDir, `${randomUUID()}.json`);
           // relayOwnerMessage emits its line before its first await: lines go out in arrival order.
-          void relayOwnerMessage(message, { detached: inRunner, takes: takesMessages, owner: account.id, session: sessionId, file, emit, take: takeFile })
+          c.watch(relayOwnerMessage(message, { detached: inRunner, takes: takesMessages, owner: account.id, session: sessionId, file, emit, take: takeFile })
             .then((answer) => run.gate.current()?.send(answer))
             .finally(() => fs.rm(file, { force: true }).catch(() => {}))
-            .catch((err: unknown) => emit({ type: "log", text: `couldn't pass the owner's message on: ${String((err as Error)?.message ?? err)}` }));
+            .catch((err: unknown) => emit({ type: "log", text: `couldn't pass the owner's message on: ${String((err as Error)?.message ?? err)}` })));
           return;
         }
         if (message.type !== "release") return emit({ type: "log", text: `the office server sent a ${message.type} message, which this data layer doesn't handle yet` });
-        void run.hold.release(message.id).then((released) => {
+        c.watch(run.hold.release(message.id).then((released) => {
           if (released && shown) run.gate.current()?.update((run.sent = outgoing(run, ...shown)));
-        });
-      },
+        }));
+      }),
       hello: {
         type: "hello",
         v: PROTOCOL_VERSION,
@@ -423,15 +511,15 @@ export async function reportSession(o: ReportSessionOptions): Promise<Ended> {
       const held = typeof until === "number" && until > Date.now();
       const run = { office, known: held, dormant: null, homing: null, result: null, connected: false, unwanted: held, unwantedUntil: held ? until : null, sent: null } as OfficeRun;
       run.hold = await openReportHold(releasedPath(claudeDir, office, sessionId), (text) => emit({ type: "log", text: `${text} (for ${server})` }));
-      run.emit = (line) => {
+      run.emit = c.guard((line: DataLayerLine) => {
         if (line.type === "status") {
           run.connected = line.state === "connected";
           downSince = runs.some((r) => r.connected) ? null : (downSince ?? Date.now());
           // A link that drops has the list of repos the office takes read again, in case that is why.
-          if (line.state === "disconnected") void run.approved.refresh(true);
+          if (line.state === "disconnected") c.watch(run.approved.refresh(true));
         }
         emit(line.type === "status" || line.type === "pair" ? { ...line, label } : line.type === "asked" || line.type === "ask-rights" ? { ...line, server } : line);
-      };
+      });
       // The runner's own, shared by every session it reports: one pairing for the office, which a session's link closing leaves answering.
       const shared = o.shared?.(office);
       if (shared) {
@@ -462,6 +550,7 @@ export async function reportSession(o: ReportSessionOptions): Promise<Ended> {
       return run;
     }));
   const links = () => runs.flatMap((run) => run.gate.current() ?? []);
+  c.links = links;
   // In the runner, and every office either doesn't want this project or doesn't take its repo, one at least not wanting it.
   const isUnwanted = () => runs.some((r) => r.unwanted) && runs.every((r) => r.unwanted || r.dormant === "not-approved");
   // Whether an office's list now takes the session's home, checked at once with the others'; a check
@@ -512,8 +601,11 @@ export async function reportSession(o: ReportSessionOptions): Promise<Ended> {
   const startedAt = Date.now();
   // Whether to go on to the next pass, once this one's wait is over; each reason not to is logged.
   const goOn = async () => {
-    // In the runner only `closed` ends the wait early: the runner stopped.
-    if (!(await wait(dormant && !pending ? DORMANT_MS : config.streamSeconds * 1000))) return inRunner ? stopping("the runner stopped") : false;
+    // In the runner only the runner stopping (`closed`), or an error that ended the session, ends the wait early.
+    if (!(await wait(dormant && !pending ? DORMANT_MS : config.streamSeconds * 1000))) {
+      const failure = c.why();
+      return failure ? stopping(await failure) : inRunner ? stopping("the runner stopped") : false;
+    }
     if (isUnwanted()) return stopping("no office this reports to wants this session's project or takes its repo, so it holds off");
     if (inRunner && (await lockHolder(lock)) !== process.pid) return stopping("another data layer reports this session now");
     if (await isOff()) return stopping("Claude Code lists the Isoplan plugin as uninstalled or disabled here now");
@@ -663,6 +755,13 @@ export async function reportSession(o: ReportSessionOptions): Promise<Ended> {
 
   for (const link of links()) link.close();
   await releaseLock(lock, process.pid).catch(() => {});
+  // An error that ended the session during a pass that then stopped for another reason is said too,
+  // and is why it ended; a hold-off that reason brings is kept.
+  const failure = c.why();
+  if (failure) {
+    const text = await failure;
+    if (why !== text) stopping(text);
+  }
   // The offices that didn't want the session, each until its hold-off ends: the runner reads no list
   // of theirs, and lists only of the offices configured now (reporting.ts).
   const notWanted = Object.fromEntries(runs.filter((r) => r.unwanted).map((r) => [r.office.server, r.unwantedUntil ?? Date.now() + HOLD_OFF_MS]));

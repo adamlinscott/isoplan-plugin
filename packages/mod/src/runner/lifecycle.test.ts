@@ -5,7 +5,8 @@ import { NOW, line, session, tempRoot, touch } from "../data-layer/fixture.js";
 import { nodeIo } from "../data-layer/io.js";
 import { holdOff, lockHolder, refreshLock, takeLock } from "../wake/lock.js";
 import { wakeRecordPath } from "../wake/wake.js";
-import { anyRoomSince, askableMs, MAX_FAST_FAILURES, NOT_WANTED_CODE, supervise, UNPAIRED_CODE } from "./lifecycle.js";
+import { anyRoomSince, askableMs, MAX_FAST_FAILURES, NOT_WANTED_CODE, onEscapes, supervise, UNPAIRED_CODE } from "./lifecycle.js";
+import { errorText } from "./scan.js";
 import { applyClaudeDir, RUNNER_FRESH_MS, runnerCode, runnerLockPath, startRunner, stopRunner } from "./start.js";
 
 const OTHER = 4242; // a pid that isn't this process
@@ -183,4 +184,20 @@ test("runner: --claude-dir wins over an inherited CLAUDE_CONFIG_DIR", () => {
   expect(env).toEqual({ CLAUDE_CONFIG_DIR: "/custom/claude" });
   applyClaudeDir(["node", "runner.mjs", "--worker"], env, home);
   expect(env).toEqual({ CLAUDE_CONFIG_DIR: "/custom/claude" });
+});
+
+test("lifecycle: an error nothing caught is logged, its text checked for secrets; after a rejection the worker goes on, after an exception it exits for the supervisor", async () => {
+  const handlers: Record<string, (err: unknown) => void> = {};
+  const logs: string[] = [];
+  let exits = 0;
+  const patterns = [{ name: "GitHub token", regex: /ghp_\w+/ }];
+  onEscapes({ on: (event, handler) => (handlers[event] = handler), said: async (err) => errorText(err, patterns), log: (text) => logs.push(text), exit: () => exits++ });
+  handlers.unhandledRejection!(new Error("a promise broke"));
+  await new Promise((r) => setTimeout(r, 0));
+  expect(logs.at(-1)).toMatch(/caught an error nothing else did, and goes on: Error: a promise broke/);
+  expect(exits).toBe(0);
+  handlers.uncaughtException!(new Error("a handler broke with ghp_secret"));
+  await new Promise((r) => setTimeout(r, 0));
+  expect(logs.at(-1)).toBe("the runner's worker caught an error nothing else did, so it starts again: (its text is left out: it matches the secret pattern GitHub token)");
+  expect(exits).toBe(1);
 });

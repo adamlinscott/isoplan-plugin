@@ -53,6 +53,25 @@ export async function supervise({ run, log, sleep = (ms) => new Promise((r) => s
   }
 }
 
+/**
+ * What the worker does with an error nothing caught (#104), each session's own having ended that
+ * session alone (report-session.ts). It is logged, its text checked for secrets (`said`). After a
+ * rejection the worker goes on: the code that made it has already unwound. After an exception it
+ * exits with code 1 once the log is written, since a handler that threw partway may have left its
+ * state half-changed; the supervisor starts it again, with its backoff and crash-loop hold-off, and
+ * the worker reports its sessions again at its first look.
+ */
+export function onEscapes(o: { on: (event: "uncaughtException" | "unhandledRejection", handler: (err: unknown) => void) => void; said: (err: unknown) => Promise<string>; log: (text: string) => void; exit: () => void }): void {
+  const told = (err: unknown) => o.said(err).catch(() => "(its text couldn't be checked for secrets, so it is left out)");
+  o.on("unhandledRejection", (err) => void told(err).then((text) => o.log(`the runner's worker caught an error nothing else did, and goes on: ${text}`)));
+  o.on("uncaughtException", (err) =>
+    void told(err).then((text) => {
+      o.log(`the runner's worker caught an error nothing else did, so it starts again: ${text}`);
+      o.exit();
+    }),
+  );
+}
+
 /** Whether any session transcript under `projectsDir` was written since `since`, so its room is still lit. */
 export async function anyRoomSince(io: Pick<NodeIo, "listDir" | "stat">, projectsDir: string, since: number): Promise<boolean> {
   for (const dir of await io.listDir(projectsDir)) {

@@ -31,6 +31,9 @@
 // through `sendLive`, only while the link is up: they never wait in the outbox. `onOpen` is told
 // after every hello and `onClose` at every drop, so the runner forgets the connection's drive-policy
 // and sends no driven message on the new one until its first drive-policy has come (runner/session.ts).
+//
+// Given `onError`, a throw in the link's socket handlers or its pacing timer (in `filter`, say) goes
+// to it, and that handler sends nothing more; without it, the throw reaches the process as before.
 
 import {
   parseOfficeServerMessage,
@@ -100,6 +103,8 @@ export interface LinkOptions {
   /** How often a link waiting for its code to be approved asks again. */
   pairPollMs?: number;
   random?: () => number;
+  /** Told of a throw in the link's socket handlers or pacing timer, in place of the process. */
+  onError?: (err: unknown) => void;
 }
 
 /** What a runner sends back: a reply, a refusal, or what it did with a handoff it took. */
@@ -144,6 +149,7 @@ export function createLink({
   pairPollMs = 5000,
   admit,
   random = Math.random,
+  onError,
 }: LinkOptions): Link {
   const outbox: { message: Outgoing; at: number }[] = [];
   let latest: Facts | null = null;
@@ -165,6 +171,18 @@ export function createLink({
   let refusals = 0; // hellos refused for their token, in a row
   let projects: ReadonlySet<string> | null = null; // the office's, from this connection's welcome
   let stable: ReturnType<typeof setTimeout> | null = null; // counts refusals from zero once the link has stayed up
+
+  // A socket handler or timer, whose throw goes to `onError` when there is one.
+  const contained =
+    <A extends unknown[]>(fn: (...args: A) => void) =>
+    (...args: A) => {
+      if (!onError) return fn(...args);
+      try {
+        fn(...args);
+      } catch (err) {
+        onError(err);
+      }
+    };
 
   // Before every try, the first and each reconnect, `admit` may say no: then nothing is sent, and it
   // asks again after retryCapMs (the data layer closes a link whose repo has left the office).
@@ -208,7 +226,7 @@ export function createLink({
     const ws = new WebSocket(url);
     socket = ws;
     sentToken = token;
-    ws.onopen = () => {
+    ws.onopen = contained(() => {
       if (socket !== ws) return;
       failures = 0;
       isOpen = true;
@@ -220,10 +238,10 @@ export function createLink({
       sendFull();
       emit({ type: "status", server: url, state: "connected" });
       onOpen?.();
-    };
-    ws.onmessage = (event) => {
+    });
+    ws.onmessage = contained((event: MessageEvent) => {
       if (socket === ws) receive(event.data);
-    };
+    });
     // Either event is the drop, handled once per socket: Node 22's WebSocket fires only `error`
     // for a connection that never opened (refused, failed handshake), with no `close` after it.
     ws.onerror = () => {
@@ -306,7 +324,7 @@ export function createLink({
     if (!changed) return;
     const wait = sentAt + minIntervalMs - Date.now();
     if (wait > 0) {
-      pacing = setTimeout(flush, wait);
+      pacing = setTimeout(contained(flush), wait);
       return;
     }
     send({ type: "changes", v: PROTOCOL_VERSION, seq: seq++, ...changed });

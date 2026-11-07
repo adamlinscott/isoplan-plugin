@@ -8209,6 +8209,12 @@ function scan(text, patterns) {
 	if (!patterns) return UNREADABLE;
 	return patterns.find((p) => p.regex.test(text))?.name ?? null;
 }
+/** An error's stack (or its text) to log; in its place, a note when it matches a secret pattern, or the patterns can't be read. */
+function errorText(err, patterns) {
+	const text = String(err?.stack ?? err);
+	const hit = scan(text, patterns);
+	return hit === null ? text : hit === "unreadable patterns: everything is held" ? "(its text is left out: the secret patterns can't be read)" : `(its text is left out: it matches the secret pattern ${hit})`;
+}
 //#endregion
 //#region src/data-layer/git.ts
 /** True for a Windows-shaped path: a drive letter, a UNC prefix, or any backslash. */
@@ -11558,7 +11564,7 @@ const same = (a, b) => a !== void 0 && JSON.stringify(a) === JSON.stringify(b);
 const STABLE_MS = 3e4;
 const OUTBOX_MAX = 100;
 const OUTBOX_MAX_AGE_MS = 36e5;
-function createLink({ url, hello, emit, minIntervalMs = 1e3, retryBaseMs = 1e3, retryCapMs = 3e4, notWantedRetryMs = 36e5, takenRetryMs = 36e5, onNotWanted, onPairingEnded, onMessage, onDrive, onOpen, onClose, filter = (facts) => facts, answered, pairing, pairPollMs = 5e3, admit, random = Math.random }) {
+function createLink({ url, hello, emit, minIntervalMs = 1e3, retryBaseMs = 1e3, retryCapMs = 3e4, notWantedRetryMs = 36e5, takenRetryMs = 36e5, onNotWanted, onPairingEnded, onMessage, onDrive, onOpen, onClose, filter = (facts) => facts, answered, pairing, pairPollMs = 5e3, admit, random = Math.random, onError }) {
 	const outbox = [];
 	let latest = null;
 	let socket = null;
@@ -11579,6 +11585,14 @@ function createLink({ url, hello, emit, minIntervalMs = 1e3, retryBaseMs = 1e3, 
 	let refusals = 0;
 	let projects = null;
 	let stable = null;
+	const contained = (fn) => (...args) => {
+		if (!onError) return fn(...args);
+		try {
+			fn(...args);
+		} catch (err) {
+			onError(err);
+		}
+	};
 	function connect() {
 		retry = null;
 		if (!admit) return proceed();
@@ -11624,7 +11638,7 @@ function createLink({ url, hello, emit, minIntervalMs = 1e3, retryBaseMs = 1e3, 
 		const ws = new WebSocket(url);
 		socket = ws;
 		sentToken = token;
-		ws.onopen = () => {
+		ws.onopen = contained(() => {
 			if (socket !== ws) return;
 			failures = 0;
 			isOpen = true;
@@ -11643,10 +11657,10 @@ function createLink({ url, hello, emit, minIntervalMs = 1e3, retryBaseMs = 1e3, 
 				state: "connected"
 			});
 			onOpen?.();
-		};
-		ws.onmessage = (event) => {
+		});
+		ws.onmessage = contained((event) => {
 			if (socket === ws) receive(event.data);
-		};
+		});
 		ws.onerror = () => {
 			if (socket !== ws) return;
 			dropped();
@@ -11740,7 +11754,7 @@ function createLink({ url, hello, emit, minIntervalMs = 1e3, retryBaseMs = 1e3, 
 		if (!changed) return;
 		const wait = sentAt + minIntervalMs - Date.now();
 		if (wait > 0) {
-			pacing = setTimeout(flush, wait);
+			pacing = setTimeout(contained(flush), wait);
 			return;
 		}
 		send({
@@ -12357,8 +12371,70 @@ const DORMANT_MS = 3e4;
 const LOCK_FRESH_MS = 3 * DORMANT_MS;
 /** The same for a holder whose passes `streamSeconds` makes slower: a pass may wait that long, and a slow office's list as long again. */
 const lockFreshMs = (config) => Math.max(LOCK_FRESH_MS, 6 * config.streamSeconds * 1e3);
+const passThrough = () => ({
+	failed: new Promise(() => {}),
+	why: () => null,
+	fail: (err) => {
+		throw err;
+	},
+	guard: (fn) => fn,
+	watch: (promise) => void 0,
+	links: () => []
+});
+function contained(patterns) {
+	let why = null;
+	let failed = () => {};
+	const c = {
+		failed: new Promise((resolve) => failed = resolve),
+		why: () => why,
+		fail(err) {
+			if (why) return;
+			why = patterns().catch(() => null).then((p) => `something went wrong in reporting it: ${errorText(err, p)}`);
+			failed();
+		},
+		guard: (fn, fallback) => (...args) => {
+			try {
+				return fn(...args);
+			} catch (err) {
+				c.fail(err);
+				return fallback;
+			}
+		},
+		watch: (promise) => void promise.catch((err) => c.fail(err)),
+		links: () => []
+	};
+	return c;
+}
 /** Reports the session until it should end. */
 async function reportSession(o) {
+	if (o.by !== "runner") return reporting(o, passThrough());
+	const { dir: claudeDir } = claudePaths(process.env, os.homedir());
+	const patterns = () => loadPatterns(path.join(o.appDir, "secret-patterns.json"), path.join(claudeDir, "isoplan", "secret-patterns.json"), () => {});
+	const c = contained(patterns);
+	try {
+		return await reporting(o, c);
+	} catch (err) {
+		const earlier = c.why();
+		c.fail(err);
+		for (const link of c.links()) link.close();
+		await releaseLock(lockPath(claudeDir, o.sessionId), process.pid).catch(() => {});
+		const why = await c.why();
+		try {
+			o.emit({
+				type: "log",
+				text: `stopping: ${why}`
+			});
+			if (earlier) o.emit({
+				type: "log",
+				text: `then, as it stopped, something else went wrong: ${errorText(err, await patterns().catch(() => null))}`
+			});
+		} catch {
+			throw new Error(why);
+		}
+		return { why };
+	}
+}
+async function reporting(o, c) {
 	const { sessionId, cwd, closed } = o;
 	const inRunner = o.by === "runner";
 	const takesMessages = !inRunner && !!o.takesMessages;
@@ -12390,7 +12466,11 @@ async function reportSession(o) {
 	const wait = (ms) => {
 		let timer;
 		const timeUp = new Promise((resolve) => timer = setTimeout(() => resolve(o.goOn?.() ?? true), ms));
-		return Promise.race([timeUp, closed.then(() => false)]).finally(() => clearTimeout(timer));
+		return Promise.race([
+			timeUp,
+			closed.then(() => false),
+			c.failed.then(() => false)
+		]).finally(() => clearTimeout(timer));
 	};
 	let why = "it was stopped";
 	const stopping = (reason) => {
@@ -12493,7 +12573,7 @@ async function reportSession(o) {
 			text: `not checking for a newer version of the plugin: ${off} is set (FORCE_AUTOUPDATE_PLUGINS=1 turns plugin updates back on)`
 		});
 		checking = true;
-		(async () => {
+		c.watch((async () => {
 			if (await pluginState(place, self).catch(() => "enabled") !== "enabled") return emit({
 				type: "log",
 				text: "not checking for a newer version of the plugin: it is disabled for this machine"
@@ -12520,9 +12600,9 @@ async function reportSession(o) {
 		})().catch((err) => emit({
 			type: "log",
 			text: `couldn't check for a newer version of the plugin: ${String(err?.message ?? err)}`
-		})).finally(() => checking = false);
+		})).finally(() => checking = false));
 	};
-	installing.then(() => checkUpdate(START_GAP_MS));
+	c.watch(installing.then(() => checkUpdate(START_GAP_MS)));
 	const offices = officesOf(config);
 	for (const { server } of offices.filter((o) => o.plainRefused)) emit({
 		type: "log",
@@ -12585,16 +12665,17 @@ async function reportSession(o) {
 		emit: run.emit,
 		pairing: run.pairing,
 		admit: mayConnect,
-		onNotWanted: () => {
+		onNotWanted: c.guard(() => {
 			run.unwanted = inRunner;
 			run.gate.notWanted();
-		},
+		}),
 		filter: (f, projects) => forOffice(candidates?.workspace ? inRepos(f) : f, projects, checkouts),
-		answered: (id) => answered(id),
-		onMessage: (message) => {
+		onError: c.fail,
+		answered: c.guard((id) => answered(id), false),
+		onMessage: c.guard((message) => {
 			if (message.type === "request" && message.kind === "owner-answer") {
 				const file = path.join(answersDir, `${randomUUID()}.json`);
-				fs.mkdir(answersDir, { recursive: true }).then(async () => {
+				c.watch(fs.mkdir(answersDir, { recursive: true }).then(async () => {
 					const relayed = await relayOwnerAnswer(message, {
 						detached: inRunner,
 						facts: () => run.sent,
@@ -12620,12 +12701,12 @@ async function reportSession(o) {
 				}).finally(() => fs.rm(file, { force: true }).catch(() => {})).catch((err) => emit({
 					type: "log",
 					text: `couldn't pass the owner's answer on: ${String(err?.message ?? err)}`
-				}));
+				})));
 				return;
 			}
 			if (message.type === "request" && message.kind === "owner-message") {
 				const file = path.join(messagesDir, `${randomUUID()}.json`);
-				relayOwnerMessage(message, {
+				c.watch(relayOwnerMessage(message, {
 					detached: inRunner,
 					takes: takesMessages,
 					owner: account.id,
@@ -12636,17 +12717,17 @@ async function reportSession(o) {
 				}).then((answer) => run.gate.current()?.send(answer)).finally(() => fs.rm(file, { force: true }).catch(() => {})).catch((err) => emit({
 					type: "log",
 					text: `couldn't pass the owner's message on: ${String(err?.message ?? err)}`
-				}));
+				})));
 				return;
 			}
 			if (message.type !== "release") return emit({
 				type: "log",
 				text: `the office server sent a ${message.type} message, which this data layer doesn't handle yet`
 			});
-			run.hold.release(message.id).then((released) => {
+			c.watch(run.hold.release(message.id).then((released) => {
 				if (released && shown) run.gate.current()?.update(run.sent = outgoing(run, ...shown));
-			});
-		},
+			}));
+		}),
 		hello: {
 			type: "hello",
 			v: 1,
@@ -12676,11 +12757,11 @@ async function reportSession(o) {
 			type: "log",
 			text: `${text} (for ${server})`
 		}));
-		run.emit = (line) => {
+		run.emit = c.guard((line) => {
 			if (line.type === "status") {
 				run.connected = line.state === "connected";
 				downSince = runs.some((r) => r.connected) ? null : downSince ?? Date.now();
-				if (line.state === "disconnected") run.approved.refresh(true);
+				if (line.state === "disconnected") c.watch(run.approved.refresh(true));
 			}
 			emit(line.type === "status" || line.type === "pair" ? {
 				...line,
@@ -12689,7 +12770,7 @@ async function reportSession(o) {
 				...line,
 				server
 			} : line);
-		};
+		});
 		const shared = o.shared?.(office);
 		if (shared) {
 			run.pairing = {
@@ -12728,6 +12809,7 @@ async function reportSession(o) {
 		return run;
 	}));
 	const links = () => runs.flatMap((run) => run.gate.current() ?? []);
+	c.links = links;
 	const isUnwanted = () => runs.some((r) => r.unwanted) && runs.every((r) => r.unwanted || r.dormant === "not-approved");
 	const check = (run, projects, workspace) => run.homing ??= run.gate.home(projects).then((gated) => void (run.result = {
 		dormancy: gated.dormancy,
@@ -12794,7 +12876,10 @@ async function reportSession(o) {
 	let pending = false;
 	const startedAt = Date.now();
 	const goOn = async () => {
-		if (!await wait(dormant && !pending ? DORMANT_MS : config.streamSeconds * 1e3)) return inRunner ? stopping("the runner stopped") : false;
+		if (!await wait(dormant && !pending ? DORMANT_MS : config.streamSeconds * 1e3)) {
+			const failure = c.why();
+			return failure ? stopping(await failure) : inRunner ? stopping("the runner stopped") : false;
+		}
 		if (isUnwanted()) return stopping("no office this reports to wants this session's project or takes its repo, so it holds off");
 		if (inRunner && await lockHolder(lock) !== process.pid) return stopping("another data layer reports this session now");
 		if (await isOff()) return stopping("Claude Code lists the Isoplan plugin as uninstalled or disabled here now");
@@ -12997,6 +13082,11 @@ async function reportSession(o) {
 	} while (await goOn());
 	for (const link of links()) link.close();
 	await releaseLock(lock, process.pid).catch(() => {});
+	const failure = c.why();
+	if (failure) {
+		const text = await failure;
+		if (why !== text) stopping(text);
+	}
 	const notWanted = Object.fromEntries(runs.filter((r) => r.unwanted).map((r) => [r.office.server, r.unwantedUntil ?? Date.now() + 36e5]));
 	const named = {
 		offices: offices.map((office) => office.server),
