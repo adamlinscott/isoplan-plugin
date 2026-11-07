@@ -12300,7 +12300,7 @@ async function changedSince(run, dir, timeoutMs) {
 	});
 	return ahead.code === 0 && Number(ahead.stdout.trim()) > 0;
 }
-const INSTALL_FOR_DESKTOP = `Install Claude Code for the terminal, version ${DESKTOP_MIN_VERSION} or newer, to open handoffs in the Claude app.`;
+const INSTALL_FOR_DESKTOP = `Install Claude Code for the terminal, version ${DESKTOP_MIN_VERSION} or newer, to open sessions in the Claude app.`;
 /** Starts `claude --bg`, hidden, which returns once the background session is up; rejects when it couldn't. */
 async function startBackground({ argv, cwd }, env) {
 	const r = await hidden(argv, cwd, env, 6e4);

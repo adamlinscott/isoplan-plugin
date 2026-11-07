@@ -141,6 +141,14 @@ test("the Claude app: a machine it can't open sessions on opens nothing, and no 
   expect(t.asked).toEqual([]);
 });
 
+test("the Claude app: a Claude Code too old for it opens nothing, and the refusal doesn't speak of handoffs", async () => {
+  const t = setUp("darwin");
+  const claude = fakeClaude(t.root, { version: "2.1.284" });
+  const r = await startWhere(t.start({ mode: "desktop" }), claude.bin, { ...t.options, arch: "arm64", env: { CLAUDE_CONFIG_DIR: t.claudeDir } });
+  expect(r).toEqual({ opened: false, problem: "Install Claude Code for the terminal, version 2.1.285 or newer, to open sessions in the Claude app. sam-laptop has version 2.1.284, so nothing was made." });
+  expect(r.problem).not.toMatch(/handoff|take/);
+});
+
 test("the Claude app: the task goes in task.md, the hidden first turn only reads it, under the start's session id, then the app opens that session; an app that won't open leaves it started, with a note", async () => {
   const t = setUp("win32");
   const claude = fakeClaude(t.root);

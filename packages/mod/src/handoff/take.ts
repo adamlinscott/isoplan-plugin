@@ -488,7 +488,7 @@ async function changedSince(run: RunGit, dir: string, timeoutMs: number): Promis
   return ahead.code === 0 && Number(ahead.stdout.trim()) > 0;
 }
 
-const INSTALL_FOR_DESKTOP = `Install Claude Code for the terminal, version ${DESKTOP_MIN_VERSION} or newer, to open handoffs in the Claude app.`;
+const INSTALL_FOR_DESKTOP = `Install Claude Code for the terminal, version ${DESKTOP_MIN_VERSION} or newer, to open sessions in the Claude app.`;
 
 /** Starts `claude --bg`, hidden, which returns once the background session is up; rejects when it couldn't. */
 export async function startBackground({ argv, cwd }: Background, env: Record<string, string>): Promise<void> {
