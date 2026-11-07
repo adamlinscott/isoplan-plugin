@@ -107,6 +107,18 @@ test("headless: the same worktree and setup, the worktree alone trusted, then cl
   expect(config).toEqual({ userID: "u", projects: { "/elsewhere": { hasTrustDialogAccepted: false, allowedTools: ["Read"] }, [trustKey(dir, "win32")]: { hasTrustDialogAccepted: true } } });
 });
 
+test("a spin-off: its task goes in task.md beside the brief, and the session's first prompt leads with it, not the text", async () => {
+  const t = await handedOver("h2s");
+  const task = 'Write the docs pages for session management, "quoted" & all.';
+  const taken = await takeHandoff({ handoff: { ...t.handoff, task }, mode: "headless", session: SESSION }, t.options);
+  expect(taken).toMatchObject({ session: `claude-code:${SESSION}`, failures: [] });
+  const folder = path.join(t.claudeDir, "isoplan", "handoffs", "h2s");
+  expect(fs.readFileSync(path.join(folder, "task.md"), "utf8")).toBe(`${task}\n`);
+  const prompt = t.started[0]!.argv[1]!;
+  expect(prompt.startsWith(`Isoplan spin-off h2s: you are starting a new task of your own, in ${path.join(folder, "task.md")}. Read it first, then its brief in ${path.join(folder, "brief.md")}`)).toBe(true);
+  expect(prompt).not.toContain(task);
+});
+
 test("headless: a session claude agents doesn't list is reported, not taken", async () => {
   const t = await handedOver("h2b");
   const taken = await takeHandoff({ handoff: t.handoff, mode: "headless", session: SESSION }, { ...t.options, agents: async () => [] });
