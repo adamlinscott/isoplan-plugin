@@ -87,6 +87,8 @@ export interface SourceRead {
   facts: Facts | null;
   /** Why the facts can't be read at all, in one line; null when they can. */
   status: string | null;
+  /** The session's transcript hasn't started: none is found yet, or it has only bookkeeping lines. */
+  unstarted?: boolean;
   /** Transcripts that couldn't be read, counted, with the first error. */
   errors: { count: number; first: string | null };
   /** The session's folder is a workspace above several repos, so its own project is a local path. */
@@ -123,6 +125,7 @@ export function createClaudeCode(io: SourceIo) {
     const none = (status: string | null = null): SourceRead => ({ facts: null, status, errors });
 
     const c = await candidate(sessionId, cwd, now, config);
+    if (c === "unstarted") return { ...none(), unstarted: true };
     if (!c) return none();
     let main: TranscriptState;
     try {
@@ -137,7 +140,8 @@ export function createClaudeCode(io: SourceIo) {
         // Lines that don't parse, or message lines that parse but never name a folder: the format
         // has moved on. A session that has written only bookkeeping lines (ai-title, mode…) is not
         // drift, just not started.
-        return none(main.seen && (!main.parsed || main.messages) ? "transcript format not recognised" : null);
+        if (main.seen && (!main.parsed || main.messages)) return none("transcript format not recognised");
+        return { ...none(), unstarted: true };
       }
       // The session's own folder is home (#74). One git can't place that holds repos is a workspace:
       // the session stays in its own room, whichever of its repos it works in.
@@ -213,10 +217,10 @@ export function createClaudeCode(io: SourceIo) {
   // window, whichever is wider, so its edits still count towards a possible conflict. With the
   // lights off that window ends at the session's last activity, not now: the room keeps whoever
   // was there when it went quiet.
-  async function candidate(sessionId: string, cwd: string, now: number, config: Config): Promise<Candidate | null> {
+  async function candidate(sessionId: string, cwd: string, now: number, config: Config): Promise<Candidate | "unstarted" | null> {
     const path = await locate(sessionId, cwd, now);
     const st = path && (await io.stat(path));
-    if (!path || !st) return null;
+    if (!path || !st) return "unstarted";
     const idleMs = config.idleMinutes * 60000;
     const keepMs = Math.max(idleMs, config.lightsOffHours * 3600000);
     const agentWindowMs = Math.max(idleMs, config.touchedWindowMinutes * 60000);

@@ -9773,6 +9773,10 @@ function createClaudeCode(io) {
 			errors
 		});
 		const c = await candidate(sessionId, cwd, now, config);
+		if (c === "unstarted") return {
+			...none(),
+			unstarted: true
+		};
 		if (!c) return none();
 		let main;
 		try {
@@ -9783,7 +9787,13 @@ function createClaudeCode(io) {
 		}
 		try {
 			if (leftOut(main, c, config)) return none();
-			if (!main.cwd) return none(main.seen && (!main.parsed || main.messages) ? "transcript format not recognised" : null);
+			if (!main.cwd) {
+				if (main.seen && (!main.parsed || main.messages)) return none("transcript format not recognised");
+				return {
+					...none(),
+					unstarted: true
+				};
+			}
 			const home = await resolve(cwd);
 			const workspace = !home && await isWorkspace(cwd, now, config);
 			const where = workspace ? {
@@ -9851,7 +9861,7 @@ function createClaudeCode(io) {
 	async function candidate(sessionId, cwd, now, config) {
 		const path = await locate(sessionId, cwd, now);
 		const st = path && await io.stat(path);
-		if (!path || !st) return null;
+		if (!path || !st) return "unstarted";
 		const idleMs = config.idleMinutes * 6e4;
 		const keepMs = Math.max(idleMs, config.lightsOffHours * 36e5);
 		const agentWindowMs = Math.max(idleMs, config.touchedWindowMinutes * 6e4);
@@ -14468,7 +14478,7 @@ function createDriver(o) {
 	function wire(s, child) {
 		s.child = child;
 		s.stderr = "";
-		const unreport = o.report?.(uuidOf(s.record.session), s.record.folder);
+		const unreport = o.report?.(uuidOf(s.record.session), s.record.folder, () => Date.parse(s.record.lastActivity));
 		let closed = () => {};
 		s.closed = new Promise((resolve) => closed = resolve);
 		let buffer = "";
@@ -15623,13 +15633,18 @@ const hiddenStart = (args, cwd) => spawn(process.execPath, args, {
 	stdio: "ignore",
 	windowsHide: true
 }).on("error", () => {}).unref();
-/** For a driven session's process as it opens: keeps the session reported until the returned stop is called, as the process ends. */
+/**
+* For a driven session's process as it opens: keeps the session reported until the returned stop
+* is called, as the process ends. `lastActive` is when the process last did anything, in ms.
+*/
 function keepReported(o) {
 	const spawn = o.spawn ?? hiddenStart;
-	return (session, folder) => {
+	return (session, folder, lastActive) => {
 		let timer = null;
 		let stopped = false;
+		let seconds = 0;
 		const look = async () => {
+			if (Date.now() - lastActive() > await o.idleMinutes() * 6e4) return;
 			if (await recordedState(o.paths, folder).catch(() => "enabled") !== "enabled") return;
 			const input = JSON.stringify({
 				session_id: session,
@@ -15659,8 +15674,11 @@ function keepReported(o) {
 				said = text;
 			}
 			if (stopped) return;
-			const seconds = await o.everySeconds().catch((err) => (o.log(`stopped looking after driven session ${session}'s data layer: ${err.message}`), null));
-			if (seconds === null || stopped) return;
+			seconds = await o.everySeconds().catch((err) => {
+				if (!seconds) o.log(`stopped looking after driven session ${session}'s data layer: ${err.message}`);
+				return seconds;
+			});
+			if (!seconds || stopped) return;
 			timer = setTimeout(() => void next(), seconds * 1e3);
 			timer.unref?.();
 		};
@@ -15759,7 +15777,7 @@ async function worker() {
 	const offices = officesOf(first);
 	for (const { server } of offices.filter((o) => o.plainRefused)) log(`the runner doesn't answer through ${server}: it is plain ws:// to another machine; use wss://, or set "allowPlainWs": true in config.json`);
 	if (offices.every((o) => o.plainRefused)) return 0;
-	await settings();
+	const firstSettings = await settings();
 	const registry = createRegistry({
 		file: registryPath(claudeDir),
 		log
@@ -16008,7 +16026,8 @@ async function worker() {
 				managed: managedDir(process.platform),
 				pluginDirs: pluginDirsOf(process.env)
 			},
-			everySeconds: async () => (await settings()).drivenReportSeconds,
+			everySeconds: async () => (await settings().catch(() => firstSettings)).drivenReportSeconds,
+			idleMinutes: async () => (await config()).idleMinutes,
 			log
 		}),
 		setup: (m) => {

@@ -130,6 +130,18 @@ test("a detached data layer whose session's transcript has nothing to report wit
   expect(fs.existsSync(lock)).toBe(false);
 });
 
+// A transcript that has started but is left out (a helper session) has nothing to report, and isn't waited for.
+const helper: Lines = (repo, now) => [{ type: "user", cwd: repo, timestamp: now, message: { role: "user", content: "Generate a short git branch name for this" } }, { type: "assistant", cwd: repo, timestamp: now, message: { role: "assistant", content: [{ type: "text", text: "fix-it" }] } }];
+test("a detached data layer for a session that has started but has nothing to report stops at once, without waiting for facts", async () => {
+  const o = await office();
+  o.state.repos = ["github.com/team/app"];
+  const begun = Date.now();
+  const { exited, logged } = start(o.url, { factsWaitSeconds: 60 }, helper);
+  await exited;
+  expect(Date.now() - begun).toBeLessThan(15000);
+  expect(logged()).toContain("stopping: the session has nothing to report now");
+});
+
 test("an approved session connects; once its copy of the list is past its maximum age and can't be checked, its link closes and no other socket opens, reconnects included", async () => {
   const o = await office();
   o.state.repos = ["github.com/team/app"];
@@ -285,6 +297,14 @@ test("a copy in the plugin cache that an update left behind says so, installs no
   expect(await detached.exited).toBe(0);
   expect(fs.existsSync(v.lock)).toBe(false);
   expect(fs.readFileSync(path.join(v.claudeDir, "isoplan", "logs", "s1.log"), "utf8")).toMatch(/a newer version of the Isoplan plugin is installed/);
+});
+
+test("a detached data layer whose plugin is turned off for the session says so in its log as it stops", async () => {
+  const v = versions();
+  fs.writeFileSync(path.join(v.claudeDir, "settings.json"), JSON.stringify({ enabledPlugins: { "isoplan@isoplan": false } }));
+  const detached = v.run("0.3.0", "--detached");
+  expect(await detached.exited).toBe(0);
+  expect(fs.readFileSync(path.join(v.claudeDir, "isoplan", "logs", "s1.log"), "utf8")).toContain("stopping: Claude Code lists the Isoplan plugin as uninstalled or disabled here");
 });
 
 test("after /reload-plugins the old version's data layer leaves the session to the new one's, and of one version the later start keeps it", async () => {

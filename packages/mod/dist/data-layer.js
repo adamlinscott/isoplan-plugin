@@ -9719,6 +9719,10 @@ function createClaudeCode(io) {
 			errors
 		});
 		const c = await candidate(sessionId, cwd, now, config);
+		if (c === "unstarted") return {
+			...none(),
+			unstarted: true
+		};
 		if (!c) return none();
 		let main;
 		try {
@@ -9729,7 +9733,13 @@ function createClaudeCode(io) {
 		}
 		try {
 			if (leftOut(main, c, config)) return none();
-			if (!main.cwd) return none(main.seen && (!main.parsed || main.messages) ? "transcript format not recognised" : null);
+			if (!main.cwd) {
+				if (main.seen && (!main.parsed || main.messages)) return none("transcript format not recognised");
+				return {
+					...none(),
+					unstarted: true
+				};
+			}
 			const home = await resolve(cwd);
 			const workspace = !home && await isWorkspace(cwd, now, config);
 			const where = workspace ? {
@@ -9797,7 +9807,7 @@ function createClaudeCode(io) {
 	async function candidate(sessionId, cwd, now, config) {
 		const path = await locate(sessionId, cwd, now);
 		const st = path && await io.stat(path);
-		if (!path || !st) return null;
+		if (!path || !st) return "unstarted";
 		const idleMs = config.idleMinutes * 6e4;
 		const keepMs = Math.max(idleMs, config.lightsOffHours * 36e5);
 		const agentWindowMs = Math.max(idleMs, config.touchedWindowMinutes * 6e4);
@@ -12443,8 +12453,9 @@ async function main(argv) {
 	if (await isOff()) {
 		emit({
 			type: "log",
-			text: "Claude Code lists the Isoplan plugin as uninstalled or disabled here, so this session isn't reported"
+			text: "stopping: Claude Code lists the Isoplan plugin as uninstalled or disabled here, so this session isn't reported"
 		});
+		await logging;
 		return 0;
 	}
 	const since = Number(value(argv, "--since")) || Date.now();
@@ -12999,8 +13010,12 @@ async function main(argv) {
 					stopping(`git can't place ${cwd}, so it holds off`);
 					break;
 				}
-				if (!factsSession && Date.now() - startedAt < config.factsWaitSeconds * 1e3) continue;
-				stopping(factsSession ? "the session has nothing to report now (lights off with no reply, aged out, or its transcript gone)" : `the session's transcript had nothing to report within ${config.factsWaitSeconds} seconds`);
+				if (read.unstarted && !factsSession) {
+					if (Date.now() - startedAt < config.factsWaitSeconds * 1e3) continue;
+					stopping(`the session's transcript had nothing to report within ${config.factsWaitSeconds} seconds`);
+					break;
+				}
+				stopping("the session has nothing to report now (lights off with no reply, left out, aged out, or its transcript gone)");
 				break;
 			}
 			for (const run of taking) {

@@ -88,7 +88,7 @@ import { alive, HOLD_OFF_MS, holdOff, lockHolder, lockPath, notWantedPath, readL
 import { approvedPath, cachedRepos, createApproved, createSessionGate, type Approved, type Dormancy, type SessionGate } from "./approved.js";
 import { forOffice } from "./attribution.js";
 import { candidatesOf, inRepos } from "./home.js";
-import { createClaudeCode } from "./claude-code.js";
+import { createClaudeCode, type SourceRead } from "./claude-code.js";
 import { loadConfig, officesOf, type Config, type Office } from "./config.js";
 import { detachedStop } from "./detached.js";
 import { createGit, pathKey, type Where } from "./git.js";
@@ -215,7 +215,8 @@ async function main(argv: string[]): Promise<number> {
   const self = path.join(here, "data-layer.js");
   const isOff = async () => (await pluginState(place, self, project).catch(() => "enabled")) !== "enabled";
   if (await isOff()) {
-    emit({ type: "log", text: "Claude Code lists the Isoplan plugin as uninstalled or disabled here, so this session isn't reported" });
+    emit({ type: "log", text: "stopping: Claude Code lists the Isoplan plugin as uninstalled or disabled here, so this session isn't reported" });
+    await logging;
     return 0;
   }
   // When this window's hooks module started: one it starts again keeps its window's place.
@@ -604,7 +605,7 @@ async function main(argv: string[]): Promise<number> {
       continue;
     }
 
-    const read = await source.read({ sessionId, cwd, now, config, resolve, projectOf: projectOfRepo }).catch((err: unknown) => ({
+    const read: SourceRead = await source.read({ sessionId, cwd, now, config, resolve, projectOf: projectOfRepo }).catch((err: unknown) => ({
       facts: null,
       status: String((err as Error)?.message ?? err),
       errors: { count: 0, first: null },
@@ -623,9 +624,13 @@ async function main(argv: string[]): Promise<number> {
           stopping(`git can't place ${cwd}, so it holds off`);
           break;
         }
-        // Started before the transcript has anything to report: it waits for it, for a while (#92).
-        if (!factsSession && Date.now() - startedAt < config.factsWaitSeconds * 1000) continue;
-        stopping(factsSession ? "the session has nothing to report now (lights off with no reply, aged out, or its transcript gone)" : `the session's transcript had nothing to report within ${config.factsWaitSeconds} seconds`);
+        // Started before the transcript has started (none yet, or only bookkeeping lines): it waits for it, for a while (#92).
+        if (read.unstarted && !factsSession) {
+          if (Date.now() - startedAt < config.factsWaitSeconds * 1000) continue;
+          stopping(`the session's transcript had nothing to report within ${config.factsWaitSeconds} seconds`);
+          break;
+        }
+        stopping("the session has nothing to report now (lights off with no reply, left out, aged out, or its transcript gone)");
         break;
       }
       for (const run of taking) {
