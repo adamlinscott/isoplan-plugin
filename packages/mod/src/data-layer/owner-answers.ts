@@ -13,8 +13,8 @@
 // With no word in TAKEN_WAIT_MS, a question that has closed meanwhile gets a `closed` reply, which
 // says it has an answer without saying whose; one still open is refused. Either way the word is
 // looked for a minute longer, and a take that comes then is sent as a `late` reply.
-// Only the plugin's own data layer can pass it on: a detached one, for a session seen only through
-// the wake hook, has no hooks module, so its questions are answered in the terminal.
+// Only the plugin's own data layer can pass it on: the runner, reporting a session without a hooks
+// module, can't, so its questions are answered in the terminal.
 
 import { PROTOCOL_VERSION, type Facts, type RefusalMessage, type ReplyMessage, type RequestMessage } from "@isoplan/protocol";
 import type { AnswerTaken, DataLayerLine } from "../lines.js";

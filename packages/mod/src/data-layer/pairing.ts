@@ -9,8 +9,7 @@
 //    and the machine's own random id (made once, kept in pairing.json), which tells two machines of
 //    one name apart.
 // 2. It shows the link it gets, `<office>/#pair=<code>`, as a `pair` line: the hooks module puts it
-//    in the status line and, once per session start, in the transcript; a detached data layer and
-//    the runner log it. The other processes show the same link from the file. Nothing opens a
+//    in the status line and, once per session start, in the transcript; the runner logs it. The other processes show the same link from the file. Nothing opens a
 //    browser.
 // 3. The person clicks it on this computer and approves it on the floor, and the browser is sent to
 //    the callback with a one-time code. The callback swaps the code and the verifier for the

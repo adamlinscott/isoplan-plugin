@@ -163,7 +163,7 @@ type Of<K extends Kind> = Extract<DrivenMessage, { kind: K }>;
 
 // `policy`: the drive-policy the office's server sends first on the connection, as a server that
 // drives sessions does; null for none yet. What it sends with it (holding) isn't kept in `sent`.
-async function setUp({ settings = {}, linger = false, records = [] as ProcessRecord[], spawn, policy: first = [] as string[] | null, setup, report, elsewhere }: { settings?: Partial<DriveSettings>; linger?: boolean; records?: ProcessRecord[]; spawn?: Spawn; policy?: string[] | null; setup?: DriverOptions["setup"]; report?: DriverOptions["report"]; elsewhere?: DriverOptions["elsewhere"] } = {}) {
+async function setUp({ settings = {}, linger = false, records = [] as ProcessRecord[], spawn, policy: first = [] as string[] | null, setup, elsewhere }: { settings?: Partial<DriveSettings>; linger?: boolean; records?: ProcessRecord[]; spawn?: Spawn; policy?: string[] | null; setup?: DriverOptions["setup"]; elsewhere?: DriverOptions["elsewhere"] } = {}) {
   const root = tempRoot();
   const claudeDir = path.join(root, ".claude");
   const state = path.join(root, "state");
@@ -223,7 +223,6 @@ async function setUp({ settings = {}, linger = false, records = [] as ProcessRec
     newId: () => ids.shift()!,
     ...(spawn ? { spawn } : {}),
     ...(setup ? { setup } : {}),
-    ...(report ? { report } : {}),
     ...(elsewhere ? { elsewhere } : {}),
   });
   const fakeLog = () => (fs.existsSync(path.join(state, "log.jsonl")) ? fs.readFileSync(path.join(state, "log.jsonl"), "utf8").trim().split("\n").map((l) => JSON.parse(l)) : []);
@@ -456,18 +455,6 @@ test("start: a new session in the folder the room's session ran in, its turn's t
       driven: { room: "room-1", project: "github.com/ada/app", office: SERVER, owner: ADA.id, permissions: "auto", asked: "auto", transcript: true },
     },
   ]);
-});
-
-// #92: the runner keeps a data layer reporting the session while its process runs (reported.ts).
-test("start: the session is kept reported from as its process opens until it ends", async () => {
-  const reported: string[] = [];
-  const t = await setUp({ report: (session, folder) => (reported.push(`open ${session} ${folder}`), () => void reported.push(`end ${session}`)) });
-  t.drive(start("d1", { instruction: "use a tool" }));
-  await t.until(() => t.of("turn-ended").length === 1);
-  expect(reported).toEqual([`open ${UUIDS[0]} ${t.folder}`]);
-  t.drive({ id: "d2", kind: "stop", session: S1 });
-  await t.until(() => t.of("released").length === 1);
-  expect(reported).toEqual([`open ${UUIDS[0]} ${t.folder}`, `end ${UUIDS[0]}`]);
 });
 
 test("start: no folder of the room's sessions here is no-folder, a person other than the runner's own is not-owner, and an answer finds no prompt", async () => {

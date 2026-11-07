@@ -6977,7 +6977,7 @@ async function lockHolder(file) {
 const held = (lock, now, { isAlive = alive, freshMs }) => !!lock && (lock.until !== null && lock.until > now || lock.pid !== null && isAlive(lock.pid) && (freshMs === void 0 || now - lock.mtimeMs < freshMs));
 /**
 * Takes the lock for `pid`; false when it is held (`isHeld`). With `force` (the plugin's data
-* layer) it is taken regardless: a detached one holding it sees that and steps aside. `extra` is
+* layer) it is taken regardless: the runner holding it sees that and steps aside. `extra` is
 * written into the lock beside the pid.
 *
 * A new lock is created exclusively, so of two takers at once only one gets it. A stale one is

@@ -126,7 +126,7 @@ function slugify(input) {
 	return input.toLowerCase().trim().replace(/[^\w\s-]/g, "").replace(/[\s_-]+/g, "-").replace(/^-+|-+$/g, "");
 }
 const captureStackTrace = "captureStackTrace" in Error ? Error.captureStackTrace : (..._args) => {};
-function isObject$1(data) {
+function isObject$2(data) {
 	return typeof data === "object" && data !== null && !Array.isArray(data);
 }
 const allowsEval = /* @__PURE__*/ cached(() => {
@@ -140,12 +140,12 @@ const allowsEval = /* @__PURE__*/ cached(() => {
 	}
 });
 function isPlainObject(o) {
-	if (isObject$1(o) === false) return false;
+	if (isObject$2(o) === false) return false;
 	const ctor = o.constructor;
 	if (ctor === void 0) return true;
 	if (typeof ctor !== "function") return true;
 	const prot = ctor.prototype;
-	if (isObject$1(prot) === false) return false;
+	if (isObject$2(prot) === false) return false;
 	if (Object.prototype.hasOwnProperty.call(prot, "isPrototypeOf") === false) return false;
 	return true;
 }
@@ -2092,7 +2092,7 @@ const $ZodObject = /*@__PURE__*/ $constructor("$ZodObject", (inst, def) => {
 		}
 		return propValues;
 	});
-	const isObject = isObject$1;
+	const isObject = isObject$2;
 	const catchall = def.catchall;
 	let value;
 	const memo = globalConfig.memoizer;
@@ -2230,7 +2230,7 @@ const $ZodObjectJIT = /*@__PURE__*/ $constructor("$ZodObjectJIT", (inst, def) =>
 		return doc.compile();
 	};
 	let fastpass;
-	const isObject = isObject$1;
+	const isObject = isObject$2;
 	const jit = !globalConfig.jitless;
 	const fastEnabled = jit && allowsEval.value;
 	const catchall = def.catchall;
@@ -2349,7 +2349,7 @@ const $ZodDiscriminatedUnion = /*@__PURE__*/ $constructor("$ZodDiscriminatedUnio
 	const disc = cached(() => discriminatorMap(def));
 	inst._zod.parse = (payload, ctx) => {
 		const input = payload.value;
-		if (!isObject$1(input)) {
+		if (!isObject$2(input)) {
 			payload.issues.push({
 				code: "invalid_type",
 				expected: "object",
@@ -4744,7 +4744,7 @@ const initializer = (inst, issues) => {
 const ZodRealError = /*@__PURE__*/ $constructor("ZodError", initializer, void 0, { Parent: Error });
 //#endregion
 //#region ../../node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/classic/parse.js
-const parse$1 = /* @__PURE__ */ _parse(ZodRealError);
+const parse$2 = /* @__PURE__ */ _parse(ZodRealError);
 const parseAsync = /* @__PURE__ */ _parseAsync(ZodRealError);
 const safeParse = /* @__PURE__ */ _safeParse(ZodRealError);
 const safeParseAsync = /* @__PURE__ */ _safeParseAsync(ZodRealError);
@@ -4876,7 +4876,7 @@ const ZodType = /*@__PURE__*/ $constructor("ZodType", (inst, def) => {
 		own(this, "~standard", value);
 	},
 	parse: function _parse(data, params) {
-		return parse$1(this, data, params, { callee: _parse });
+		return parse$2(this, data, params, { callee: _parse });
 	},
 	parseAsync: async function _parseAsync(data, params) {
 		return await parseAsync(this, data, params, { callee: _parseAsync });
@@ -6810,9 +6810,9 @@ const OfficeServerMessageSchema = discriminatedUnion("type", [
 ]);
 /** Validates a message a data layer received from an office server. */
 function parseOfficeServerMessage(value) {
-	return parse(OfficeServerMessageSchema, value);
+	return parse$1(OfficeServerMessageSchema, value);
 }
-function parse(schema, value) {
+function parse$1(schema, value) {
 	if (typeof value === "object" && value !== null && "v" in value && typeof value.v === "number" && value.v !== 1) return {
 		ok: false,
 		kind: "unsupported-version",
@@ -6976,11 +6976,6 @@ function freshRepos(copy, maxAgeMs, now) {
 //#endregion
 //#region src/wake/lock.ts
 const lockPath = (claudeDir, sessionId) => path.join(claudeDir, "isoplan", "live", `${sessionId}.json`);
-/**
-* The offices that didn't want a session, each until when (#105): the wake hook moves them here from
-* a hold-off it ends, for the data layer it starts, which reads the file once and removes it.
-*/
-const notWantedPath = (claudeDir, sessionId) => path.join(claudeDir, "isoplan", "live", `${sessionId}.not-wanted`);
 const HOLD_OFF_MS = 36e5;
 async function readText(file) {
 	try {
@@ -7015,16 +7010,9 @@ async function lockHolder(file) {
 	return (await readLock(file))?.pid ?? null;
 }
 const held = (lock, now, { isAlive = alive, freshMs }) => !!lock && (lock.until !== null && lock.until > now || lock.pid !== null && isAlive(lock.pid) && (freshMs === void 0 || now - lock.mtimeMs < freshMs));
-/** Whether the lock is held: by a live pid (kept fresh, under `freshMs`), or by a hold-off that hasn't ended. */
-async function isHeld(file, now = Date.now(), isAlive = alive, rule = {}) {
-	return held(await readLock(file), now, {
-		...rule,
-		isAlive
-	});
-}
 /**
 * Takes the lock for `pid`; false when it is held (`isHeld`). With `force` (the plugin's data
-* layer) it is taken regardless: a detached one holding it sees that and steps aside. `extra` is
+* layer) it is taken regardless: the runner holding it sees that and steps aside. `extra` is
 * written into the lock beside the pid.
 *
 * A new lock is created exclusively, so of two takers at once only one gets it. A stale one is
@@ -7509,6 +7497,13 @@ const isList = (value) => {
 };
 /** Whether `a` is a later list than `b`: a newer version, by when it was first had, or the same one confirmed later. */
 const later = (a, b) => !b || (a.version !== b.version ? a.fetched > b.fetched : a.checked > b.checked);
+/**
+* The approved repos as approved.json has them from `server`, for a command that only reads (the
+* handoff and ask-the-room commands); null with no copy, or one past `maxAgeMs`.
+*/
+async function cachedRepos(file, server, maxAgeMs, now = Date.now()) {
+	return freshRepos(await readApproved(file, server), maxAgeMs, now);
+}
 /** Written whole, through a temp file, so a reader never sees half of it; owner-only. A refused rename is tried again, then thrown. */
 async function writeFile(file, value) {
 	await fs.mkdir(path.dirname(file), { recursive: true });
@@ -7650,6 +7645,60 @@ function createApproved({ server, file, pairing, refreshMs, maxAgeMs, log, get =
 		problem: () => list && !freshRepos(list, maxAgeMs, now()) ? "unreachable" : list ? null : problem,
 		refresh: (force = false) => run(force).then(() => {}),
 		ask: () => run(true, true).then((asked) => asked ?? "unreachable")
+	};
+}
+function createSessionGate({ approved, open }) {
+	let link = null;
+	let home = null;
+	let linked = null;
+	let unwanted;
+	const shut = () => {
+		link?.close();
+		link = null;
+		linked = null;
+	};
+	const mayConnect = async () => {
+		await approved.refresh(true);
+		const repos = approved.repos();
+		return !!repos && linked !== null && repos.has(linked.toLowerCase());
+	};
+	return {
+		async home(candidates) {
+			await approved.refresh();
+			const repos = approved.repos();
+			home = repos && candidates.find((p) => repos.has(p.id.toLowerCase())) || null;
+			if (!home) {
+				shut();
+				return {
+					home: null,
+					dormancy: repos ? "not-approved" : approved.problem() === "pairing" ? "pairing" : "no-list"
+				};
+			}
+			if (linked !== null && linked !== home.id) shut();
+			if (unwanted !== void 0 && approved.version() !== unwanted) {
+				unwanted = void 0;
+				shut();
+			}
+			return {
+				home,
+				dormancy: null
+			};
+		},
+		link() {
+			if (!home) return null;
+			if (!link) {
+				link = open(home, mayConnect);
+				linked = home.id;
+			}
+			return link;
+		},
+		current: () => link,
+		drop: shut,
+		notWanted() {
+			unwanted = approved.version();
+			approved.refresh(true);
+		},
+		mayConnect
 	};
 }
 //#endregion
@@ -7981,6 +8030,26 @@ async function candidatesOf(folder, io) {
 	return {
 		projects,
 		workspace: true
+	};
+}
+/**
+* A workspace's facts as they may leave the machine: only its work inside a repo, each named by its
+* repo; files outside every repo, and a command's file there, stay on the machine. Which of those
+* repos may go is the link's filter (attribution.ts forOffice), by the server's welcome.
+*/
+function inRepos(facts) {
+	const placed = (list) => list.every((f) => f.project) ? list : list.filter((f) => f.project);
+	return {
+		...facts,
+		edits: placed(facts.edits),
+		reads: placed(facts.reads),
+		agents: facts.agents.map((a) => a.doing && !a.doing.project && a.doing.file !== void 0 ? {
+			...a,
+			doing: {
+				kind: a.doing.kind,
+				since: a.doing.since
+			}
+		} : a)
 	};
 }
 /** The first of `folder`'s candidates on `repos`: what a session there reports as. Null when none is, or there is no list. */
@@ -8687,6 +8756,37 @@ function createAttribution({ folder, where: home, resolve, projectOf, stat, real
 			if (where) return elsewhere(where, d);
 			return !home && (relativeTo(await homeFolder, d) !== null || pathKey(await homeFolder) === pathKey(d)) ? {} : null;
 		}
+	};
+}
+/**
+* The facts as they may leave the machine: a file, command or subagent's checkout in another repo
+* only when `projects`, the office's from the server's welcome, holds that repo. Without a welcome
+* (an older server, or none yet on this connection) none of them leave. `checkouts` names the
+* project of each subagent whose worktree is another repo's, by agent id.
+*/
+function forOffice(facts, projects, checkouts = {}) {
+	const held = (id) => projects !== null && projects.has(id.toLowerCase());
+	const ok = (p) => !p || held(p.id);
+	const files = (list) => list.every((f) => ok(f.project)) ? list : list.filter((f) => ok(f.project));
+	return {
+		...facts,
+		agents: facts.agents.map((a) => {
+			let out = a.doing && !ok(a.doing.project) ? {
+				...a,
+				doing: {
+					kind: a.doing.kind,
+					since: a.doing.since
+				}
+			} : a;
+			const elsewhere = Object.hasOwn(checkouts, a.id) ? checkouts[a.id] : null;
+			if (elsewhere !== null && !held(elsewhere) && (out.checkout !== void 0 || out.branch !== void 0)) {
+				const { checkout: _c, branch: _b, ...rest } = out;
+				out = rest;
+			}
+			return out;
+		}),
+		edits: files(facts.edits),
+		reads: files(facts.reads)
 	};
 }
 //#endregion
@@ -9570,6 +9670,64 @@ function viewWorkflow(input) {
 			...input.more ? { moreAgents: input.more } : {}
 		},
 		agents
+	};
+}
+/** What withheld workflow text says in its place. */
+const WORKFLOW_WITHHELD = "Hidden by the secret check";
+/**
+* The facts with each workflow's name, description, phase titles and details, and its agents'
+* labels, phases, tasks and descriptions, secret-checked: a text the scan matches, and every one
+* while `patterns` is null, goes out as WORKFLOW_WITHHELD. The task and description are checked on
+* their own: they come uncut from meta.json, while the label is cut and may come from the journal.
+*/
+function prepareWorkflows(facts, patterns, log) {
+	if (!facts.workflows?.length) return facts;
+	const check = (value, what) => {
+		if (!value) return value;
+		const matched = scan(value, patterns);
+		if (!matched) return value;
+		log(`withheld ${what}: ${patterns ? `it matches the secret pattern "${matched}"` : "the secret patterns couldn't be read"}`);
+		return WORKFLOW_WITHHELD;
+	};
+	const workflows = facts.workflows.map((w) => {
+		const { description, ...rest } = w;
+		const said = description === void 0 ? void 0 : check(description, `the description of workflow ${w.id}`);
+		return {
+			...rest,
+			name: check(w.name, `the name of workflow ${w.id}`),
+			...said === void 0 ? {} : { description: said },
+			phases: w.phases.map((p, i) => ({
+				title: check(p.title, `phase ${i + 1}'s title in workflow ${w.id}`),
+				...p.detail === void 0 ? {} : { detail: check(p.detail, `phase ${i + 1}'s detail in workflow ${w.id}`) }
+			}))
+		};
+	});
+	const agents = facts.agents.map((a) => {
+		if (!a.workflow) return a;
+		const label = check(a.workflow.label, `the label of ${a.id}`);
+		const phase = check(a.workflow.phase, `the phase of ${a.id}`);
+		const task = a.task === null ? null : check(a.task, `the task of ${a.id}`);
+		const said = a.extra?.description;
+		const description = typeof said === "string" ? check(said, `the description of ${a.id}`) : said;
+		if (label === a.workflow.label && phase === a.workflow.phase && task === a.task && description === said) return a;
+		return {
+			...a,
+			workflow: {
+				...a.workflow,
+				label,
+				phase
+			},
+			task,
+			...description === said ? {} : { extra: {
+				...a.extra,
+				description
+			} }
+		};
+	});
+	return {
+		...facts,
+		agents,
+		workflows
 	};
 }
 /**
@@ -10719,7 +10877,7 @@ const desktopPlatform = (platform, arch) => platform === "darwin" || platform ==
 //#endregion
 //#region src/runner/claude.ts
 const PREFIX = "claude-code:";
-const EXIT_GRACE_MS = 5e3;
+const EXIT_GRACE_MS$1 = 5e3;
 /** Every flag of the fork's command line, after the binary. */
 function forkArgs(sessionId, model) {
 	return [
@@ -10897,7 +11055,7 @@ function drive(child, { instructions, request, timeoutMs }) {
 			isDone = true;
 			clearTimeout(timer);
 			resolve(answered);
-			setTimeout(() => killTree(child), EXIT_GRACE_MS).unref();
+			setTimeout(() => killTree(child), EXIT_GRACE_MS$1).unref();
 		};
 		const fail = (kind, detail) => finish({
 			ok: false,
@@ -11981,7 +12139,7 @@ async function sessionFolders(io, projectsDir, since, cwds, { gone = false } = {
 			const file = path.join(projectsDir, dir.name, entry.name);
 			const st = await io.stat(file);
 			if (!st || st.mtimeMs < since) continue;
-			const cwd = cwds?.get(file) ?? await cwdOf(io, file, st.size);
+			const cwd = cwds?.get(file) ?? await cwdOf$1(io, file, st.size);
 			if (cwd) {
 				used.add(file);
 				cwds?.set(file, cwd);
@@ -12008,7 +12166,7 @@ async function sessionFolders(io, projectsDir, since, cwds, { gone = false } = {
 	}
 	return out;
 }
-async function cwdOf(io, file, size) {
+async function cwdOf$1(io, file, size) {
 	for (const text of (await io.read(file, 0, Math.min(size, 65536)).catch(() => "")).split("\n")) {
 		if (!text.includes("\"cwd\"")) continue;
 		try {
@@ -14617,7 +14775,6 @@ function createDriver(o) {
 	function wire(s, child) {
 		s.child = child;
 		s.stderr = "";
-		const unreport = o.report?.(uuidOf(s.record.session), s.record.folder, () => Date.parse(s.record.lastActivity));
 		let closed = () => {};
 		s.closed = new Promise((resolve) => closed = resolve);
 		let buffer = "";
@@ -14643,7 +14800,6 @@ function createDriver(o) {
 		const end = (code) => {
 			if (over) return;
 			over = true;
-			unreport?.();
 			closed();
 			ended(s, child, code);
 		};
@@ -15477,6 +15633,427 @@ function createDriver(o) {
 	};
 }
 //#endregion
+//#region src/wake/wake.ts
+const wakeRecordPath = (claudeDir) => path.join(claudeDir, "isoplan", "wake.json");
+//#endregion
+//#region src/runner/environment.ts
+const runnerEnvPath = (claudeDir) => path.join(claudeDir, "isoplan", "runner", "environment.json");
+/** The recorded environment, or null when there is none, or it doesn't parse, so the starter's is used. */
+async function recordedEnv(claudeDir) {
+	try {
+		const { env } = JSON.parse(await fs.readFile(runnerEnvPath(claudeDir), "utf8"));
+		if (!env || typeof env !== "object" || Array.isArray(env)) return null;
+		return Object.fromEntries(Object.entries(env).filter((e) => typeof e[1] === "string"));
+	} catch {
+		return null;
+	}
+}
+//#endregion
+//#region src/runner/start.ts
+/** The runner's lock: `{ pid, code }` of the supervisor that holds it. */
+const runnerLockPath = (claudeDir) => path.join(claudeDir, "isoplan", "runner", "lock.json");
+const LOCK_REFRESH_MS = 3e4;
+/** What names a runner.js's code: its size and write time. Null when it is gone. */
+async function runnerCode(file) {
+	const st = await fs.stat(file).catch(() => null);
+	return st && st.isFile() ? `${st.size}-${Math.round(st.mtimeMs)}` : null;
+}
+/** The live runner's lock: a hold-off that hasn't ended, or a live pid that keeps it fresh. */
+async function liveRunner(claudeDir, now, isAlive) {
+	const lock = await readLock(runnerLockPath(claudeDir));
+	if (!lock) return null;
+	if (lock.until !== null && lock.until > now) return {
+		...lock,
+		isHoldOff: true
+	};
+	if (lock.pid !== null && isAlive(lock.pid) && now - lock.mtimeMs < 9e4) return {
+		...lock,
+		isHoldOff: false
+	};
+	return null;
+}
+/**
+* Starts the recorded runner unless a live one runs the recorded code. One on older code is
+* replaced. A hold-off keeps it from starting, except a crash loop's hold-off on older code: a new
+* version may have fixed what crashed.
+*/
+async function startRunner({ claudeDir, spawn, isAlive = alive, kill = (pid) => process.kill(pid), now = Date.now }) {
+	let runner;
+	try {
+		runner = JSON.parse(await fs.readFile(wakeRecordPath(claudeDir), "utf8")).runner;
+	} catch {
+		return "not-installed";
+	}
+	if (typeof runner !== "string") return "not-installed";
+	const code = await runnerCode(runner);
+	if (!code) return "not-installed";
+	const lockFile = runnerLockPath(claudeDir);
+	const live = await liveRunner(claudeDir, now(), isAlive);
+	if (live?.isHoldOff) {
+		if (live.extra.reason !== "gave-up" || live.extra.code === code) return "held-off";
+		if ((await readLock(lockFile))?.until === live.until) await fs.rm(lockFile, { force: true });
+	} else if (live) {
+		if (live.extra.code === code) return "running";
+		await stopRunner(claudeDir, {
+			isAlive,
+			kill,
+			now,
+			expect: {
+				pid: live.pid,
+				code: live.extra.code
+			}
+		});
+	}
+	const env = await recordedEnv(claudeDir);
+	spawn([
+		runner,
+		"--claude-dir",
+		claudeDir,
+		...env ? [] : ["--inherited-env"]
+	], claudeDir, env ?? void 0);
+	return "started";
+}
+/**
+* Ends the running runner, for uninstall and updates: its worker and forks follow once its
+* supervisor has gone. True when one was running. A stale lock's pid is never killed. With
+* `expect`, only the runner judged outdated is: if the lock names another pid or code by now
+* (another starter replaced it already), it is left.
+*/
+async function stopRunner(claudeDir, { isAlive = alive, kill = (pid) => process.kill(pid), now = Date.now, expect } = {}) {
+	const live = await liveRunner(claudeDir, now(), isAlive);
+	if (!live || live.isHoldOff || live.pid === null) return false;
+	if (expect && (live.pid !== expect.pid || live.extra.code !== expect.code)) return false;
+	try {
+		kill(live.pid);
+	} catch {}
+	await releaseLock(runnerLockPath(claudeDir), live.pid);
+	return true;
+}
+/**
+* Makes the runner use the config folder `--claude-dir` names, whatever it inherited: the default
+* ~/.claude takes CLAUDE_CONFIG_DIR away (Claude Code then looks there, and for ~/.claude.json);
+* any other folder is set as CLAUDE_CONFIG_DIR, for the runner and its forks.
+*/
+function applyClaudeDir(argv, env, home) {
+	const i = argv.indexOf("--claude-dir");
+	const dir = i >= 0 ? argv[i + 1] : void 0;
+	if (!dir || dir.startsWith("--")) return;
+	if (path.resolve(dir) === path.resolve(home, ".claude")) delete env.CLAUDE_CONFIG_DIR;
+	else env.CLAUDE_CONFIG_DIR = dir;
+}
+//#endregion
+//#region src/connect/dialog.ts
+const exec = (file, args, env) => new Promise((resolve) => {
+	let stdout = "";
+	const child = spawn(file, args, {
+		windowsHide: true,
+		stdio: [
+			"ignore",
+			"pipe",
+			"ignore"
+		],
+		env: env ? {
+			...process.env,
+			...env
+		} : process.env
+	});
+	child.stdout.on("data", (chunk) => stdout += String(chunk));
+	child.on("error", () => resolve({
+		code: null,
+		stdout
+	}));
+	child.on("close", (code) => resolve({
+		code,
+		stdout
+	}));
+});
+[
+	"$ErrorActionPreference = 'Stop'",
+	"Add-Type -AssemblyName System.Windows.Forms, System.Drawing",
+	...[`Add-Type -Namespace IsoplanWin -Name User32 -MemberDefinition '[DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int c);'`, "$first = New-Object System.Windows.Forms.Form; [void][IsoplanWin.User32]::ShowWindow($first.Handle, 0); $first.Dispose()"],
+	"[System.Windows.Forms.Application]::EnableVisualStyles()",
+	"$f = New-Object System.Windows.Forms.Form",
+	"$f.Text = $env:ISOPLAN_DIALOG_TITLE",
+	"$f.FormBorderStyle = 'FixedDialog'; $f.MaximizeBox = $false; $f.MinimizeBox = $false; $f.StartPosition = 'CenterScreen'; $f.TopMost = $true",
+	"$f.AutoSize = $true; $f.AutoSizeMode = 'GrowAndShrink'; $f.Padding = New-Object System.Windows.Forms.Padding 16",
+	"$layout = New-Object System.Windows.Forms.FlowLayoutPanel; $layout.FlowDirection = 'TopDown'; $layout.AutoSize = $true; $layout.AutoSizeMode = 'GrowAndShrink'",
+	"$label = New-Object System.Windows.Forms.Label; $label.Text = $env:ISOPLAN_DIALOG_TEXT; $label.UseMnemonic = $false; $label.AutoSize = $true; $label.MaximumSize = New-Object System.Drawing.Size 480, 0",
+	"$row = New-Object System.Windows.Forms.FlowLayoutPanel; $row.FlowDirection = 'RightToLeft'; $row.AutoSize = $true; $row.Anchor = 'Right'",
+	"$cancel = New-Object System.Windows.Forms.Button; $cancel.Text = 'Cancel'; $cancel.UseMnemonic = $false; $cancel.AutoSize = $true; $cancel.DialogResult = 'Cancel'",
+	"$connect = New-Object System.Windows.Forms.Button; $connect.Text = 'Connect'; $connect.UseMnemonic = $false; $connect.AutoSize = $true; $connect.DialogResult = 'OK'",
+	"$row.Controls.AddRange(@($cancel, $connect)); $layout.Controls.AddRange(@($label, $row)); $f.Controls.Add($layout)",
+	"$f.AcceptButton = $cancel; $f.CancelButton = $cancel",
+	`$timer = New-Object System.Windows.Forms.Timer; $timer.Interval = 300000; $timer.Add_Tick({ $f.DialogResult = 'Cancel'; $f.Close() })`,
+	"$f.Add_Shown({ $f.Activate(); $cancel.Focus(); $timer.Start() })",
+	"$r = $f.ShowDialog(); $timer.Stop()",
+	"if ($r -eq [System.Windows.Forms.DialogResult]::OK) { exit 0 } else { exit 2 }"
+].join("\n");
+//#endregion
+//#region src/install/hidden-launch.ts
+/** wscript.exe, by its full path, so no other program of that name is found first. */
+const wscriptPath = (env = process.env) => path.win32.join(env.SystemRoot || "C:\\Windows", "System32", "wscript.exe");
+/** The command Windows runs: wscript in batch mode (no prompts, no logo), with the JScript engine, on `launcher`, then `args`. */
+const launchCommand = (launcher, args = "") => `"${wscriptPath()}" //B //NoLogo //E:JScript "${launcher}"${args ? ` ${args}` : ""}`;
+/** The launcher `launchCommand` names in a command; null for any other command. */
+const launcherOf = (command) => command ? /^"[^"]+\\wscript\.exe" \/\/B \/\/NoLogo \/\/E:JScript "([^"]+)"/i.exec(command)?.[1] ?? null : null;
+/** A literal JScript and JSON both read: JSON, with every character outside printable ASCII as \uXXXX. */
+const asciiLiteral = (value) => JSON.stringify(value).replace(/[^\x20-\x7e]/g, (c) => `\\u${c.charCodeAt(0).toString(16).padStart(4, "0")}`);
+/**
+* The launcher: runs `"<node>" "<script>" <args>` hidden. With `link`, the link Windows gives it goes
+* to node in ISOPLAN_CONNECT_URL, never on a command line, as the Mac handler passes it.
+*/
+function hiddenLauncher(node, script, { args = "", link = false } = {}) {
+	const command = `"${node}" "${script}"${args ? ` ${args}` : ""}`;
+	return [
+		"// Isoplan: starts node with no window. The plugin's install wrote this file; uninstall removes it.",
+		`var isoplan = ${asciiLiteral({
+			node,
+			script
+		})};`,
+		"var shell = new ActiveXObject(\"WScript.Shell\");",
+		...link ? ["shell.Environment(\"PROCESS\")(\"ISOPLAN_CONNECT_URL\") = WScript.Arguments(0);"] : [],
+		`shell.Run(${asciiLiteral(command)}, 0, false);`,
+		""
+	].join("\r\n");
+}
+/** The node and script a launcher names, as hiddenLauncher writes them; null when it isn't one. */
+function launcherPaths(text) {
+	const line = text ? /^var isoplan = (.*);\r?$/m.exec(text)?.[1] : void 0;
+	try {
+		return line ? JSON.parse(line) : null;
+	} catch {
+		return null;
+	}
+}
+const SCRIPT_HOST_KEYS = ["HKCU\\Software\\Microsoft\\Windows Script Host\\Settings", "HKLM\\Software\\Microsoft\\Windows Script Host\\Settings"];
+/** Whether Windows Script Host is turned off for this person or this computer (`Enabled` set to 0). */
+async function scriptHostOff(run) {
+	for (const key of SCRIPT_HOST_KEYS) {
+		const value = /\bEnabled[ \t]+REG_\w+[ \t]+(\S+)/i.exec((await run("reg", [
+			"query",
+			key,
+			"/v",
+			"Enabled"
+		])).stdout)?.[1];
+		if (value !== void 0 && /^(0|0x0+)$/i.test(value)) return true;
+	}
+	return false;
+}
+//#endregion
+//#region src/install/link-handler.ts
+const KEY = "HKCU\\Software\\Classes\\isoplan";
+const OPEN_KEY = `${KEY}\\shell\\open`;
+const COMMAND_KEY = `${OPEN_KEY}\\command`;
+const LSREGISTER = "/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister";
+const DESKTOP = "isoplan-connect.desktop";
+const macAppPath = (claudeDir) => path.join(claudeDir, "isoplan", "Isoplan Connect.app");
+const macMarker = (app) => path.join(app, "Contents", "Resources", "isoplan-handler.json");
+const desktopPath = (h) => path.join(h.dataHome || path.join(h.home, ".local", "share"), "applications", DESKTOP);
+/** The Windows launcher the open command runs. */
+const linkLauncherPath = (claudeDir) => path.join(claudeDir, "isoplan", "open-link.js");
+/** The Windows open command: wscript on the launcher, and the link. */
+const windowsCommand = (launcher) => launchCommand(launcher, "\"%1\"");
+/** The open command where Windows Script Host is off: node and the handler, quoted, and the link. */
+const directCommand = (node, script) => `"${node}" "${script}" "%1"`;
+/** The value `reg query` prints for a key's default or a named value, whatever the language of its "(Default)" label. */
+const regValue = (stdout) => /REG_SZ[ \t]+(.*?)\s*$/m.exec(stdout)?.[1] ?? null;
+const appleString = (text) => `"${text.replace(/\\/g, "\\\\").replace(/"/g, "\\\"")}"`;
+/** The macOS app's script: the link to node in the background, quoted by the shell's own rules. */
+const macScript = (node, script) => [
+	"on open location theURL",
+	`\tdo shell script "ISOPLAN_CONNECT_URL=" & quoted form of theURL & " " & quoted form of ${appleString(node)} & " " & quoted form of ${appleString(script)} & " >/dev/null 2>&1 &"`,
+	"end open location",
+	""
+].join("\n");
+const exists = (file) => fs.stat(file).then(() => true, () => false);
+/** Whether a registration naming this node and this handler still works: both are there. */
+const works = async (paths) => !!paths && typeof paths.node === "string" && typeof paths.script === "string" && await exists(paths.node) && await exists(paths.script);
+/** The node and handler a direct Windows open command names, as directCommand writes it. */
+const directPaths = (command) => {
+	const m = command ? /^"([^"]+)" "([^"]+)" "%1"$/.exec(command) : null;
+	return m ? {
+		node: m[1],
+		script: m[2]
+	} : null;
+};
+/** A desktop entry's Exec argument, quoted as the Desktop Entry spec asks, then escaped as its strings are. */
+const execArg = (value) => `"${value.replace(/(["`$\\])/g, "\\$1")}"`.replace(/\\/g, "\\\\");
+/** The Linux desktop entry. */
+const desktopEntry = (node, script) => [
+	"[Desktop Entry]",
+	"Type=Application",
+	"Name=Isoplan Connect",
+	`Exec=${execArg(node)} ${execArg(script)} %u`,
+	"NoDisplay=true",
+	"Terminal=false",
+	"MimeType=x-scheme-handler/isoplan;",
+	`X-Isoplan-Handler=${JSON.stringify({
+		node,
+		script
+	})}`,
+	""
+].join("\n");
+const desktopPaths = (entry) => {
+	const line = entry ? /^X-Isoplan-Handler=(.*)$/m.exec(entry)?.[1] : void 0;
+	try {
+		return line ? JSON.parse(line) : null;
+	} catch {
+		return null;
+	}
+};
+const linkHandlerLockPath = (claudeDir) => path.join(claudeDir, "isoplan", "link-handler.lock");
+/** Registers the handler when none works; says what it changed. Another install registering at the same moment leaves it to that one. */
+async function registerLinkHandler(given) {
+	const lock = linkHandlerLockPath(given.claudeDir);
+	if (!await takeLock(lock, process.pid, alive, false, Date.now(), { freshMs: 12e4 })) return [];
+	try {
+		return await register$1(given);
+	} finally {
+		await releaseLock(lock, process.pid).catch(() => {});
+	}
+}
+async function register$1(given) {
+	const h = {
+		...given,
+		node: await fs.realpath(given.node).catch(() => given.node)
+	};
+	const run = h.run ?? exec;
+	const must = async (file, args) => {
+		const r = await run(file, args);
+		if (r.code !== 0) throw new Error(`${path.basename(file)} ${args[0] ?? ""} failed${r.code === null ? " to start" : ` (${r.code})`}`);
+	};
+	if (h.platform === "win32") {
+		const current = regValue((await run("reg", [
+			"query",
+			COMMAND_KEY,
+			"/ve"
+		])).stdout);
+		const off = await scriptHostOff(run);
+		if (off && await works(directPaths(current))) return [];
+		const launcher = launcherOf(current);
+		if (!off && launcher && await works(launcherPaths(await fs.readFile(launcher, "utf8").catch(() => null)))) return [];
+		const file = linkLauncherPath(h.claudeDir);
+		if (!off) {
+			await fs.mkdir(path.dirname(file), { recursive: true });
+			await fs.writeFile(file, hiddenLauncher(h.node, h.script, { link: true }));
+		}
+		await must("reg", [
+			"add",
+			KEY,
+			"/ve",
+			"/d",
+			"URL:Isoplan",
+			"/f"
+		]);
+		await must("reg", [
+			"add",
+			KEY,
+			"/v",
+			"URL Protocol",
+			"/d",
+			"",
+			"/f"
+		]);
+		await must("reg", [
+			"add",
+			OPEN_KEY,
+			"/v",
+			"FriendlyAppName",
+			"/d",
+			"Isoplan",
+			"/f"
+		]);
+		await must("reg", [
+			"add",
+			COMMAND_KEY,
+			"/ve",
+			"/d",
+			off ? directCommand(h.node, h.script) : windowsCommand(file),
+			"/f"
+		]);
+		return [off ? `registered isoplan:// links to open ${h.script}; Windows Script Host is turned off, so a link shows a console window for a moment` : `registered isoplan:// links to open ${h.script}, through ${file}`];
+	}
+	if (h.platform === "darwin") {
+		const app = macAppPath(h.claudeDir);
+		const marker = JSON.stringify({
+			node: h.node,
+			script: h.script
+		});
+		const registered = await fs.readFile(macMarker(app), "utf8").then((t) => JSON.parse(t), () => null);
+		if (await works(registered)) return [];
+		const source = path.join(h.claudeDir, "isoplan", "connect.applescript");
+		await fs.rm(app, {
+			recursive: true,
+			force: true
+		});
+		await fs.mkdir(path.dirname(source), { recursive: true });
+		await fs.writeFile(source, macScript(h.node, h.script));
+		try {
+			await must("osacompile", [
+				"-o",
+				app,
+				source
+			]);
+		} finally {
+			await fs.rm(source, { force: true });
+		}
+		const plist = path.join(app, "Contents", "Info.plist");
+		await must("plutil", [
+			"-replace",
+			"CFBundleIdentifier",
+			"-string",
+			"dev.isoplan.connect",
+			plist
+		]);
+		await must("plutil", [
+			"-replace",
+			"CFBundleURLTypes",
+			"-json",
+			JSON.stringify([{
+				CFBundleURLName: "Isoplan link",
+				CFBundleURLSchemes: ["isoplan"]
+			}]),
+			plist
+		]);
+		await must("plutil", [
+			"-replace",
+			"LSUIElement",
+			"-bool",
+			"true",
+			plist
+		]);
+		await must("codesign", [
+			"--force",
+			"--deep",
+			"--sign",
+			"-",
+			app
+		]);
+		await fs.writeFile(macMarker(app), marker);
+		await must(LSREGISTER, ["-f", app]);
+		return [`registered isoplan:// links to open ${h.script}, through ${app}`];
+	}
+	if (h.platform === "linux") {
+		const file = desktopPath(h);
+		const want = desktopEntry(h.node, h.script);
+		if ((await run("xdg-mime", [
+			"query",
+			"default",
+			"x-scheme-handler/isoplan"
+		])).stdout.trim() === DESKTOP && await works(desktopPaths(await fs.readFile(file, "utf8").catch(() => null)))) return [];
+		await fs.mkdir(path.dirname(file), { recursive: true });
+		await fs.writeFile(file, want);
+		await must("xdg-mime", [
+			"default",
+			DESKTOP,
+			"x-scheme-handler/isoplan"
+		]);
+		await run("update-desktop-database", [path.dirname(file)]);
+		return [`registered isoplan:// links to open ${h.script}, through ${file}`];
+	}
+	return [];
+}
+//#endregion
 //#region src/install/state.ts
 /** Claude Code's plugins folder: $CLAUDE_CODE_PLUGIN_CACHE_DIR when it is set, else <claude dir>/plugins. */
 const pluginsDir = (claudeDir, env) => env.CLAUDE_CODE_PLUGIN_CACHE_DIR || path.join(claudeDir, "plugins");
@@ -15505,6 +16082,11 @@ async function realCacheParts(plugins, file) {
 		cache,
 		parts: cacheParts(cache, await fs.realpath(file).catch(() => file))
 	};
+}
+/** The id, `<plugin>@<marketplace>`, of the marketplace install `file` is part of; null for a file outside the plugin cache. */
+function pluginIdOf(plugins, file) {
+	const parts = cacheParts(path.join(plugins, "cache"), file);
+	return parts ? `${parts[1]}@${parts[0]}` : null;
 }
 const appliesTo = (install, project) => !project || !(install.scope === "project" || install.scope === "local") || !install.projectPath || normalPath(install.projectPath) === normalPath(project);
 const KEY_FILES = [
@@ -15581,9 +16163,9 @@ const nameOf = (id) => id.slice(0, id.lastIndexOf("@"));
 async function installs(plugins) {
 	const record = await readJson(path.join(plugins, "installed_plugins.json"));
 	const list = record?.plugins;
-	if (record?.version !== 2 || !isObject(list) || !Object.values(list).every(Array.isArray)) return null;
+	if (record?.version !== 2 || !isObject$1(list) || !Object.values(list).every(Array.isArray)) return null;
 	return Object.entries(list).flatMap(([id, entries]) => entries.map((entry) => {
-		const e = isObject(entry) ? entry : {};
+		const e = isObject$1(entry) ? entry : {};
 		const text = (key) => typeof e[key] === "string" ? e[key] : null;
 		return {
 			id,
@@ -15598,7 +16180,7 @@ async function installs(plugins) {
 /** Whether `enabledPlugins` names the plugin `id` enabled, disabled, or not at all (null). */
 async function enabledIn(file, id) {
 	const value = (await readJson(file))?.enabledPlugins;
-	return isObject(value) && typeof value[id] === "boolean" ? value[id] : null;
+	return isObject$1(value) && typeof value[id] === "boolean" ? value[id] : null;
 }
 /**
 * What Claude Code says of the plugin `dataLayer` belongs to. With `project` (a session's project
@@ -15655,128 +16237,249 @@ async function gitRoot(dir) {
 		if (path.dirname(at) === at) return null;
 	}
 }
-const isObject = (value) => !!value && typeof value === "object" && !Array.isArray(value);
+const isObject$1 = (value) => !!value && typeof value === "object" && !Array.isArray(value);
 async function readJson(file) {
 	try {
 		const value = JSON.parse((await fs.readFile(file, "utf8")).replace(/^\uFEFF/, ""));
-		return isObject(value) ? value : null;
+		return isObject$1(value) ? value : null;
 	} catch {
 		return null;
 	}
 }
 //#endregion
-//#region src/wake/wake.ts
-const wakeRecordPath = (claudeDir) => path.join(claudeDir, "isoplan", "wake.json");
+//#region src/install/login-item.ts
+/** What the item passes the wake hook. */
+const LOGIN_ARG = "--login";
+const RUN_KEY = "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+/** A short id of the config folder, so each folder's item has its own name. */
+const loginItemId = (claudeDir, platform) => createHash("sha256").update(normalPath(claudeDir, platform)).digest("hex").slice(0, 8);
+const runValueName = (claudeDir) => `Isoplan runner ${loginItemId(claudeDir, "win32")}`;
+const loginLauncherPath = (claudeDir) => path.join(claudeDir, "isoplan", "start-at-login.js");
+const launchAgentLabel = (claudeDir) => `dev.isoplan.runner.${loginItemId(claudeDir, "darwin")}`;
+const launchAgentPath = (home, claudeDir) => path.join(home, "Library", "LaunchAgents", `${launchAgentLabel(claudeDir)}.plist`);
+const autostartPath = (h) => path.join(h.configHome || path.join(h.home, ".config"), "autostart", `isoplan-runner-${loginItemId(h.claudeDir, "linux")}.desktop`);
+/** The Run value: wscript on the launcher. */
+const windowsLoginCommand = (claudeDir) => launchCommand(loginLauncherPath(claudeDir));
+const xml = (text) => text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+const unxml = (text) => text.replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&amp;/g, "&");
 /**
-* `input` is the hook's stdin JSON (`session_id`, `cwd`, ...). True when a data layer was started.
-* Anything missing or unreadable means nothing to do.
+* The LaunchAgent. AbandonProcessGroup, since launchd otherwise ends what is left in the job's
+* process group once the job exits, and the job exits as soon as it has started the runner.
 */
-async function wake(input, { claudeDir, spawn, isAlive = alive, project, plugins }) {
-	const { session_id: sessionId, cwd } = JSON.parse(input);
-	if (typeof sessionId !== "string" || !/^[\w-]+$/.test(sessionId) || typeof cwd !== "string" || !cwd) return false;
-	const lock = lockPath(claudeDir, sessionId);
-	const { dataLayer: recorded } = JSON.parse(await fs.readFile(wakeRecordPath(claudeDir), "utf8"));
-	if (typeof recorded !== "string") return false;
-	if (await isHeld(lock, Date.now(), isAlive)) {
-		const notWanted = await nowApproved(claudeDir, lock, await configuredServers(claudeDir, recorded));
-		if (!notWanted) return false;
-		await fs.rm(lock, { force: true });
-		if (Object.keys(notWanted).length) await fs.writeFile(notWantedPath(claudeDir, sessionId), JSON.stringify(notWanted));
-	}
-	const dataLayer = plugins ? await newestDataLayer(plugins, recorded, project).catch(() => recorded) : recorded;
-	if (!await fs.stat(dataLayer).then((s) => s.isFile(), () => false)) return false;
-	spawn([
-		dataLayer,
-		"--session",
-		sessionId,
-		"--cwd",
-		cwd,
-		...project ? ["--project", project] : [],
-		"--detached"
-	], cwd);
-	return true;
-}
-/** The office servers config.json names now, by the defaults beside the recorded data layer; none when it can't be read. */
-async function configuredServers(claudeDir, dataLayer) {
-	const config = await loadConfig({
-		stat: (p) => fs.stat(p).then((s) => ({
-			isDir: s.isDirectory(),
-			mtimeMs: s.mtimeMs,
-			size: s.size
-		}), () => null),
-		read: (p) => fs.readFile(p, "utf8")
-	}, path.join(path.dirname(path.dirname(dataLayer)), "config.json"), path.join(claudeDir, "isoplan", "config.json")).catch(() => null);
-	return config ? officesOf(config).map((o) => o.server) : [];
-}
-/**
-* Whether `lock` is a hold-off for repos no office took, one of which a fresh copy of an office's
-* list now has: then the offices that didn't want the session, each until when, else null. Only the
-* lists of the offices the data layer reported to, or that config.json names now (`configured`),
-* count (a folder left by a server taken out of config.json doesn't), and never one of an office
-* that didn't want the session.
-*/
-async function nowApproved(claudeDir, lock, configured) {
-	const held = await readLock(lock);
-	const { projects, offices, notWanted: said } = held?.extra ?? {};
-	if (held?.pid !== null || held.extra.reason !== "not-approved" || !Array.isArray(projects)) return null;
-	const now = Date.now();
-	const notWanted = Object.fromEntries(Object.entries(said && typeof said === "object" ? said : {}).filter(([, until]) => typeof until === "number" && until > now));
-	for (const file of await approvedFiles(claudeDir)) {
-		const copy = await readApproved(file);
-		if (!copy || Array.isArray(offices) && !offices.includes(copy.server) && !configured.includes(copy.server) || copy.server in notWanted) continue;
-		const repos = freshRepos(copy, 9e5, now);
-		if (repos && projects.some((p) => typeof p === "string" && repos.has(p))) return notWanted;
-	}
-	return null;
-}
-//#endregion
-//#region src/runner/environment.ts
-const runnerEnvPath = (claudeDir) => path.join(claudeDir, "isoplan", "runner", "environment.json");
-//#endregion
-//#region src/runner/start.ts
-/** The runner's lock: `{ pid, code }` of the supervisor that holds it. */
-const runnerLockPath = (claudeDir) => path.join(claudeDir, "isoplan", "runner", "lock.json");
-const LOCK_REFRESH_MS = 3e4;
-/** What names a runner.js's code: its size and write time. Null when it is gone. */
-async function runnerCode(file) {
-	const st = await fs.stat(file).catch(() => null);
-	return st && st.isFile() ? `${st.size}-${Math.round(st.mtimeMs)}` : null;
-}
-/**
-* Makes the runner use the config folder `--claude-dir` names, whatever it inherited: the default
-* ~/.claude takes CLAUDE_CONFIG_DIR away (Claude Code then looks there, and for ~/.claude.json);
-* any other folder is set as CLAUDE_CONFIG_DIR, for the runner and its forks.
-*/
-function applyClaudeDir(argv, env, home) {
-	const i = argv.indexOf("--claude-dir");
-	const dir = i >= 0 ? argv[i + 1] : void 0;
-	if (!dir || dir.startsWith("--")) return;
-	if (path.resolve(dir) === path.resolve(home, ".claude")) delete env.CLAUDE_CONFIG_DIR;
-	else env.CLAUDE_CONFIG_DIR = dir;
-}
-[
-	"$ErrorActionPreference = 'Stop'",
-	"Add-Type -AssemblyName System.Windows.Forms, System.Drawing",
-	...[`Add-Type -Namespace IsoplanWin -Name User32 -MemberDefinition '[DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int c);'`, "$first = New-Object System.Windows.Forms.Form; [void][IsoplanWin.User32]::ShowWindow($first.Handle, 0); $first.Dispose()"],
-	"[System.Windows.Forms.Application]::EnableVisualStyles()",
-	"$f = New-Object System.Windows.Forms.Form",
-	"$f.Text = $env:ISOPLAN_DIALOG_TITLE",
-	"$f.FormBorderStyle = 'FixedDialog'; $f.MaximizeBox = $false; $f.MinimizeBox = $false; $f.StartPosition = 'CenterScreen'; $f.TopMost = $true",
-	"$f.AutoSize = $true; $f.AutoSizeMode = 'GrowAndShrink'; $f.Padding = New-Object System.Windows.Forms.Padding 16",
-	"$layout = New-Object System.Windows.Forms.FlowLayoutPanel; $layout.FlowDirection = 'TopDown'; $layout.AutoSize = $true; $layout.AutoSizeMode = 'GrowAndShrink'",
-	"$label = New-Object System.Windows.Forms.Label; $label.Text = $env:ISOPLAN_DIALOG_TEXT; $label.UseMnemonic = $false; $label.AutoSize = $true; $label.MaximumSize = New-Object System.Drawing.Size 480, 0",
-	"$row = New-Object System.Windows.Forms.FlowLayoutPanel; $row.FlowDirection = 'RightToLeft'; $row.AutoSize = $true; $row.Anchor = 'Right'",
-	"$cancel = New-Object System.Windows.Forms.Button; $cancel.Text = 'Cancel'; $cancel.UseMnemonic = $false; $cancel.AutoSize = $true; $cancel.DialogResult = 'Cancel'",
-	"$connect = New-Object System.Windows.Forms.Button; $connect.Text = 'Connect'; $connect.UseMnemonic = $false; $connect.AutoSize = $true; $connect.DialogResult = 'OK'",
-	"$row.Controls.AddRange(@($cancel, $connect)); $layout.Controls.AddRange(@($label, $row)); $f.Controls.Add($layout)",
-	"$f.AcceptButton = $cancel; $f.CancelButton = $cancel",
-	`$timer = New-Object System.Windows.Forms.Timer; $timer.Interval = 300000; $timer.Add_Tick({ $f.DialogResult = 'Cancel'; $f.Close() })`,
-	"$f.Add_Shown({ $f.Activate(); $cancel.Focus(); $timer.Start() })",
-	"$r = $f.ShowDialog(); $timer.Stop()",
-	"if ($r -eq [System.Windows.Forms.DialogResult]::OK) { exit 0 } else { exit 2 }"
+const launchAgentPlist = (label, node, script) => [
+	"<?xml version=\"1.0\" encoding=\"UTF-8\"?>",
+	"<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">",
+	"<plist version=\"1.0\">",
+	"<dict>",
+	"	<key>Label</key>",
+	`\t<string>${xml(label)}</string>`,
+	"	<key>ProgramArguments</key>",
+	"	<array>",
+	...[
+		node,
+		script,
+		LOGIN_ARG
+	].map((arg) => `\t\t<string>${xml(arg)}</string>`),
+	"	</array>",
+	"	<key>RunAtLoad</key>",
+	"	<true/>",
+	"	<key>AbandonProcessGroup</key>",
+	"	<true/>",
+	"</dict>",
+	"</plist>",
+	""
 ].join("\n");
+const plistPaths = (text) => {
+	const args = text ? /<key>ProgramArguments<\/key>\s*<array>([\s\S]*?)<\/array>/.exec(text)?.[1] : void 0;
+	const [node, script] = args ? [...args.matchAll(/<string>([^<]*)<\/string>/g)].map((m) => unxml(m[1])) : [];
+	return node && script ? {
+		node,
+		script
+	} : null;
+};
+/** The XDG autostart entry. */
+const autostartEntry = (node, script) => [
+	"[Desktop Entry]",
+	"Type=Application",
+	"Name=Isoplan",
+	"Comment=Starts Isoplan's runner when you log in",
+	`Exec=${execArg(node)} ${execArg(script)} ${LOGIN_ARG}`,
+	"Terminal=false",
+	"NoDisplay=true",
+	`X-Isoplan-Login=${JSON.stringify({
+		node,
+		script
+	})}`,
+	""
+].join("\n");
+const autostartPaths = (entry) => {
+	const line = entry ? /^X-Isoplan-Login=(.*)$/m.exec(entry)?.[1] : void 0;
+	try {
+		return line ? JSON.parse(line) : null;
+	} catch {
+		return null;
+	}
+};
+const read = (file) => fs.readFile(file, "utf8").catch(() => null);
+/** Whether runner.json (`defaultsPath`, overridden by the person's `userPath`) has the runner start at login; on unless it says false. */
+async function startsAtLogin(defaultsPath, userPath) {
+	return (await loadSettings(nodeIo(), defaultsPath, userPath).catch(() => null))?.startAtLogin !== false;
+}
+const loginItemLockPath = (claudeDir) => path.join(claudeDir, "isoplan", "login-item.lock");
+/** Registers the login item unless a working one is there; says what it changed. Another install registering at the same moment leaves it to that one. */
+async function registerLoginItem(given) {
+	const lock = loginItemLockPath(given.claudeDir);
+	if (!await takeLock(lock, process.pid, alive, false, Date.now(), { freshMs: 12e4 })) return [];
+	try {
+		return await register(given);
+	} finally {
+		await releaseLock(lock, process.pid).catch(() => {});
+	}
+}
+async function register(given) {
+	const h = {
+		...given,
+		node: await fs.realpath(given.node).catch(() => given.node)
+	};
+	const run = h.run ?? exec;
+	const must = async (file, args) => {
+		const r = await run(file, args);
+		if (r.code !== 0) throw new Error(`${path.basename(file)} ${args[0] ?? ""} failed${r.code === null ? " to start" : ` (${r.code})`}`);
+	};
+	if (h.platform === "win32") {
+		if (await scriptHostOff(run)) {
+			const why = "Windows Script Host is turned off on this computer, and without it the runner can't start with no window";
+			const removed = await unregisterLoginItem(h);
+			if (!removed.length) throw new Error(why);
+			return removed.map((change) => `${change}: ${why}`);
+		}
+		const launcher = loginLauncherPath(h.claudeDir);
+		const want = windowsLoginCommand(h.claudeDir);
+		if (regValue((await run("reg", [
+			"query",
+			RUN_KEY,
+			"/v",
+			runValueName(h.claudeDir)
+		])).stdout)?.toLowerCase() === want.toLowerCase() && await works(launcherPaths(await read(launcher)))) return [];
+		await fs.mkdir(path.dirname(launcher), { recursive: true });
+		await fs.writeFile(launcher, hiddenLauncher(h.node, h.script, { args: LOGIN_ARG }));
+		await must("reg", [
+			"add",
+			RUN_KEY,
+			"/v",
+			runValueName(h.claudeDir),
+			"/d",
+			want,
+			"/f"
+		]);
+		return [`set the runner to start at login, through ${launcher}`];
+	}
+	if (h.platform === "darwin") {
+		const file = launchAgentPath(h.home, h.claudeDir);
+		const label = launchAgentLabel(h.claudeDir);
+		if (await works(plistPaths(await read(file)))) return [];
+		await run("launchctl", ["bootout", `gui/${h.uid}/${label}`]);
+		await fs.mkdir(path.dirname(file), { recursive: true });
+		await fs.writeFile(file, launchAgentPlist(label, h.node, h.script));
+		await must("launchctl", [
+			"bootstrap",
+			`gui/${h.uid}`,
+			file
+		]);
+		return [`set the runner to start at login, through ${file}`];
+	}
+	if (h.platform === "linux") {
+		const file = autostartPath(h);
+		if (await works(autostartPaths(await read(file)))) return [];
+		await fs.mkdir(path.dirname(file), { recursive: true });
+		await fs.writeFile(file, autostartEntry(h.node, h.script));
+		return [`set the runner to start at login, through ${file}`];
+	}
+	return [];
+}
+/** Takes this config folder's login item out; says what it changed. */
+async function unregisterLoginItem(h) {
+	const run = h.run ?? exec;
+	const removed = (where) => [`took out the runner's start at login (${where})`];
+	if (h.platform === "win32") {
+		const name = runValueName(h.claudeDir);
+		const had = (await run("reg", [
+			"query",
+			RUN_KEY,
+			"/v",
+			name
+		])).code === 0;
+		if (had) await run("reg", [
+			"delete",
+			RUN_KEY,
+			"/v",
+			name,
+			"/f"
+		]);
+		const launcher = loginLauncherPath(h.claudeDir);
+		const hadLauncher = !!await fs.stat(launcher).catch(() => null);
+		await fs.rm(launcher, { force: true });
+		return had || hadLauncher ? removed(`${RUN_KEY}\\${name}`) : [];
+	}
+	if (h.platform === "darwin") {
+		const file = launchAgentPath(h.home, h.claudeDir);
+		if (!await fs.stat(file).catch(() => null)) return [];
+		await fs.rm(file, { force: true });
+		await run("launchctl", ["bootout", `gui/${h.uid}/${launchAgentLabel(h.claudeDir)}`]);
+		return removed(file);
+	}
+	if (h.platform === "linux") {
+		const file = autostartPath(h);
+		if (!await fs.stat(file).catch(() => null)) return [];
+		await fs.rm(file, { force: true });
+		return removed(file);
+	}
+	return [];
+}
 //#endregion
 //#region src/install/install.ts
+const WAKE_EVENTS = ["UserPromptSubmit", "Stop"];
+const TIMEOUT_SECONDS = 10;
+const wakeScriptPath = (claudeDir) => path.join(claudeDir, "isoplan", "wake.mjs");
+/** Where install copies the runner and the defaults it reads, under the plugin's own layout. */
+const runnerAppDir = (claudeDir) => path.join(claudeDir, "isoplan", "runner", "app");
+const RUNNER_FILES = [
+	"config.json",
+	"runner.json",
+	"secret-patterns.json",
+	"prompts/instructions.md",
+	"prompts/question.md",
+	"prompts/brief.md",
+	"prompts/spin-off.md",
+	"dist/connect.js",
+	"dist/runner.js"
+];
+/** The link handler's copy, which the operating system runs for an isoplan:// link. */
+const connectScriptPath = (claudeDir) => path.join(runnerAppDir(claudeDir), copiedAs("dist/connect.js"));
+/** A file's name in the copy: the bundle is an ES module and no package.json beside the copy says so, so it is .mjs, as wake.mjs is. */
+const copiedAs = (file) => file.replace(/\.js$/, ".mjs");
+/** The uninstall's lock, which also holds off a retry once one has failed. */
+const uninstallLockPath = (claudeDir) => path.join(claudeDir, "isoplan", "uninstall.json");
+/** Where an uninstall in the background says what stopped it. */
+const uninstallLogPath = (claudeDir) => path.join(claudeDir, "isoplan", "uninstall.log");
+/**
+* The hook's command. Shell form, quoted, with forward slashes, so Git Bash, PowerShell and sh all
+* read the path the same way.
+*/
+const wakeCommand = (script) => `node "${script.replace(/\\/g, "/")}"`;
+/** The script a hook command runs with node, as `node "<script>"` or `node <script>`; null for any other command. */
+function nodeScriptOf(command) {
+	const m = /^\s*node(?:\.exe)?\s+(?:"([^"]+)"|'([^']+)'|(\S+))\s*$/i.exec(command);
+	return m ? m[1] ?? m[2] ?? m[3] : null;
+}
+const isWakeFor = (claudeDir) => {
+	const script = normalPath(wakeScriptPath(claudeDir));
+	return (hook) => {
+		const command = hook?.command;
+		const runs = typeof command === "string" ? nodeScriptOf(command) : null;
+		return runs !== null && normalPath(runs) === script;
+	};
+};
 /** The data layer wake.json records; null when there is none. */
 async function recordedDataLayer(claudeDir) {
 	try {
@@ -15791,68 +16494,1703 @@ async function recordedState(paths, cwd) {
 	const dataLayer = await recordedDataLayer(paths.claudeDir);
 	return dataLayer ? pluginState(paths, dataLayer, cwd) : "enabled";
 }
+/**
+* Copies `wakeSource` (dist/wake.js) into place, records `dataLayer`, and adds or updates the hooks.
+* With `runnerFrom` (the plugin's folder) it copies the runner too, and records the copy.
+* Returns what it changed, [] when it was all there. Throws when settings.json can't be merged.
+* With `auto` (the plugin's data layer) it does nothing once the hook has been uninstalled, but
+* finish what that uninstall left (a wake.mjs no hook names), or once Claude Code lists the plugin
+* `dataLayer` belongs to as uninstalled: a session that loaded it before then still runs it.
+*
+* A background uninstall that is running is waited for, up to `waitMs`; one still running then
+* leaves the plugin's data layer doing nothing (its next start tries again), and the install
+* script failing. An uninstall that failed, or whose process has gone, leaves its lock and log,
+* which go now, since the plugin is wanted after all.
+*/
+async function installWake(paths, dataLayer, wakeSource, { auto = false, runnerFrom, findClaude, waitMs = INSTALL_WAIT_MS, linkHandler, loginItem } = {}) {
+	const { claudeDir, settings } = paths;
+	if (auto && await isOptedOut(claudeDir)) return finishOptOut(paths);
+	if (auto && await pluginState(paths, dataLayer) === "uninstalled") return [];
+	if (!await waitForUninstall(claudeDir, waitMs)) {
+		if (auto) return [];
+		throw new Error(`an uninstall is running (${uninstallLockPath(claudeDir)}); try again once it is done`);
+	}
+	const isWake = isWakeFor(claudeDir);
+	const current = await readSettings(settings);
+	const script = wakeScriptPath(claudeDir);
+	const hooks = current.hooks ??= {};
+	if (typeof hooks !== "object" || Array.isArray(hooks)) throw new Error(`${settings}: "hooks" isn't an object; left it alone`);
+	const want = {
+		type: "command",
+		command: wakeCommand(script),
+		timeout: TIMEOUT_SECONDS
+	};
+	const done = [];
+	for (const event of WAKE_EVENTS) {
+		const groups = hooks[event] ??= [];
+		if (!Array.isArray(groups)) throw new Error(`${settings}: hooks.${event} isn't a list; left it alone`);
+		let found = false;
+		let changed = false;
+		const kept = groups.filter((group) => {
+			const list = group?.hooks;
+			if (!Array.isArray(list) || !list.some(isWake)) return true;
+			group.hooks = list.flatMap((hook) => {
+				if (!isWake(hook)) return [hook];
+				if (found) {
+					changed = true;
+					return [];
+				}
+				found = true;
+				if (JSON.stringify(hook) !== JSON.stringify(want)) changed = true;
+				return [want];
+			});
+			return group.hooks.length > 0;
+		});
+		if (!found) kept.push({ hooks: [want] });
+		hooks[event] = kept;
+		if (!found) done.push(`added the wake hook to ${settings} on ${event}`);
+		else if (changed) done.push(`updated the wake hook in ${settings} on ${event}`);
+	}
+	const changes = [];
+	let runner;
+	if (runnerFrom) {
+		const app = runnerAppDir(claudeDir);
+		let copied = false;
+		for (const file of RUNNER_FILES) if (await writeIfChanged(path.join(app, copiedAs(file)), await fs.readFile(path.join(runnerFrom, file), "utf8"))) copied = true;
+		runner = path.join(app, copiedAs("dist/runner.js"));
+		if (copied) changes.push(`copied the runner to ${app}`);
+	}
+	const record = runner ? {
+		dataLayer,
+		runner
+	} : { dataLayer };
+	await fs.mkdir(path.dirname(script), { recursive: true });
+	if (await writeIfChanged(script, await fs.readFile(wakeSource, "utf8"))) changes.push(`copied the wake hook to ${script}`);
+	if (await writeIfChanged(wakeRecordPath(claudeDir), JSON.stringify(record, null, 2) + "\n")) changes.push(`recorded the data layer at ${dataLayer}${runner ? ` and the runner at ${runner}` : ""}`);
+	const binary = claudeBinaryPath(claudeDir);
+	const kind = await binaryRecord(binary);
+	if (kind === "broken") changes.push(`kept ${binary}, which doesn't parse: it may have been edited by hand`);
+	const claude = findClaude && (kind === "none" || kind === "auto") ? await findClaude() : null;
+	if (claude && await writeIfChanged(binary, JSON.stringify({
+		path: claude,
+		auto: true
+	}, null, 2) + "\n")) changes.push(`recorded the claude binary at ${claude}`);
+	for (const file of [uninstallLogPath(claudeDir), uninstallLockPath(claudeDir)]) if (await fs.rm(file).then(() => true, () => false)) changes.push(`removed ${file}, left by an uninstall that didn't finish`);
+	if (runnerFrom && linkHandler) changes.push(...await registerLinkHandler({
+		...linkHandler,
+		claudeDir,
+		script: connectScriptPath(claudeDir)
+	}).catch((err) => [`couldn't register isoplan:// links: ${String(err?.message ?? err)}`]));
+	if (runnerFrom && loginItem) {
+		const item = {
+			...loginItem,
+			claudeDir,
+			script
+		};
+		const on = await startsAtLogin(path.join(runnerFrom, "runner.json"), path.join(claudeDir, "isoplan", "runner.json"));
+		changes.push(...await (on ? registerLoginItem(item) : unregisterLoginItem(item)).catch((err) => [`couldn't ${on ? "set the runner to start" : "take out the runner's start"} at login: ${String(err?.message ?? err)}`]));
+	}
+	if (done.length) await writeSettings(settings, current);
+	return [...changes, ...done];
+}
+/** How long an install waits for a running background uninstall. */
+const INSTALL_WAIT_MS = 15e3;
+async function waitForUninstall(claudeDir, waitMs) {
+	const file = uninstallLockPath(claudeDir);
+	for (const until = Date.now() + waitMs;; await new Promise((r) => setTimeout(r, 250))) {
+		const pid = (await readLock(file))?.pid;
+		if (!pid || !alive(pid)) return true;
+		if (Date.now() >= until) return false;
+	}
+}
+async function finishOptOut({ claudeDir, settings }) {
+	const isWake = isWakeFor(claudeDir);
+	const hooks = await readSettings(settings).then((current) => current.hooks, () => void 0);
+	const named = !!hooks && typeof hooks === "object" && Object.values(hooks).some((groups) => Array.isArray(groups) && groups.some((g) => Array.isArray(g?.hooks) && g.hooks.some(isWake)));
+	const changes = [];
+	if (named || !await waitForUninstall(claudeDir, 0)) return changes;
+	for (const file of [
+		wakeScriptPath(claudeDir),
+		uninstallLogPath(claudeDir),
+		uninstallLockPath(claudeDir)
+	]) if (await fs.rm(file).then(() => true, () => false)) changes.push(`removed ${file}, left by an uninstall`);
+	return changes;
+}
+async function binaryRecord(file) {
+	let text;
+	try {
+		text = await fs.readFile(file, "utf8");
+	} catch {
+		return "none";
+	}
+	try {
+		const record = JSON.parse(text);
+		if (record?.auto === true) return "auto";
+		return typeof record?.path === "string" && record.path !== "" ? "hand" : "broken";
+	} catch {
+		return "broken";
+	}
+}
+async function isOptedOut(claudeDir) {
+	try {
+		return JSON.parse(await fs.readFile(wakeRecordPath(claudeDir), "utf8")).disabled === true;
+	} catch {
+		return false;
+	}
+}
+/** The settings as an object; {} when there is no file yet. A leading byte order mark is skipped. Throws when it isn't a JSON object. */
+async function readSettings(file) {
+	let text;
+	try {
+		text = await fs.readFile(file, "utf8");
+	} catch (err) {
+		if (err.code === "ENOENT") return {};
+		throw err;
+	}
+	let value;
+	try {
+		value = JSON.parse(text.replace(/^﻿/, ""));
+	} catch {
+		throw new Error(`${file} isn't valid JSON; left it alone`);
+	}
+	if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(`${file} isn't a JSON object; left it alone`);
+	return value;
+}
+/** Writes the settings whole, as two-space JSON. */
+const writeSettings = (file, settings) => writeWhole(file, JSON.stringify(settings, null, 2) + "\n");
+async function writeIfChanged(file, text) {
+	if (await fs.readFile(file, "utf8").catch(() => null) === text) return false;
+	await writeWhole(file, text);
+	return true;
+}
+async function writeWhole(file, text) {
+	const target = await fs.realpath(file).catch(() => file);
+	const mode = (await fs.stat(target).catch(() => null))?.mode;
+	await fs.mkdir(path.dirname(target), { recursive: true });
+	const temp = `${target}.isoplan-${process.pid}`;
+	try {
+		await fs.writeFile(temp, text);
+		if (mode !== void 0) await fs.chmod(temp, mode & 4095);
+		await fs.rename(temp, target);
+	} catch (err) {
+		await fs.rm(temp, { force: true }).catch(() => {});
+		throw err;
+	}
+}
 //#endregion
-//#region src/runner/reported.ts
-const hiddenStart = (args, cwd) => spawn(process.execPath, args, {
-	cwd,
+//#region src/update/update.ts
+const updateRecordPath = (claudeDir) => path.join(claudeDir, "isoplan", "update.json");
+const updateLockPath = (claudeDir) => path.join(claudeDir, "isoplan", "update.lock");
+/** A check at session start is skipped when one started this recently. */
+const START_GAP_MS = 6e5;
+/** The most each `claude plugin` command may take. */
+const COMMAND_TIMEOUT_MS = 3e5;
+const EXIT_GRACE_MS = 1e3;
+/** The variables that turn updates off, and the one that turns plugin updates back on. */
+const OFF_VARIABLES = [
+	"DISABLE_UPDATES",
+	"DISABLE_AUTOUPDATER",
+	"CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"
+];
+const isSet = (value) => !!value && !/^(0|false|no|off)$/i.test(value.trim());
+/** The variable that turns updates off here; null when none does, or FORCE_AUTOUPDATE_PLUGINS turns them back on. */
+function updatesOffBy(env) {
+	if (isSet(env["FORCE_AUTOUPDATE_PLUGINS"])) return null;
+	return OFF_VARIABLES.find((name) => isSet(env[name])) ?? null;
+}
+/**
+* The environment the commands run with: this one's without the session's own variables (as the
+* runner's fork, claude.ts), and nothing that can prompt (as a handoff's git, handoff/git.ts). The
+* askpass, where the person set none (GIT_ASKPASS, SSH_ASKPASS, core.askPass), is node, which takes
+* git's prompt for a script it can't find and fails, so git gives up at once instead of asking.
+*/
+function commandEnv(env, git = {
+	sshCommand: false,
+	askPass: false
+}, node = process.execPath) {
+	const out = noPromptEnv(forkEnv(env), git.sshCommand);
+	if (!git.askPass && !out.GIT_ASKPASS && !out.SSH_ASKPASS) Object.assign(out, {
+		GIT_ASKPASS: node,
+		SSH_ASKPASS: node,
+		SSH_ASKPASS_REQUIRE: "never"
+	});
+	return out;
+}
+/** What git's config sets for core.sshCommand and core.askPass, as `cwd` sees it; nothing set when git can't say. */
+async function gitChoices(cwd, env = process.env) {
+	const set = async (key) => {
+		const r = await runHidden([
+			"git",
+			"config",
+			"--get",
+			key
+		], cwd, {
+			env: noPromptEnv(forkEnv(env), true),
+			timeoutMs: 15e3
+		});
+		return r.code === 0 && r.output.trim() !== "";
+	};
+	return {
+		sshCommand: await set("core.sshCommand"),
+		askPass: await set("core.askPass")
+	};
+}
+/**
+* Runs a command by argv, with no shell and no window, and keeps the end of what it printed. It is
+* done when the command exits: what it printed by then, and within EXIT_GRACE_MS, is kept, and its
+* pipes are let go even if a process it left behind holds them. Past `timeoutMs` it is stopped with
+* everything it started (on Windows taskkill /T; elsewhere its process group, which it leads).
+*/
+function runHidden(argv, cwd, { env = commandEnv(process.env), timeoutMs = COMMAND_TIMEOUT_MS } = {}) {
+	return new Promise((resolve) => {
+		let output = "";
+		let timedOut = false;
+		const keep = (piece) => output = (output + piece).slice(-8e3);
+		const child = spawn(argv[0], argv.slice(1), {
+			cwd,
+			env,
+			stdio: [
+				"pipe",
+				"pipe",
+				"pipe"
+			],
+			windowsHide: true,
+			detached: process.platform !== "win32"
+		});
+		child.stdin.end();
+		child.stdout.setEncoding("utf8").on("data", keep);
+		child.stderr.setEncoding("utf8").on("data", keep);
+		const timer = setTimeout(() => {
+			timedOut = true;
+			killTree(child);
+		}, timeoutMs);
+		let ended = null;
+		const done = () => {
+			child.stdout.destroy();
+			child.stderr.destroy();
+			resolve({
+				...ended,
+				output
+			});
+		};
+		child.on("error", (err) => {
+			clearTimeout(timer);
+			resolve({
+				code: null,
+				output,
+				error: `couldn't start ${argv[0]}: ${err.message}`
+			});
+		});
+		child.on("exit", (code) => {
+			clearTimeout(timer);
+			ended = timedOut ? {
+				code: null,
+				output,
+				error: `didn't finish within ${Math.round(timeoutMs / 1e3)} s, so it was stopped`
+			} : {
+				code,
+				output
+			};
+			const grace = setTimeout(done, EXIT_GRACE_MS);
+			child.on("close", () => (clearTimeout(grace), done()));
+		});
+	});
+}
+/** Turns on Claude Code's auto-update for `marketplace` in `settings` (see above); what it changed, or null. */
+async function turnOnAutoUpdate(settings, marketplace) {
+	const current = await readSettings(settings);
+	const known = current.extraKnownMarketplaces;
+	const entry = isObject(known) ? known[marketplace] : void 0;
+	if (!isObject(entry) || !isObject(entry.source) || "autoUpdate" in entry) return null;
+	entry.autoUpdate = true;
+	await writeSettings(settings, current);
+	return `turned on Claude Code's auto-update for the ${marketplace} marketplace in ${settings}`;
+}
+/**
+* The `claude plugin update` runs for the plugin `id`: one per install recorded (scope and project
+* folder), each with its scope; one with no scope, in `cwd`, when the record can't be read.
+*/
+function updateRuns(list, id, cwd) {
+	const mine = (list ?? []).filter((i) => i.id === id);
+	if (!list || !mine.length) return [{
+		args: [
+			"plugin",
+			"update",
+			id
+		],
+		cwd
+	}];
+	const runs = /* @__PURE__ */ new Map();
+	for (const install of mine) {
+		const inProject = (install.scope === "project" || install.scope === "local") && install.projectPath;
+		const at = inProject ? install.projectPath : cwd;
+		const key = `${install.scope}|${inProject ? install.projectPath : ""}`;
+		if (!runs.has(key)) runs.set(key, {
+			args: [
+				"plugin",
+				"update",
+				id,
+				...install.scope ? ["--scope", install.scope] : []
+			],
+			cwd: at
+		});
+	}
+	return [...runs.values()];
+}
+/** One check (see above), unless another is running or one started within `gapMs`. */
+async function checkForUpdate({ claudeDir, settings, plugins, id, cwd, claude, env = commandEnv(process.env), gapMs, run = (argv, at, e) => runHidden(argv, at, { env: e }), now = Date.now, isAlive = alive }) {
+	const lock = updateLockPath(claudeDir);
+	if (!await takeLock(lock, process.pid, isAlive, false, now(), { freshMs: 3e6 })) return {
+		ran: false,
+		said: []
+	};
+	try {
+		const recordFile = updateRecordPath(claudeDir);
+		const record = await fs.readFile(recordFile, "utf8").then((text) => JSON.parse(text), () => ({}));
+		if (typeof record.checkedAt === "number" && now() - record.checkedAt < gapMs) return {
+			ran: false,
+			said: []
+		};
+		const marketplace = id.slice(id.lastIndexOf("@") + 1);
+		const write = () => fs.writeFile(recordFile, JSON.stringify(record) + "\n");
+		record.checkedAt = now();
+		await write();
+		const said = [];
+		const turnedOn = await turnOnAutoUpdate(settings, marketplace).catch((err) => `couldn't turn on Claude Code's auto-update for ${marketplace}: ${err.message}`);
+		if (turnedOn) said.push(turnedOn);
+		if (turnedOn?.startsWith("turned on")) {
+			const entry = (await readSettings(settings)).extraKnownMarketplaces[marketplace];
+			record.autoUpdateOn = {
+				marketplace,
+				entry: JSON.stringify(entry),
+				at: now()
+			};
+			await write();
+		}
+		const say = async (args, at) => {
+			const r = await run([...claude, ...args], at, env);
+			const failed = r.error ?? (r.code === null ? "didn't finish" : r.code !== 0 ? `failed with exit code ${r.code}` : null);
+			said.push(`claude ${args.join(" ")}: ${[failed, lastLine(r.output)].filter(Boolean).join(": ")}`);
+			return !failed;
+		};
+		if (!await say([
+			"plugin",
+			"marketplace",
+			"update",
+			marketplace
+		], cwd)) return {
+			ran: true,
+			said
+		};
+		for (const step of updateRuns(await installs(plugins), id, cwd)) if (await fs.stat(step.cwd).then((s) => s.isDirectory(), () => false)) await say(step.args, step.cwd);
+		else said.push(`claude ${step.args.join(" ")}: skipped, its project folder ${step.cwd} isn't there`);
+		return {
+			ran: true,
+			said
+		};
+	} finally {
+		await releaseLock(lock, process.pid).catch(() => {});
+	}
+}
+const lastLine = (output) => output.replace(/\u001b\[[0-9;]*[A-Za-z]/g, "").split(/\r?\n/).map((l) => l.trim()).filter(Boolean).at(-1) ?? "";
+const isObject = (value) => !!value && typeof value === "object" && !Array.isArray(value);
+//#endregion
+//#region src/data-layer/detached.ts
+const LINK_DOWN_MS = 3e5;
+/**
+* Why the runner should stop reporting a session now, or null to go on. A quiet session is still reported
+* once: the quiet rule waits for the link to connect, which sends the facts in full.
+*/
+function detachedStop({ now, lastActive, idleMinutes, downSince }) {
+	if (downSince === null && now - Date.parse(lastActive) > idleMinutes * 6e4) return `the session has been quiet more than ${idleMinutes} minutes`;
+	if (downSince !== null && now - downSince >= 3e5) return `the office server has been out of reach for ${LINK_DOWN_MS / 6e4} minutes`;
+	return null;
+}
+//#endregion
+//#region src/data-layer/owner-answers.ts
+const TAKEN_WAIT_MS$1 = 1e4;
+const POLL_MS$1 = 100;
+const LATE_MS = 6e4;
+/** What a withheld question says in place of its text. */
+const WITHHELD_QUESTION = "Held for its owner to check: the secret check found what may be a secret in this question, so it is answered in the terminal.";
+/**
+* The facts with their questions as they are sent: each one the scan matches, or every one while
+* `patterns` is null, as a placeholder marked `withheld`; each other one `answerable` while `waiting`
+* holds its id, unless the source left part of it out.
+*/
+function prepareQuestions(facts, patterns, waiting, log) {
+	if (!facts.questions?.length) return facts;
+	const questions = facts.questions.map((q) => {
+		const matched = scan(q.questions.flatMap((x) => [
+			x.question,
+			x.header,
+			...x.options.flatMap((o) => [o.label, o.description])
+		]).join("\n"), patterns);
+		if (matched) {
+			log(`withheld the question ${q.id} of ${q.agent}: ${patterns ? `it matches the secret pattern "${matched}"` : "the secret patterns couldn't be read"}; it is answered in the terminal`);
+			return {
+				id: q.id,
+				agent: q.agent,
+				at: q.at,
+				questions: [{
+					question: WITHHELD_QUESTION,
+					header: "",
+					options: [],
+					multiSelect: false
+				}],
+				withheld: true
+			};
+		}
+		return waiting.has(q.id) && !q.extra?.incomplete ? {
+			...q,
+			answerable: true
+		} : q;
+	});
+	return {
+		...facts,
+		questions
+	};
+}
+/**
+* A reply only once the hooks module says the answer ended the question's call; a refusal saying why
+* not otherwise. With no word from it in `waitMs`, a question that has closed since gets a `closed`
+* reply, which says only that it has an answer, the floor's or the terminal's.
+*/
+async function relayOwnerAnswer(request, { detached, facts, file, emit, take, sleep = wait$1, waitMs = TAKEN_WAIT_MS$1 }) {
+	const refuse = (detail, gaveUp = false) => ({
+		message: {
+			type: "refusal",
+			v: 1,
+			id: request.id,
+			reason: "unavailable",
+			detail
+		},
+		gaveUp
+	});
+	const open = () => facts()?.questions?.find((q) => q.id === request.question);
+	if (detached) return refuse("This session is seen only through Isoplan's wake hook, so its question can only be answered in its terminal.");
+	const question = open();
+	if (!question) return refuse("The question isn't waiting for an answer any more: it was answered in the terminal, or the agent moved on.");
+	if (!question.answerable) return refuse("Isoplan's plugin isn't waiting for this question in its session, so answer it in its terminal.");
+	emit({
+		type: "owner-answer",
+		question: request.question,
+		answers: request.answers,
+		file
+	});
+	for (let waited = 0; waited < waitMs; waited += POLL_MS$1) {
+		await sleep(POLL_MS$1);
+		const taken = await takenFrom(take, file, request.question);
+		if (taken === null) continue;
+		if (taken) return {
+			message: {
+				type: "reply",
+				v: 1,
+				id: request.id,
+				kind: "owner-answer"
+			},
+			gaveUp: false
+		};
+		return refuse("The question was answered in the terminal first.");
+	}
+	if (!open()) return {
+		message: {
+			type: "reply",
+			v: 1,
+			id: request.id,
+			kind: "owner-answer",
+			closed: true
+		},
+		gaveUp: true
+	};
+	return refuse("Claude Code didn't take the answer in time: answer it in the terminal.", true);
+}
+/**
+* After a request gave up: whether the hooks module still says, within `ms`, that it took the answer
+* (true), that it didn't (false), or nothing at all (null).
+*/
+async function lateTake(question, file, take, { sleep = wait$1, ms = LATE_MS } = {}) {
+	for (let waited = 0; waited < ms; waited += POLL_MS$1) {
+		await sleep(POLL_MS$1);
+		const taken = await takenFrom(take, file, question);
+		if (taken !== null) return taken;
+	}
+	return null;
+}
+async function takenFrom(take, file, question) {
+	const text = await take(file);
+	if (text === null) return null;
+	let taken = {};
+	try {
+		taken = JSON.parse(text);
+	} catch {}
+	return taken.question === question ? taken.taken === true : null;
+}
+const wait$1 = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+//#endregion
+//#region src/data-layer/owner-messages.ts
+const TAKEN_WAIT_MS = 1e4;
+const POLL_MS = 100;
+/** What the floor is told for each refusal. */
+const REFUSED = {
+	"not-owner": "Only the session's owner can send it messages.",
+	detached: "This session runs without Isoplan's plugin loaded, so it can't take messages from the floor. Type the message in its terminal.",
+	"no-submit": "This session's version of Claude Code can't take messages from Isoplan. Update Claude Code, or type the message in its terminal.",
+	ended: "This session has ended, or carried on as a new one, so the message wasn't sent.",
+	dropped: "Claude Code didn't let the message in. Type it in the session's terminal.",
+	"no-answer": "The session didn't say whether it took the message, and it may have closed. Check its terminal before sending it again."
+};
+/** A reply once the hooks module says the message went in; a refusal saying why not otherwise. */
+async function relayOwnerMessage(request, { detached, takes, owner, session, file, emit, take, sleep = wait, waitMs = TAKEN_WAIT_MS }) {
+	const refuse = (code) => ({
+		type: "refusal",
+		v: 1,
+		id: request.id,
+		reason: "unavailable",
+		detail: REFUSED[code],
+		code
+	});
+	if (request.from.id !== owner) return refuse("not-owner");
+	if (detached) return refuse("detached");
+	if (!takes) return refuse("no-submit");
+	emit({
+		type: "owner-message",
+		session,
+		text: request.text,
+		file
+	});
+	for (let waited = 0; waited < waitMs; waited += POLL_MS) {
+		await sleep(POLL_MS);
+		const taken = parse(await take(file));
+		if (!taken) continue;
+		if (taken.taken) return {
+			type: "reply",
+			v: 1,
+			id: request.id,
+			kind: "owner-message",
+			...taken.queued ? { queued: true } : {}
+		};
+		return refuse(taken.reason);
+	}
+	return refuse("no-answer");
+}
+function parse(text) {
+	if (text === null) return null;
+	let said;
+	try {
+		said = JSON.parse(text);
+	} catch {
+		return null;
+	}
+	if (said?.taken === true) return said.queued === true ? {
+		taken: true,
+		queued: true
+	} : { taken: true };
+	if (said?.taken === false && (said.reason === "no-submit" || said.reason === "ended" || said.reason === "dropped")) return {
+		taken: false,
+		reason: said.reason
+	};
+	return null;
+}
+const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+//#endregion
+//#region src/data-layer/reports.ts
+/** Where the reports released on one office's floor are kept for `session`; the server a version before #105 reports to keeps the old place. */
+const releasedPath = (claudeDir, office, session) => path.join(office.legacy ? path.join(claudeDir, "isoplan") : officeDir(claudeDir, office.server), "released", `${session}.json`);
+/** What a withheld report says in place of its text. */
+const WITHHELD_TEXT = "Held for its owner to check: the secret check found what may be a secret in this report.";
+const hash = (agent, text) => createHash("sha256").update(`${agent}
+${text}`).digest("hex");
+async function openReportHold(file, log) {
+	const released = new Set(await readReleased(file));
+	let held = /* @__PURE__ */ new Map();
+	let ids = /* @__PURE__ */ new Map();
+	const told = /* @__PURE__ */ new Set();
+	return {
+		apply(facts, patterns) {
+			held = /* @__PURE__ */ new Map();
+			const kept = /* @__PURE__ */ new Map();
+			const reports = facts.reports.map((report) => {
+				const h = hash(report.agent, report.text);
+				if (released.has(h)) return report;
+				const matched = patterns ? scan(report.text, patterns) : null;
+				if (patterns && !matched) return report;
+				const id = ids.get(h) ?? kept.get(h) ?? randomUUID();
+				kept.set(h, id);
+				held.set(id, {
+					agent: report.agent,
+					hash: h
+				});
+				if (!told.has(h)) {
+					told.add(h);
+					log(`withheld the report of ${report.agent}: ${matched ? `it matches the secret pattern "${matched}"` : "the secret patterns couldn't be read"}; its owner can release it from the floor`);
+				}
+				return {
+					agent: report.agent,
+					at: report.at,
+					text: WITHHELD_TEXT,
+					withheld: { id }
+				};
+			});
+			ids = kept;
+			return held.size ? {
+				...facts,
+				reports
+			} : facts;
+		},
+		async release(id) {
+			const report = held.get(id);
+			if (!report) {
+				log(`the office server released the report held as ${id}, but none is held under that id here; it may have been replaced by a newer report, or the data layer restarted`);
+				return false;
+			}
+			const { agent } = report;
+			held.delete(id);
+			released.add(report.hash);
+			log(`the report of ${agent} was released, so it is sent`);
+			await fs.mkdir(path.dirname(file), { recursive: true }).then(() => fs.writeFile(file, JSON.stringify({ released: [...released] }) + "\n")).catch((err) => log(`couldn't save the release of ${agent}'s report, so it is withheld again after a restart: ${err.message}`));
+			return true;
+		}
+	};
+}
+async function readReleased(file) {
+	try {
+		const list = JSON.parse(await fs.readFile(file, "utf8")).released;
+		return Array.isArray(list) ? list.filter((h) => typeof h === "string") : [];
+	} catch {
+		return [];
+	}
+}
+//#endregion
+//#region src/data-layer/titles.ts
+const ASK_EVERY_MS = 6e5;
+const MAX_FILES = 15;
+const MAX_TASKS = 10;
+const MAX_TITLE = 60;
+const TITLE_SYSTEM = "You name coding sessions for a floor plan of a team's work. From the facts given, write a title of 3 to 6 words saying what the session is working on. Reply with the title alone: no quotes and no full stop.";
+/** What the session's title is written from, each list sorted. */
+function titleInputs(facts) {
+	const subs = facts.agents.filter((a) => a.startedBy !== null);
+	const files = /* @__PURE__ */ new Map();
+	for (const e of facts.edits) {
+		const hit = files.get(e.file.toLowerCase());
+		if (!hit) files.set(e.file.toLowerCase(), {
+			file: e.file,
+			at: e.at
+		});
+		else if (e.at > hit.at) hit.at = e.at;
+	}
+	const tasks = subs.filter((a) => a.task).sort((a, b) => cmp(b.lastActive, a.lastActive));
+	return {
+		branch: facts.session.branch,
+		files: [...files.values()].sort((a, b) => cmp(b.at, a.at)).slice(0, MAX_FILES).map((f) => f.file).sort(),
+		types: [...new Set(subs.map((a) => a.agentType).filter((t) => !!t))].sort(),
+		tasks: [...new Set(tasks.map((a) => a.task))].slice(0, MAX_TASKS).sort()
+	};
+}
+/** The cache key for the inputs: a new call goes out only when this changes. */
+const titleKey = (inputs) => JSON.stringify(inputs);
+/** The prompt for the inputs. */
+function titlePrompt({ branch, files, types, tasks }) {
+	const out = [`Branch: ${branch || "(none)"}`];
+	if (files.length) out.push("Files edited:", ...files.map((f) => "- " + f));
+	if (types.length) out.push(`Agent types: ${types.join(", ")}`);
+	if (tasks.length) out.push("Subagent tasks:", ...tasks.map((t) => "- " + t));
+	return out.join("\n");
+}
+/** The title from a reply's text: its first line, unquoted, clipped; null when nothing is left. */
+function cleanTitle(reply) {
+	const title = (reply.split(/\r?\n/).map((l) => l.trim()).find(Boolean) || "").replace(/^["'`*]+|["'`*.]+$/g, "").trim();
+	if (!title) return null;
+	return title.length <= MAX_TITLE ? title : title.slice(0, 59).trimEnd() + "…";
+}
+/**
+* The title call due now, or null: when the session is titled by its branch, its inputs changed
+* since its last written title, and its last ask was at least ASK_EVERY_MS ago.
+*/
+function nextTitle(facts, cache, now) {
+	if (facts.session.titleFrom !== "branch") return null;
+	const inputs = titleInputs(facts);
+	if (!inputs.branch && !inputs.files.length && !inputs.tasks.length) return null;
+	const key = titleKey(inputs);
+	if (cache && (cache.key === key || now - cache.at < ASK_EVERY_MS)) return null;
+	return {
+		key,
+		prompt: titlePrompt(inputs)
+	};
+}
+const cmp = (a, b) => a < b ? -1 : a > b ? 1 : 0;
+//#endregion
+//#region src/data-layer/report-session.ts
+const LOG_CAP_BYTES$1 = 65536;
+const DORMANT_MS = 3e4;
+const LOCK_FRESH_MS = 3 * DORMANT_MS;
+/** The same for a holder whose passes `streamSeconds` makes slower: a pass may wait that long, and a slow office's list as long again. */
+const lockFreshMs = (config) => Math.max(LOCK_FRESH_MS, 6 * config.streamSeconds * 1e3);
+/** Reports the session until it should end. */
+async function reportSession(o) {
+	const { sessionId, cwd, closed } = o;
+	const inRunner = o.by === "runner";
+	const takesMessages = !inRunner && !!o.takesMessages;
+	const here = path.join(o.appDir, "dist");
+	const defaultsPath = path.join(o.appDir, "config.json");
+	const { dir: claudeDir, json: claudeJson } = claudePaths(process.env, os.homedir());
+	const lock = lockPath(claudeDir, sessionId);
+	const userConfigPath = path.join(claudeDir, "isoplan", "config.json");
+	const titlesDir = path.join(claudeDir, "isoplan", "titles");
+	const titleFile = path.join(titlesDir, `${sessionId}.json`);
+	const answersDir = path.join(claudeDir, "isoplan", "answers", sessionId);
+	const messagesDir = path.join(claudeDir, "isoplan", "messages", sessionId);
+	const waitsDir = path.join(claudeDir, "isoplan", "waits", sessionId);
+	const windowFile = path.join(claudeDir, "isoplan", "windows", `${sessionId}.json`);
+	const modPatterns = path.join(o.appDir, "secret-patterns.json");
+	const ownerPatterns = path.join(claudeDir, "isoplan", "secret-patterns.json");
+	const machine = os.hostname();
+	const io = nodeIo();
+	const git = createGit(io);
+	const projects = /* @__PURE__ */ new Map();
+	const names = askingRemoteNames(claudeDir);
+	const source = createClaudeCode({
+		...io,
+		claudeDir,
+		home: os.homedir()
+	});
+	let downSince = Date.now();
+	const emit = o.emit;
+	const wait = (ms) => {
+		let timer;
+		const timeUp = new Promise((resolve) => timer = setTimeout(() => resolve(o.goOn?.() ?? true), ms));
+		return Promise.race([timeUp, closed.then(() => false)]).finally(() => clearTimeout(timer));
+	};
+	let why = "it was stopped";
+	const stopping = (reason) => {
+		why = reason;
+		emit({
+			type: "log",
+			text: `stopping: ${reason}`
+		});
+		return false;
+	};
+	const end = (reason) => (stopping(reason), { why });
+	const place = {
+		claudeDir,
+		plugins: pluginsDir(claudeDir, process.env),
+		managed: managedDir(process.platform),
+		pluginDirs: pluginDirsOf(process.env)
+	};
+	const project = o.project ?? cwd;
+	const self = path.join(here, "data-layer.js");
+	const isOff = o.isOff ?? (async () => await pluginState(place, self, project).catch(() => "enabled") !== "enabled");
+	if (await isOff()) return end("Claude Code lists the Isoplan plugin as uninstalled or disabled here, so this session isn't reported");
+	const since = o.since ?? Date.now();
+	const lockExtra = inRunner ? {
+		detached: true,
+		runner: true,
+		cwd
+	} : {
+		dataLayer: self,
+		detached: false,
+		since,
+		parent: process.ppid,
+		cwd
+	};
+	const newest = () => newestDataLayer(place.plugins, self, project).catch(() => self);
+	const isOutdated = async () => !inRunner && await newest() !== self;
+	let outdated = await isOutdated();
+	const supersededBy = async () => {
+		const held = await readLock(lock);
+		if (!held?.pid || held.pid === process.pid || !alive(held.pid) || Date.now() - held.mtimeMs >= 9e4) return null;
+		const { dataLayer: other, detached: otherDetached, since: otherSince, parent } = held.extra;
+		if (otherDetached !== false || typeof other !== "string") return null;
+		if (normalPath(other) === normalPath(self)) return typeof otherSince === "number" && otherSince > since && typeof parent === "number" && alive(parent) ? "window" : null;
+		const current = await newest();
+		outdated = current !== self;
+		return outdated && normalPath(current) === normalPath(other) ? "newer" : null;
+	};
+	const leave = (reason) => {
+		stopping(reason === "newer" ? "the newer version's data layer that a reload started reports this session now" : "the session's newer window reports it now");
+		emit({
+			type: "superseded",
+			reason
+		});
+	};
+	if (!inRunner) {
+		const reason = await supersededBy();
+		if (reason) {
+			leave(reason);
+			return { why };
+		}
+	}
+	const notWantedBefore = inRunner ? o.notWanted ?? {} : {};
+	let config = await loadConfig(io, defaultsPath, userConfigPath);
+	try {
+		if (inRunner && (await readLock(lock))?.pid === null) await fs.rm(lock, { force: true });
+		if (!await takeLock(lock, process.pid, alive, !inRunner, Date.now(), {
+			extra: lockExtra,
+			...inRunner && { freshMs: lockFreshMs(config) }
+		})) return end("another data layer already reports this session");
+	} catch (err) {
+		if (inRunner) return end(`couldn't take the session lock: ${String(err?.message ?? err)}`);
+		emit({
+			type: "log",
+			text: `couldn't take the session lock, so going on without it: ${String(err?.message ?? err)}`
+		});
+	}
+	const paths = {
+		...place,
+		settings: path.join(claudeDir, "settings.json")
+	};
+	const installing = inRunner || outdated ? Promise.resolve() : startMachine({
+		place,
+		here,
+		spawn: spawnHidden,
+		log: (text) => emit({
+			type: "log",
+			text
+		}),
+		...systemPlaces()
+	}).installed;
+	if (outdated) emit({ type: "updated" });
+	const pluginId = pluginIdOf(place.plugins, self);
+	let checking = false;
+	let checkedAt = Date.now();
+	const checkUpdate = (gapMs) => {
+		if (inRunner || !pluginId || outdated || checking || !config.updateCheckHours) return;
+		checkedAt = Date.now();
+		const off = updatesOffBy(process.env);
+		if (off) return emit({
+			type: "log",
+			text: `not checking for a newer version of the plugin: ${off} is set (FORCE_AUTOUPDATE_PLUGINS=1 turns plugin updates back on)`
+		});
+		checking = true;
+		(async () => {
+			if (await pluginState(place, self).catch(() => "enabled") !== "enabled") return emit({
+				type: "log",
+				text: "not checking for a newer version of the plugin: it is disabled for this machine"
+			});
+			const binary = await claudeBinary(claudeDir, process.env, process.platform, os.homedir());
+			if (!binary) return emit({
+				type: "log",
+				text: "couldn't find the claude binary, so the plugin can't update itself"
+			});
+			const checked = await checkForUpdate({
+				claudeDir,
+				settings: paths.settings,
+				plugins: place.plugins,
+				id: pluginId,
+				cwd: project,
+				claude: claudeCommand(binary),
+				env: commandEnv(process.env, await gitChoices(project)),
+				gapMs
+			});
+			for (const text of checked.said) emit({
+				type: "log",
+				text: `update check: ${text}`
+			});
+		})().catch((err) => emit({
+			type: "log",
+			text: `couldn't check for a newer version of the plugin: ${String(err?.message ?? err)}`
+		})).finally(() => checking = false);
+	};
+	installing.then(() => checkUpdate(START_GAP_MS));
+	const offices = officesOf(config);
+	for (const { server } of offices.filter((o) => o.plainRefused)) emit({
+		type: "log",
+		text: `not reporting to ${server}: it is plain ws:// to another machine; use wss://, or set "allowPlainWs": true in config.json`
+	});
+	if (!inRunner) {
+		for (const dir of [
+			answersDir,
+			waitsDir,
+			messagesDir
+		]) await fs.rm(dir, {
+			recursive: true,
+			force: true
+		}).catch(() => {});
+		if (await fs.mkdir(waitsDir, { recursive: true }).then(() => true, () => false)) emit({
+			type: "waits",
+			dir: waitsDir
+		});
+		await fs.mkdir(messagesDir, { recursive: true }).catch(() => {});
+		await fs.rm(windowFile, { force: true }).catch(() => {});
+		if (await fs.mkdir(path.dirname(windowFile), { recursive: true }).then(() => true, () => false)) emit({
+			type: "window",
+			file: windowFile
+		});
+	}
+	const machineAccount = await accountOf({
+		readText: (p) => fs.readFile(p, "utf8").catch(() => null),
+		run: io.run
+	}, claudeJson, os.homedir());
+	let candidates = null;
+	let candidatesAt = -Infinity;
+	let dormant = null;
+	let notApproved = null;
+	let factsSession = "";
+	let reported = "";
+	let title = null;
+	let asked = null;
+	let isPlaceless = false;
+	let passes = 0;
+	let shown = null;
+	let waiting = /* @__PURE__ */ new Set();
+	const said = /* @__PURE__ */ new Set();
+	const patternLog = (text) => {
+		if (!said.has(text)) emit({
+			type: "log",
+			text
+		});
+		said.add(text);
+	};
+	const outgoing = (run, facts, patterns) => prepareWorkflows(prepareQuestions(run.hold.apply(facts, patterns), patterns, waiting, patternLog), patterns, patternLog);
+	let checkouts = {};
+	let answered = (_id) => false;
+	let contextWindow = null;
+	const account = await accountOf({
+		readText: (p) => fs.readFile(p, "utf8").catch(() => null),
+		run: io.run
+	}, claudeJson, cwd);
+	const openLink = (run, home, mayConnect) => createLink({
+		url: run.office.server,
+		emit: run.emit,
+		pairing: run.pairing,
+		admit: mayConnect,
+		onNotWanted: () => {
+			run.unwanted = inRunner;
+			run.gate.notWanted();
+		},
+		filter: (f, projects) => forOffice(candidates?.workspace ? inRepos(f) : f, projects, checkouts),
+		answered: (id) => answered(id),
+		onMessage: (message) => {
+			if (message.type === "request" && message.kind === "owner-answer") {
+				const file = path.join(answersDir, `${randomUUID()}.json`);
+				fs.mkdir(answersDir, { recursive: true }).then(async () => {
+					const relayed = await relayOwnerAnswer(message, {
+						detached: inRunner,
+						facts: () => run.sent,
+						file,
+						emit,
+						take: takeFile
+					});
+					run.gate.current()?.send(relayed.message);
+					if (!relayed.gaveUp) return;
+					const late = await lateTake(message.question, file, takeFile);
+					if (late === null) return;
+					emit({
+						type: "log",
+						text: `the hooks module said late that it ${late ? "took" : "didn't take"} the owner's answer to ${message.question}`
+					});
+					if (late) run.gate.current()?.send({
+						type: "reply",
+						v: 1,
+						id: message.id,
+						kind: "owner-answer",
+						late: true
+					});
+				}).finally(() => fs.rm(file, { force: true }).catch(() => {})).catch((err) => emit({
+					type: "log",
+					text: `couldn't pass the owner's answer on: ${String(err?.message ?? err)}`
+				}));
+				return;
+			}
+			if (message.type === "request" && message.kind === "owner-message") {
+				const file = path.join(messagesDir, `${randomUUID()}.json`);
+				relayOwnerMessage(message, {
+					detached: inRunner,
+					takes: takesMessages,
+					owner: account.id,
+					session: sessionId,
+					file,
+					emit,
+					take: takeFile
+				}).then((answer) => run.gate.current()?.send(answer)).finally(() => fs.rm(file, { force: true }).catch(() => {})).catch((err) => emit({
+					type: "log",
+					text: `couldn't pass the owner's message on: ${String(err?.message ?? err)}`
+				}));
+				return;
+			}
+			if (message.type !== "release") return emit({
+				type: "log",
+				text: `the office server sent a ${message.type} message, which this data layer doesn't handle yet`
+			});
+			run.hold.release(message.id).then((released) => {
+				if (released && shown) run.gate.current()?.update(run.sent = outgoing(run, ...shown));
+			});
+		},
+		hello: {
+			type: "hello",
+			v: 1,
+			source: "claude-code",
+			account,
+			machine: { name: machine },
+			session: factsSession,
+			project: home
+		}
+	});
+	const runs = await Promise.all(offices.filter((o) => !o.plainRefused).map(async (office) => {
+		const { server, label } = office;
+		const until = notWantedBefore[server];
+		const held = typeof until === "number" && until > Date.now();
+		const run = {
+			office,
+			known: held,
+			dormant: null,
+			homing: null,
+			result: null,
+			connected: false,
+			unwanted: held,
+			unwantedUntil: held ? until : null,
+			sent: null
+		};
+		run.hold = await openReportHold(releasedPath(claudeDir, office, sessionId), (text) => emit({
+			type: "log",
+			text: `${text} (for ${server})`
+		}));
+		run.emit = (line) => {
+			if (line.type === "status") {
+				run.connected = line.state === "connected";
+				downSince = runs.some((r) => r.connected) ? null : downSince ?? Date.now();
+				if (line.state === "disconnected") run.approved.refresh(true);
+			}
+			emit(line.type === "status" || line.type === "pair" ? {
+				...line,
+				label
+			} : line.type === "asked" || line.type === "ask-rights" ? {
+				...line,
+				server
+			} : line);
+		};
+		const shared = o.shared?.(office);
+		if (shared) {
+			run.pairing = {
+				...shared.pairing,
+				close: async () => {}
+			};
+			run.approved = shared.approved;
+		} else {
+			run.pairing = createPairing({
+				file: pairingPath(claudeDir),
+				lock: pairingLockPath(claudeDir, office),
+				writeLock: pairingWriteLockPath(claudeDir),
+				server,
+				account: machineAccount,
+				machine,
+				emit: run.emit,
+				allowPlainWs: config.allowPlainWs,
+				legacy: !!office.legacy
+			});
+			run.approved = createApproved({
+				server,
+				file: approvedPath(claudeDir, server),
+				pairing: run.pairing,
+				refreshMs: config.approvedRefreshMinutes * 6e4,
+				maxAgeMs: config.approvedMaxAgeMinutes * 6e4,
+				log: (text) => emit({
+					type: "log",
+					text
+				})
+			});
+		}
+		run.gate = createSessionGate({
+			approved: run.approved,
+			open: (home, mayConnect) => openLink(run, home, mayConnect)
+		});
+		return run;
+	}));
+	const links = () => runs.flatMap((run) => run.gate.current() ?? []);
+	const isUnwanted = () => runs.some((r) => r.unwanted) && runs.every((r) => r.unwanted || r.dormant === "not-approved");
+	const check = (run, projects, workspace) => run.homing ??= run.gate.home(projects).then((gated) => void (run.result = {
+		dormancy: gated.dormancy,
+		projects,
+		workspace
+	})).catch((err) => emit({
+		type: "log",
+		text: `couldn't check which repos ${run.office.server} takes: ${String(err?.message ?? err)}`
+	})).finally(() => run.homing = null);
+	const apply = (run) => {
+		if (!run.result) return;
+		const { dormancy, projects, workspace } = run.result;
+		run.result = null;
+		const { server, label } = run.office;
+		if (dormancy !== run.dormant || !run.known) {
+			run.emit({
+				type: "status",
+				server,
+				label,
+				state: dormancy ?? "waiting",
+				...workspace && dormancy && { workspace: true }
+			});
+			const what = workspace ? "none of the repos in this folder is" : `${projects[0]?.id ?? cwd} isn't`;
+			if (dormancy === "not-approved") emit({
+				type: "log",
+				text: `${what} one the office at ${server} takes, so nothing of this session is sent to it`
+			});
+			if (dormancy === "no-list") emit({
+				type: "log",
+				text: `can't tell which repos ${server} takes (no list, or one older than ${config.approvedMaxAgeMinutes} minutes), so nothing of this session is sent to it`
+			});
+		}
+		run.dormant = dormancy;
+		run.known = true;
+	};
+	const isHeldOff = (run, now) => {
+		if (run.unwantedUntil !== null && run.unwantedUntil <= now) {
+			run.unwanted = false;
+			run.unwantedUntil = null;
+		}
+		return run.unwantedUntil !== null;
+	};
+	const insecureSaid = /* @__PURE__ */ new Map();
+	const sayInsecure = async (projects) => {
+		for (const { server, label } of offices.filter((o) => o.plainRefused)) {
+			const repos = await cachedRepos(approvedPath(claudeDir, server), server, config.approvedMaxAgeMinutes * 6e4);
+			const state = !repos ? "unchecked" : projects.some((p) => repos.has(p.id.toLowerCase())) ? "insecure" : "not-approved";
+			if (insecureSaid.get(server) === state) continue;
+			insecureSaid.set(server, state);
+			emit(state === "not-approved" ? {
+				type: "status",
+				server,
+				label,
+				state
+			} : {
+				type: "status",
+				server,
+				label,
+				state: "insecure",
+				...state === "unchecked" && { unchecked: true }
+			});
+		}
+	};
+	let pending = false;
+	const startedAt = Date.now();
+	const goOn = async () => {
+		if (!await wait(dormant && !pending ? DORMANT_MS : config.streamSeconds * 1e3)) return inRunner ? stopping("the runner stopped") : false;
+		if (isUnwanted()) return stopping("no office this reports to wants this session's project or takes its repo, so it holds off");
+		if (inRunner && await lockHolder(lock) !== process.pid) return stopping("another data layer reports this session now");
+		if (await isOff()) return stopping("Claude Code lists the Isoplan plugin as uninstalled or disabled here now");
+		return true;
+	};
+	do {
+		const now = Date.now();
+		const isFirstPass = passes++ === 0;
+		const holds = await lockHolder(lock) === process.pid;
+		if (!inRunner && !holds) {
+			const reason = await supersededBy();
+			if (reason) {
+				leave(reason);
+				break;
+			}
+			await takeLock(lock, process.pid, alive, true, Date.now(), { extra: lockExtra }).catch(() => {});
+		} else if (holds) await refreshLock(lock, process.pid).catch(() => {});
+		config = await loadConfig(io, defaultsPath, userConfigPath).catch(() => config);
+		if (!outdated && (outdated = await isOutdated())) emit({ type: "updated" });
+		if (now - checkedAt >= config.updateCheckHours * 36e5) checkUpdate(config.updateCheckHours * 36e5);
+		const gitOpts = {
+			now,
+			maxAgeMs: config.gitCacheSeconds * 1e3
+		};
+		const resolve = (dir) => git.resolve(dir, gitOpts);
+		const projectOfRepo = (where) => {
+			const key = pathKey(where.commonDir);
+			const hit = projects.get(key);
+			if (hit && now - hit.at <= gitOpts.maxAgeMs) return hit.project;
+			const project = projectOf(io.run, where, where.toplevel, machine, { names });
+			projects.set(key, {
+				at: now,
+				project
+			});
+			return project;
+		};
+		if (!candidates || now - candidatesAt > gitOpts.maxAgeMs) {
+			candidates = await candidatesOf(cwd, {
+				resolve,
+				projectOf: (where, dir) => projectOf(io.run, where, dir, machine, { names }),
+				stat: (f) => io.stat(f),
+				listDir: (d) => io.listDir(d),
+				home: os.homedir(),
+				workspaceRepos: config.workspaceRepos
+			});
+			candidatesAt = now;
+		}
+		await sayInsecure(candidates.projects);
+		const { projects: homes, workspace } = candidates;
+		const checks = runs.filter((r) => !isHeldOff(r, now)).map((r) => check(r, homes, workspace));
+		let slow;
+		await Promise.race([Promise.allSettled(checks), new Promise((r) => slow = setTimeout(r, config.streamSeconds * 1e3))]);
+		clearTimeout(slow);
+		for (const run of runs) apply(run);
+		const taking = runs.filter((r) => r.known && !r.dormant && !isHeldOff(r, now));
+		pending = runs.some((r) => !r.known);
+		dormant = taking.length ? null : pending ? "no-list" : runs.find((r) => r.dormant && r.dormant !== "not-approved")?.dormant ?? "not-approved";
+		if (!taking.length) {
+			if (inRunner && dormant === "not-approved") {
+				notApproved = candidates.projects.map((p) => p.id.toLowerCase());
+				stopping(`no office this reports to takes ${notApproved.join(", ") || cwd}, so it holds off until one does`);
+				break;
+			}
+			const quiet = inRunner ? detachedStop({
+				now,
+				lastActive: new Date(now).toISOString(),
+				idleMinutes: config.idleMinutes,
+				downSince
+			}) : null;
+			if (quiet) {
+				stopping(quiet);
+				break;
+			}
+			continue;
+		}
+		const read = await source.read({
+			sessionId,
+			cwd,
+			now,
+			config,
+			resolve,
+			projectOf: projectOfRepo
+		}).catch((err) => ({
+			facts: null,
+			status: String(err?.message ?? err),
+			errors: {
+				count: 0,
+				first: null
+			}
+		}));
+		const problem = read.status ?? (read.errors.count ? `${read.errors.count} transcript(s) could not be read: ${read.errors.first}` : "");
+		if (problem && problem !== reported) emit({
+			type: "log",
+			text: problem
+		});
+		reported = problem;
+		if (!read.facts) {
+			if (inRunner) {
+				isPlaceless = isFirstPass && !await resolve(cwd);
+				if (isPlaceless) {
+					stopping(`git can't place ${cwd}, so it holds off`);
+					break;
+				}
+				if (read.unstarted && !factsSession) {
+					if (Date.now() - startedAt < config.factsWaitSeconds * 1e3) continue;
+					stopping(`the session's transcript had nothing to report within ${config.factsWaitSeconds} seconds`);
+					break;
+				}
+				stopping("the session has nothing to report now (lights off with no reply, left out, aged out, or its transcript gone)");
+				break;
+			}
+			for (const run of taking) {
+				if (!run.gate.current()) continue;
+				run.gate.drop();
+				run.emit({
+					type: "status",
+					server: run.office.server,
+					label: run.office.label,
+					state: "waiting"
+				});
+			}
+			continue;
+		}
+		factsSession = read.facts.session.id;
+		const reply = await takeReply(titleFile);
+		if (reply) {
+			const text = reply.key === asked ? cleanTitle(reply.text) : null;
+			if (text && title) title = {
+				key: reply.key,
+				title: text,
+				at: title.at
+			};
+		}
+		const ask = nextTitle(read.facts, title, now);
+		if (ask && await fs.mkdir(titlesDir, { recursive: true }).then(() => true, () => false)) {
+			title = {
+				key: title?.key ?? null,
+				title: title?.title ?? null,
+				at: now
+			};
+			asked = ask.key;
+			emit({
+				type: "title-ask",
+				model: "haiku",
+				system: TITLE_SYSTEM,
+				prompt: ask.prompt,
+				maxTokens: 40,
+				key: ask.key,
+				file: titleFile
+			});
+		}
+		if (!inRunner) contextWindow = await windowOf(windowFile) ?? contextWindow;
+		const titled = read.facts.session.titleFrom === "branch" && title?.title ? {
+			...read.facts,
+			session: {
+				...read.facts.session,
+				title: title.title
+			}
+		} : read.facts;
+		const sized = contextWindow ? {
+			...titled,
+			session: {
+				...titled.session,
+				contextWindow
+			}
+		} : titled;
+		const facts = takesMessages ? {
+			...sized,
+			session: {
+				...sized.session,
+				takesMessages: true
+			}
+		} : sized;
+		checkouts = read.checkouts ?? {};
+		answered = read.answered ?? answered;
+		const patterns = await loadPatterns(modPatterns, ownerPatterns, patternLog).catch((err) => {
+			patternLog(`couldn't read the secret patterns, so every report is withheld: ${String(err?.message ?? err)}`);
+			return null;
+		});
+		waiting = inRunner ? /* @__PURE__ */ new Set() : await waitsOf(waitsDir, facts);
+		shown = [facts, patterns];
+		for (const run of taking) try {
+			run.gate.link()?.update(run.sent = outgoing(run, facts, patterns));
+		} catch (err) {
+			emit({
+				type: "log",
+				text: `couldn't send this session's facts to ${run.office.server}: ${String(err?.message ?? err)}`
+			});
+		}
+		const quiet = inRunner ? detachedStop({
+			now,
+			lastActive: facts.session.lastActive,
+			idleMinutes: config.idleMinutes,
+			downSince
+		}) : null;
+		if (quiet) {
+			stopping(quiet);
+			break;
+		}
+	} while (await goOn());
+	for (const link of links()) link.close();
+	await releaseLock(lock, process.pid).catch(() => {});
+	const notWanted = Object.fromEntries(runs.filter((r) => r.unwanted).map((r) => [r.office.server, r.unwantedUntil ?? Date.now() + 36e5]));
+	const named = {
+		offices: offices.map((office) => office.server),
+		notWanted
+	};
+	if (isUnwanted() && runs.some((r) => r.dormant === "not-approved")) notApproved = (candidates?.projects ?? []).map((p) => p.id.toLowerCase());
+	if (isUnwanted() && !notApproved || isPlaceless) return {
+		why,
+		holdOff: {
+			until: Date.now() + HOLD_OFF_MS,
+			...named
+		}
+	};
+	if (notApproved) return {
+		why,
+		holdOff: {
+			until: Date.now() + HOLD_OFF_MS,
+			projects: notApproved,
+			...named
+		}
+	};
+	return { why };
+}
+/** Starts `node <args>` detached and hidden, without waiting for it. */
+const spawnHidden = (args, dir, env) => spawn(process.execPath, args, {
+	cwd: dir,
+	env,
 	detached: true,
 	stdio: "ignore",
 	windowsHide: true
 }).on("error", () => {}).unref();
+/** Where this machine finds the claude binary, and keeps the isoplan:// link handler and the login item (src/install). */
+const systemPlaces = () => ({
+	findClaude: () => findClaude(process.env, process.platform, os.homedir()),
+	linkHandler: {
+		platform: process.platform,
+		home: os.homedir(),
+		dataHome: process.env.XDG_DATA_HOME,
+		node: process.execPath
+	},
+	loginItem: {
+		platform: process.platform,
+		home: os.homedir(),
+		configHome: process.env.XDG_CONFIG_HOME,
+		uid: process.getuid?.(),
+		node: process.execPath
+	}
+});
 /**
-* For a driven session's process as it opens: keeps the session reported until the returned stop
-* is called, as the process ends. `lastActive` is when the process last did anything, in ms.
+* The machine's part of a current plugin data layer's start: the wake hook and the runner's copy
+* (src/install), then the runner (src/runner/start.ts), which replaces one running older code. The
+* runner answers for the machine's rooms and reports every session without a hooks module. Not
+* while the plugin is disabled for the machine, though a session's project enables it.
 */
-function keepReported(o) {
-	const spawn = o.spawn ?? hiddenStart;
-	return (session, folder, lastActive) => {
-		let timer = null;
-		let stopped = false;
-		let seconds = 0;
-		const look = async () => {
-			if (Date.now() - lastActive() > await o.idleMinutes() * 6e4) return;
-			if (await recordedState(o.paths, folder).catch(() => "enabled") !== "enabled") return;
-			const input = JSON.stringify({
-				session_id: session,
-				cwd: folder
-			});
-			const start = (args, cwd) => {
-				if (stopped) return;
-				spawn(args, cwd);
-				o.log(`started a data layer to report driven session ${session}`);
-			};
-			await wake(input, {
-				claudeDir: o.paths.claudeDir,
-				spawn: start,
-				project: folder,
-				plugins: o.paths.plugins,
-				...o.isAlive ? { isAlive: o.isAlive } : {}
-			});
-		};
-		let said = "";
-		const next = async () => {
-			try {
-				await look();
-				said = "";
-			} catch (err) {
-				const text = `couldn't start a data layer for driven session ${session}: ${err?.message ?? String(err)}`;
-				if (text !== said) o.log(text);
-				said = text;
+function startMachine(o) {
+	const self = path.join(o.here, "data-layer.js");
+	const installed = installWake({
+		...o.place,
+		settings: path.join(o.place.claudeDir, "settings.json")
+	}, self, path.join(o.here, "wake.js"), {
+		auto: true,
+		runnerFrom: path.join(o.here, ".."),
+		findClaude: o.findClaude,
+		linkHandler: o.linkHandler,
+		loginItem: o.loginItem
+	}).then((changes) => changes.forEach((text) => o.log(text)), (err) => o.log(`couldn't install the wake hook: ${String(err?.message ?? err)}`));
+	return {
+		installed,
+		started: installed.then(async () => await pluginState(o.place, self) === "enabled" ? startRunner({
+			claudeDir: o.place.claudeDir,
+			spawn: o.spawn
+		}) : null).catch(() => null)
+	};
+}
+/**
+* Where a session the runner reports says what it does: its log lines, the office's errors and
+* pairing links, in <claude dir>/isoplan/logs/<session>.log; the rest is for a hooks module, so dropped.
+* `flushed` settles once what was said so far is written.
+*/
+function sessionLog(claudeDir, sessionId) {
+	const file = path.join(claudeDir, "isoplan", "logs", `${sessionId}.log`);
+	let logging = Promise.resolve();
+	const say = (said) => {
+		const text = `${(/* @__PURE__ */ new Date()).toISOString()} ${said}
+`;
+		logging = logging.then(() => writeLog$1(file, text)).catch(() => {});
+	};
+	return {
+		emit: (line) => {
+			if (line.type === "log" || line.type === "error" || line.type === "pair") say(line.type === "log" ? line.text : line.type === "pair" ? pairNote(line) : `the office server says: ${line.message} (${line.code})`);
+		},
+		say,
+		flushed: () => logging
+	};
+}
+/** A pair line as the log says it. */
+const pairNote = (line) => `to report to ${line.server}, pair this machine: click ${line.url} on this computer and approve it in the office (it works until ${line.expires})`;
+async function writeLog$1(file, text) {
+	const size = (await fs.stat(file).catch(() => null))?.size ?? 0;
+	await fs.mkdir(path.dirname(file), { recursive: true });
+	if (size > LOG_CAP_BYTES$1) await fs.writeFile(file, text);
+	else await fs.appendFile(file, text);
+}
+async function waitsOf(dir, facts) {
+	const out = /* @__PURE__ */ new Set();
+	for (const q of facts.questions ?? []) {
+		if (!/^[A-Za-z0-9_-]{1,200}$/.test(q.id)) continue;
+		const mark = await fs.readFile(path.join(dir, `${q.id}.json`), "utf8").then((text) => JSON.parse(text), () => null);
+		if (mark?.question === q.id && mark.waiting === true) out.add(q.id);
+	}
+	return out;
+}
+/** The context window the hooks module wrote, in tokens; null while there is none, or it isn't a whole positive number. */
+async function windowOf(file) {
+	let said;
+	try {
+		said = JSON.parse(await fs.readFile(file, "utf8"));
+	} catch {
+		return null;
+	}
+	const value = said && typeof said === "object" ? said.contextWindow : null;
+	return Number.isInteger(value) && value > 0 ? value : null;
+}
+async function takeFile(file) {
+	const text = await fs.readFile(file, "utf8").catch(() => null);
+	try {
+		JSON.parse(text ?? "");
+	} catch {
+		return null;
+	}
+	await fs.rm(file, { force: true }).catch(() => {});
+	return text;
+}
+async function takeReply(file) {
+	let value;
+	try {
+		value = JSON.parse(await fs.readFile(file, "utf8"));
+	} catch {
+		return null;
+	}
+	await fs.rm(file, { force: true }).catch(() => {});
+	const r = value;
+	return typeof r.key === "string" && typeof r.text === "string" ? {
+		key: r.key,
+		text: r.text
+	} : null;
+}
+//#endregion
+//#region src/sweep/find.ts
+const HEAD_BYTES = 65536;
+/** The first folder a transcript's lines name, from its first and last 64 KB. */
+async function cwdOf(io, path, size) {
+	for (const [start, end] of [[0, HEAD_BYTES], [Math.max(0, size - HEAD_BYTES), size]]) for (const text of (await io.read(path, start, end).catch(() => "")).split("\n")) {
+		if (!text.includes("\"cwd\"")) continue;
+		try {
+			const cwd = JSON.parse(text).cwd;
+			if (typeof cwd === "string" && cwd) return cwd;
+		} catch {}
+	}
+	return null;
+}
+const STOP_WAIT_MS = 5e3;
+function watchSessions(o) {
+	const { claudeDir, io, isAlive = alive, pid = process.pid, gapMs = 250, stopWaitMs = STOP_WAIT_MS } = o;
+	const projectsDir = path.join(claudeDir, "projects");
+	const seen = /* @__PURE__ */ new Map();
+	let first = true;
+	let stopped = false;
+	let timer = null;
+	let said = "";
+	const start = (id, s, cwd) => {
+		let close = () => {};
+		const closed = new Promise((resolve) => close = resolve);
+		const now = Date.now();
+		const notWanted = Object.fromEntries(Object.entries(s.notWanted).filter(([, until]) => until > now));
+		const done = o.report({
+			sessionId: id,
+			cwd,
+			notWanted,
+			closed
+		}).then((ended) => {
+			if (ended.holdOff) {
+				s.holdOff = ended.holdOff;
+				s.notWanted = ended.holdOff.notWanted;
 			}
-			if (stopped) return;
-			seconds = await o.everySeconds().catch((err) => {
-				if (!seconds) o.log(`stopped looking after driven session ${session}'s data layer: ${err.message}`);
-				return seconds;
-			});
-			if (!seconds || stopped) return;
-			timer = setTimeout(() => void next(), seconds * 1e3);
-			timer.unref?.();
+		}, (err) => o.log(`couldn't report session ${id}: ${String(err?.stack ?? err)}`)).finally(async () => {
+			s.endedAt = (await io.stat(s.file))?.mtimeMs ?? s.mtimeMs;
+			s.running = null;
+		});
+		s.running = {
+			stop: close,
+			done
 		};
-		next();
-		return () => {
+	};
+	/** Whether a fresh copy of an office's list takes one of the repos a hold-off names (see above). */
+	const nowTaken = async (holdOff, config) => {
+		const now = Date.now();
+		const configured = officesOf(config).map((office) => office.server);
+		for (const file of await approvedFiles(claudeDir)) {
+			const copy = await readApproved(file);
+			if (!copy || !holdOff.offices.includes(copy.server) && !configured.includes(copy.server) || (holdOff.notWanted[copy.server] ?? 0) > now) continue;
+			const repos = freshRepos(copy, config.approvedMaxAgeMinutes * 6e4, now);
+			if (repos && holdOff.projects.some((p) => repos.has(p))) return true;
+		}
+		return false;
+	};
+	/** Whether the session's lock names another live process that keeps it fresh. */
+	const heldByAnother = async (id, now, config) => {
+		const lock = await readLock(lockPath(claudeDir, id));
+		return !!lock?.pid && lock.pid !== pid && isAlive(lock.pid) && now - lock.mtimeMs < lockFreshMs(config);
+	};
+	const look = async () => {
+		const config = await o.config();
+		const now = Date.now();
+		const windowMs = Math.max(config.idleMinutes * 6e4, first ? config.lightsOffHours * 36e5 : 0);
+		const quiet = [];
+		for (const dir of await io.listDir(projectsDir)) {
+			if (!dir.isDir) continue;
+			for (const entry of await io.listDir(path.join(projectsDir, dir.name))) {
+				const id = entry.name.slice(0, -6);
+				if (entry.isDir || !entry.name.endsWith(".jsonl") || !/^[\w-]+$/.test(id)) continue;
+				const file = path.join(projectsDir, dir.name, entry.name);
+				const st = await io.stat(file);
+				if (!st) continue;
+				let s = seen.get(id);
+				if (!s) seen.set(id, s = {
+					file,
+					mtimeMs: st.mtimeMs,
+					size: st.size,
+					cwd: null,
+					running: null,
+					queued: false,
+					endedAt: null,
+					holdOff: null,
+					notWanted: {},
+					held: false
+				});
+				Object.assign(s, {
+					file,
+					mtimeMs: st.mtimeMs,
+					size: st.size
+				});
+				if (s.running || s.queued || st.mtimeMs < now - windowMs) continue;
+				if (s.endedAt !== null && st.mtimeMs <= s.endedAt) {
+					if (s.held && !await heldByAnother(id, now, config)) s.held = false;
+					continue;
+				}
+				if (s.holdOff) {
+					if (!(s.holdOff.until <= now || !!s.holdOff.projects && await nowTaken(s.holdOff, config))) {
+						s.endedAt = st.mtimeMs;
+						continue;
+					}
+					s.holdOff = null;
+				}
+				if (await heldByAnother(id, now, config)) {
+					s.held = true;
+					s.endedAt = st.mtimeMs;
+					continue;
+				}
+				if (s.held) {
+					s.held = false;
+					s.endedAt = st.mtimeMs;
+					continue;
+				}
+				s.cwd ??= await cwdOf(io, file, st.size);
+				if (!s.cwd) continue;
+				if (!await fs.stat(s.cwd).then((d) => d.isDirectory(), () => false) || await o.isOff(s.cwd)) {
+					s.endedAt = st.mtimeMs;
+					continue;
+				}
+				if (first && st.mtimeMs < now - config.idleMinutes * 6e4) quiet.push([
+					id,
+					s,
+					s.cwd
+				]);
+				else start(id, s, s.cwd);
+			}
+		}
+		if (first && quiet.length) {
+			for (const [, s] of quiet) s.queued = true;
+			(async () => {
+				for (const [id, s, cwd] of quiet) {
+					await new Promise((r) => setTimeout(r, gapMs));
+					s.queued = false;
+					if (!stopped && !s.running) start(id, s, cwd);
+				}
+			})();
+		}
+		first = false;
+	};
+	let looking = null;
+	const lookOnce = () => looking ??= look().finally(() => looking = null);
+	const next = async () => {
+		let seconds = 1;
+		try {
+			await lookOnce();
+			seconds = (await o.config()).streamSeconds;
+			said = "";
+		} catch (err) {
+			const text = `couldn't look for this machine's sessions to report: ${String(err?.message ?? err)}`;
+			if (text !== said) o.log(text);
+			said = text;
+		}
+		if (stopped) return;
+		timer = setTimeout(() => void next(), seconds * 1e3);
+		timer.unref?.();
+	};
+	next();
+	return {
+		heldOff: (id) => {
+			const holdOff = seen.get(id)?.holdOff;
+			return !!holdOff && holdOff.until > Date.now();
+		},
+		reporting: () => [...seen].filter(([, s]) => s.running).map(([id]) => id),
+		look: lookOnce,
+		async stop() {
 			stopped = true;
 			if (timer) clearTimeout(timer);
-		};
+			const running = [...seen.values()].flatMap((s) => s.running ?? []);
+			for (const r of running) r.stop();
+			let timeout;
+			await Promise.race([Promise.all(running.map((r) => r.done)), new Promise((r) => timeout = setTimeout(r, stopWaitMs))]);
+			clearTimeout(timeout);
+		}
 	};
 }
 //#endregion
@@ -16031,7 +18369,79 @@ async function worker() {
 	const offices = officesOf(first);
 	for (const { server } of offices.filter((o) => o.plainRefused)) log(`the runner doesn't answer through ${server}: it is plain ws:// to another machine; use wss://, or set "allowPlainWs": true in config.json`);
 	if (offices.every((o) => o.plainRefused)) return 0;
-	const firstSettings = await settings();
+	await settings();
+	const answering = offices.filter((o) => !o.plainRefused);
+	const account = await accountOf({
+		readText: (p) => fs.readFile(p, "utf8").catch(() => null),
+		run: io.run
+	}, claudeJson, os.homedir());
+	const emitFor = (server) => (line) => {
+		if (line.type === "log") log(line.text);
+		else if (line.type === "error") log(`the office server at ${server} says: ${line.message} (${line.code})`);
+		else if (line.type === "pair") log(`to answer for this machine's rooms through ${line.server}, pair it: click ${line.url} on this computer and approve it in the office (it works until ${line.expires})`);
+	};
+	const shared = new Map(answering.map((office) => {
+		const { server } = office;
+		const pairing = createPairing({
+			file: pairingPath(claudeDir),
+			lock: pairingLockPath(claudeDir, office),
+			writeLock: pairingWriteLockPath(claudeDir),
+			server,
+			account,
+			machine: os.hostname(),
+			emit: emitFor(server),
+			allowPlainWs: first.allowPlainWs,
+			legacy: !!office.legacy
+		});
+		return [server, {
+			pairing,
+			approved: createApproved({
+				server,
+				file: approvedPath(claudeDir, server),
+				pairing,
+				refreshMs: first.approvedRefreshMinutes * 6e4,
+				maxAgeMs: first.approvedMaxAgeMinutes * 6e4,
+				log
+			})
+		}];
+	}));
+	const paths = {
+		claudeDir,
+		settings: path.join(claudeDir, "settings.json"),
+		plugins: pluginsDir(claudeDir, process.env),
+		managed: managedDir(process.platform),
+		pluginDirs: pluginDirsOf(process.env)
+	};
+	const isOff = async (folder) => await recordedState(paths, folder).catch(() => "enabled") !== "enabled";
+	const reporting = watchSessions({
+		claudeDir,
+		io,
+		config,
+		isOff,
+		log,
+		report: async ({ sessionId, cwd, notWanted, closed }) => {
+			const said = sessionLog(claudeDir, sessionId);
+			said.say(`the runner reports this session, in ${cwd}`);
+			try {
+				return await reportSession({
+					sessionId,
+					cwd,
+					by: "runner",
+					appDir,
+					emit: said.emit,
+					closed,
+					notWanted,
+					isOff: () => isOff(cwd),
+					shared: (office) => shared.get(office.server) ?? null
+				});
+			} catch (err) {
+				said.say(`stopping: something went wrong: ${String(err?.stack ?? err)}`);
+				throw err;
+			} finally {
+				await said.flushed();
+			}
+		}
+	});
 	const registry = createRegistry({
 		file: registryPath(claudeDir),
 		log
@@ -16058,15 +18468,6 @@ async function worker() {
 		return new PushFailed(gitFailed(err));
 	};
 	const scanText = async (text) => scan(text, await loadPatterns(path.join(appDir, "secret-patterns.json"), path.join(isoplanDir, "secret-patterns.json"), log));
-	const account = await accountOf({
-		readText: (p) => fs.readFile(p, "utf8").catch(() => null),
-		run: io.run
-	}, claudeJson, os.homedir());
-	const emitFor = (server) => (line) => {
-		if (line.type === "log") log(line.text);
-		else if (line.type === "error") log(`the office server at ${server} says: ${line.message} (${line.code})`);
-		else if (line.type === "pair") log(`to answer for this machine's rooms through ${line.server}, pair it: click ${line.url} on this computer and approve it in the office (it works until ${line.expires})`);
-	};
 	const orca = () => findOrca(process.env, process.platform, os.homedir());
 	const hasOrca = await orca() !== null;
 	const takeOrca = async () => {
@@ -16094,7 +18495,6 @@ async function worker() {
 	const ledger = await openLedger(path.join(isoplanDir, "runner", "ledger.json"));
 	const preparedFor = /* @__PURE__ */ new Map();
 	const forks = createForkSlots();
-	const answering = offices.filter((o) => !o.plainRefused);
 	let send = (_index) => () => {};
 	let live = (_index) => (_message) => false;
 	const isDir = (p) => fs.stat(p).then((s) => s.isDirectory(), () => false);
@@ -16113,25 +18513,7 @@ async function worker() {
 	});
 	const runnerFor = (office, index) => {
 		const { server } = office;
-		const pairing = createPairing({
-			file: pairingPath(claudeDir),
-			lock: pairingLockPath(claudeDir, office),
-			writeLock: pairingWriteLockPath(claudeDir),
-			server,
-			account,
-			machine: os.hostname(),
-			emit: emitFor(server),
-			allowPlainWs: first.allowPlainWs,
-			legacy: !!office.legacy
-		});
-		const approved = createApproved({
-			server,
-			file: approvedPath(claudeDir, server),
-			pairing,
-			refreshMs: first.approvedRefreshMinutes * 6e4,
-			maxAgeMs: first.approvedMaxAgeMinutes * 6e4,
-			log
-		});
+		const { pairing, approved } = shared.get(server);
 		const takes = async () => {
 			await approved.refresh();
 			return takesFrom(homeIo, approved.repos());
@@ -16189,8 +18571,7 @@ async function worker() {
 				isDir,
 				isReported: async (session, lead) => {
 					const id = forkableId(session);
-					const lock = id ? await readLock(lockPath(claudeDir, id)) : null;
-					if (!id || lock && lock.pid === null && lock.until !== null && lock.until > Date.now()) return false;
+					if (!id || reporting.heldOff(id)) return false;
 					if (Date.now() - lead.lastActive > askableMs(await config().catch(() => first))) return false;
 					await approved.refresh();
 					return await approvedHome(lead.cwd, homeIo, approved.repos()) !== null;
@@ -16272,18 +18653,6 @@ async function worker() {
 		scan: scanText,
 		log,
 		projectOf: async (folder) => (await homeIo.projectOf(await homeIo.resolve(folder), folder)).id,
-		report: keepReported({
-			paths: {
-				claudeDir,
-				settings: path.join(claudeDir, "settings.json"),
-				plugins: pluginsDir(claudeDir, process.env),
-				managed: managedDir(process.platform),
-				pluginDirs: pluginDirsOf(process.env)
-			},
-			everySeconds: async () => (await settings().catch(() => firstSettings)).drivenReportSeconds,
-			idleMinutes: async () => (await config()).idleMinutes,
-			log
-		}),
 		elsewhere: (start, bin) => startWhere(start, bin, {
 			run: git,
 			claudeDir,
@@ -16334,7 +18703,7 @@ async function worker() {
 			});
 		},
 		paired: async (office) => !!pairingEntry(await readPairing(pairingPath(claudeDir)), office.server, account.id)?.credential,
-		idle: () => answerers.every((a) => a.runner.idle()),
+		idle: () => answerers.every((a) => a.runner.idle()) && reporting.reporting().length === 0,
 		lit: async () => anyRoomSince(io, path.join(claudeDir, "projects"), Date.now() - askableMs(await config().catch(() => first))),
 		keep: async () => drive.held() > 0 || (await settings()).startAtLogin,
 		gone: new Promise((resolve) => process.stdin.on("end", resolve).on("error", resolve).resume()),
@@ -16345,6 +18714,7 @@ async function worker() {
 	send = links.sender;
 	live = links.live;
 	const ended = await links.ended;
+	await reporting.stop();
 	return ended === "not-wanted" ? 3 : ended === "unpaired" ? 4 : 0;
 }
 process.exitCode = await (process.argv.includes("--worker") ? worker() : supervisor());

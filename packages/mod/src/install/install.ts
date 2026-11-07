@@ -299,8 +299,7 @@ export interface Uninstalled {
 
 /**
  * Takes out everything install and the plugin put in place, in this order: the running runner;
- * under <claude dir>/isoplan the session locks (a detached data layer stops once its lock isn't
- * its own); a wait of `settleMs`; the runner's copy and its records (environment, ledger, lock),
+ * under <claude dir>/isoplan the session locks; a wait of `settleMs`; the runner's copy and its records (environment, ledger, lock),
  * the pairing credential, the logs, the title files and the released-report hashes, and
  * claude-binary.json unless it was set by hand; then the wake
  * hooks in settings.json, and wake.mjs and wake.json. What else is in the folder, the files a
@@ -428,7 +427,7 @@ export async function uninstallInBackground(
 export const isUninstalling = (claudeDir: string) => isHeld(uninstallLockPath(claudeDir));
 
 /**
- * How long uninstall waits for a detached data layer to see its lock has gone: two of its passes
+ * How long uninstall waits for a data layer to see its lock has gone: two of its passes
  * (`streamSeconds`, with `defaultsPath` the mod's config.json and the person's config.json over
  * it) and a second. Ten seconds when the config can't be read.
  */

@@ -6999,7 +6999,7 @@ async function isHeld(file, now = Date.now(), isAlive = alive, rule = {}) {
 }
 /**
 * Takes the lock for `pid`; false when it is held (`isHeld`). With `force` (the plugin's data
-* layer) it is taken regardless: a detached one holding it sees that and steps aside. `extra` is
+* layer) it is taken regardless: the runner holding it sees that and steps aside. `extra` is
 * written into the lock beside the pid.
 *
 * A new lock is created exclusively, so of two takers at once only one gets it. A stale one is

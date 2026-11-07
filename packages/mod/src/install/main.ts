@@ -1,10 +1,10 @@
 // The install script: puts the wake hook in Claude Code's user settings without a session, as the
 // plugin's data layer does when it starts, or takes out everything install and the plugin put in
 // place (install.ts), leaving wake.json marking the hook as uninstalled, so the plugin's data layer
-// doesn't put it back. Installing also backfills: every session written inside the window is
-// reported now rather than on its next turn, so running it again fills the office back in. It also
-// records the `claude` binary and starts the machine's runner (src/runner), which answers for its
-// rooms, with an environment recorded from this shell.
+// doesn't put it back. It also records the `claude` binary and starts the machine's runner
+// (src/runner), with an environment recorded from this shell: the runner answers for the machine's
+// rooms, and as it starts reports every session written inside the lights-off window, so an install
+// that starts it fills the office back in; one already running reports those sessions already.
 //
 //   node dist/install.js [--uninstall]
 //
@@ -21,8 +21,6 @@ import { nodeIo } from "../data-layer/io.js";
 import { claudeBinaryPath, findClaude } from "../runner/claude-binary.js";
 import { recordEnv, runnerEnvPath } from "../runner/environment.js";
 import { startRunner } from "../runner/start.js";
-import { recentSessions } from "../sweep/find.js";
-import { backfill } from "../wake/backfill.js";
 import { installWake, processCommand, settleMs, uninstall as uninstallAll } from "./install.js";
 import { managedDir, pluginDirsOf, pluginsDir } from "./state.js";
 
@@ -64,12 +62,8 @@ try {
         "not-installed": "The runner wasn't started: its copy isn't in place.",
       }[runner],
     );
-    const io = nodeIo();
-    const config = await loadConfig(io, path.join(here, "..", "config.json"), path.join(claudeDir, "isoplan", "config.json"));
-    const found = await recentSessions(io, path.join(claudeDir, "projects"), Date.now() - config.lightsOffHours * 3600000);
-    const dataLayer = path.join(here, "data-layer.js");
-    const started = await backfill(found, { claudeDir, dataLayer, spawn: start });
-    console.log(`Reported ${started} session(s) from the last ${config.lightsOffHours} hours to ${officesOf(config).map((o) => o.server).join(", ")}; ${found.length - started} were already reported or their folder is gone.`);
+    const config = await loadConfig(nodeIo(), path.join(here, "..", "config.json"), path.join(claudeDir, "isoplan", "config.json"));
+    if (runner === "started") console.log(`The runner reports this machine's sessions from the last ${config.lightsOffHours} hours to ${officesOf(config).map((o) => o.server).join(", ")} as it starts.`);
   }
 } catch (err) {
   process.stderr.write(`isoplan install: ${(err as Error).message}\n`);

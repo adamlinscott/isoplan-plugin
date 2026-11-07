@@ -1,8 +1,9 @@
-// The data layer's main loop, run as it ships (dist/data-layer.js, rebuilt with every change), in
-// detached mode so it installs nothing and starts no runner, against a stand-in office server, with
-// a throwaway Claude config folder: what it sends for a session in a repo the office doesn't take,
-// and when the copy of the office's list is too old (isoplan-app/isoplan#91); and what a copy in
-// the plugin cache does once Claude Code has installed a newer one (isoplan-app/isoplan#96).
+// The data layer's loop (report-session.ts) against a stand-in office server, with a throwaway
+// Claude config folder: as the runner runs it, in this process, so it installs nothing and starts
+// no runner: what it sends for a session in a repo the office doesn't take, and when the copy of the
+// office's list is too old (isoplan-app/isoplan#91); and as the plugin's data layer ships
+// (dist/data-layer.js, rebuilt with every change), what a copy in the plugin cache does once Claude
+// Code has installed a newer one (isoplan-app/isoplan#96).
 
 import { execFileSync, spawn, type ChildProcess } from "node:child_process";
 import fs from "node:fs";
@@ -10,6 +11,7 @@ import http from "node:http";
 import type { AddressInfo } from "node:net";
 import path from "node:path";
 import { afterEach, expect, test, vi } from "vitest";
+import { reportSession, sessionLog, startDetached, type ReportSessionOptions } from "./report-session.js";
 import { WebSocketServer } from "ws";
 import { modDir, tempRoot } from "./fixture.js";
 
@@ -17,8 +19,13 @@ vi.setConfig({ testTimeout: 30000 });
 
 const children: ChildProcess[] = [];
 const servers: (() => Promise<unknown>)[] = [];
+const reporting: { stop: () => void; done: Promise<unknown> }[] = [];
 afterEach(async () => {
   for (const c of children.splice(0)) c.kill();
+  const stopping = reporting.splice(0);
+  for (const r of stopping) r.stop();
+  await Promise.all(stopping.map((r) => r.done));
+  vi.unstubAllEnvs();
   for (const close of servers.splice(0)) await close();
 });
 
@@ -70,23 +77,27 @@ function session(claudeDir: string, root: string, lines = turn): string {
   return repo;
 }
 
-/** session(), and the data layer started for it, detached. */
+/** Session s1 reported as the runner reports it, in this process, until the test ends. */
+function inRunner(claudeDir: string, repo: string, extra: Partial<ReportSessionOptions> = {}) {
+  vi.stubEnv("CLAUDE_CONFIG_DIR", claudeDir);
+  let stop = () => {};
+  const closed = new Promise<void>((resolve) => (stop = resolve));
+  const log = sessionLog(claudeDir, "s1");
+  const done = reportSession({ sessionId: "s1", cwd: repo, by: "runner", appDir: modDir, emit: log.emit, closed, isOff: async () => false, ...extra }).then(async (ended) => (await log.flushed(), ended));
+  reporting.push({ stop, done });
+  return done;
+}
+
+/** session(), and the runner reporting it. */
 function start(url: string, config: Record<string, unknown> = {}, lines = turn) {
   const root = tempRoot();
   const claudeDir = path.join(root, "claude");
   const repo = session(claudeDir, root, lines);
   fs.writeFileSync(path.join(claudeDir, "isoplan", "config.json"), JSON.stringify({ server: url, ...config }));
-  const child = spawn(process.execPath, [path.join(modDir, "dist", "data-layer.js"), "--session", "s1", "--cwd", repo, "--detached"], {
-    cwd: repo,
-    env: { ...process.env, CLAUDE_CONFIG_DIR: claudeDir },
-    stdio: "ignore",
-    windowsHide: true,
-  });
-  children.push(child);
-  const exited = new Promise<number | null>((resolve) => child.on("exit", resolve));
+  const ended = inRunner(claudeDir, repo);
   const transcript = path.join(claudeDir, "projects", repo.replace(/[^a-zA-Z0-9]/g, "-"), "s1.jsonl");
   const logged = () => fs.readFileSync(path.join(claudeDir, "isoplan", "logs", "s1.log"), "utf8");
-  return { claudeDir, repo, transcript, exited, logged, lock: path.join(claudeDir, "isoplan", "live", "s1.json") };
+  return { claudeDir, repo, transcript, ended, logged, stop: reporting.at(-1)!.stop, lock: path.join(claudeDir, "isoplan", "live", "s1.json") };
 }
 
 const wait = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -98,33 +109,33 @@ async function until(check: () => boolean, ms = 15000) {
   }
 }
 
-test("a session in a repo the office doesn't take opens no socket, and its detached data layer holds off, naming the repo for the wake hook", async () => {
+test("a session in a repo the office doesn't take opens no socket, and the runner holds it off, naming the repo", async () => {
   const o = await office();
   o.state.repos = ["github.com/team/other"];
-  const { exited, lock, logged } = start(o.url);
-  await exited;
+  const { ended, lock, logged } = start(o.url);
+  expect((await ended).holdOff).toMatchObject({ projects: ["github.com/team/app"], offices: [o.url] });
   expect(o.state.connections).toEqual([]);
-  expect(JSON.parse(fs.readFileSync(lock, "utf8"))).toMatchObject({ pid: 0, reason: "not-approved", projects: ["github.com/team/app"] });
+  expect(fs.existsSync(lock)).toBe(false);
   expect(logged()).toContain("stopping: no office this reports to takes github.com/team/app, so it holds off until one does");
 });
 
-// #92: the wake hook runs as the first prompt goes in, before Claude Code has written a line that names the session's folder.
-test("a detached data layer started before its session's transcript has anything to report waits for it, and reports the session once it has", async () => {
+// #92: a session may be seen before Claude Code has written a line that names the session's folder.
+test("the runner, reporting a session before its transcript has anything to report, waits for it, and reports the session once it has", async () => {
   const o = await office();
   o.state.repos = ["github.com/team/app"];
   const { repo, transcript, lock } = start(o.url, {}, bookkeeping);
   await wait(1500);
   expect(o.state.connections).toEqual([]);
-  expect(JSON.parse(fs.readFileSync(lock, "utf8"))).toMatchObject({ detached: true });
+  expect(JSON.parse(fs.readFileSync(lock, "utf8"))).toMatchObject({ pid: process.pid, detached: true, runner: true });
   fs.appendFileSync(transcript, jsonl(turn(repo, new Date().toISOString())));
   await until(() => o.state.connections[0]?.messages.some((m) => m.type === "full") ?? false);
 });
 
-test("a detached data layer whose session's transcript has nothing to report within factsWaitSeconds stops, saying why, and lets the session go", async () => {
+test("the runner stops reporting a session whose transcript has nothing to report within factsWaitSeconds, saying why, and lets the session go", async () => {
   const o = await office();
   o.state.repos = ["github.com/team/app"];
-  const { exited, lock, logged } = start(o.url, { factsWaitSeconds: 1 }, bookkeeping);
-  await exited;
+  const { ended, lock, logged } = start(o.url, { factsWaitSeconds: 1 }, bookkeeping);
+  expect((await ended).holdOff).toBeUndefined();
   expect(o.state.connections).toEqual([]);
   expect(logged()).toContain("stopping: the session's transcript had nothing to report within 1 seconds");
   expect(fs.existsSync(lock)).toBe(false);
@@ -132,14 +143,27 @@ test("a detached data layer whose session's transcript has nothing to report wit
 
 // A transcript that has started but is left out (a helper session) has nothing to report, and isn't waited for.
 const helper: Lines = (repo, now) => [{ type: "user", cwd: repo, timestamp: now, message: { role: "user", content: "Generate a short git branch name for this" } }, { type: "assistant", cwd: repo, timestamp: now, message: { role: "assistant", content: [{ type: "text", text: "fix-it" }] } }];
-test("a detached data layer for a session that has started but has nothing to report stops at once, without waiting for facts", async () => {
+test("the runner stops reporting a session that has started but has nothing to report at once, without waiting for facts", async () => {
   const o = await office();
   o.state.repos = ["github.com/team/app"];
   const begun = Date.now();
-  const { exited, logged } = start(o.url, { factsWaitSeconds: 60 }, helper);
-  await exited;
+  const { ended, logged } = start(o.url, { factsWaitSeconds: 60 }, helper);
+  await ended;
   expect(Date.now() - begun).toBeLessThan(15000);
   expect(logged()).toContain("stopping: the session has nothing to report now");
+});
+
+test("the runner keeps the session's lock fresh each pass, and as it stops reporting the session, its log says why", async () => {
+  const o = await office();
+  o.state.repos = ["github.com/team/app"];
+  const { ended, lock, logged, stop } = start(o.url);
+  await until(() => o.state.connections[0]?.messages.some((m) => m.type === "full") ?? false);
+  const old = new Date(Date.now() - 60000);
+  fs.utimesSync(lock, old, old);
+  await until(() => fs.statSync(lock).mtimeMs > Date.now() - 10000);
+  stop();
+  expect((await ended).why).toBe("the runner stopped");
+  expect(logged()).toContain("stopping: the runner stopped");
 });
 
 test("an approved session connects; once its copy of the list is past its maximum age and can't be checked, its link closes and no other socket opens, reconnects included", async () => {
@@ -214,27 +238,22 @@ test("a slow office's list never holds up another's: the one that answers gets t
   expect(slow.state.connections).toEqual([]);
 });
 
-test("one office not wanting the session while no other takes its repo holds it off naming that office; started again, it leaves that office alone (#105)", async () => {
+test("one office not wanting the session while no other takes its repo holds it off naming that office; reported again, it leaves that office alone (#105)", async () => {
   const internal = await office();
   const dev = await office();
   internal.state.repos = ["github.com/team/app"];
   internal.state.notWanted = true;
   const servers = [{ label: "internal", server: internal.url }, { label: "dev", server: dev.url }];
-  const { claudeDir, exited, lock } = start("ws://127.0.0.1:9/data-layer", { servers, approvedRefreshMinutes: 0.01 });
-  await exited;
-  const held = JSON.parse(fs.readFileSync(lock, "utf8"));
-  expect(held).toMatchObject({ pid: 0, reason: "not-approved", projects: ["github.com/team/app"], offices: [internal.url, dev.url] });
+  const { claudeDir, repo, ended } = start("ws://127.0.0.1:9/data-layer", { servers, approvedRefreshMinutes: 0.01 });
+  const held = (await ended).holdOff!;
+  expect(held).toMatchObject({ projects: ["github.com/team/app"], offices: [internal.url, dev.url] });
   expect(held.notWanted[internal.url]).toBeGreaterThan(Date.now());
 
-  // The wake hook starts it again once dev takes the repo, leaving the not-wanted office in the lock.
+  // The runner reports it again once dev takes the repo, passing on the office that didn't want it.
   dev.state.repos = ["github.com/team/app"];
   dev.state.version++;
-  fs.rmSync(lock);
-  fs.writeFileSync(path.join(claudeDir, "isoplan", "live", "s1.not-wanted"), JSON.stringify(held.notWanted));
   const asked = internal.state.connections.length;
-  const repo = path.join(path.dirname(claudeDir), "app");
-  const child = spawn(process.execPath, [path.join(modDir, "dist", "data-layer.js"), "--session", "s1", "--cwd", repo, "--detached"], { cwd: repo, env: { ...process.env, CLAUDE_CONFIG_DIR: claudeDir }, stdio: "ignore", windowsHide: true });
-  children.push(child);
+  void inRunner(claudeDir, repo, { notWanted: held.notWanted });
   await until(() => dev.state.connections[0]?.messages.some((m) => m.type === "hello") ?? false);
   await wait(1500);
   expect(internal.state.connections).toHaveLength(asked);
@@ -249,6 +268,8 @@ function versions(server = "ws://127.0.0.1:9/data-layer") {
   for (const version of ["0.2.0", "0.3.0"]) {
     fs.mkdirSync(path.join(folder(version), "dist"), { recursive: true });
     fs.mkdirSync(path.join(folder(version), ".claude-plugin"), { recursive: true });
+    // Never the runner's files: without them a copy that installs fails before it reaches the link
+    // handler and the login item, which point at this machine's real home and registry (systemPlaces).
     for (const file of ["data-layer.js", "wake.js", "hooks.js"]) fs.copyFileSync(path.join(modDir, "dist", file), path.join(folder(version), "dist", file));
     fs.copyFileSync(path.join(modDir, "config.json"), path.join(folder(version), "config.json"));
     fs.writeFileSync(path.join(folder(version), ".claude-plugin", "plugin.json"), JSON.stringify({ name: "isoplan", version }));
@@ -282,7 +303,7 @@ function versions(server = "ws://127.0.0.1:9/data-layer") {
   return { claudeDir, lock, run, held, holder: () => (fs.existsSync(lock) ? (JSON.parse(fs.readFileSync(lock, "utf8")).pid as number) : null) };
 }
 
-test("a copy in the plugin cache that an update left behind says so, installs nothing and checks for nothing; a detached one leaves the session to the new one", async () => {
+test("a copy in the plugin cache that an update left behind says so, installs nothing and checks for nothing; started --detached by an older wake hook, it ends at once, saying why in the session's log", async () => {
   const v = versions();
   const loaded = v.run("0.2.0");
   await until(() => loaded.lines().some((l) => l.type === "updated"));
@@ -293,18 +314,35 @@ test("a copy in the plugin cache that an update left behind says so, installs no
   children.splice(0).forEach((c) => c.kill());
 
   fs.rmSync(path.join(v.claudeDir, "isoplan", "live"), { recursive: true, force: true }); // the killed one's lock
-  const detached = v.run("0.2.0", "--detached");
-  expect(await detached.exited).toBe(0);
-  expect(fs.existsSync(v.lock)).toBe(false);
-  expect(fs.readFileSync(path.join(v.claudeDir, "isoplan", "logs", "s1.log"), "utf8")).toMatch(/a newer version of the Isoplan plugin is installed/);
-});
-
-test("a detached data layer whose plugin is turned off for the session says so in its log as it stops", async () => {
-  const v = versions();
-  fs.writeFileSync(path.join(v.claudeDir, "settings.json"), JSON.stringify({ enabledPlugins: { "isoplan@isoplan": false } }));
   const detached = v.run("0.3.0", "--detached");
   expect(await detached.exited).toBe(0);
-  expect(fs.readFileSync(path.join(v.claudeDir, "isoplan", "logs", "s1.log"), "utf8")).toContain("stopping: Claude Code lists the Isoplan plugin as uninstalled or disabled here");
+  expect(fs.existsSync(v.lock)).toBe(false);
+  expect(fs.readFileSync(path.join(v.claudeDir, "isoplan", "logs", "s1.log"), "utf8")).toContain("the runner reports it now, so this data layer ends");
+});
+
+test("started --detached by an earlier version's wake hook, it puts this version's wake hook and runner in place, starts the runner hidden, and says so in the session's log", async () => {
+  const root = tempRoot();
+  const claudeDir = path.join(root, "claude");
+  vi.stubEnv("CLAUDE_CONFIG_DIR", claudeDir);
+  vi.stubEnv("CLAUDE_CODE_PLUGIN_CACHE_DIR", "");
+  const spawned: { args: string[]; cwd: string }[] = [];
+  await startDetached({ sessionId: "s1", project: root, appDir: modDir, spawn: (args, cwd) => void spawned.push({ args, cwd }) });
+  const wake = JSON.parse(fs.readFileSync(path.join(claudeDir, "isoplan", "wake.json"), "utf8")) as { dataLayer: string; runner: string };
+  expect(wake.runner).toBe(path.join(claudeDir, "isoplan", "runner", "app", "dist", "runner.mjs"));
+  expect(fs.existsSync(wake.runner)).toBe(true);
+  expect(fs.readFileSync(path.join(claudeDir, "settings.json"), "utf8")).toContain("wake.mjs");
+  expect(spawned.map(({ args, cwd }) => ({ args: args.map((a) => (a.startsWith("--") ? a : path.resolve(a))), cwd: path.resolve(cwd) }))).toEqual([{ args: [wake.runner, "--claude-dir", path.resolve(claudeDir), "--inherited-env"], cwd: path.resolve(claudeDir) }]);
+  expect(fs.readFileSync(path.join(claudeDir, "isoplan", "logs", "s1.log"), "utf8")).toContain("the runner reports it now, so this data layer ends (started the runner)");
+});
+
+test("the runner, reporting a session whose plugin is turned off for its folder, says so in the session's log as it stops", async () => {
+  const root = tempRoot();
+  const claudeDir = path.join(root, "claude");
+  const repo = session(claudeDir, root);
+  const ended = await inRunner(claudeDir, repo, { isOff: async () => true });
+  expect(ended.why).toMatch(/^Claude Code lists the Isoplan plugin as uninstalled or disabled here/);
+  expect(fs.readFileSync(path.join(claudeDir, "isoplan", "logs", "s1.log"), "utf8")).toContain("stopping: Claude Code lists the Isoplan plugin as uninstalled or disabled here");
+  expect(fs.existsSync(path.join(claudeDir, "isoplan", "live", "s1.json"))).toBe(false);
 });
 
 test("after /reload-plugins the old version's data layer leaves the session to the new one's, and of one version the later start keeps it", async () => {
@@ -437,7 +475,7 @@ test("several messages the owner sends back to back reach the hooks module in th
   expect(lines().map((l) => l.text)).toEqual(texts);
 });
 
-test("a detached data layer refuses its owner's message and leaves no messages folder behind", async () => {
+test("the runner refuses its owner's message for a session it reports and leaves no messages folder behind", async () => {
   const o = await office();
   o.state.repos = ["github.com/team/app"];
   const { claudeDir } = start(o.url);
