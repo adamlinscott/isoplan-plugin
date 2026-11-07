@@ -204,10 +204,12 @@ const valid = {
   "asked queued": { type: "asked", v, question: "q-4f9c", text: "Why does the CRLF check exist?", state: "queued", note: "Adam's machine isn't reachable." },
   "runner that drives sessions": { type: "runner", v, account: adam, machine: { name: "sevengill" }, drive: true },
   "runner without Claude Code": { type: "runner", v, account: adam, machine: { name: "sevengill" }, drive: true, claude: "missing" },
+  "runner with places to start in": { type: "runner", v, account: adam, machine: { name: "sevengill" }, drive: true, orca: true, starts: ["terminal", "headless", "orca"] },
   "handoff as a driven session": { type: "handoff", v, handoff, mode: "driven", session: "0b5c4d3e-0000-4000-8000-000000000001", by: sam, room, permissions: "auto" },
   "drive start": { type: "drive", v, kind: "start", id: "d1", by: adam, room, project: isoplan, roomSessions: ["claude-code:s1"], instruction: "Fix the failing test in src/a.ts.", permissions: "auto" },
   "drive start in a folder": { type: "drive", v, kind: "start", id: "d8", by: adam, folder: "C:\\Users\\adam\\isoplan", project: isoplan, instruction: "Add a dark mode.", permissions: "auto" },
   "drive start on a branch": { type: "drive", v, kind: "start", id: "d9", by: adam, folder: "/Users/sam/code/isoplan", branch: "feat/dark-mode", project: isoplan, permissions: "auto" },
+  "drive start in Orca": { type: "drive", v, kind: "start", id: "d10", by: adam, folder: "/Users/sam/code/isoplan", branch: "feat/dark-mode", project: isoplan, instruction: "Write the docs page.", permissions: "auto", mode: "orca" },
   "drive instruct": { type: "drive", v, kind: "instruct", id: "i2", by: adam, session: driving, text: "Now run the whole suite." },
   "drive stop": { type: "drive", v, kind: "stop", id: "d3", by: adam, session: driving },
   "drive hand-back": { type: "drive", v, kind: "hand-back", id: "d4", by: adam, session: driving },
@@ -232,6 +234,7 @@ const valid = {
   "driven refused": { type: "driven", v, kind: "refused", id: "d1", reason: "no-folder" },
   "driven refused at the cap": { type: "driven", v, kind: "refused", id: "d1", reason: "cap-reached", limit: 4 },
   "driven refused unavailable": { type: "driven", v, kind: "refused", id: "d1", reason: "unavailable", detail: "Claude Code isn't signed in on this machine." },
+  "driven opened": { type: "driven", v, kind: "opened", id: "d10", session: driving, room: `room:${driving}`, mode: "desktop", note: "The Claude app didn't open on the session." },
   "driven folders": { type: "driven", v, kind: "folders", repos: [{ project: isoplan.id, folders: ["/Users/sam/code/isoplan", "/Users/sam/code/isoplan-wt"] }] },
   "driven folders with branches": { type: "driven", v, kind: "folders", repos: [{ project: isoplan.id, folders: ["/Users/sam/code/isoplan"], branches: ["main", "feat/dark-mode"] }] },
   "driven holding": { type: "driven", v, kind: "holding", sessions: [{ session: driving, room, held: true, permissions: "auto", turn: "i2" }] },
@@ -292,10 +295,12 @@ const parsers = {
   "asked queued": parseOfficeServerMessage,
   "runner that drives sessions": parseDataLayerMessage,
   "runner without Claude Code": parseDataLayerMessage,
+  "runner with places to start in": parseDataLayerMessage,
   "handoff as a driven session": parseOfficeServerMessage,
   "drive start": parseOfficeServerMessage,
   "drive start in a folder": parseOfficeServerMessage,
   "drive start on a branch": parseOfficeServerMessage,
+  "drive start in Orca": parseOfficeServerMessage,
   "drive instruct": parseOfficeServerMessage,
   "drive stop": parseOfficeServerMessage,
   "drive hand-back": parseOfficeServerMessage,
@@ -320,6 +325,7 @@ const parsers = {
   "driven refused": parseDataLayerMessage,
   "driven refused at the cap": parseDataLayerMessage,
   "driven refused unavailable": parseDataLayerMessage,
+  "driven opened": parseDataLayerMessage,
   "driven holding": parseDataLayerMessage,
   "driven folders": parseDataLayerMessage,
   "driven folders with branches": parseDataLayerMessage,
@@ -381,10 +387,12 @@ const broken: Record<keyof typeof valid, [unknown, string]> = {
   "asked queued": [{ ...valid["asked queued"], note: "" }, "note"],
   "runner that drives sessions": [{ ...valid["runner that drives sessions"], drive: "yes" }, "drive"],
   "runner without Claude Code": [{ ...valid["runner without Claude Code"], claude: "none" }, "claude"],
+  "runner with places to start in": [{ ...valid["runner with places to start in"], starts: ["driven"] }, "starts[0]"],
   "handoff as a driven session": [{ ...valid["handoff as a driven session"], room: undefined }, "room"],
   "drive start": [{ ...valid["drive start"], permissions: "default" }, "permissions"],
   "drive start in a folder": [{ ...valid["drive start in a folder"], folder: "" }, "folder"],
   "drive start on a branch": [{ ...valid["drive start on a branch"], branch: "" }, "branch"],
+  "drive start in Orca": [{ ...valid["drive start in Orca"], instruction: undefined }, "instruction"],
   "drive instruct": [{ ...valid["drive instruct"], text: "x".repeat(MAX_INSTRUCTION_LENGTH + 1) }, "text"],
   "drive stop": [{ ...valid["drive stop"], by: undefined }, "by"],
   "drive hand-back": [{ ...valid["drive hand-back"], session: "" }, "session"],
@@ -409,6 +417,7 @@ const broken: Record<keyof typeof valid, [unknown, string]> = {
   "driven refused": [{ ...valid["driven refused"], reason: "nope" }, "reason"],
   "driven refused at the cap": [{ ...valid["driven refused at the cap"], limit: 0 }, "limit"],
   "driven refused unavailable": [{ ...valid["driven refused unavailable"], detail: undefined }, "detail"],
+  "driven opened": [{ ...valid["driven opened"], mode: "driven" }, "mode"],
   "driven holding": [{ ...valid["driven holding"], sessions: [{ ...valid["driven holding"].sessions[0], held: "yes" }] }, "sessions[0].held"],
   "driven folders": [{ ...valid["driven folders"], repos: [{ project: isoplan.id, folders: [] }] }, "repos[0].folders"],
   "driven folders with branches": [{ ...valid["driven folders with branches"], repos: [{ project: isoplan.id, folders: ["/Users/sam/code/isoplan"], branches: [""] }] }, "repos[0].branches"],
@@ -770,6 +779,18 @@ describe("driven sessions", () => {
       expect(result).toMatchObject({ ok: false, kind: "invalid" });
       expect(!result.ok && result.error).toContain(path);
     }
+  });
+
+  test("a start that opens outside the floor names a folder and its first instruction; a driven one needn't", () => {
+    for (const [message, path] of [
+      [{ ...valid["drive start"], mode: "terminal" }, "folder"],
+      [{ ...valid["drive start on a branch"], mode: "headless" }, "instruction"],
+    ] as const) {
+      const result = parseOfficeServerMessage(message);
+      expect(result).toMatchObject({ ok: false, kind: "invalid" });
+      expect(!result.ok && result.error).toContain(path);
+    }
+    for (const message of [{ ...valid["drive start"], mode: "driven" }, { ...valid["drive start on a branch"], mode: "driven" }]) expect(parseOfficeServerMessage(message)).toEqual({ ok: true, message });
   });
 
   test("a start in a Windows folder keeps its backslashes", () => {

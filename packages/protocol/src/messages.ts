@@ -174,6 +174,9 @@ const Withheld = z.object({ id: DriveId }).optional();
  */
 export const DrivePermissionsSchema = z.enum(["auto", "bypassPermissions"]);
 
+/** Where a new session from the floor opens other than run from the floor (protocol 0.10.0): a start's `mode`, as a take's. */
+export const StartModeSchema = z.enum(["terminal", "headless", "orca", "desktop"]);
+
 // Data layer → office server.
 
 /** The first message on a connection: who is reporting, from where, about which session. */
@@ -201,6 +204,11 @@ export const HelloMessageSchema = z.object({
  * driven sessions, a take into a terminal and a headless one all need. A runner that says it says it
  * on every hello, says `driven` `claude` whenever it changes, and takes the `install-claude` and
  * `sign-in-claude` drive requests; the server sends neither to a runner that didn't say it.
+ * `starts` (protocol 0.10.0, isoplan-plugin#85): the places other than the floor a new session from
+ * the floor can open in on this machine, the start's `mode`: `terminal` and `headless` where this
+ * runner can open them, and `orca` and `desktop` only where `orca` and `desktop` are said. The server
+ * sends a start with a `mode` only to a runner that says `starts`, and only one of its places: a
+ * runner from before 0.10.0 drops the field it doesn't know and would run the session from the floor.
  */
 export const RunnerHelloMessageSchema = z.object({
   type: z.literal("runner"),
@@ -212,6 +220,7 @@ export const RunnerHelloMessageSchema = z.object({
   desktop: z.boolean().optional(),
   drive: z.boolean().optional(),
   claude: ClaudeCliSchema.optional(),
+  starts: z.array(StartModeSchema).max(4).optional(),
 });
 
 /** All of the session's facts. Sent on connect and on repair. */
@@ -456,6 +465,11 @@ export const DrivenMessageSchema = z.discriminatedUnion("kind", [
   // The turn is over: `done`; `failed`, when Claude Code said it failed or its process ended mid-turn;
   // or `stopped`, when the session was stopped or handed back mid-turn.
   z.object({ ...driven, kind: z.literal("turn-ended"), session: DrivenSessionId, turn: DriveId, outcome: z.enum(["done", "failed", "stopped"]) }),
+  // A start with a `mode` other than `driven` opened its session there (protocol 0.10.0): `session`,
+  // in a room of its own, `room:<session>`. The runner doesn't hold it: it is reported as any session
+  // the person opened, by its own data layer. `note`: what still needs the person, in the runner's own
+  // words, such as a session the Claude app didn't open by itself.
+  z.object({ ...driven, kind: z.literal("opened"), id: DriveId, session: DrivenSessionId, room: Room, mode: StartModeSchema, note: Detail.optional() }),
   // Something went wrong in the session, in the runner's own words: never the model's output.
   z.object({ ...driven, kind: z.literal("error"), session: DrivenSessionId, turn: DriveId.optional(), text: Detail }),
   // The full output asked for, as plain text: of `turn`, or of the whole session without one; empty
@@ -782,6 +796,12 @@ export const DriveMessageSchema = z.discriminatedUnion("kind", [
   // for that repo. The branch the folder is on opens the folder; another opens in a git worktree of
   // that branch beside it, so the folder's own branch is never switched. A branch it didn't list is
   // refused `no-folder`. A runner from before 0.9.0 ignores `branch` and opens the folder as it is.
+  // With `mode` (protocol 0.10.0, only with `folder` and `instruction`, and only to a runner whose
+  // hello says it in `starts`): where the session opens, as a take's mode: `driven`, the default, as
+  // above; or in Orca (in a worktree of the branch Orca makes in the repo's Orca workspace, when the
+  // folder isn't on it), the Claude app, a terminal window or a background session, in the folder and
+  // on the branch above, with `instruction` its first message. Such a start is answered `opened`, or
+  // `refused`; `permissions` counts only for `driven`, and the runner's cap is for those alone.
   z
     .object({
       ...drive,
@@ -793,8 +813,13 @@ export const DriveMessageSchema = z.discriminatedUnion("kind", [
       roomSessions: z.array(DrivenSessionId).max(MAX_ROOM_SESSIONS).optional(),
       instruction: Instruction.optional(),
       permissions: DrivePermissionsSchema,
+      mode: z.enum(["terminal", "headless", "orca", "desktop", "driven"]).optional(),
     })
     .superRefine((message, context) => {
+      if (message.mode !== undefined && message.mode !== "driven") {
+        if (message.folder === undefined) context.addIssue({ code: "custom", path: ["folder"], message: "a start that opens outside the floor names a folder" });
+        if (message.instruction === undefined) context.addIssue({ code: "custom", path: ["instruction"], message: "a start that opens outside the floor names its first instruction" });
+      }
       if (message.folder === undefined) {
         if (message.room === undefined) context.addIssue({ code: "custom", path: ["room"], message: "a start names a room, or a folder" });
         if (message.branch !== undefined) context.addIssue({ code: "custom", path: ["branch"], message: "a start names a branch only with a folder" });
@@ -904,6 +929,7 @@ export type AskRightsMessage = z.infer<typeof AskRightsMessageSchema>;
 export type OfficeServerMessage = z.infer<typeof OfficeServerMessageSchema>;
 export type WelcomeMessage = z.infer<typeof WelcomeMessageSchema>;
 export type DrivePermissions = z.infer<typeof DrivePermissionsSchema>;
+export type StartMode = z.infer<typeof StartModeSchema>;
 export type DriveMessage = z.infer<typeof DriveMessageSchema>;
 export type DriveKind = DriveMessage["kind"];
 export type DrivePolicyMessage = z.infer<typeof DrivePolicyMessageSchema>;
