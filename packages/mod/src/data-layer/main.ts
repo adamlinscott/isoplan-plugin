@@ -8,12 +8,14 @@
 // pid is reused.
 //
 // The machine's runner reports every session without a hooks module itself (src/runner/reporting.ts,
-// ADR 0007). A wake hook from an earlier version may still start this with `--detached`: it ends at
-// once: that wake hook starts the runner itself.
+// ADR 0007). A wake hook or runner of an earlier version may still start this with `--detached`
+// (before a session loads the new version): it puts this version's wake hook and runner in place,
+// starts that runner, which reports the session, says so in the session's log, and ends
+// (startDetached).
 
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { reportSession } from "./report-session.js";
+import { reportSession, spawnHidden, startDetached, systemPlaces } from "./report-session.js";
 import { alive } from "../wake/lock.js";
 
 const value = (argv: string[], flag: string) => {
@@ -26,7 +28,10 @@ async function main(argv: string[]): Promise<number> {
   const cwd = value(argv, "--cwd");
   // dist/data-layer.js sits one folder below the mod's config.json.
   const appDir = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
-  if (argv.includes("--detached")) return 0;
+  if (argv.includes("--detached")) {
+    await startDetached({ sessionId, project: value(argv, "--project") ?? cwd, appDir, spawn: spawnHidden, ...systemPlaces() });
+    return 0;
+  }
   if (!sessionId || !cwd) {
     process.stderr.write("usage: node data-layer.js --session <id> --cwd <dir> [--project <dir>] [--since <ms>] [--messages]\n");
     return 2;

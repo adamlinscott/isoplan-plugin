@@ -7,8 +7,9 @@
 // link, which holds the WebSocket to the office server. For a hooks module it emits JSON lines
 // (src/lines.ts): the link's state, the server's notes, and room titles to write. Claude Code ends
 // the plugin's data layer with the session; as a backstop it also stops when stdout breaks or its
-// parent process has gone (main.ts). When it starts it also installs the wake hook (src/install),
-// and starts the machine's runner (src/runner) if none is running. Each agent's report is
+// parent process has gone (main.ts). As the plugin's data layer starts it also installs the wake
+// hook and the runner's copy (src/install), and starts the machine's runner (src/runner) unless one
+// on the same code is running (startMachine); the runner's own does neither. Each agent's report is
 // secret-checked before it is sent, and one that matches is held until its owner releases it
 // (src/data-layer/reports.ts). Only a session in a repo the office takes is reported: the data layer
 // reads the office's list of repos (src/data-layer/approved.ts) and opens no link for any other,
@@ -52,7 +53,8 @@
 //
 // One data layer reports a session: each takes <claude dir>/isoplan/live/<session>.json (src/wake/
 // lock.ts), the plugin's naming its own script, when its window's hooks module started (`--since`)
-// and that window's Claude Code process, the runner's `detached`, and refreshes it each pass. The
+// and that window's Claude Code process, the runner's `detached`, and each refreshes it each pass
+// while it holds it; a lock counts as fresh for three of its holder's slowest passes (lockFreshMs). The
 // runner's doesn't start while another holds it, and ends as soon as the plugin's takes it over.
 // The plugin's takes it regardless, and goes on without it if the folder can't be written. It takes
 // it back each pass, unless the plugin's data layer holding it, with a fresh lock, is the newest copy
@@ -66,12 +68,13 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { PROTOCOL_VERSION, type Facts, type Project } from "@isoplan/protocol";
-import { installWake } from "../install/install.js";
+import { installWake, type LinkHandlerPlace } from "../install/install.js";
+import type { LoginItemPlace } from "../install/login-item.js";
 import { managedDir, newestDataLayer, normalPath, pluginDirsOf, pluginIdOf, pluginState, pluginsDir, type Place } from "../install/state.js";
 import type { ContextWindow, DataLayerLine, TitleReply, WaitMark } from "../lines.js";
 import { claudeBinary, claudeCommand, findClaude } from "../runner/claude-binary.js";
 import { loadPatterns, type Pattern } from "../runner/scan.js";
-import { startRunner } from "../runner/start.js";
+import { startRunner, type StartOptions, type Started } from "../runner/start.js";
 import { checkForUpdate, commandEnv, gitChoices, START_GAP_MS, updatesOffBy } from "../update/update.js";
 import { alive, HOLD_OFF_MS, lockHolder, lockPath, readLock, refreshLock, releaseLock, takeLock } from "../wake/lock.js";
 import { approvedPath, cachedRepos, createApproved, createSessionGate, type Approved, type Dormancy, type SessionGate } from "./approved.js";
@@ -124,6 +127,8 @@ const DORMANT_MS = 30000;
 // nothing when a data layer decides whether to give the session up, or the runner whether to take
 // it: the pid may have been reused.
 export const LOCK_FRESH_MS = 3 * DORMANT_MS;
+/** The same for a holder whose passes `streamSeconds` makes slower: a pass may wait that long, and a slow office's list as long again. */
+export const lockFreshMs = (config: Pick<Config, "streamSeconds">) => Math.max(LOCK_FRESH_MS, 3 * 2 * config.streamSeconds * 1000);
 
 export interface ReportSessionOptions {
   sessionId: string;
@@ -259,34 +264,20 @@ export async function reportSession(o: ReportSessionOptions): Promise<Ended> {
   // Reported again after one office didn't want the session: that office stays left alone until its
   // hold-off ends (src/runner/reporting.ts).
   const notWantedBefore: Record<string, unknown> = inRunner ? (o.notWanted ?? {}) : {};
+  let config: Config = await loadConfig(io, defaultsPath, userConfigPath);
   try {
     // In the runner, a hold-off a detached data layer of an earlier version left counts for nothing: the runner keeps its own.
     if (inRunner && (await readLock(lock))?.pid === null) await fs.rm(lock, { force: true });
-    if (!(await takeLock(lock, process.pid, alive, !inRunner, Date.now(), { extra: lockExtra, ...(inRunner && { freshMs: LOCK_FRESH_MS }) }))) return end("another data layer already reports this session");
+    if (!(await takeLock(lock, process.pid, alive, !inRunner, Date.now(), { extra: lockExtra, ...(inRunner && { freshMs: lockFreshMs(config) }) }))) return end("another data layer already reports this session");
   } catch (err) {
     if (inRunner) return end(`couldn't take the session lock: ${String((err as Error)?.message ?? err)}`);
     emit({ type: "log", text: `couldn't take the session lock, so going on without it: ${String((err as Error)?.message ?? err)}` });
   }
 
   const paths = { ...place, settings: path.join(claudeDir, "settings.json") };
-  const start = (args: string[], dir: string, env?: Record<string, string>) => spawn(process.execPath, args, { cwd: dir, env, detached: true, stdio: "ignore", windowsHide: true }).on("error", () => {}).unref();
-  const installing = inRunner || outdated
-    ? Promise.resolve([])
-    : installWake(paths, path.join(here, "data-layer.js"), path.join(here, "wake.js"), {
-        auto: true,
-        runnerFrom: path.join(here, ".."),
-        findClaude: () => findClaude(process.env, process.platform, os.homedir()),
-        linkHandler: { platform: process.platform, home: os.homedir(), dataHome: process.env.XDG_DATA_HOME, node: process.execPath },
-        loginItem: { platform: process.platform, home: os.homedir(), configHome: process.env.XDG_CONFIG_HOME, uid: process.getuid?.(), node: process.execPath },
-      }).then(
-        (changes) => (changes.forEach((text) => emit({ type: "log", text })), changes),
-        (err: unknown) => (emit({ type: "log", text: `couldn't install the wake hook: ${String((err as Error)?.message ?? err)}` }), []),
-      );
-  // The machine's runner answers for its rooms; it is started here as well as by the wake hook.
-  // Not while the plugin is disabled for the machine, though this session's project enables it.
-  if (!inRunner && !outdated) void installing.then(async () => (await pluginState(place, self)) === "enabled" && startRunner({ claudeDir, spawn: start })).catch(() => {});
+  // The machine's runner is started here as well as by the wake hook.
+  const installing = inRunner || outdated ? Promise.resolve() : startMachine({ place, here, spawn: spawnHidden, log: (text) => emit({ type: "log", text }), ...systemPlaces() }).installed;
 
-  let config: Config = await loadConfig(io, defaultsPath, userConfigPath);
   if (outdated) emit({ type: "updated" });
   // The update check (src/update), for a copy in Claude Code's plugin cache: there is nothing to
   // update in a checkout or a folder loaded in place. One at a time in this process; the machine's
@@ -520,7 +511,8 @@ export async function reportSession(o: ReportSessionOptions): Promise<Ended> {
   const startedAt = Date.now();
   // Whether to go on to the next pass, once this one's wait is over; each reason not to is logged.
   const goOn = async () => {
-    if (!(await wait(dormant && !pending ? DORMANT_MS : config.streamSeconds * 1000))) return false;
+    // In the runner only `closed` ends the wait early: the runner stopped.
+    if (!(await wait(dormant && !pending ? DORMANT_MS : config.streamSeconds * 1000))) return inRunner ? stopping("the runner stopped") : false;
     if (isUnwanted()) return stopping("no office this reports to wants this session's project or takes its repo, so it holds off");
     if (inRunner && (await lockHolder(lock)) !== process.pid) return stopping("another data layer reports this session now");
     if (await isOff()) return stopping("Claude Code lists the Isoplan plugin as uninstalled or disabled here now");
@@ -531,16 +523,15 @@ export async function reportSession(o: ReportSessionOptions): Promise<Ended> {
     const now = Date.now();
     const isFirstPass = passes++ === 0;
     // A data layer of an earlier version that stopped may have deleted this one's lock as it went.
-    if (!inRunner) {
-      if ((await lockHolder(lock)) !== process.pid) {
-        const reason = await supersededBy();
-        if (reason) {
-          leave(reason);
-          break;
-        }
-        await takeLock(lock, process.pid, alive, true, Date.now(), { extra: lockExtra }).catch(() => {});
-      } else await refreshLock(lock, process.pid).catch(() => {});
-    }
+    const holds = (await lockHolder(lock)) === process.pid;
+    if (!inRunner && !holds) {
+      const reason = await supersededBy();
+      if (reason) {
+        leave(reason);
+        break;
+      }
+      await takeLock(lock, process.pid, alive, true, Date.now(), { extra: lockExtra }).catch(() => {});
+    } else if (holds) await refreshLock(lock, process.pid).catch(() => {});
     config = await loadConfig(io, defaultsPath, userConfigPath).catch(() => config);
     if (!outdated && (outdated = await isOutdated())) emit({ type: "updated" });
     if (now - checkedAt >= config.updateCheckHours * 3600000) checkUpdate(config.updateCheckHours * 3600000);
@@ -680,6 +671,73 @@ export async function reportSession(o: ReportSessionOptions): Promise<Ended> {
   if ((isUnwanted() && !notApproved) || isPlaceless) return { why, holdOff: { until: Date.now() + HOLD_OFF_MS, ...named } };
   if (notApproved) return { why, holdOff: { until: Date.now() + HOLD_OFF_MS, projects: notApproved, ...named } };
   return { why };
+}
+
+/** Starts `node <args>` detached and hidden, without waiting for it. */
+export const spawnHidden: StartOptions["spawn"] = (args, dir, env) => spawn(process.execPath, args, { cwd: dir, env, detached: true, stdio: "ignore", windowsHide: true }).on("error", () => {}).unref();
+
+/** Where this machine finds the claude binary, and keeps the isoplan:// link handler and the login item (src/install). */
+export const systemPlaces = () => ({
+  findClaude: () => findClaude(process.env, process.platform, os.homedir()),
+  linkHandler: { platform: process.platform, home: os.homedir(), dataHome: process.env.XDG_DATA_HOME, node: process.execPath },
+  loginItem: { platform: process.platform, home: os.homedir(), configHome: process.env.XDG_CONFIG_HOME, uid: process.getuid?.(), node: process.execPath },
+});
+
+export interface MachineStart {
+  place: Place;
+  /** The dist/ folder this data layer runs from. */
+  here: string;
+  spawn: StartOptions["spawn"];
+  log: (text: string) => void;
+  findClaude?: () => Promise<string | null>;
+  linkHandler?: LinkHandlerPlace;
+  loginItem?: LoginItemPlace;
+}
+
+/**
+ * The machine's part of a current plugin data layer's start: the wake hook and the runner's copy
+ * (src/install), then the runner (src/runner/start.ts), which replaces one running older code. The
+ * runner answers for the machine's rooms and reports every session without a hooks module. Not
+ * while the plugin is disabled for the machine, though a session's project enables it.
+ */
+export function startMachine(o: MachineStart): { installed: Promise<void>; started: Promise<Started | null> } {
+  const self = path.join(o.here, "data-layer.js");
+  const installed = installWake({ ...o.place, settings: path.join(o.place.claudeDir, "settings.json") }, self, path.join(o.here, "wake.js"), {
+    auto: true,
+    runnerFrom: path.join(o.here, ".."),
+    findClaude: o.findClaude,
+    linkHandler: o.linkHandler,
+    loginItem: o.loginItem,
+  }).then(
+    (changes) => changes.forEach((text) => o.log(text)),
+    (err: unknown) => o.log(`couldn't install the wake hook: ${String((err as Error)?.message ?? err)}`),
+  );
+  const started = installed.then(async () => ((await pluginState(o.place, self)) === "enabled" ? startRunner({ claudeDir: o.place.claudeDir, spawn: o.spawn }) : null)).catch(() => null);
+  return { installed, started };
+}
+
+/**
+ * For `--detached` (main.ts): a wake hook or runner of an earlier version started this data layer
+ * for a session without a hooks module, which the runner reports now (src/runner/reporting.ts).
+ * So it does the machine's part of its start (startMachine), putting this version's wake hook and
+ * runner in place and starting that runner in place of the older one, says so in the session's
+ * log, and is done. An outdated copy does nothing, so it never hands them back to older code.
+ */
+export async function startDetached(o: { sessionId: string | null; project: string | null; appDir: string } & Omit<MachineStart, "place" | "here" | "log">): Promise<void> {
+  const { dir: claudeDir } = claudePaths(process.env, os.homedir());
+  const here = path.join(o.appDir, "dist");
+  const self = path.join(here, "data-layer.js");
+  const place: Place = { claudeDir, plugins: pluginsDir(claudeDir, process.env), managed: managedDir(process.platform), pluginDirs: pluginDirsOf(process.env) };
+  const said = o.sessionId ? sessionLog(claudeDir, o.sessionId) : null;
+  const say = (text: string) => said?.say(text);
+  if ((await newestDataLayer(place.plugins, self, o.project ?? undefined).catch(() => self)) !== self) {
+    say("an earlier version's wake hook or runner started an outdated copy of the plugin's data layer for this session, which does nothing: the newest version's runner reports sessions without the plugin");
+  } else {
+    const started = await startMachine({ place, here, spawn: o.spawn, log: say, findClaude: o.findClaude, linkHandler: o.linkHandler, loginItem: o.loginItem }).started;
+    const runner = started === null ? "the plugin is disabled for this machine, so the runner wasn't started" : { started: "started the runner", running: "the runner was already running", "held-off": "the runner is holding off for now (see runner.log)", "not-installed": "the runner's copy isn't in place, so it wasn't started" }[started];
+    say(`an earlier version's wake hook or runner asked for this session to be reported: the runner reports it now, so this data layer ends (${runner})`);
+  }
+  await said?.flushed();
 }
 
 /**

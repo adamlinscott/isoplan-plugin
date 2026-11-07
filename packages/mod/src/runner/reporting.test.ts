@@ -14,7 +14,7 @@ import { WebSocketServer } from "ws";
 import { approvedPath } from "../data-layer/approved-file.js";
 import type { Config } from "../data-layer/config.js";
 import { defaults, modDir, tempRoot } from "../data-layer/fixture.js";
-import { nodeIo } from "../data-layer/io.js";
+import { nodeIo, type NodeIo } from "../data-layer/io.js";
 import { reportSession, sessionLog, type Ended } from "../data-layer/report-session.js";
 import { lockPath } from "../wake/lock.js";
 import { watchSessions, type Reporting, type ToReport } from "./reporting.js";
@@ -59,14 +59,14 @@ function machine(settings: Partial<Config> = {}) {
 }
 
 /** watchSessions with a stand-in report: each session it starts is kept, and ends when told (or when the runner stops). */
-function watch(m: ReturnType<typeof machine>, o: { isOff?: (folder: string) => Promise<boolean>; isAlive?: (pid: number) => boolean; gapMs?: number } = {}) {
+function watch(m: ReturnType<typeof machine>, o: { isOff?: (folder: string) => Promise<boolean>; isAlive?: (pid: number) => boolean; gapMs?: number; io?: NodeIo } = {}) {
   const started: { id: string; notWanted: Record<string, number>; end: (ended?: Ended) => void }[] = [];
   const report = (s: ToReport) =>
     new Promise<Ended>((resolve) => {
       started.push({ id: s.sessionId, notWanted: s.notWanted, end: (ended = { why: "done" }) => resolve(ended) });
       void s.closed.then(() => resolve({ why: "stopped" }));
     });
-  const w = watchSessions({ claudeDir: m.claudeDir, io: nodeIo(), config: async () => m.config, report, isOff: o.isOff ?? (async () => false), log: () => {}, gapMs: o.gapMs ?? 0, ...(o.isAlive && { isAlive: o.isAlive }) });
+  const w = watchSessions({ claudeDir: m.claudeDir, io: o.io ?? nodeIo(), config: async () => m.config, report, isOff: o.isOff ?? (async () => false), log: () => {}, gapMs: o.gapMs ?? 0, ...(o.isAlive && { isAlive: o.isAlive }) });
   watching.push(w);
   return { w, started, ids: () => started.map((s) => s.id) };
 }
@@ -85,7 +85,7 @@ test("each session written within idleMinutes is reported, once; one whose trans
   expect(w.reporting().sort()).toEqual(["s1", "s2"]);
 });
 
-test("a session whose lock another live process keeps fresh isn't reported (the plugin's data layer has it); once that has gone, it is", async () => {
+test("a session whose lock another live process keeps fresh isn't reported (the plugin's data layer has it); once that has gone, only once its transcript moves, so a closed session goes unreachable", async () => {
   const m = machine();
   let holderAlive = true;
   fs.mkdirSync(path.dirname(lockPath(m.claudeDir, "s1")), { recursive: true });
@@ -95,8 +95,38 @@ test("a session whose lock another live process keeps fresh isn't reported (the 
   await w.look();
   await w.look();
   expect(ids()).toEqual([]);
+  // The session closes: its data layer lets the lock go.
   holderAlive = false;
+  fs.rmSync(lockPath(m.claudeDir, "s1"));
+  await w.look();
+  await w.look();
+  expect(ids()).toEqual([]);
+  // Its data layer had crashed, and the session goes on.
+  await wait(20);
+  m.write("s1");
   await until(() => ids().includes("s1"));
+});
+
+test("a lock counts as fresh for three of its holder's slowest passes, which a long streamSeconds makes longer", async () => {
+  const m = machine({ streamSeconds: 20 }); // three passes of up to 40 s: two minutes
+  const lock = lockPath(m.claudeDir, "s1");
+  const age = (seconds: number) => {
+    const t = new Date(Date.now() - seconds * 1000);
+    fs.utimesSync(lock, t, t);
+  };
+  fs.mkdirSync(path.dirname(lock), { recursive: true });
+  fs.writeFileSync(lock, JSON.stringify({ pid: OTHER, detached: false }));
+  age(100);
+  m.write("s1");
+  const { w, ids } = watch(m, { isAlive: () => true });
+  await w.look();
+  await w.look();
+  expect(ids()).toEqual([]);
+  age(130);
+  await wait(20);
+  m.write("s1");
+  await w.look();
+  expect(ids()).toEqual(["s1"]);
 });
 
 test("a session that stopped being reported is reported again only once its transcript moves", async () => {
@@ -112,6 +142,30 @@ test("a session that stopped being reported is reported again only once its tran
   await wait(20); // a write time past the one it ended at
   m.write("s1");
   await until(() => ids().length === 2);
+});
+
+test("a session that just stopped being reported isn't started again while the runner reads its write time", async () => {
+  const m = machine({ streamSeconds: 60 }); // only the first look, and those asked for
+  m.write("s1");
+  // The next stat after `slow` is set takes a while.
+  let slow = false;
+  const io = nodeIo();
+  const stat: NodeIo["stat"] = async (file) => {
+    if (slow) {
+      slow = false;
+      await wait(300);
+    }
+    return io.stat(file);
+  };
+  const { w, started, ids } = watch(m, { io: { ...io, stat } });
+  await until(() => ids().length === 1);
+  slow = true;
+  started[0]!.end();
+  await wait(50);
+  await w.look();
+  await until(() => w.reporting().length === 0);
+  await w.look();
+  expect(ids()).toEqual(["s1"]);
 });
 
 test("quiet past idleMinutes, the folder gone, or the plugin off for the folder: not reported", async () => {

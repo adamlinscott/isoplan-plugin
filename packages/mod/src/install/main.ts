@@ -3,8 +3,8 @@
 // place (install.ts), leaving wake.json marking the hook as uninstalled, so the plugin's data layer
 // doesn't put it back. It also records the `claude` binary and starts the machine's runner
 // (src/runner), with an environment recorded from this shell: the runner answers for the machine's
-// rooms, and as it starts reports every session written inside the lights-off window, so running
-// install again fills the office back in.
+// rooms, and as it starts reports every session written inside the lights-off window, so an install
+// that starts it fills the office back in; one already running reports those sessions already.
 //
 //   node dist/install.js [--uninstall]
 //

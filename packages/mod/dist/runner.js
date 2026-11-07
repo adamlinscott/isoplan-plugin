@@ -17224,6 +17224,9 @@ const cmp = (a, b) => a < b ? -1 : a > b ? 1 : 0;
 //#region src/data-layer/report-session.ts
 const LOG_CAP_BYTES$1 = 65536;
 const DORMANT_MS = 3e4;
+const LOCK_FRESH_MS = 3 * DORMANT_MS;
+/** The same for a holder whose passes `streamSeconds` makes slower: a pass may wait that long, and a slow office's list as long again. */
+const lockFreshMs = (config) => Math.max(LOCK_FRESH_MS, 6 * config.streamSeconds * 1e3);
 /** Reports the session until it should end. */
 async function reportSession(o) {
 	const { sessionId, cwd, closed } = o;
@@ -17319,11 +17322,12 @@ async function reportSession(o) {
 		}
 	}
 	const notWantedBefore = inRunner ? o.notWanted ?? {} : {};
+	let config = await loadConfig(io, defaultsPath, userConfigPath);
 	try {
 		if (inRunner && (await readLock(lock))?.pid === null) await fs.rm(lock, { force: true });
 		if (!await takeLock(lock, process.pid, alive, !inRunner, Date.now(), {
 			extra: lockExtra,
-			...inRunner && { freshMs: 9e4 }
+			...inRunner && { freshMs: lockFreshMs(config) }
 		})) return end("another data layer already reports this session");
 	} catch (err) {
 		if (inRunner) return end(`couldn't take the session lock: ${String(err?.message ?? err)}`);
@@ -17336,42 +17340,16 @@ async function reportSession(o) {
 		...place,
 		settings: path.join(claudeDir, "settings.json")
 	};
-	const start = (args, dir, env) => spawn(process.execPath, args, {
-		cwd: dir,
-		env,
-		detached: true,
-		stdio: "ignore",
-		windowsHide: true
-	}).on("error", () => {}).unref();
-	const installing = inRunner || outdated ? Promise.resolve([]) : installWake(paths, path.join(here, "data-layer.js"), path.join(here, "wake.js"), {
-		auto: true,
-		runnerFrom: path.join(here, ".."),
-		findClaude: () => findClaude(process.env, process.platform, os.homedir()),
-		linkHandler: {
-			platform: process.platform,
-			home: os.homedir(),
-			dataHome: process.env.XDG_DATA_HOME,
-			node: process.execPath
-		},
-		loginItem: {
-			platform: process.platform,
-			home: os.homedir(),
-			configHome: process.env.XDG_CONFIG_HOME,
-			uid: process.getuid?.(),
-			node: process.execPath
-		}
-	}).then((changes) => (changes.forEach((text) => emit({
-		type: "log",
-		text
-	})), changes), (err) => (emit({
-		type: "log",
-		text: `couldn't install the wake hook: ${String(err?.message ?? err)}`
-	}), []));
-	if (!inRunner && !outdated) installing.then(async () => await pluginState(place, self) === "enabled" && startRunner({
-		claudeDir,
-		spawn: start
-	})).catch(() => {});
-	let config = await loadConfig(io, defaultsPath, userConfigPath);
+	const installing = inRunner || outdated ? Promise.resolve() : startMachine({
+		place,
+		here,
+		spawn: spawnHidden,
+		log: (text) => emit({
+			type: "log",
+			text
+		}),
+		...systemPlaces()
+	}).installed;
 	if (outdated) emit({ type: "updated" });
 	const pluginId = pluginIdOf(place.plugins, self);
 	let checking = false;
@@ -17686,7 +17664,7 @@ async function reportSession(o) {
 	let pending = false;
 	const startedAt = Date.now();
 	const goOn = async () => {
-		if (!await wait(dormant && !pending ? DORMANT_MS : config.streamSeconds * 1e3)) return false;
+		if (!await wait(dormant && !pending ? DORMANT_MS : config.streamSeconds * 1e3)) return inRunner ? stopping("the runner stopped") : false;
 		if (isUnwanted()) return stopping("no office this reports to wants this session's project or takes its repo, so it holds off");
 		if (inRunner && await lockHolder(lock) !== process.pid) return stopping("another data layer reports this session now");
 		if (await isOff()) return stopping("Claude Code lists the Isoplan plugin as uninstalled or disabled here now");
@@ -17695,16 +17673,15 @@ async function reportSession(o) {
 	do {
 		const now = Date.now();
 		const isFirstPass = passes++ === 0;
-		if (!inRunner) {
-			if (await lockHolder(lock) !== process.pid) {
-				const reason = await supersededBy();
-				if (reason) {
-					leave(reason);
-					break;
-				}
-				await takeLock(lock, process.pid, alive, true, Date.now(), { extra: lockExtra }).catch(() => {});
-			} else await refreshLock(lock, process.pid).catch(() => {});
-		}
+		const holds = await lockHolder(lock) === process.pid;
+		if (!inRunner && !holds) {
+			const reason = await supersededBy();
+			if (reason) {
+				leave(reason);
+				break;
+			}
+			await takeLock(lock, process.pid, alive, true, Date.now(), { extra: lockExtra }).catch(() => {});
+		} else if (holds) await refreshLock(lock, process.pid).catch(() => {});
 		config = await loadConfig(io, defaultsPath, userConfigPath).catch(() => config);
 		if (!outdated && (outdated = await isOutdated())) emit({ type: "updated" });
 		if (now - checkedAt >= config.updateCheckHours * 36e5) checkUpdate(config.updateCheckHours * 36e5);
@@ -17913,6 +17890,57 @@ async function reportSession(o) {
 	};
 	return { why };
 }
+/** Starts `node <args>` detached and hidden, without waiting for it. */
+const spawnHidden = (args, dir, env) => spawn(process.execPath, args, {
+	cwd: dir,
+	env,
+	detached: true,
+	stdio: "ignore",
+	windowsHide: true
+}).on("error", () => {}).unref();
+/** Where this machine finds the claude binary, and keeps the isoplan:// link handler and the login item (src/install). */
+const systemPlaces = () => ({
+	findClaude: () => findClaude(process.env, process.platform, os.homedir()),
+	linkHandler: {
+		platform: process.platform,
+		home: os.homedir(),
+		dataHome: process.env.XDG_DATA_HOME,
+		node: process.execPath
+	},
+	loginItem: {
+		platform: process.platform,
+		home: os.homedir(),
+		configHome: process.env.XDG_CONFIG_HOME,
+		uid: process.getuid?.(),
+		node: process.execPath
+	}
+});
+/**
+* The machine's part of a current plugin data layer's start: the wake hook and the runner's copy
+* (src/install), then the runner (src/runner/start.ts), which replaces one running older code. The
+* runner answers for the machine's rooms and reports every session without a hooks module. Not
+* while the plugin is disabled for the machine, though a session's project enables it.
+*/
+function startMachine(o) {
+	const self = path.join(o.here, "data-layer.js");
+	const installed = installWake({
+		...o.place,
+		settings: path.join(o.place.claudeDir, "settings.json")
+	}, self, path.join(o.here, "wake.js"), {
+		auto: true,
+		runnerFrom: path.join(o.here, ".."),
+		findClaude: o.findClaude,
+		linkHandler: o.linkHandler,
+		loginItem: o.loginItem
+	}).then((changes) => changes.forEach((text) => o.log(text)), (err) => o.log(`couldn't install the wake hook: ${String(err?.message ?? err)}`));
+	return {
+		installed,
+		started: installed.then(async () => await pluginState(o.place, self) === "enabled" ? startRunner({
+			claudeDir: o.place.claudeDir,
+			spawn: o.spawn
+		}) : null).catch(() => null)
+	};
+}
 /**
 * Where a session the runner reports says what it does: its log lines, the office's errors and
 * pairing links, in <claude dir>/isoplan/logs/<session>.log; the rest is for a hooks module, so dropped.
@@ -18024,8 +18052,8 @@ function watchSessions(o) {
 				s.notWanted = ended.holdOff.notWanted;
 			}
 		}, (err) => o.log(`couldn't report session ${id}: ${String(err?.stack ?? err)}`)).finally(async () => {
-			s.running = null;
 			s.endedAt = (await io.stat(s.file))?.mtimeMs ?? s.mtimeMs;
+			s.running = null;
 		});
 		s.running = {
 			stop: close,
@@ -18045,9 +18073,9 @@ function watchSessions(o) {
 		return false;
 	};
 	/** Whether the session's lock names another live process that keeps it fresh. */
-	const heldByAnother = async (id, now) => {
+	const heldByAnother = async (id, now, config) => {
 		const lock = await readLock(lockPath(claudeDir, id));
-		return !!lock?.pid && lock.pid !== pid && isAlive(lock.pid) && now - lock.mtimeMs < 9e4;
+		return !!lock?.pid && lock.pid !== pid && isAlive(lock.pid) && now - lock.mtimeMs < lockFreshMs(config);
 	};
 	const look = async () => {
 		const config = await o.config();
@@ -18087,7 +18115,10 @@ function watchSessions(o) {
 					}
 					s.holdOff = null;
 				}
-				if (await heldByAnother(id, now)) continue;
+				if (await heldByAnother(id, now, config)) {
+					s.endedAt = st.mtimeMs;
+					continue;
+				}
 				s.cwd ??= await cwdOf(io, file, st.size);
 				if (!s.cwd) continue;
 				if (!await fs.stat(s.cwd).then((d) => d.isDirectory(), () => false) || await o.isOff(s.cwd)) {
@@ -18658,7 +18689,7 @@ async function worker() {
 			});
 		},
 		paired: async (office) => !!pairingEntry(await readPairing(pairingPath(claudeDir)), office.server, account.id)?.credential,
-		idle: () => answerers.every((a) => a.runner.idle()),
+		idle: () => answerers.every((a) => a.runner.idle()) && reporting.reporting().length === 0,
 		lit: async () => anyRoomSince(io, path.join(claudeDir, "projects"), Date.now() - askableMs(await config().catch(() => first))),
 		keep: async () => drive.held() > 0 || (await settings()).startAtLogin,
 		gone: new Promise((resolve) => process.stdin.on("end", resolve).on("error", resolve).resume()),
@@ -18669,6 +18700,7 @@ async function worker() {
 	send = links.sender;
 	live = links.live;
 	const ended = await links.ended;
+	await reporting.stop();
 	return ended === "not-wanted" ? 3 : ended === "unpaired" ? 4 : 0;
 }
 process.exitCode = await (process.argv.includes("--worker") ? worker() : supervisor());

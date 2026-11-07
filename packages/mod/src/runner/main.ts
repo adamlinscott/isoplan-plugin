@@ -147,8 +147,9 @@ async function supervisor(): Promise<number> {
   });
   clearInterval(refresh);
   if (stopped === "done" || stopped === "unpaired") {
-    // Unpaired, it doesn't hold off: the sessions' data layers pair the machine again, and the next
-    // start, from one of them or the wake hook, picks up the new credential.
+    // Unpaired, it doesn't hold off: the plugin's data layers pair the machine again, and the next
+    // start, from one of them, the wake hook or the login item, picks up the new credential. While
+    // the worker reports sessions it doesn't end, and their shared pairing pairs the machine again.
     log(`runner ${process.pid} stopped: ${stopped === "done" ? "no room on this machine is lit" : "the office server says this machine's pairing has ended"}`);
     await releaseLock(lock, process.pid).catch(() => {});
   } else {
@@ -479,7 +480,8 @@ async function worker(): Promise<number> {
       });
     },
     paired: async (office) => !!pairingEntry(await readPairing(pairingPath(claudeDir)), office.server, account.id)?.credential,
-    idle: () => answerers.every((a) => a.runner.idle()),
+    // Nor while it reports sessions: their links, and the pairing they share, would end with it.
+    idle: () => answerers.every((a) => a.runner.idle()) && reporting.reporting().length === 0,
     lit: async () => anyRoomSince(io, path.join(claudeDir, "projects"), Date.now() - askableMs(await config().catch(() => first))),
     keep: async () => drive.held() > 0 || (await settings()).startAtLogin,
     gone,
@@ -490,6 +492,8 @@ async function worker(): Promise<number> {
   send = links.sender;
   live = links.live;
   const ended = await links.ended;
+  // Each session's link closes, and its log says so, before the worker exits.
+  await reporting.stop();
   return ended === "not-wanted" ? NOT_WANTED_CODE : ended === "unpaired" ? UNPAIRED_CODE : 0;
 }
 

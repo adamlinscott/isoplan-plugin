@@ -6,11 +6,14 @@
 // per session to each office, as a data layer would. Not while the session's lock in
 // <claude dir>/isoplan/live names another live process that keeps it fresh (the plugin's data layer,
 // for its hooks module), while the transcript names no folder yet or the folder has gone, or while
-// Claude Code lists the plugin as uninstalled or disabled for the folder.
+// Claude Code lists the plugin as uninstalled or disabled for the folder. A lock counts as fresh for
+// three of its holder's slowest passes (lockFreshMs).
 //
 // A session it stopped reporting (quiet past `idleMinutes`, nothing to report, its link down five
-// minutes, or the plugin's data layer took its lock over) is reported again once its transcript
-// moves. One that ended with a hold-off (no office wants its project, git can't place its folder, or
+// minutes, or the plugin's data layer took its lock over), or that it found the plugin's data layer
+// reporting, is reported again once its transcript moves: so a session with the plugin that closes
+// goes unreachable, as it did before, and one whose plugin data layer crashed is taken at its next
+// turn. One that ended with a hold-off (no office wants its project, git can't place its folder, or
 // no office takes its repo) isn't reported again before the hold-off ends; one no office took is,
 // as its transcript moves, once a fresh copy of one office's list takes one of its repos: only of an
 // office it reported to or that config.json names now, never of one that didn't want it. The
@@ -22,7 +25,7 @@ import path from "node:path";
 import { approvedFiles, freshRepos, readApproved } from "../data-layer/approved-file.js";
 import { officesOf, type Config } from "../data-layer/config.js";
 import type { NodeIo } from "../data-layer/io.js";
-import { LOCK_FRESH_MS, type Ended } from "../data-layer/report-session.js";
+import { lockFreshMs, type Ended } from "../data-layer/report-session.js";
 import { cwdOf } from "../sweep/find.js";
 import { alive, lockPath, readLock } from "../wake/lock.js";
 
@@ -106,8 +109,9 @@ export function watchSessions(o: ReportingOptions): Reporting {
         (err: unknown) => o.log(`couldn't report session ${id}: ${String((err as Error)?.stack ?? err)}`),
       )
       .finally(async () => {
-        s.running = null;
+        // The write time first: a look between the two would start it again at once.
         s.endedAt = (await io.stat(s.file))?.mtimeMs ?? s.mtimeMs;
+        s.running = null;
       });
     s.running = { stop: close, done };
   };
@@ -126,9 +130,9 @@ export function watchSessions(o: ReportingOptions): Reporting {
   };
 
   /** Whether the session's lock names another live process that keeps it fresh. */
-  const heldByAnother = async (id: string, now: number) => {
+  const heldByAnother = async (id: string, now: number, config: Config) => {
     const lock = await readLock(lockPath(claudeDir, id));
-    return !!lock?.pid && lock.pid !== pid && isAlive(lock.pid) && now - lock.mtimeMs < LOCK_FRESH_MS;
+    return !!lock?.pid && lock.pid !== pid && isAlive(lock.pid) && now - lock.mtimeMs < lockFreshMs(config);
   };
 
   const look = async () => {
@@ -157,7 +161,10 @@ export function watchSessions(o: ReportingOptions): Reporting {
           }
           s.holdOff = null;
         }
-        if (await heldByAnother(id, now)) continue;
+        if (await heldByAnother(id, now, config)) {
+          s.endedAt = st.mtimeMs;
+          continue;
+        }
         s.cwd ??= await cwdOf(io, file, st.size);
         if (!s.cwd) continue; // nothing in it names a folder yet: looked at again next time
         if (!(await fs.stat(s.cwd).then((d) => d.isDirectory(), () => false)) || (await o.isOff(s.cwd))) {

@@ -11,7 +11,7 @@ import http from "node:http";
 import type { AddressInfo } from "node:net";
 import path from "node:path";
 import { afterEach, expect, test, vi } from "vitest";
-import { reportSession, sessionLog, type ReportSessionOptions } from "./report-session.js";
+import { reportSession, sessionLog, startDetached, type ReportSessionOptions } from "./report-session.js";
 import { WebSocketServer } from "ws";
 import { modDir, tempRoot } from "./fixture.js";
 
@@ -97,7 +97,7 @@ function start(url: string, config: Record<string, unknown> = {}, lines = turn) 
   const ended = inRunner(claudeDir, repo);
   const transcript = path.join(claudeDir, "projects", repo.replace(/[^a-zA-Z0-9]/g, "-"), "s1.jsonl");
   const logged = () => fs.readFileSync(path.join(claudeDir, "isoplan", "logs", "s1.log"), "utf8");
-  return { claudeDir, repo, transcript, ended, logged, lock: path.join(claudeDir, "isoplan", "live", "s1.json") };
+  return { claudeDir, repo, transcript, ended, logged, stop: reporting.at(-1)!.stop, lock: path.join(claudeDir, "isoplan", "live", "s1.json") };
 }
 
 const wait = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -151,6 +151,19 @@ test("the runner stops reporting a session that has started but has nothing to r
   await ended;
   expect(Date.now() - begun).toBeLessThan(15000);
   expect(logged()).toContain("stopping: the session has nothing to report now");
+});
+
+test("the runner keeps the session's lock fresh each pass, and as it stops reporting the session, its log says why", async () => {
+  const o = await office();
+  o.state.repos = ["github.com/team/app"];
+  const { ended, lock, logged, stop } = start(o.url);
+  await until(() => o.state.connections[0]?.messages.some((m) => m.type === "full") ?? false);
+  const old = new Date(Date.now() - 60000);
+  fs.utimesSync(lock, old, old);
+  await until(() => fs.statSync(lock).mtimeMs > Date.now() - 10000);
+  stop();
+  expect((await ended).why).toBe("the runner stopped");
+  expect(logged()).toContain("stopping: the runner stopped");
 });
 
 test("an approved session connects; once its copy of the list is past its maximum age and can't be checked, its link closes and no other socket opens, reconnects included", async () => {
@@ -288,7 +301,7 @@ function versions(server = "ws://127.0.0.1:9/data-layer") {
   return { claudeDir, lock, run, held, holder: () => (fs.existsSync(lock) ? (JSON.parse(fs.readFileSync(lock, "utf8")).pid as number) : null) };
 }
 
-test("a copy in the plugin cache that an update left behind says so, installs nothing and checks for nothing; started --detached by an older wake hook, it ends at once", async () => {
+test("a copy in the plugin cache that an update left behind says so, installs nothing and checks for nothing; started --detached by an older wake hook, it ends at once, saying why in the session's log", async () => {
   const v = versions();
   const loaded = v.run("0.2.0");
   await until(() => loaded.lines().some((l) => l.type === "updated"));
@@ -302,6 +315,22 @@ test("a copy in the plugin cache that an update left behind says so, installs no
   const detached = v.run("0.3.0", "--detached");
   expect(await detached.exited).toBe(0);
   expect(fs.existsSync(v.lock)).toBe(false);
+  expect(fs.readFileSync(path.join(v.claudeDir, "isoplan", "logs", "s1.log"), "utf8")).toContain("the runner reports it now, so this data layer ends");
+});
+
+test("started --detached by an earlier version's wake hook, it puts this version's wake hook and runner in place, starts the runner hidden, and says so in the session's log", async () => {
+  const root = tempRoot();
+  const claudeDir = path.join(root, "claude");
+  vi.stubEnv("CLAUDE_CONFIG_DIR", claudeDir);
+  vi.stubEnv("CLAUDE_CODE_PLUGIN_CACHE_DIR", "");
+  const spawned: { args: string[]; cwd: string }[] = [];
+  await startDetached({ sessionId: "s1", project: root, appDir: modDir, spawn: (args, cwd) => void spawned.push({ args, cwd }) });
+  const wake = JSON.parse(fs.readFileSync(path.join(claudeDir, "isoplan", "wake.json"), "utf8")) as { dataLayer: string; runner: string };
+  expect(wake.runner).toBe(path.join(claudeDir, "isoplan", "runner", "app", "dist", "runner.mjs"));
+  expect(fs.existsSync(wake.runner)).toBe(true);
+  expect(fs.readFileSync(path.join(claudeDir, "settings.json"), "utf8")).toContain("wake.mjs");
+  expect(spawned.map(({ args, cwd }) => ({ args: args.map((a) => (a.startsWith("--") ? a : path.resolve(a))), cwd: path.resolve(cwd) }))).toEqual([{ args: [wake.runner, "--claude-dir", path.resolve(claudeDir), "--inherited-env"], cwd: path.resolve(claudeDir) }]);
+  expect(fs.readFileSync(path.join(claudeDir, "isoplan", "logs", "s1.log"), "utf8")).toContain("the runner reports it now, so this data layer ends (started the runner)");
 });
 
 test("the runner, reporting a session whose plugin is turned off for its folder, says so in the session's log as it stops", async () => {

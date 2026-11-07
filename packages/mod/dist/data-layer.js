@@ -12352,7 +12352,11 @@ function nextTitle(facts, cache, now) {
 const cmp = (a, b) => a < b ? -1 : a > b ? 1 : 0;
 //#endregion
 //#region src/data-layer/report-session.ts
+const LOG_CAP_BYTES = 65536;
 const DORMANT_MS = 3e4;
+const LOCK_FRESH_MS = 3 * DORMANT_MS;
+/** The same for a holder whose passes `streamSeconds` makes slower: a pass may wait that long, and a slow office's list as long again. */
+const lockFreshMs = (config) => Math.max(LOCK_FRESH_MS, 6 * config.streamSeconds * 1e3);
 /** Reports the session until it should end. */
 async function reportSession(o) {
 	const { sessionId, cwd, closed } = o;
@@ -12448,11 +12452,12 @@ async function reportSession(o) {
 		}
 	}
 	const notWantedBefore = inRunner ? o.notWanted ?? {} : {};
+	let config = await loadConfig(io, defaultsPath, userConfigPath);
 	try {
 		if (inRunner && (await readLock(lock))?.pid === null) await fs.rm(lock, { force: true });
 		if (!await takeLock(lock, process.pid, alive, !inRunner, Date.now(), {
 			extra: lockExtra,
-			...inRunner && { freshMs: 9e4 }
+			...inRunner && { freshMs: lockFreshMs(config) }
 		})) return end("another data layer already reports this session");
 	} catch (err) {
 		if (inRunner) return end(`couldn't take the session lock: ${String(err?.message ?? err)}`);
@@ -12465,42 +12470,16 @@ async function reportSession(o) {
 		...place,
 		settings: path.join(claudeDir, "settings.json")
 	};
-	const start = (args, dir, env) => spawn(process.execPath, args, {
-		cwd: dir,
-		env,
-		detached: true,
-		stdio: "ignore",
-		windowsHide: true
-	}).on("error", () => {}).unref();
-	const installing = inRunner || outdated ? Promise.resolve([]) : installWake(paths, path.join(here, "data-layer.js"), path.join(here, "wake.js"), {
-		auto: true,
-		runnerFrom: path.join(here, ".."),
-		findClaude: () => findClaude(process.env, process.platform, os.homedir()),
-		linkHandler: {
-			platform: process.platform,
-			home: os.homedir(),
-			dataHome: process.env.XDG_DATA_HOME,
-			node: process.execPath
-		},
-		loginItem: {
-			platform: process.platform,
-			home: os.homedir(),
-			configHome: process.env.XDG_CONFIG_HOME,
-			uid: process.getuid?.(),
-			node: process.execPath
-		}
-	}).then((changes) => (changes.forEach((text) => emit({
-		type: "log",
-		text
-	})), changes), (err) => (emit({
-		type: "log",
-		text: `couldn't install the wake hook: ${String(err?.message ?? err)}`
-	}), []));
-	if (!inRunner && !outdated) installing.then(async () => await pluginState(place, self) === "enabled" && startRunner({
-		claudeDir,
-		spawn: start
-	})).catch(() => {});
-	let config = await loadConfig(io, defaultsPath, userConfigPath);
+	const installing = inRunner || outdated ? Promise.resolve() : startMachine({
+		place,
+		here,
+		spawn: spawnHidden,
+		log: (text) => emit({
+			type: "log",
+			text
+		}),
+		...systemPlaces()
+	}).installed;
 	if (outdated) emit({ type: "updated" });
 	const pluginId = pluginIdOf(place.plugins, self);
 	let checking = false;
@@ -12815,7 +12794,7 @@ async function reportSession(o) {
 	let pending = false;
 	const startedAt = Date.now();
 	const goOn = async () => {
-		if (!await wait(dormant && !pending ? DORMANT_MS : config.streamSeconds * 1e3)) return false;
+		if (!await wait(dormant && !pending ? DORMANT_MS : config.streamSeconds * 1e3)) return inRunner ? stopping("the runner stopped") : false;
 		if (isUnwanted()) return stopping("no office this reports to wants this session's project or takes its repo, so it holds off");
 		if (inRunner && await lockHolder(lock) !== process.pid) return stopping("another data layer reports this session now");
 		if (await isOff()) return stopping("Claude Code lists the Isoplan plugin as uninstalled or disabled here now");
@@ -12824,16 +12803,15 @@ async function reportSession(o) {
 	do {
 		const now = Date.now();
 		const isFirstPass = passes++ === 0;
-		if (!inRunner) {
-			if (await lockHolder(lock) !== process.pid) {
-				const reason = await supersededBy();
-				if (reason) {
-					leave(reason);
-					break;
-				}
-				await takeLock(lock, process.pid, alive, true, Date.now(), { extra: lockExtra }).catch(() => {});
-			} else await refreshLock(lock, process.pid).catch(() => {});
-		}
+		const holds = await lockHolder(lock) === process.pid;
+		if (!inRunner && !holds) {
+			const reason = await supersededBy();
+			if (reason) {
+				leave(reason);
+				break;
+			}
+			await takeLock(lock, process.pid, alive, true, Date.now(), { extra: lockExtra }).catch(() => {});
+		} else if (holds) await refreshLock(lock, process.pid).catch(() => {});
 		config = await loadConfig(io, defaultsPath, userConfigPath).catch(() => config);
 		if (!outdated && (outdated = await isOutdated())) emit({ type: "updated" });
 		if (now - checkedAt >= config.updateCheckHours * 36e5) checkUpdate(config.updateCheckHours * 36e5);
@@ -13042,6 +13020,125 @@ async function reportSession(o) {
 	};
 	return { why };
 }
+/** Starts `node <args>` detached and hidden, without waiting for it. */
+const spawnHidden = (args, dir, env) => spawn(process.execPath, args, {
+	cwd: dir,
+	env,
+	detached: true,
+	stdio: "ignore",
+	windowsHide: true
+}).on("error", () => {}).unref();
+/** Where this machine finds the claude binary, and keeps the isoplan:// link handler and the login item (src/install). */
+const systemPlaces = () => ({
+	findClaude: () => findClaude(process.env, process.platform, os.homedir()),
+	linkHandler: {
+		platform: process.platform,
+		home: os.homedir(),
+		dataHome: process.env.XDG_DATA_HOME,
+		node: process.execPath
+	},
+	loginItem: {
+		platform: process.platform,
+		home: os.homedir(),
+		configHome: process.env.XDG_CONFIG_HOME,
+		uid: process.getuid?.(),
+		node: process.execPath
+	}
+});
+/**
+* The machine's part of a current plugin data layer's start: the wake hook and the runner's copy
+* (src/install), then the runner (src/runner/start.ts), which replaces one running older code. The
+* runner answers for the machine's rooms and reports every session without a hooks module. Not
+* while the plugin is disabled for the machine, though a session's project enables it.
+*/
+function startMachine(o) {
+	const self = path.join(o.here, "data-layer.js");
+	const installed = installWake({
+		...o.place,
+		settings: path.join(o.place.claudeDir, "settings.json")
+	}, self, path.join(o.here, "wake.js"), {
+		auto: true,
+		runnerFrom: path.join(o.here, ".."),
+		findClaude: o.findClaude,
+		linkHandler: o.linkHandler,
+		loginItem: o.loginItem
+	}).then((changes) => changes.forEach((text) => o.log(text)), (err) => o.log(`couldn't install the wake hook: ${String(err?.message ?? err)}`));
+	return {
+		installed,
+		started: installed.then(async () => await pluginState(o.place, self) === "enabled" ? startRunner({
+			claudeDir: o.place.claudeDir,
+			spawn: o.spawn
+		}) : null).catch(() => null)
+	};
+}
+/**
+* For `--detached` (main.ts): a wake hook or runner of an earlier version started this data layer
+* for a session without a hooks module, which the runner reports now (src/runner/reporting.ts).
+* So it does the machine's part of its start (startMachine), putting this version's wake hook and
+* runner in place and starting that runner in place of the older one, says so in the session's
+* log, and is done. An outdated copy does nothing, so it never hands them back to older code.
+*/
+async function startDetached(o) {
+	const { dir: claudeDir } = claudePaths(process.env, os.homedir());
+	const here = path.join(o.appDir, "dist");
+	const self = path.join(here, "data-layer.js");
+	const place = {
+		claudeDir,
+		plugins: pluginsDir(claudeDir, process.env),
+		managed: managedDir(process.platform),
+		pluginDirs: pluginDirsOf(process.env)
+	};
+	const said = o.sessionId ? sessionLog(claudeDir, o.sessionId) : null;
+	const say = (text) => said?.say(text);
+	if (await newestDataLayer(place.plugins, self, o.project ?? void 0).catch(() => self) !== self) say("an earlier version's wake hook or runner started an outdated copy of the plugin's data layer for this session, which does nothing: the newest version's runner reports sessions without the plugin");
+	else {
+		const started = await startMachine({
+			place,
+			here,
+			spawn: o.spawn,
+			log: say,
+			findClaude: o.findClaude,
+			linkHandler: o.linkHandler,
+			loginItem: o.loginItem
+		}).started;
+		say(`an earlier version's wake hook or runner asked for this session to be reported: the runner reports it now, so this data layer ends (${started === null ? "the plugin is disabled for this machine, so the runner wasn't started" : {
+			started: "started the runner",
+			running: "the runner was already running",
+			"held-off": "the runner is holding off for now (see runner.log)",
+			"not-installed": "the runner's copy isn't in place, so it wasn't started"
+		}[started]})`);
+	}
+	await said?.flushed();
+}
+/**
+* Where a session the runner reports says what it does: its log lines, the office's errors and
+* pairing links, in <claude dir>/isoplan/logs/<session>.log; the rest is for a hooks module, so dropped.
+* `flushed` settles once what was said so far is written.
+*/
+function sessionLog(claudeDir, sessionId) {
+	const file = path.join(claudeDir, "isoplan", "logs", `${sessionId}.log`);
+	let logging = Promise.resolve();
+	const say = (said) => {
+		const text = `${(/* @__PURE__ */ new Date()).toISOString()} ${said}
+`;
+		logging = logging.then(() => writeLog(file, text)).catch(() => {});
+	};
+	return {
+		emit: (line) => {
+			if (line.type === "log" || line.type === "error" || line.type === "pair") say(line.type === "log" ? line.text : line.type === "pair" ? pairNote(line) : `the office server says: ${line.message} (${line.code})`);
+		},
+		say,
+		flushed: () => logging
+	};
+}
+/** A pair line as the log says it. */
+const pairNote = (line) => `to report to ${line.server}, pair this machine: click ${line.url} on this computer and approve it in the office (it works until ${line.expires})`;
+async function writeLog(file, text) {
+	const size = (await fs.stat(file).catch(() => null))?.size ?? 0;
+	await fs.mkdir(path.dirname(file), { recursive: true });
+	if (size > LOG_CAP_BYTES) await fs.writeFile(file, text);
+	else await fs.appendFile(file, text);
+}
 async function waitsOf(dir, facts) {
 	const out = /* @__PURE__ */ new Set();
 	for (const q of facts.questions ?? []) {
@@ -13096,7 +13193,16 @@ async function main(argv) {
 	const sessionId = value(argv, "--session");
 	const cwd = value(argv, "--cwd");
 	const appDir = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
-	if (argv.includes("--detached")) return 0;
+	if (argv.includes("--detached")) {
+		await startDetached({
+			sessionId,
+			project: value(argv, "--project") ?? cwd,
+			appDir,
+			spawn: spawnHidden,
+			...systemPlaces()
+		});
+		return 0;
+	}
 	if (!sessionId || !cwd) {
 		process.stderr.write("usage: node data-layer.js --session <id> --cwd <dir> [--project <dir>] [--since <ms>] [--messages]\n");
 		return 2;
