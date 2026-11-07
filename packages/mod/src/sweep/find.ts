@@ -1,5 +1,5 @@
 // Finds this machine's Claude Code sessions: every top-level transcript under ~/.claude/projects
-// written inside the window (the backfill takes them all), or only those whose folder is in a
+// written inside the window, or only those whose folder is in a
 // checkout or worktree of one project (the sweep).
 
 import type { Git } from "../data-layer/git.js";

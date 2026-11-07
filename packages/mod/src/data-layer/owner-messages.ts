@@ -9,8 +9,8 @@
 // turn and any message before it, and writes in the file the line names whether it went in. The
 // server gets a reply once it went in, or with `queued` once the session accepted it to run after
 // the running turn (it hasn't gone in yet then), and a refusal with a plain
-// reason and its code otherwise. A detached data layer, for a session seen only through the wake
-// hook, has no hooks module, so its session takes none.
+// reason and its code otherwise. The runner, reporting a session without a hooks module, has none to
+// pass it to, so its session takes none.
 
 import { PROTOCOL_VERSION, type OwnerMessageRefusal, type RefusalMessage, type ReplyMessage, type RequestMessage } from "@isoplan/protocol";
 import type { DataLayerLine, MessageTaken } from "../lines.js";

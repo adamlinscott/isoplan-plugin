@@ -1,10 +1,10 @@
-import { execFile, spawn, spawnSync } from "node:child_process";
-import { createHash, randomBytes, randomUUID } from "node:crypto";
-import { appendFileSync, mkdirSync, statSync } from "node:fs";
-import fs from "node:fs/promises";
-import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { execFile, spawn, spawnSync } from "node:child_process";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
+import fs from "node:fs/promises";
+import os from "node:os";
+import { statSync } from "node:fs";
 import http from "node:http";
 //#region ../../node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/core/util.js
 function getEnumValues(entries) {
@@ -7022,11 +7022,6 @@ async function claudeBinary(claudeDir, env, platform, home) {
 //#endregion
 //#region src/wake/lock.ts
 const lockPath = (claudeDir, sessionId) => path.join(claudeDir, "isoplan", "live", `${sessionId}.json`);
-/**
-* The offices that didn't want a session, each until when (#105): the wake hook moves them here from
-* a hold-off it ends, for the data layer it starts, which reads the file once and removes it.
-*/
-const notWantedPath = (claudeDir, sessionId) => path.join(claudeDir, "isoplan", "live", `${sessionId}.not-wanted`);
 const HOLD_OFF_MS = 36e5;
 async function readText(file) {
 	try {
@@ -7061,16 +7056,9 @@ async function lockHolder(file) {
 	return (await readLock(file))?.pid ?? null;
 }
 const held = (lock, now, { isAlive = alive, freshMs }) => !!lock && (lock.until !== null && lock.until > now || lock.pid !== null && isAlive(lock.pid) && (freshMs === void 0 || now - lock.mtimeMs < freshMs));
-/** Whether the lock is held: by a live pid (kept fresh, under `freshMs`), or by a hold-off that hasn't ended. */
-async function isHeld(file, now = Date.now(), isAlive = alive, rule = {}) {
-	return held(await readLock(file), now, {
-		...rule,
-		isAlive
-	});
-}
 /**
 * Takes the lock for `pid`; false when it is held (`isHeld`). With `force` (the plugin's data
-* layer) it is taken regardless: a detached one holding it sees that and steps aside. `extra` is
+* layer) it is taken regardless: the runner holding it sees that and steps aside. `extra` is
 * written into the lock beside the pid.
 *
 * A new lock is created exclusively, so of two takers at once only one gets it. A stale one is
@@ -7146,232 +7134,12 @@ async function refreshLock(file, pid, now = Date.now(), retryMs = 250) {
 async function releaseLock(file, pid) {
 	if (await lockHolder(file) === pid) await fs.rm(file, { force: true });
 }
-/** Turns the lock `pid` holds into a hold-off until `until`, with `extra` beside it; one another has taken is left. */
-async function holdOff(file, pid, until, extra = {}) {
-	if (await lockHolder(file) === pid) await fs.writeFile(file, JSON.stringify({
-		pid: 0,
-		until,
-		...extra
-	}));
-}
 function alive(pid) {
 	try {
 		process.kill(pid, 0);
 		return true;
 	} catch (err) {
 		return err.code === "EPERM";
-	}
-}
-//#endregion
-//#region src/data-layer/approved-file.ts
-/** The folder of what is kept for one office server alone: its list, and its pairing's lock. Named by a hash of its address. */
-const officeDir = (claudeDir, server) => path.join(claudeDir, "isoplan", "offices", createHash("sha256").update(server).digest("hex").slice(0, 12));
-const approvedPath = (claudeDir, server) => path.join(officeDir(claudeDir, server), "approved.json");
-const isFile = (v) => !!v && typeof v.server === "string" && typeof v.version === "string" && typeof v.fetched === "number" && typeof v.checked === "number" && Array.isArray(v.repos) && v.repos.every((r) => typeof r === "string");
-/** approved.json, for `server` when given; null when there is none, or it is another server's. */
-async function readApproved(file, server) {
-	try {
-		const value = JSON.parse(await fs.readFile(file, "utf8"));
-		return isFile(value) && (server === void 0 || value.server === server) ? value : null;
-	} catch {
-		return null;
-	}
-}
-/** The approved repos' ids, lower case, while the copy is younger than `maxAgeMs`; null after, or with none. */
-function freshRepos(copy, maxAgeMs, now) {
-	return copy && now - copy.checked <= maxAgeMs ? new Set(copy.repos.map((r) => r.toLowerCase())) : null;
-}
-//#endregion
-//#region src/install/state.ts
-/** Claude Code's plugins folder: $CLAUDE_CODE_PLUGIN_CACHE_DIR when it is set, else <claude dir>/plugins. */
-const pluginsDir = (claudeDir, env) => env.CLAUDE_CODE_PLUGIN_CACHE_DIR || path.join(claudeDir, "plugins");
-/** The folders $CLAUDE_CODE_PLUGIN_DIRS names. */
-const pluginDirsOf = (env) => (env.CLAUDE_CODE_PLUGIN_DIRS ?? "").split(path.delimiter).filter(Boolean);
-/** The system folder Claude Code reads managed-settings.json from. */
-function managedDir(platform) {
-	if (platform === "win32") return "C:\\Program Files\\ClaudeCode";
-	if (platform === "darwin") return "/Library/Application Support/ClaudeCode";
-	return "/etc/claude-code";
-}
-/** A path as compared: resolved, with forward slashes, and on Windows and macOS without regard to case. */
-function normalPath(p, platform = process.platform) {
-	const resolved = path.resolve(p).replace(/\\/g, "/");
-	return platform === "win32" || platform === "darwin" ? resolved.toLowerCase() : resolved;
-}
-function cacheParts(cache, file) {
-	const relative = path.relative(cache, path.resolve(file));
-	if (path.isAbsolute(relative)) return null;
-	const parts = relative.split(path.sep);
-	return parts.length >= 4 && parts[0] !== ".." ? parts : null;
-}
-async function realCacheParts(plugins, file) {
-	const cache = await fs.realpath(path.join(plugins, "cache")).catch(() => path.join(plugins, "cache"));
-	return {
-		cache,
-		parts: cacheParts(cache, await fs.realpath(file).catch(() => file))
-	};
-}
-/** The id, `<plugin>@<marketplace>`, of the marketplace install `file` is part of; null for a file outside the plugin cache. */
-function pluginIdOf(plugins, file) {
-	const parts = cacheParts(path.join(plugins, "cache"), file);
-	return parts ? `${parts[1]}@${parts[0]}` : null;
-}
-const appliesTo = (install, project) => !project || !(install.scope === "project" || install.scope === "local") || !install.projectPath || normalPath(install.projectPath) === normalPath(project);
-const KEY_FILES = [
-	["dist", "data-layer.js"],
-	["dist", "wake.js"],
-	["dist", "hooks.js"],
-	[".claude-plugin", "plugin.json"]
-];
-/**
-* The data layer of the newest copy of its plugin Claude Code records for a session in `project`
-* (`appliesTo`, as `pluginState` counts installs): by version when every one is x.y.z, else by
-* which was updated last (`newestFirst`), counting only a folder that holds KEY_FILES and whose
-* plugin.json names the recorded version (a plugin.json naming none counts, its version came from
-* elsewhere). `dataLayer` itself when that copy is its own folder, when it is outside the cache, or
-* when no record reads. A data layer this doesn't return is outdated: an update put another version
-* on disk, which the session loads at its next start or /reload-plugins.
-*/
-async function newestDataLayer(plugins, dataLayer, project) {
-	const { cache, parts } = await realCacheParts(plugins, dataLayer);
-	if (!parts) return dataLayer;
-	const id = `${parts[1]}@${parts[0]}`;
-	const root = await realPath(path.join(cache, ...parts.slice(0, 3)));
-	const recorded = newestFirst((await installs(plugins) ?? []).filter((i) => i.id === id && i.installPath && appliesTo(i, project)));
-	for (const install of recorded) {
-		if (await realPath(install.installPath) === root) return dataLayer;
-		if (await isComplete(install)) return path.join(install.installPath, ...parts.slice(3));
-	}
-	return dataLayer;
-}
-/**
-* Installs newest first, in one order for the whole list: by semantic version when every install's
-* version is one (a pre-release below its release), else by `lastUpdated`, latest first.
-*/
-function newestFirst(list) {
-	const versions = list.map((i) => semver(i.version));
-	if (!versions.every(Boolean)) return [...list].sort((a, b) => (b.lastUpdated ?? "").localeCompare(a.lastUpdated ?? ""));
-	return list.map((install, k) => ({
-		install,
-		v: versions[k]
-	})).sort((a, b) => compareSemver(b.v, a.v)).map((x) => x.install);
-}
-const semver = (version) => {
-	const m = version ? /^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?$/.exec(version) : null;
-	return m ? {
-		core: [
-			Number(m[1]),
-			Number(m[2]),
-			Number(m[3])
-		],
-		pre: m[4] ? m[4].split(".") : null
-	} : null;
-};
-function compareSemver(a, b) {
-	for (let i = 0; i < 3; i++) if (a.core[i] !== b.core[i]) return a.core[i] - b.core[i];
-	if (!a.pre || !b.pre) return (a.pre ? -1 : 0) - (b.pre ? -1 : 0);
-	for (let i = 0; i < Math.min(a.pre.length, b.pre.length); i++) {
-		const [x, y] = [a.pre[i], b.pre[i]];
-		if (x === y) continue;
-		const [nx, ny] = [/^\d+$/.test(x), /^\d+$/.test(y)];
-		if (nx && ny) return Number(x) - Number(y);
-		if (nx !== ny) return nx ? -1 : 1;
-		return x < y ? -1 : 1;
-	}
-	return a.pre.length - b.pre.length;
-}
-async function isComplete(install) {
-	for (const file of KEY_FILES) if (!await fs.stat(path.join(install.installPath, ...file)).then((s) => s.isFile(), () => false)) return false;
-	const manifest = await readJson(path.join(install.installPath, ".claude-plugin", "plugin.json"));
-	return !!manifest && (typeof manifest.version !== "string" || manifest.version === install.version);
-}
-const realPath = async (p) => normalPath(await fs.realpath(p).catch(() => p));
-const nameOf = (id) => id.slice(0, id.lastIndexOf("@"));
-/** Every install installed_plugins.json records; null when it is missing, can't be read, or isn't the shape known. */
-async function installs(plugins) {
-	const record = await readJson(path.join(plugins, "installed_plugins.json"));
-	const list = record?.plugins;
-	if (record?.version !== 2 || !isObject$1(list) || !Object.values(list).every(Array.isArray)) return null;
-	return Object.entries(list).flatMap(([id, entries]) => entries.map((entry) => {
-		const e = isObject$1(entry) ? entry : {};
-		const text = (key) => typeof e[key] === "string" ? e[key] : null;
-		return {
-			id,
-			scope: text("scope"),
-			projectPath: text("projectPath"),
-			installPath: text("installPath"),
-			version: text("version"),
-			lastUpdated: text("lastUpdated")
-		};
-	}));
-}
-/** Whether `enabledPlugins` names the plugin `id` enabled, disabled, or not at all (null). */
-async function enabledIn(file, id) {
-	const value = (await readJson(file))?.enabledPlugins;
-	return isObject$1(value) && typeof value[id] === "boolean" ? value[id] : null;
-}
-/**
-* What Claude Code says of the plugin `dataLayer` belongs to. With `project` (a session's project
-* folder) the project's settings and installs count too; without, only the machine's: the
-* managed files, the user's settings, and every install.
-*/
-async function pluginState(place, dataLayer, project) {
-	const { parts } = await realCacheParts(place.plugins, dataLayer);
-	if (!parts) return "enabled";
-	const id = `${parts[1]}@${parts[0]}`;
-	const name = nameOf(id);
-	const all = await installs(place.plugins);
-	let ids = [id];
-	if (all) {
-		const mine = all.filter((i) => nameOf(i.id) === name);
-		if (!mine.length) return await isInPluginDirs(place.pluginDirs ?? [], name) ? "enabled" : "uninstalled";
-		const here = mine.filter((i) => appliesTo(i, project));
-		if (!here.length) return "disabled";
-		ids = [...new Set(here.map((i) => i.id))];
-	}
-	return (await Promise.all(ids.map((one) => enabledFor(place, one, project)))).includes(true) ? "enabled" : "disabled";
-}
-async function enabledFor(place, id, project) {
-	const managed = await Promise.all((await managedFiles(place.managed)).map((file) => enabledIn(file, id)));
-	if (managed.includes(false)) return false;
-	if (managed.includes(true)) return true;
-	for (const file of await ownFiles(place, project)) {
-		const enabled = await enabledIn(file, id);
-		if (enabled !== null) return enabled;
-	}
-	return true;
-}
-async function isInPluginDirs(dirs, name) {
-	for (const dir of dirs) if ((await readJson(path.join(dir, ".claude-plugin", "plugin.json")))?.name === name) return true;
-	return false;
-}
-async function managedFiles(managed) {
-	const dropIns = await fs.readdir(path.join(managed, "managed-settings.d")).then((names) => names.filter((n) => n.endsWith(".json")).map((n) => path.join(managed, "managed-settings.d", n)), () => []);
-	return [path.join(managed, "managed-settings.json"), ...dropIns];
-}
-async function ownFiles({ claudeDir }, project) {
-	const files = [];
-	if (project) {
-		const root = await gitRoot(project);
-		if (root && normalPath(root) !== normalPath(project)) files.push(path.join(root, ".claude", "settings.local.json"));
-		files.push(path.join(project, ".claude", "settings.local.json"), path.join(project, ".claude", "settings.json"));
-	}
-	files.push(path.join(claudeDir, "settings.json"));
-	return files;
-}
-async function gitRoot(dir) {
-	for (let at = path.resolve(dir);; at = path.dirname(at)) {
-		if (await fs.stat(path.join(at, ".git")).then(() => true, () => false)) return at;
-		if (path.dirname(at) === at) return null;
-	}
-}
-const isObject$1 = (value) => !!value && typeof value === "object" && !Array.isArray(value);
-async function readJson(file) {
-	try {
-		const value = JSON.parse((await fs.readFile(file, "utf8")).replace(/^\uFEFF/, ""));
-		return isObject$1(value) ? value : null;
-	} catch {
-		return null;
 	}
 }
 //#endregion
@@ -7781,6 +7549,199 @@ async function register$1(given) {
 		return [`registered isoplan:// links to open ${h.script}, through ${file}`];
 	}
 	return [];
+}
+//#endregion
+//#region src/install/state.ts
+/** Claude Code's plugins folder: $CLAUDE_CODE_PLUGIN_CACHE_DIR when it is set, else <claude dir>/plugins. */
+const pluginsDir = (claudeDir, env) => env.CLAUDE_CODE_PLUGIN_CACHE_DIR || path.join(claudeDir, "plugins");
+/** The folders $CLAUDE_CODE_PLUGIN_DIRS names. */
+const pluginDirsOf = (env) => (env.CLAUDE_CODE_PLUGIN_DIRS ?? "").split(path.delimiter).filter(Boolean);
+/** The system folder Claude Code reads managed-settings.json from. */
+function managedDir(platform) {
+	if (platform === "win32") return "C:\\Program Files\\ClaudeCode";
+	if (platform === "darwin") return "/Library/Application Support/ClaudeCode";
+	return "/etc/claude-code";
+}
+/** A path as compared: resolved, with forward slashes, and on Windows and macOS without regard to case. */
+function normalPath(p, platform = process.platform) {
+	const resolved = path.resolve(p).replace(/\\/g, "/");
+	return platform === "win32" || platform === "darwin" ? resolved.toLowerCase() : resolved;
+}
+function cacheParts(cache, file) {
+	const relative = path.relative(cache, path.resolve(file));
+	if (path.isAbsolute(relative)) return null;
+	const parts = relative.split(path.sep);
+	return parts.length >= 4 && parts[0] !== ".." ? parts : null;
+}
+async function realCacheParts(plugins, file) {
+	const cache = await fs.realpath(path.join(plugins, "cache")).catch(() => path.join(plugins, "cache"));
+	return {
+		cache,
+		parts: cacheParts(cache, await fs.realpath(file).catch(() => file))
+	};
+}
+/** The id, `<plugin>@<marketplace>`, of the marketplace install `file` is part of; null for a file outside the plugin cache. */
+function pluginIdOf(plugins, file) {
+	const parts = cacheParts(path.join(plugins, "cache"), file);
+	return parts ? `${parts[1]}@${parts[0]}` : null;
+}
+const appliesTo = (install, project) => !project || !(install.scope === "project" || install.scope === "local") || !install.projectPath || normalPath(install.projectPath) === normalPath(project);
+const KEY_FILES = [
+	["dist", "data-layer.js"],
+	["dist", "wake.js"],
+	["dist", "hooks.js"],
+	[".claude-plugin", "plugin.json"]
+];
+/**
+* The data layer of the newest copy of its plugin Claude Code records for a session in `project`
+* (`appliesTo`, as `pluginState` counts installs): by version when every one is x.y.z, else by
+* which was updated last (`newestFirst`), counting only a folder that holds KEY_FILES and whose
+* plugin.json names the recorded version (a plugin.json naming none counts, its version came from
+* elsewhere). `dataLayer` itself when that copy is its own folder, when it is outside the cache, or
+* when no record reads. A data layer this doesn't return is outdated: an update put another version
+* on disk, which the session loads at its next start or /reload-plugins.
+*/
+async function newestDataLayer(plugins, dataLayer, project) {
+	const { cache, parts } = await realCacheParts(plugins, dataLayer);
+	if (!parts) return dataLayer;
+	const id = `${parts[1]}@${parts[0]}`;
+	const root = await realPath(path.join(cache, ...parts.slice(0, 3)));
+	const recorded = newestFirst((await installs(plugins) ?? []).filter((i) => i.id === id && i.installPath && appliesTo(i, project)));
+	for (const install of recorded) {
+		if (await realPath(install.installPath) === root) return dataLayer;
+		if (await isComplete(install)) return path.join(install.installPath, ...parts.slice(3));
+	}
+	return dataLayer;
+}
+/**
+* Installs newest first, in one order for the whole list: by semantic version when every install's
+* version is one (a pre-release below its release), else by `lastUpdated`, latest first.
+*/
+function newestFirst(list) {
+	const versions = list.map((i) => semver(i.version));
+	if (!versions.every(Boolean)) return [...list].sort((a, b) => (b.lastUpdated ?? "").localeCompare(a.lastUpdated ?? ""));
+	return list.map((install, k) => ({
+		install,
+		v: versions[k]
+	})).sort((a, b) => compareSemver(b.v, a.v)).map((x) => x.install);
+}
+const semver = (version) => {
+	const m = version ? /^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?$/.exec(version) : null;
+	return m ? {
+		core: [
+			Number(m[1]),
+			Number(m[2]),
+			Number(m[3])
+		],
+		pre: m[4] ? m[4].split(".") : null
+	} : null;
+};
+function compareSemver(a, b) {
+	for (let i = 0; i < 3; i++) if (a.core[i] !== b.core[i]) return a.core[i] - b.core[i];
+	if (!a.pre || !b.pre) return (a.pre ? -1 : 0) - (b.pre ? -1 : 0);
+	for (let i = 0; i < Math.min(a.pre.length, b.pre.length); i++) {
+		const [x, y] = [a.pre[i], b.pre[i]];
+		if (x === y) continue;
+		const [nx, ny] = [/^\d+$/.test(x), /^\d+$/.test(y)];
+		if (nx && ny) return Number(x) - Number(y);
+		if (nx !== ny) return nx ? -1 : 1;
+		return x < y ? -1 : 1;
+	}
+	return a.pre.length - b.pre.length;
+}
+async function isComplete(install) {
+	for (const file of KEY_FILES) if (!await fs.stat(path.join(install.installPath, ...file)).then((s) => s.isFile(), () => false)) return false;
+	const manifest = await readJson(path.join(install.installPath, ".claude-plugin", "plugin.json"));
+	return !!manifest && (typeof manifest.version !== "string" || manifest.version === install.version);
+}
+const realPath = async (p) => normalPath(await fs.realpath(p).catch(() => p));
+const nameOf = (id) => id.slice(0, id.lastIndexOf("@"));
+/** Every install installed_plugins.json records; null when it is missing, can't be read, or isn't the shape known. */
+async function installs(plugins) {
+	const record = await readJson(path.join(plugins, "installed_plugins.json"));
+	const list = record?.plugins;
+	if (record?.version !== 2 || !isObject$1(list) || !Object.values(list).every(Array.isArray)) return null;
+	return Object.entries(list).flatMap(([id, entries]) => entries.map((entry) => {
+		const e = isObject$1(entry) ? entry : {};
+		const text = (key) => typeof e[key] === "string" ? e[key] : null;
+		return {
+			id,
+			scope: text("scope"),
+			projectPath: text("projectPath"),
+			installPath: text("installPath"),
+			version: text("version"),
+			lastUpdated: text("lastUpdated")
+		};
+	}));
+}
+/** Whether `enabledPlugins` names the plugin `id` enabled, disabled, or not at all (null). */
+async function enabledIn(file, id) {
+	const value = (await readJson(file))?.enabledPlugins;
+	return isObject$1(value) && typeof value[id] === "boolean" ? value[id] : null;
+}
+/**
+* What Claude Code says of the plugin `dataLayer` belongs to. With `project` (a session's project
+* folder) the project's settings and installs count too; without, only the machine's: the
+* managed files, the user's settings, and every install.
+*/
+async function pluginState(place, dataLayer, project) {
+	const { parts } = await realCacheParts(place.plugins, dataLayer);
+	if (!parts) return "enabled";
+	const id = `${parts[1]}@${parts[0]}`;
+	const name = nameOf(id);
+	const all = await installs(place.plugins);
+	let ids = [id];
+	if (all) {
+		const mine = all.filter((i) => nameOf(i.id) === name);
+		if (!mine.length) return await isInPluginDirs(place.pluginDirs ?? [], name) ? "enabled" : "uninstalled";
+		const here = mine.filter((i) => appliesTo(i, project));
+		if (!here.length) return "disabled";
+		ids = [...new Set(here.map((i) => i.id))];
+	}
+	return (await Promise.all(ids.map((one) => enabledFor(place, one, project)))).includes(true) ? "enabled" : "disabled";
+}
+async function enabledFor(place, id, project) {
+	const managed = await Promise.all((await managedFiles(place.managed)).map((file) => enabledIn(file, id)));
+	if (managed.includes(false)) return false;
+	if (managed.includes(true)) return true;
+	for (const file of await ownFiles(place, project)) {
+		const enabled = await enabledIn(file, id);
+		if (enabled !== null) return enabled;
+	}
+	return true;
+}
+async function isInPluginDirs(dirs, name) {
+	for (const dir of dirs) if ((await readJson(path.join(dir, ".claude-plugin", "plugin.json")))?.name === name) return true;
+	return false;
+}
+async function managedFiles(managed) {
+	const dropIns = await fs.readdir(path.join(managed, "managed-settings.d")).then((names) => names.filter((n) => n.endsWith(".json")).map((n) => path.join(managed, "managed-settings.d", n)), () => []);
+	return [path.join(managed, "managed-settings.json"), ...dropIns];
+}
+async function ownFiles({ claudeDir }, project) {
+	const files = [];
+	if (project) {
+		const root = await gitRoot(project);
+		if (root && normalPath(root) !== normalPath(project)) files.push(path.join(root, ".claude", "settings.local.json"));
+		files.push(path.join(project, ".claude", "settings.local.json"), path.join(project, ".claude", "settings.json"));
+	}
+	files.push(path.join(claudeDir, "settings.json"));
+	return files;
+}
+async function gitRoot(dir) {
+	for (let at = path.resolve(dir);; at = path.dirname(at)) {
+		if (await fs.stat(path.join(at, ".git")).then(() => true, () => false)) return at;
+		if (path.dirname(at) === at) return null;
+	}
+}
+const isObject$1 = (value) => !!value && typeof value === "object" && !Array.isArray(value);
+async function readJson(file) {
+	try {
+		const value = JSON.parse((await fs.readFile(file, "utf8")).replace(/^\uFEFF/, ""));
+		return isObject$1(value) ? value : null;
+	} catch {
+		return null;
+	}
 }
 //#endregion
 //#region src/install/login-item.ts
@@ -8401,124 +8362,6 @@ async function readOptional(io, p) {
 	} catch {
 		return null;
 	}
-}
-//#endregion
-//#region src/data-layer/claude-paths.ts
-/**
-* Claude Code's config folder and its .claude.json: both in $CLAUDE_CONFIG_DIR when it is set,
-* else ~/.claude and ~/.claude.json, where Claude Code itself looks.
-*/
-function claudePaths(env, home) {
-	const custom = env.CLAUDE_CONFIG_DIR;
-	return custom ? {
-		dir: normalize(custom),
-		json: join(custom, ".claude.json")
-	} : {
-		dir: join(home, ".claude"),
-		json: join(home, ".claude.json")
-	};
-}
-//#endregion
-//#region src/data-layer/identity.ts
-/** `claudeJson` is the path of .claude.json (`claudePaths`); git runs in `cwd`. */
-async function accountOf(io, claudeJson, cwd) {
-	const config = asObject(parseJson(await io.readText(claudeJson)));
-	const oauth = asObject(config.oauthAccount);
-	const gitName = async () => {
-		const r = io.run ? await Promise.resolve(io.run([
-			"git",
-			"config",
-			"user.name"
-		], { cwd })).catch(() => null) : null;
-		return r && r.code === 0 && r.stdout.trim() ? r.stdout.trim() : null;
-	};
-	if (nonEmpty(oauth.accountUuid)) return {
-		id: `claude:${oauth.accountUuid}`,
-		name: nonEmpty(oauth.displayName) ? oauth.displayName : await gitName() ?? ""
-	};
-	const name = await gitName();
-	if (nonEmpty(config.userID)) return {
-		id: `claude-install:${config.userID}`,
-		name: name ?? ""
-	};
-	return {
-		id: `git:${name ?? "unknown"}`,
-		name: name ?? ""
-	};
-}
-/**
-* The project the session's folder belongs to: its git remote's, or for a repo with no usable
-* remote, the main checkout's folder on this machine (so every worktree of one repo is one
-* project). A folder git can't place is its own local project. On a file system that ignores case
-* (Windows, macOS) a local project's id is lower-cased, so one folder reached in two spellings is
-* one project, in the hello and in every edit alike. With `names`, a remote naming a GitHub repo by
-* an old name gives the repo's current id (remote-names.ts), so an old clone is the same project.
-*/
-async function projectOf(run, where, cwd, machine, { caseless = process.platform === "win32" || process.platform === "darwin", names = null } = {}) {
-	let remote = null;
-	if (run && where) {
-		const r = await Promise.resolve(run([
-			"git",
-			"remote",
-			"get-url",
-			"origin"
-		], { cwd: where.toplevel })).catch(() => null);
-		if (r && r.code === 0 && r.stdout.trim()) remote = r.stdout.trim();
-	}
-	const root = !where ? normalize(cwd) : /\/\.git$/.test(where.commonDir) ? dirname(where.commonDir) : where.toplevel;
-	const project = projectId(remote, {
-		machine,
-		root
-	});
-	if (remote !== null && names && !project.id.startsWith("local:")) return names.current(project);
-	return caseless && project.id.startsWith("local:") ? {
-		...project,
-		id: project.id.toLowerCase()
-	} : project;
-}
-function parseJson(text) {
-	try {
-		return text === null ? null : JSON.parse(text);
-	} catch {
-		return null;
-	}
-}
-function asObject(value) {
-	return value && typeof value === "object" && !Array.isArray(value) ? value : {};
-}
-const nonEmpty = (v) => typeof v === "string" && v.trim() !== "";
-//#endregion
-//#region src/sweep/find.ts
-const HEAD_BYTES = 65536;
-/** The first folder a transcript's lines name, from its first and last 64 KB. */
-async function cwdOf(io, path, size) {
-	for (const [start, end] of [[0, HEAD_BYTES], [Math.max(0, size - HEAD_BYTES), size]]) for (const text of (await io.read(path, start, end).catch(() => "")).split("\n")) {
-		if (!text.includes("\"cwd\"")) continue;
-		try {
-			const cwd = JSON.parse(text).cwd;
-			if (typeof cwd === "string" && cwd) return cwd;
-		} catch {}
-	}
-	return null;
-}
-/** Every session on this machine, in any project, whose transcript was written since `since`. */
-async function recentSessions(io, projectsDir, since) {
-	const out = [];
-	for (const dir of await io.listDir(projectsDir)) {
-		if (!dir.isDir) continue;
-		for (const entry of await io.listDir(`${projectsDir}/${dir.name}`)) {
-			if (entry.isDir || !entry.name.endsWith(".jsonl")) continue;
-			const path = `${projectsDir}/${dir.name}/${entry.name}`;
-			const st = await io.stat(path);
-			if (!st || st.mtimeMs < since) continue;
-			const cwd = await cwdOf(io, path, st.size);
-			if (cwd) out.push({
-				id: entry.name.slice(0, -6),
-				cwd
-			});
-		}
-	}
-	return out;
 }
 //#endregion
 //#region src/data-layer/attribution.ts
@@ -10896,23 +10739,24 @@ async function checkForUpdate({ claudeDir, settings, plugins, id, cwd, claude, e
 }
 const lastLine = (output) => output.replace(/\u001b\[[0-9;]*[A-Za-z]/g, "").split(/\r?\n/).map((l) => l.trim()).filter(Boolean).at(-1) ?? "";
 const isObject = (value) => !!value && typeof value === "object" && !Array.isArray(value);
-/** Starts a data layer for each session no one reports whose folder is still there; returns how many. */
-async function backfill(found, { claudeDir, dataLayer, spawn, isAlive = alive, pause = (ms) => new Promise((r) => setTimeout(r, ms)) }) {
-	let started = 0;
-	for (const { id, cwd } of found) {
-		if (!/^[\w-]+$/.test(id) || await isHeld(lockPath(claudeDir, id), Date.now(), isAlive)) continue;
-		if (!await fs.stat(cwd).then((s) => s.isDirectory(), () => false)) continue;
-		if (started++) await pause(250);
-		spawn([
-			dataLayer,
-			"--session",
-			id,
-			"--cwd",
-			cwd,
-			"--detached"
-		], cwd);
+//#endregion
+//#region src/data-layer/approved-file.ts
+/** The folder of what is kept for one office server alone: its list, and its pairing's lock. Named by a hash of its address. */
+const officeDir = (claudeDir, server) => path.join(claudeDir, "isoplan", "offices", createHash("sha256").update(server).digest("hex").slice(0, 12));
+const approvedPath = (claudeDir, server) => path.join(officeDir(claudeDir, server), "approved.json");
+const isFile = (v) => !!v && typeof v.server === "string" && typeof v.version === "string" && typeof v.fetched === "number" && typeof v.checked === "number" && Array.isArray(v.repos) && v.repos.every((r) => typeof r === "string");
+/** approved.json, for `server` when given; null when there is none, or it is another server's. */
+async function readApproved(file, server) {
+	try {
+		const value = JSON.parse(await fs.readFile(file, "utf8"));
+		return isFile(value) && (server === void 0 || value.server === server) ? value : null;
+	} catch {
+		return null;
 	}
-	return started;
+}
+/** The approved repos' ids, lower case, while the copy is younger than `maxAgeMs`; null after, or with none. */
+function freshRepos(copy, maxAgeMs, now) {
+	return copy && now - copy.checked <= maxAgeMs ? new Set(copy.repos.map((r) => r.toLowerCase())) : null;
 }
 const PAIRING_REFRESH_MS = 2e4;
 /** pairing.write.lock: free once this old, and waited for at most WRITE_WAIT_MS. */
@@ -11512,6 +11356,91 @@ function createSessionGate({ approved, open }) {
 	};
 }
 //#endregion
+//#region src/data-layer/claude-paths.ts
+/**
+* Claude Code's config folder and its .claude.json: both in $CLAUDE_CONFIG_DIR when it is set,
+* else ~/.claude and ~/.claude.json, where Claude Code itself looks.
+*/
+function claudePaths(env, home) {
+	const custom = env.CLAUDE_CONFIG_DIR;
+	return custom ? {
+		dir: normalize(custom),
+		json: join(custom, ".claude.json")
+	} : {
+		dir: join(home, ".claude"),
+		json: join(home, ".claude.json")
+	};
+}
+//#endregion
+//#region src/data-layer/identity.ts
+/** `claudeJson` is the path of .claude.json (`claudePaths`); git runs in `cwd`. */
+async function accountOf(io, claudeJson, cwd) {
+	const config = asObject(parseJson(await io.readText(claudeJson)));
+	const oauth = asObject(config.oauthAccount);
+	const gitName = async () => {
+		const r = io.run ? await Promise.resolve(io.run([
+			"git",
+			"config",
+			"user.name"
+		], { cwd })).catch(() => null) : null;
+		return r && r.code === 0 && r.stdout.trim() ? r.stdout.trim() : null;
+	};
+	if (nonEmpty(oauth.accountUuid)) return {
+		id: `claude:${oauth.accountUuid}`,
+		name: nonEmpty(oauth.displayName) ? oauth.displayName : await gitName() ?? ""
+	};
+	const name = await gitName();
+	if (nonEmpty(config.userID)) return {
+		id: `claude-install:${config.userID}`,
+		name: name ?? ""
+	};
+	return {
+		id: `git:${name ?? "unknown"}`,
+		name: name ?? ""
+	};
+}
+/**
+* The project the session's folder belongs to: its git remote's, or for a repo with no usable
+* remote, the main checkout's folder on this machine (so every worktree of one repo is one
+* project). A folder git can't place is its own local project. On a file system that ignores case
+* (Windows, macOS) a local project's id is lower-cased, so one folder reached in two spellings is
+* one project, in the hello and in every edit alike. With `names`, a remote naming a GitHub repo by
+* an old name gives the repo's current id (remote-names.ts), so an old clone is the same project.
+*/
+async function projectOf(run, where, cwd, machine, { caseless = process.platform === "win32" || process.platform === "darwin", names = null } = {}) {
+	let remote = null;
+	if (run && where) {
+		const r = await Promise.resolve(run([
+			"git",
+			"remote",
+			"get-url",
+			"origin"
+		], { cwd: where.toplevel })).catch(() => null);
+		if (r && r.code === 0 && r.stdout.trim()) remote = r.stdout.trim();
+	}
+	const root = !where ? normalize(cwd) : /\/\.git$/.test(where.commonDir) ? dirname(where.commonDir) : where.toplevel;
+	const project = projectId(remote, {
+		machine,
+		root
+	});
+	if (remote !== null && names && !project.id.startsWith("local:")) return names.current(project);
+	return caseless && project.id.startsWith("local:") ? {
+		...project,
+		id: project.id.toLowerCase()
+	} : project;
+}
+function parseJson(text) {
+	try {
+		return text === null ? null : JSON.parse(text);
+	} catch {
+		return null;
+	}
+}
+function asObject(value) {
+	return value && typeof value === "object" && !Array.isArray(value) ? value : {};
+}
+const nonEmpty = (v) => typeof v === "string" && v.trim() !== "";
+//#endregion
 //#region src/data-layer/home.ts
 /** The projects `folder` may report as, and whether it is a workspace. */
 async function candidatesOf(folder, io) {
@@ -11564,7 +11493,7 @@ function inRepos(facts) {
 //#region src/data-layer/detached.ts
 const LINK_DOWN_MS = 3e5;
 /**
-* Why a detached data layer should stop now, or null to go on. A quiet session is still reported
+* Why the runner should stop reporting a session now, or null to go on. A quiet session is still reported
 * once: the quiet rule waits for the link to connect, which sends the facts in full.
 */
 function detachedStop({ now, lastActive, idleMinutes, downSince }) {
@@ -12422,25 +12351,15 @@ function nextTitle(facts, cache, now) {
 }
 const cmp = (a, b) => a < b ? -1 : a > b ? 1 : 0;
 //#endregion
-//#region src/data-layer/main.ts
-const LOG_CAP_BYTES = 65536;
+//#region src/data-layer/report-session.ts
 const DORMANT_MS = 3e4;
-const LOCK_FRESH_MS = 3 * DORMANT_MS;
-const value = (argv, flag) => {
-	const i = argv.indexOf(flag);
-	return i >= 0 && argv[i + 1] && !argv[i + 1].startsWith("--") ? argv[i + 1] : null;
-};
-async function main(argv) {
-	const sessionId = value(argv, "--session");
-	const cwd = value(argv, "--cwd");
-	const detached = argv.includes("--detached");
-	const takesMessages = !detached && argv.includes("--messages");
-	if (!sessionId || !cwd) {
-		process.stderr.write("usage: node data-layer.js --session <id> --cwd <dir> [--detached] [--messages]\n");
-		return 2;
-	}
-	const here = path.dirname(fileURLToPath(import.meta.url));
-	const defaultsPath = path.join(here, "..", "config.json");
+/** Reports the session until it should end. */
+async function reportSession(o) {
+	const { sessionId, cwd, closed } = o;
+	const inRunner = o.by === "runner";
+	const takesMessages = !inRunner && !!o.takesMessages;
+	const here = path.join(o.appDir, "dist");
+	const defaultsPath = path.join(o.appDir, "config.json");
 	const { dir: claudeDir, json: claudeJson } = claudePaths(process.env, os.homedir());
 	const lock = lockPath(claudeDir, sessionId);
 	const userConfigPath = path.join(claudeDir, "isoplan", "config.json");
@@ -12450,7 +12369,7 @@ async function main(argv) {
 	const messagesDir = path.join(claudeDir, "isoplan", "messages", sessionId);
 	const waitsDir = path.join(claudeDir, "isoplan", "waits", sessionId);
 	const windowFile = path.join(claudeDir, "isoplan", "windows", `${sessionId}.json`);
-	const modPatterns = path.join(here, "..", "secret-patterns.json");
+	const modPatterns = path.join(o.appDir, "secret-patterns.json");
 	const ownerPatterns = path.join(claudeDir, "isoplan", "secret-patterns.json");
 	const machine = os.hostname();
 	const io = nodeIo();
@@ -12462,65 +12381,51 @@ async function main(argv) {
 		claudeDir,
 		home: os.homedir()
 	});
-	const parent = process.ppid;
-	let isOut = !detached;
-	const closed = detached ? new Promise(() => {}) : new Promise((resolve) => process.stdout.on("error", () => resolve()));
-	closed.then(() => isOut = false);
-	const logFile = path.join(claudeDir, "isoplan", "logs", `${sessionId}.log`);
-	let logging = Promise.resolve();
 	let downSince = Date.now();
-	const emit = (line) => {
-		if (isOut) process.stdout.write(JSON.stringify(line) + "\n");
-		else if (detached && (line.type === "log" || line.type === "error" || line.type === "pair")) {
-			const said = line.type === "log" ? line.text : line.type === "pair" ? pairNote(line) : `the office server says: ${line.message} (${line.code})`;
-			const text = `${(/* @__PURE__ */ new Date()).toISOString()} ${said}\n`;
-			logging = logging.then(() => writeLog(logFile, text)).catch(() => {});
-		}
-	};
+	const emit = o.emit;
 	const wait = (ms) => {
 		let timer;
-		const timeUp = new Promise((resolve) => timer = setTimeout(() => resolve(detached || process.ppid === parent && alive(parent)), ms));
+		const timeUp = new Promise((resolve) => timer = setTimeout(() => resolve(o.goOn?.() ?? true), ms));
 		return Promise.race([timeUp, closed.then(() => false)]).finally(() => clearTimeout(timer));
 	};
+	let why = "it was stopped";
+	const stopping = (reason) => {
+		why = reason;
+		emit({
+			type: "log",
+			text: `stopping: ${reason}`
+		});
+		return false;
+	};
+	const end = (reason) => (stopping(reason), { why });
 	const place = {
 		claudeDir,
 		plugins: pluginsDir(claudeDir, process.env),
 		managed: managedDir(process.platform),
 		pluginDirs: pluginDirsOf(process.env)
 	};
-	const project = value(argv, "--project") ?? cwd;
+	const project = o.project ?? cwd;
 	const self = path.join(here, "data-layer.js");
-	const isOff = async () => await pluginState(place, self, project).catch(() => "enabled") !== "enabled";
-	if (await isOff()) {
-		emit({
-			type: "log",
-			text: "stopping: Claude Code lists the Isoplan plugin as uninstalled or disabled here, so this session isn't reported"
-		});
-		await logging;
-		return 0;
-	}
-	const since = Number(value(argv, "--since")) || Date.now();
-	const lockExtra = {
+	const isOff = o.isOff ?? (async () => await pluginState(place, self, project).catch(() => "enabled") !== "enabled");
+	if (await isOff()) return end("Claude Code lists the Isoplan plugin as uninstalled or disabled here, so this session isn't reported");
+	const since = o.since ?? Date.now();
+	const lockExtra = inRunner ? {
+		detached: true,
+		runner: true,
+		cwd
+	} : {
 		dataLayer: self,
-		detached,
+		detached: false,
 		since,
 		parent: process.ppid,
 		cwd
 	};
 	const newest = () => newestDataLayer(place.plugins, self, project).catch(() => self);
-	const isOutdated = async () => await newest() !== self;
+	const isOutdated = async () => !inRunner && await newest() !== self;
 	let outdated = await isOutdated();
-	if (detached && outdated) {
-		emit({
-			type: "log",
-			text: "a newer version of the Isoplan plugin is installed, so it reports this session instead"
-		});
-		await logging;
-		return 0;
-	}
 	const supersededBy = async () => {
 		const held = await readLock(lock);
-		if (!held?.pid || held.pid === process.pid || !alive(held.pid) || Date.now() - held.mtimeMs >= LOCK_FRESH_MS) return null;
+		if (!held?.pid || held.pid === process.pid || !alive(held.pid) || Date.now() - held.mtimeMs >= 9e4) return null;
 		const { dataLayer: other, detached: otherDetached, since: otherSince, parent } = held.extra;
 		if (otherDetached !== false || typeof other !== "string") return null;
 		if (normalPath(other) === normalPath(self)) return typeof otherSince === "number" && otherSince > since && typeof parent === "number" && alive(parent) ? "window" : null;
@@ -12529,42 +12434,28 @@ async function main(argv) {
 		return outdated && normalPath(current) === normalPath(other) ? "newer" : null;
 	};
 	const leave = (reason) => {
-		emit({
-			type: "log",
-			text: reason === "newer" ? "stopping: the newer version's data layer that a reload started reports this session now" : "stopping: the session's newer window reports it now"
-		});
+		stopping(reason === "newer" ? "the newer version's data layer that a reload started reports this session now" : "the session's newer window reports it now");
 		emit({
 			type: "superseded",
 			reason
 		});
 	};
-	if (!detached) {
+	if (!inRunner) {
 		const reason = await supersededBy();
 		if (reason) {
 			leave(reason);
-			return 0;
+			return { why };
 		}
 	}
-	const notWantedBefore = detached ? await takeNotWanted(claudeDir, sessionId) : {};
+	const notWantedBefore = inRunner ? o.notWanted ?? {} : {};
 	try {
-		if (!await takeLock(lock, process.pid, alive, !detached, Date.now(), { extra: lockExtra })) {
-			process.stderr.write(`another data layer already reports session ${sessionId}\n`);
-			emit({
-				type: "log",
-				text: "stopping: another data layer already reports this session"
-			});
-			await logging;
-			return 0;
-		}
+		if (inRunner && (await readLock(lock))?.pid === null) await fs.rm(lock, { force: true });
+		if (!await takeLock(lock, process.pid, alive, !inRunner, Date.now(), {
+			extra: lockExtra,
+			...inRunner && { freshMs: 9e4 }
+		})) return end("another data layer already reports this session");
 	} catch (err) {
-		if (detached) {
-			emit({
-				type: "log",
-				text: `stopping: couldn't take the session lock: ${String(err?.message ?? err)}`
-			});
-			await logging;
-			return 0;
-		}
+		if (inRunner) return end(`couldn't take the session lock: ${String(err?.message ?? err)}`);
 		emit({
 			type: "log",
 			text: `couldn't take the session lock, so going on without it: ${String(err?.message ?? err)}`
@@ -12581,7 +12472,7 @@ async function main(argv) {
 		stdio: "ignore",
 		windowsHide: true
 	}).on("error", () => {}).unref();
-	const installing = detached || outdated ? Promise.resolve([]) : installWake(paths, path.join(here, "data-layer.js"), path.join(here, "wake.js"), {
+	const installing = inRunner || outdated ? Promise.resolve([]) : installWake(paths, path.join(here, "data-layer.js"), path.join(here, "wake.js"), {
 		auto: true,
 		runnerFrom: path.join(here, ".."),
 		findClaude: () => findClaude(process.env, process.platform, os.homedir()),
@@ -12605,7 +12496,7 @@ async function main(argv) {
 		type: "log",
 		text: `couldn't install the wake hook: ${String(err?.message ?? err)}`
 	}), []));
-	if (!detached && !outdated) installing.then(async () => await pluginState(place, self) === "enabled" && startRunner({
+	if (!inRunner && !outdated) installing.then(async () => await pluginState(place, self) === "enabled" && startRunner({
 		claudeDir,
 		spawn: start
 	})).catch(() => {});
@@ -12615,7 +12506,7 @@ async function main(argv) {
 	let checking = false;
 	let checkedAt = Date.now();
 	const checkUpdate = (gapMs) => {
-		if (detached || !pluginId || outdated || checking || !config.updateCheckHours) return;
+		if (inRunner || !pluginId || outdated || checking || !config.updateCheckHours) return;
 		checkedAt = Date.now();
 		const off = updatesOffBy(process.env);
 		if (off) return emit({
@@ -12653,27 +12544,12 @@ async function main(argv) {
 		})).finally(() => checking = false);
 	};
 	installing.then(() => checkUpdate(START_GAP_MS));
-	installing.then(async (changes) => {
-		if (!changes.length) return;
-		const started = await backfill(await recentSessions(io, path.join(claudeDir, "projects"), Date.now() - config.lightsOffHours * 36e5), {
-			claudeDir,
-			dataLayer: path.join(here, "data-layer.js"),
-			spawn: start
-		});
-		emit({
-			type: "log",
-			text: `reported ${started} other session(s) from the last ${config.lightsOffHours} hours`
-		});
-	}).catch((err) => emit({
-		type: "log",
-		text: `couldn't report the other sessions: ${String(err?.message ?? err)}`
-	}));
 	const offices = officesOf(config);
 	for (const { server } of offices.filter((o) => o.plainRefused)) emit({
 		type: "log",
 		text: `not reporting to ${server}: it is plain ws:// to another machine; use wss://, or set "allowPlainWs": true in config.json`
 	});
-	if (!detached) {
+	if (!inRunner) {
 		for (const dir of [
 			answersDir,
 			waitsDir,
@@ -12731,7 +12607,7 @@ async function main(argv) {
 		pairing: run.pairing,
 		admit: mayConnect,
 		onNotWanted: () => {
-			run.unwanted = detached;
+			run.unwanted = inRunner;
 			run.gate.notWanted();
 		},
 		filter: (f, projects) => forOffice(candidates?.workspace ? inRepos(f) : f, projects, checkouts),
@@ -12741,7 +12617,7 @@ async function main(argv) {
 				const file = path.join(answersDir, `${randomUUID()}.json`);
 				fs.mkdir(answersDir, { recursive: true }).then(async () => {
 					const relayed = await relayOwnerAnswer(message, {
-						detached,
+						detached: inRunner,
 						facts: () => run.sent,
 						file,
 						emit,
@@ -12771,7 +12647,7 @@ async function main(argv) {
 			if (message.type === "request" && message.kind === "owner-message") {
 				const file = path.join(messagesDir, `${randomUUID()}.json`);
 				relayOwnerMessage(message, {
-					detached,
+					detached: inRunner,
 					takes: takesMessages,
 					owner: account.id,
 					session: sessionId,
@@ -12835,28 +12711,37 @@ async function main(argv) {
 				server
 			} : line);
 		};
-		run.pairing = createPairing({
-			file: pairingPath(claudeDir),
-			lock: pairingLockPath(claudeDir, office),
-			writeLock: pairingWriteLockPath(claudeDir),
-			server,
-			account: machineAccount,
-			machine,
-			emit: run.emit,
-			allowPlainWs: config.allowPlainWs,
-			legacy: !!office.legacy
-		});
-		run.approved = createApproved({
-			server,
-			file: approvedPath(claudeDir, server),
-			pairing: run.pairing,
-			refreshMs: config.approvedRefreshMinutes * 6e4,
-			maxAgeMs: config.approvedMaxAgeMinutes * 6e4,
-			log: (text) => emit({
-				type: "log",
-				text
-			})
-		});
+		const shared = o.shared?.(office);
+		if (shared) {
+			run.pairing = {
+				...shared.pairing,
+				close: async () => {}
+			};
+			run.approved = shared.approved;
+		} else {
+			run.pairing = createPairing({
+				file: pairingPath(claudeDir),
+				lock: pairingLockPath(claudeDir, office),
+				writeLock: pairingWriteLockPath(claudeDir),
+				server,
+				account: machineAccount,
+				machine,
+				emit: run.emit,
+				allowPlainWs: config.allowPlainWs,
+				legacy: !!office.legacy
+			});
+			run.approved = createApproved({
+				server,
+				file: approvedPath(claudeDir, server),
+				pairing: run.pairing,
+				refreshMs: config.approvedRefreshMinutes * 6e4,
+				maxAgeMs: config.approvedMaxAgeMinutes * 6e4,
+				log: (text) => emit({
+					type: "log",
+					text
+				})
+			});
+		}
 		run.gate = createSessionGate({
 			approved: run.approved,
 			open: (home, mayConnect) => openLink(run, home, mayConnect)
@@ -12929,21 +12814,17 @@ async function main(argv) {
 	};
 	let pending = false;
 	const startedAt = Date.now();
-	const stopping = (why) => (emit({
-		type: "log",
-		text: `stopping: ${why}`
-	}), false);
 	const goOn = async () => {
 		if (!await wait(dormant && !pending ? DORMANT_MS : config.streamSeconds * 1e3)) return false;
 		if (isUnwanted()) return stopping("no office this reports to wants this session's project or takes its repo, so it holds off");
-		if (detached && await lockHolder(lock) !== process.pid) return stopping("another data layer reports this session now");
+		if (inRunner && await lockHolder(lock) !== process.pid) return stopping("another data layer reports this session now");
 		if (await isOff()) return stopping("Claude Code lists the Isoplan plugin as uninstalled or disabled here now");
 		return true;
 	};
 	do {
 		const now = Date.now();
 		const isFirstPass = passes++ === 0;
-		if (!detached) {
+		if (!inRunner) {
 			if (await lockHolder(lock) !== process.pid) {
 				const reason = await supersededBy();
 				if (reason) {
@@ -12954,16 +12835,7 @@ async function main(argv) {
 			} else await refreshLock(lock, process.pid).catch(() => {});
 		}
 		config = await loadConfig(io, defaultsPath, userConfigPath).catch(() => config);
-		if (!outdated && (outdated = await isOutdated())) {
-			if (detached) {
-				emit({
-					type: "log",
-					text: "stopping: a newer version of the Isoplan plugin is installed, which the wake hook starts next"
-				});
-				break;
-			}
-			emit({ type: "updated" });
-		}
+		if (!outdated && (outdated = await isOutdated())) emit({ type: "updated" });
 		if (now - checkedAt >= config.updateCheckHours * 36e5) checkUpdate(config.updateCheckHours * 36e5);
 		const gitOpts = {
 			now,
@@ -13003,22 +12875,19 @@ async function main(argv) {
 		pending = runs.some((r) => !r.known);
 		dormant = taking.length ? null : pending ? "no-list" : runs.find((r) => r.dormant && r.dormant !== "not-approved")?.dormant ?? "not-approved";
 		if (!taking.length) {
-			if (detached && dormant === "not-approved") {
+			if (inRunner && dormant === "not-approved") {
 				notApproved = candidates.projects.map((p) => p.id.toLowerCase());
 				stopping(`no office this reports to takes ${notApproved.join(", ") || cwd}, so it holds off until one does`);
 				break;
 			}
-			const why = detached ? detachedStop({
+			const quiet = inRunner ? detachedStop({
 				now,
 				lastActive: new Date(now).toISOString(),
 				idleMinutes: config.idleMinutes,
 				downSince
 			}) : null;
-			if (why) {
-				emit({
-					type: "log",
-					text: `stopping: ${why}`
-				});
+			if (quiet) {
+				stopping(quiet);
 				break;
 			}
 			continue;
@@ -13045,7 +12914,7 @@ async function main(argv) {
 		});
 		reported = problem;
 		if (!read.facts) {
-			if (detached) {
+			if (inRunner) {
 				isPlaceless = isFirstPass && !await resolve(cwd);
 				if (isPlaceless) {
 					stopping(`git can't place ${cwd}, so it holds off`);
@@ -13099,7 +12968,7 @@ async function main(argv) {
 				file: titleFile
 			});
 		}
-		if (!detached) contextWindow = await windowOf(windowFile) ?? contextWindow;
+		if (!inRunner) contextWindow = await windowOf(windowFile) ?? contextWindow;
 		const titled = read.facts.session.titleFrom === "branch" && title?.title ? {
 			...read.facts,
 			session: {
@@ -13127,7 +12996,7 @@ async function main(argv) {
 			patternLog(`couldn't read the secret patterns, so every report is withheld: ${String(err?.message ?? err)}`);
 			return null;
 		});
-		waiting = detached ? /* @__PURE__ */ new Set() : await waitsOf(waitsDir, facts);
+		waiting = inRunner ? /* @__PURE__ */ new Set() : await waitsOf(waitsDir, facts);
 		shown = [facts, patterns];
 		for (const run of taking) try {
 			run.gate.link()?.update(run.sent = outgoing(run, facts, patterns));
@@ -13137,51 +13006,41 @@ async function main(argv) {
 				text: `couldn't send this session's facts to ${run.office.server}: ${String(err?.message ?? err)}`
 			});
 		}
-		const why = detached ? detachedStop({
+		const quiet = inRunner ? detachedStop({
 			now,
 			lastActive: facts.session.lastActive,
 			idleMinutes: config.idleMinutes,
 			downSince
 		}) : null;
-		if (why) {
-			emit({
-				type: "log",
-				text: `stopping: ${why}`
-			});
+		if (quiet) {
+			stopping(quiet);
 			break;
 		}
 	} while (await goOn());
 	for (const link of links()) link.close();
+	await releaseLock(lock, process.pid).catch(() => {});
 	const notWanted = Object.fromEntries(runs.filter((r) => r.unwanted).map((r) => [r.office.server, r.unwantedUntil ?? Date.now() + 36e5]));
 	const named = {
-		offices: offices.map((o) => o.server),
+		offices: offices.map((office) => office.server),
 		notWanted
 	};
 	if (isUnwanted() && runs.some((r) => r.dormant === "not-approved")) notApproved = (candidates?.projects ?? []).map((p) => p.id.toLowerCase());
-	if (isUnwanted() && !notApproved || isPlaceless) await holdOff(lock, process.pid, Date.now() + HOLD_OFF_MS, named).catch(() => {});
-	else if (notApproved) await holdOff(lock, process.pid, Date.now() + HOLD_OFF_MS, {
-		reason: "not-approved",
-		projects: notApproved,
-		...named
-	}).catch(() => {});
-	else await releaseLock(lock, process.pid).catch(() => {});
-	await logging;
-	return 0;
-}
-/** The offices that didn't want this session, each until when, as the wake hook left them as it started this data layer (wake.ts); read once, then gone. */
-async function takeNotWanted(claudeDir, sessionId) {
-	const file = notWantedPath(claudeDir, sessionId);
-	const said = await fs.readFile(file, "utf8").then((text) => JSON.parse(text), () => null);
-	await fs.rm(file, { force: true }).catch(() => {});
-	return said && typeof said === "object" ? said : {};
-}
-/** A pair line as the log says it. */
-const pairNote = (line) => `to report to ${line.server}, pair this machine: click ${line.url} on this computer and approve it in the office (it works until ${line.expires})`;
-async function writeLog(file, text) {
-	const size = (await fs.stat(file).catch(() => null))?.size ?? 0;
-	await fs.mkdir(path.dirname(file), { recursive: true });
-	if (size > LOG_CAP_BYTES) await fs.writeFile(file, text);
-	else await fs.appendFile(file, text);
+	if (isUnwanted() && !notApproved || isPlaceless) return {
+		why,
+		holdOff: {
+			until: Date.now() + HOLD_OFF_MS,
+			...named
+		}
+	};
+	if (notApproved) return {
+		why,
+		holdOff: {
+			until: Date.now() + HOLD_OFF_MS,
+			projects: notApproved,
+			...named
+		}
+	};
+	return { why };
 }
 async function waitsOf(dir, facts) {
 	const out = /* @__PURE__ */ new Set();
@@ -13227,20 +13086,47 @@ async function takeReply(file) {
 		text: r.text
 	} : null;
 }
-function crashed(err) {
-	const argv = process.argv.slice(2);
+//#endregion
+//#region src/data-layer/main.ts
+const value = (argv, flag) => {
+	const i = argv.indexOf(flag);
+	return i >= 0 && argv[i + 1] && !argv[i + 1].startsWith("--") ? argv[i + 1] : null;
+};
+async function main(argv) {
 	const sessionId = value(argv, "--session");
-	const said = String(err?.stack ?? err);
-	if (argv.includes("--detached") && sessionId && /^[\w-]+$/.test(sessionId)) try {
-		const file = path.join(claudePaths(process.env, os.homedir()).dir, "isoplan", "logs", `${sessionId}.log`);
-		mkdirSync(path.dirname(file), { recursive: true });
-		appendFileSync(file, `${(/* @__PURE__ */ new Date()).toISOString()} stopping: something went wrong: ${said}\n`);
-	} catch {}
-	process.stderr.write(`${said}\n`);
+	const cwd = value(argv, "--cwd");
+	const appDir = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
+	if (argv.includes("--detached")) return 0;
+	if (!sessionId || !cwd) {
+		process.stderr.write("usage: node data-layer.js --session <id> --cwd <dir> [--project <dir>] [--since <ms>] [--messages]\n");
+		return 2;
+	}
+	const parent = process.ppid;
+	let isOut = true;
+	const closed = new Promise((resolve) => process.stdout.on("error", () => resolve()));
+	closed.then(() => isOut = false);
+	await reportSession({
+		sessionId,
+		cwd,
+		project: value(argv, "--project") ?? cwd,
+		by: "hooks",
+		appDir,
+		emit: (line) => {
+			if (isOut) process.stdout.write(JSON.stringify(line) + "\n");
+		},
+		closed,
+		goOn: () => process.ppid === parent && alive(parent),
+		takesMessages: argv.includes("--messages"),
+		since: Number(value(argv, "--since")) || Date.now()
+	});
+	return 0;
+}
+process.on("uncaughtException", crash).on("unhandledRejection", crash);
+process.exitCode = await main(process.argv.slice(2)).catch(crash);
+process.exit();
+function crash(err) {
+	process.stderr.write(`${String(err?.stack ?? err)}\n`);
 	process.exit(1);
 }
-process.on("uncaughtException", crashed).on("unhandledRejection", crashed);
-process.exitCode = await main(process.argv.slice(2)).catch(crashed);
-process.exit();
 //#endregion
 export {};

@@ -244,8 +244,6 @@ export interface DriverOptions {
   elsewhere?: (start: StartElsewhere, bin: string) => Promise<{ opened: boolean; problem: string | null }>;
   /** Installs Claude Code, or signs it in, for a request whose `by` is the runner's own person (claude-setup.ts). */
   setup?: (m: Extract<DriveMessage, { kind: "install-claude" | "sign-in-claude" }>) => void;
-  /** Keeps a session reported while its process runs (reported.ts): called as it opens, with the session's uuid, folder and when it last did anything (ms); what it returns, as it ends. */
-  report?: (session: string, folder: string, lastActive: () => number) => () => void;
   spawn?: Spawn;
   env?: Record<string, string | undefined>;
   now?: () => number;
@@ -724,7 +722,6 @@ export function createDriver(o: DriverOptions): Driver {
   function wire(s: Session, child: ChildProcessWithoutNullStreams): void {
     s.child = child;
     s.stderr = "";
-    const unreport = o.report?.(uuidOf(s.record.session), s.record.folder, () => Date.parse(s.record.lastActivity));
     let closed = () => {};
     s.closed = new Promise<void>((resolve) => (closed = resolve));
     let buffer = "";
@@ -750,7 +747,6 @@ export function createDriver(o: DriverOptions): Driver {
     const end = (code: number | null) => {
       if (over) return;
       over = true;
-      unreport?.();
       closed();
       ended(s, child, code);
     };

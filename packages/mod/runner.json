@@ -27,7 +27,6 @@
   "drivenCloseSeconds": 30,
   "drivenStartSeconds": 120,
   "drivenPromptMinutes": 10,
-  "drivenReportSeconds": 30,
   "repoFoldersCheckMinutes": 5,
   "branchRefreshMinutes": 5
 }

@@ -1,51 +1,43 @@
-// The data layer: the process the hooks module spawns for one Claude Code session.
-//
-//   node dist/data-layer.js --session <session id> --cwd <the session's folder>
+// Reporting one Claude Code session: the data layer's loop, run two ways (ADR 0007). The plugin's
+// data layer process (main.ts) runs it for its hooks module, `by: "hooks"`; the machine's runner runs
+// it in its own process for each session no hooks module reports, `by: "runner"`
+// (src/runner/reporting.ts). What follows says "the data layer" for both.
 //
 // Every `streamSeconds` it reads the session's facts from its transcripts and hands them to the
-// link, which holds the WebSocket to the office server. It writes JSON lines to stdout for the
-// hooks module (src/lines.ts): the link's state, the server's notes, and room titles to write.
-// Claude Code ends it with the session; as a backstop it also stops when stdout breaks or its
-// parent process has gone. When it starts it also installs the wake hook (src/install), so
-// sessions without the plugin are seen too, and the first time, reports the machine's other recent
-// sessions at once (src/wake/backfill.ts), and starts the machine's runner (src/runner) if none is
-// running. Each agent's report is secret-checked before it is sent, and one that matches is held
-// until its owner releases it (src/data-layer/reports.ts). Only a session in a repo the office takes
-// is reported: the data layer reads the office's list of repos (src/data-layer/approved.ts) and opens
-// no link for any other, sending nothing of it, its hello included, and says so in the status line.
-// An office server that signs people in wants the machine paired first: reading that list pairs it,
-// keeping the credential in <claude dir>/isoplan/pairing.json, under the machine's Claude account
-// (src/data-layer/pairing.ts).
+// link, which holds the WebSocket to the office server. For a hooks module it emits JSON lines
+// (src/lines.ts): the link's state, the server's notes, and room titles to write. Claude Code ends
+// the plugin's data layer with the session; as a backstop it also stops when stdout breaks or its
+// parent process has gone (main.ts). When it starts it also installs the wake hook (src/install),
+// and starts the machine's runner (src/runner) if none is running. Each agent's report is
+// secret-checked before it is sent, and one that matches is held until its owner releases it
+// (src/data-layer/reports.ts). Only a session in a repo the office takes is reported: the data layer
+// reads the office's list of repos (src/data-layer/approved.ts) and opens no link for any other,
+// sending nothing of it, its hello included, and says so in the status line. An office server that
+// signs people in wants the machine paired first: reading that list pairs it, keeping the credential
+// in <claude dir>/isoplan/pairing.json, under the machine's Claude account (src/data-layer/pairing.ts).
 // It keeps the plugin up to date (src/update): as it starts and every `updateCheckHours` it installs
 // a newer version in the background, and once one is on disk it says so in the status line, since
 // the session loads it only at /reload-plugins. An outdated data layer installs nothing, so it never
-// hands the wake hook and the runner back to older code; a detached one stops, leaving its session
-// to the newest one, which the wake hook starts.
+// hands the wake hook and the runner back to older code.
 // An agent's open question to its owner is reported too, secret-checked like a report, and
 // answerable from the floor while this data layer's hooks module marks that it waits for it
-// (src/data-layer/owner-answers.ts); a detached one's are read-only. The session fact carries the
+// (src/data-layer/owner-answers.ts); the runner's are read-only. The session fact carries the
 // session's context window once its hooks module has written the size to the file the `window`
-// line names; a detached one has no hooks module, so sends none. A Claude Code workflow's name,
+// line names; the runner has no hooks module, so sends none. A Claude Code workflow's name,
 // description, phases and agents' labels are secret-checked too, and one that matches goes out as a
 // placeholder (src/data-layer/workflows.ts); its agents' results are reports like any other.
 // Started by a hooks module that can submit a prompt (`--messages`), the session fact says
 // `takesMessages`, and a message its owner sends from the floor goes to that hooks module, which
 // submits it as the session's next turn (src/data-layer/owner-messages.ts).
 //
-//   node dist/data-layer.js --session <session id> --cwd <the session's folder> --detached
-//
-// The wake hook starts it detached, for a session without the plugin. Then there is no parent and
-// no reader: stdout lines are dropped, and log lines go to <claude dir>/isoplan/logs/<session>.log.
-// It lives only while the session is at work, since the wake hook starts another on the session's
-// next turn: it exits once the session has been quiet longer than `idleMinutes`, once its link has
-// been down five minutes in a row (src/data-layer/detached.ts), once the session has nothing to
-// report, or when the server says the project isn't wanted. Started before the session's transcript
-// has anything to report (the wake hook runs as the first prompt goes in, and Claude Code may not
-// have written it yet), it waits up to `factsWaitSeconds` for it first. Each way it stops is said
-// in its log, an error nothing caught included (#92). The runner starts one too, the way the wake
-// hook does, for each session it drives from the floor (src/runner/reported.ts). It can't watch the session's own
-// process (the hook's parent may be a short-lived shell), so a closed session shows as quiet until
-// its data layer exits, then unreachable.
+// In the runner there is no reader: lines are dropped, and log lines go to
+// <claude dir>/isoplan/logs/<session>.log. It reports only while the session is at work, and the
+// runner starts it again once the session's transcript moves: it ends once the session has been
+// quiet longer than `idleMinutes`, once its link has been down five minutes in a row
+// (src/data-layer/detached.ts), once the session has nothing to report, or when the server says the
+// project isn't wanted. Started before the session's transcript has anything to report, it waits up
+// to `factsWaitSeconds` for it first. Each way it ends is said in its log (#92). It can't watch the
+// session's own process, so a closed session shows as quiet until it ends, then unreachable.
 //
 // It reports to every office server config.json names (#105): each has its own pairing, its own
 // copy of the office's list, its own link, opened only while that office takes the session's repo,
@@ -54,26 +46,25 @@
 // `streamSeconds`, so one office's failure, pairing link, list or slowness never touches another's.
 // The facts are read once a pass and go to each of those links; what the hooks module is sent names
 // the office, and an office shows in the status line only once it is known to take the repo (or
-// waits to be paired). A detached data layer one office doesn't want, while no office takes the
-// repo, holds off naming that office, so the wake hook doesn't start it again for that office's list.
+// waits to be paired). In the runner, a session one office doesn't want, while no office takes the
+// repo, ends with a hold-off naming that office (`Ended`), which the runner keeps (reporting.ts).
+// The runner gives it its own pairing and list for each office, so a machine pairs once per office.
 //
 // One data layer reports a session: each takes <claude dir>/isoplan/live/<session>.json (src/wake/
-// lock.ts), naming its own script, whether it is detached, when its window's hooks module started
-// (`--since`) and that window's Claude Code process, and refreshes it each pass. A detached one
-// exits at once if another holds it, and as soon as the plugin's takes it over. The plugin's takes
-// it regardless, and goes on without it if the folder can't be written. It takes it back each pass,
-// unless the plugin's data layer holding it, with a fresh lock, is the newest copy for this session
-// while this one isn't, or runs the same copy, started later in a window whose Claude Code is still
-// running (a /reload-plugins, or the session opened in a second window): then it says it is
-// `superseded` and exits, never for an older or equal holder.
+// lock.ts), the plugin's naming its own script, when its window's hooks module started (`--since`)
+// and that window's Claude Code process, the runner's `detached`, and refreshes it each pass. The
+// runner's doesn't start while another holds it, and ends as soon as the plugin's takes it over.
+// The plugin's takes it regardless, and goes on without it if the folder can't be written. It takes
+// it back each pass, unless the plugin's data layer holding it, with a fresh lock, is the newest copy
+// for this session while this one isn't, or runs the same copy, started later in a window whose
+// Claude Code is still running (a /reload-plugins, or the session opened in a second window): then
+// it says it is `superseded` and ends, never for an older or equal holder.
 
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { appendFileSync, mkdirSync } from "node:fs";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
 import { PROTOCOL_VERSION, type Facts, type Project } from "@isoplan/protocol";
 import { installWake } from "../install/install.js";
 import { managedDir, newestDataLayer, normalPath, pluginDirsOf, pluginIdOf, pluginState, pluginsDir, type Place } from "../install/state.js";
@@ -81,10 +72,8 @@ import type { ContextWindow, DataLayerLine, TitleReply, WaitMark } from "../line
 import { claudeBinary, claudeCommand, findClaude } from "../runner/claude-binary.js";
 import { loadPatterns, type Pattern } from "../runner/scan.js";
 import { startRunner } from "../runner/start.js";
-import { recentSessions } from "../sweep/find.js";
 import { checkForUpdate, commandEnv, gitChoices, START_GAP_MS, updatesOffBy } from "../update/update.js";
-import { backfill } from "../wake/backfill.js";
-import { alive, HOLD_OFF_MS, holdOff, lockHolder, lockPath, notWantedPath, readLock, refreshLock, releaseLock, takeLock } from "../wake/lock.js";
+import { alive, HOLD_OFF_MS, lockHolder, lockPath, readLock, refreshLock, releaseLock, takeLock } from "../wake/lock.js";
 import { approvedPath, cachedRepos, createApproved, createSessionGate, type Approved, type Dormancy, type SessionGate } from "./approved.js";
 import { forOffice } from "./attribution.js";
 import { candidatesOf, inRepos } from "./home.js";
@@ -103,7 +92,7 @@ import { openReportHold, releasedPath, type ReportHold } from "./reports.js";
 import { cleanTitle, nextTitle, TITLE_SYSTEM, type TitleCache } from "./titles.js";
 import { prepareWorkflows } from "./workflows.js";
 
-// A detached data layer's log starts over once it is this big.
+// A session's log, in the runner, starts over once it is this big.
 const LOG_CAP_BYTES = 64 * 1024;
 /** One office server this data layer reports to, and what it keeps for it alone. */
 interface OfficeRun {
@@ -124,7 +113,7 @@ interface OfficeRun {
   homing: Promise<void> | null;
   result: { dormancy: Dormancy | null; projects: readonly Project[]; workspace: boolean } | null;
   connected: boolean;
-  /** Detached, and the server said this project isn't wanted; until when that holds, once the data layer stops. */
+  /** In the runner, and the server said this project isn't wanted; until when that holds, once it ends. */
   unwanted: boolean;
   unwantedUntil: number | null;
 }
@@ -132,28 +121,57 @@ interface OfficeRun {
 // How long a session the office doesn't take waits between passes.
 const DORMANT_MS = 30000;
 // A session lock its holder hasn't refreshed for this long (three of its slowest passes) counts for
-// nothing when a data layer decides whether to give the session up: the pid may have been reused.
-const LOCK_FRESH_MS = 3 * DORMANT_MS;
+// nothing when a data layer decides whether to give the session up, or the runner whether to take
+// it: the pid may have been reused.
+export const LOCK_FRESH_MS = 3 * DORMANT_MS;
 
-const value = (argv: string[], flag: string) => {
-  const i = argv.indexOf(flag);
-  return i >= 0 && argv[i + 1] && !argv[i + 1]!.startsWith("--") ? argv[i + 1]! : null;
-};
+export interface ReportSessionOptions {
+  sessionId: string;
+  /** The session's folder. */
+  cwd: string;
+  /** The session's project folder ($CLAUDE_PROJECT_DIR), for the plugin's settings; its folder without one. */
+  project?: string;
+  /** Who reports it: the plugin's data layer for its hooks module, or the machine's runner for a session without one. */
+  by: "hooks" | "runner";
+  /** The folder with the defaults: config.json and secret-patterns.json, and dist/ (the mod's folder, or the runner's copy). */
+  appDir: string;
+  /** Lines for the hooks module; in the runner, its log lines go to the session's log (sessionLog). */
+  emit(line: DataLayerLine): void;
+  /** Settles when it should end: the hooks module's stdout broke, or the runner stops. */
+  closed: Promise<void>;
+  /** Asked after each wait: false ends it (the plugin's data layer's parent has gone). */
+  goOn?: () => boolean;
+  /** The plugin's data layer only: its hooks module can submit a prompt (`--messages`). */
+  takesMessages?: boolean;
+  /** The plugin's data layer only: when its window's hooks module started (`--since`). */
+  since?: number;
+  /** Whether Claude Code lists the plugin as uninstalled or disabled for the session; by default, for the copy this runs from. */
+  isOff?: () => Promise<boolean>;
+  /** The runner only: the offices that didn't want the session, each until when, from an earlier run. */
+  notWanted?: Record<string, number>;
+  /** The runner only: its own pairing and list of repos for an office, shared by every session it reports. */
+  shared?: (office: Office) => { pairing: Pairing; approved: Approved } | null;
+}
 
-async function main(argv: string[]): Promise<number> {
-  const sessionId = value(argv, "--session");
-  const cwd = value(argv, "--cwd");
-  const detached = argv.includes("--detached");
-  // Only the plugin's own hooks module passes it, and only when its Claude Code can submit a prompt.
-  const takesMessages = !detached && argv.includes("--messages");
-  if (!sessionId || !cwd) {
-    process.stderr.write("usage: node data-layer.js --session <id> --cwd <dir> [--detached] [--messages]\n");
-    return 2;
-  }
+/** How it ended: why, as its log says; and in the runner, a hold-off for the runner to keep. */
+export interface Ended {
+  why: string;
+  /**
+   * Not before `until`: no office this reports to wants the project, or git can't place its folder;
+   * with `projects`, no office takes any of them, until one of those offices' lists does. `offices`
+   * are the servers it reported to, `notWanted` those that didn't want it, each until when.
+   */
+  holdOff?: { until: number; projects?: string[]; offices: string[]; notWanted: Record<string, number> };
+}
 
-  const here = path.dirname(fileURLToPath(import.meta.url));
-  // dist/data-layer.js sits one folder below the mod's config.json.
-  const defaultsPath = path.join(here, "..", "config.json");
+/** Reports the session until it should end. */
+export async function reportSession(o: ReportSessionOptions): Promise<Ended> {
+  const { sessionId, cwd, closed } = o;
+  const inRunner = o.by === "runner";
+  // Only the plugin's own hooks module can submit a prompt.
+  const takesMessages = !inRunner && !!o.takesMessages;
+  const here = path.join(o.appDir, "dist");
+  const defaultsPath = path.join(o.appDir, "config.json");
   const { dir: claudeDir, json: claudeJson } = claudePaths(process.env, os.homedir());
   const lock = lockPath(claudeDir, sessionId);
   const userConfigPath = path.join(claudeDir, "isoplan", "config.json");
@@ -168,7 +186,7 @@ async function main(argv: string[]): Promise<number> {
   const waitsDir = path.join(claudeDir, "isoplan", "waits", sessionId);
   // Where the hooks module writes the session's context window (a window line names it).
   const windowFile = path.join(claudeDir, "isoplan", "windows", `${sessionId}.json`);
-  const modPatterns = path.join(here, "..", "secret-patterns.json");
+  const modPatterns = path.join(o.appDir, "secret-patterns.json");
   const ownerPatterns = path.join(claudeDir, "isoplan", "secret-patterns.json");
   const machine = os.hostname();
 
@@ -182,56 +200,38 @@ async function main(argv: string[]): Promise<number> {
   const names = askingRemoteNames(claudeDir);
   const source = createClaudeCode({ ...io, claudeDir, home: os.homedir() });
 
-  // Ends when stdout can no longer be written, or the parent is gone (checked each pass). On POSIX
-  // an orphan is re-parented, so a changed ppid means gone even if the old pid is reused. Detached,
-  // neither applies.
-  const parent = process.ppid;
-  let isOut = !detached;
-  const closed = detached ? new Promise<void>(() => {}) : new Promise<void>((resolve) => process.stdout.on("error", () => resolve()));
-  void closed.then(() => (isOut = false));
-  const logFile = path.join(claudeDir, "isoplan", "logs", `${sessionId}.log`);
-  let logging = Promise.resolve();
   let downSince: number | null = Date.now(); // since when no office's link has been connected; null while one is
-  const emit = (line: DataLayerLine) => {
-    if (isOut) process.stdout.write(JSON.stringify(line) + "\n");
-    else if (detached && (line.type === "log" || line.type === "error" || line.type === "pair")) {
-      const said = line.type === "log" ? line.text : line.type === "pair" ? pairNote(line) : `the office server says: ${line.message} (${line.code})`;
-      const text = `${new Date().toISOString()} ${said}\n`;
-      logging = logging.then(() => writeLog(logFile, text)).catch(() => {});
-    }
-  };
+  const emit = o.emit;
   const wait = (ms: number) => {
     let timer: ReturnType<typeof setTimeout> | undefined;
-    const timeUp = new Promise<boolean>((resolve) => (timer = setTimeout(() => resolve(detached || (process.ppid === parent && alive(parent))), ms)));
+    const timeUp = new Promise<boolean>((resolve) => (timer = setTimeout(() => resolve(o.goOn?.() ?? true), ms)));
     return Promise.race([timeUp, closed.then(() => false)]).finally(() => clearTimeout(timer));
   };
+  let why = "it was stopped"; // why it ends, once it does
+  const stopping = (reason: string) => {
+    why = reason;
+    emit({ type: "log", text: `stopping: ${reason}` });
+    return false;
+  };
+  const end = (reason: string): Ended => (stopping(reason), { why });
 
   // Claude Code runs nothing of a plugin's when it is uninstalled or disabled, so this looks itself
   // (src/install/state.ts), before it takes the session's lock and on every pass: a data layer whose
-  // plugin is uninstalled or disabled for this session reports nothing and exits.
+  // plugin is uninstalled or disabled for this session reports nothing and ends.
   const place: Place = { claudeDir, plugins: pluginsDir(claudeDir, process.env), managed: managedDir(process.platform), pluginDirs: pluginDirsOf(process.env) };
-  // The project folder the wake hook passes on ($CLAUDE_PROJECT_DIR); the session's folder without it.
-  const project = value(argv, "--project") ?? cwd;
+  const project = o.project ?? cwd;
   const self = path.join(here, "data-layer.js");
-  const isOff = async () => (await pluginState(place, self, project).catch(() => "enabled")) !== "enabled";
-  if (await isOff()) {
-    emit({ type: "log", text: "stopping: Claude Code lists the Isoplan plugin as uninstalled or disabled here, so this session isn't reported" });
-    await logging;
-    return 0;
-  }
+  const isOff = o.isOff ?? (async () => (await pluginState(place, self, project).catch(() => "enabled")) !== "enabled");
+  if (await isOff()) return end("Claude Code lists the Isoplan plugin as uninstalled or disabled here, so this session isn't reported");
   // When this window's hooks module started: one it starts again keeps its window's place.
-  const since = Number(value(argv, "--since")) || Date.now();
+  const since = o.since ?? Date.now();
   // The session's folder too, so /isoplan:repos (src/repos) looks at the folder this reports as.
-  const lockExtra = { dataLayer: self, detached, since, parent: process.ppid, cwd };
-  // The newest copy of the plugin installed for this session (state.ts): another one means this one is outdated.
+  const lockExtra = inRunner ? { detached: true, runner: true, cwd } : { dataLayer: self, detached: false, since, parent: process.ppid, cwd };
+  // The newest copy of the plugin installed for this session (state.ts): another one means this one
+  // is outdated. The runner is kept up to date by its own start (src/runner/start.ts).
   const newest = () => newestDataLayer(place.plugins, self, project).catch(() => self);
-  const isOutdated = async () => (await newest()) !== self;
+  const isOutdated = async () => !inRunner && (await newest()) !== self;
   let outdated = await isOutdated();
-  if (detached && outdated) {
-    emit({ type: "log", text: "a newer version of the Isoplan plugin is installed, so it reports this session instead" });
-    await logging;
-    return 0;
-  }
 
   // Why this data layer gives the session up to the plugin's data layer holding it (see above), or null.
   const supersededBy = async (): Promise<"newer" | "window" | null> => {
@@ -245,39 +245,32 @@ async function main(argv: string[]): Promise<number> {
     return outdated && normalPath(current) === normalPath(other) ? "newer" : null;
   };
   const leave = (reason: "newer" | "window") => {
-    emit({ type: "log", text: reason === "newer" ? "stopping: the newer version's data layer that a reload started reports this session now" : "stopping: the session's newer window reports it now" });
+    stopping(reason === "newer" ? "the newer version's data layer that a reload started reports this session now" : "the session's newer window reports it now");
     emit({ type: "superseded", reason });
   };
-  if (!detached) {
+  if (!inRunner) {
     const reason = await supersededBy();
     if (reason) {
       leave(reason);
-      return 0;
+      return { why };
     }
   }
 
-  // A detached data layer started again after one office didn't want the session: that office stays
-  // left alone until its hold-off ends (wake.ts).
-  const notWantedBefore: Record<string, unknown> = detached ? await takeNotWanted(claudeDir, sessionId) : {};
+  // Reported again after one office didn't want the session: that office stays left alone until its
+  // hold-off ends (src/runner/reporting.ts).
+  const notWantedBefore: Record<string, unknown> = inRunner ? (o.notWanted ?? {}) : {};
   try {
-    if (!(await takeLock(lock, process.pid, alive, !detached, Date.now(), { extra: lockExtra }))) {
-      process.stderr.write(`another data layer already reports session ${sessionId}\n`);
-      emit({ type: "log", text: "stopping: another data layer already reports this session" });
-      await logging;
-      return 0;
-    }
+    // In the runner, a hold-off a detached data layer of an earlier version left counts for nothing: the runner keeps its own.
+    if (inRunner && (await readLock(lock))?.pid === null) await fs.rm(lock, { force: true });
+    if (!(await takeLock(lock, process.pid, alive, !inRunner, Date.now(), { extra: lockExtra, ...(inRunner && { freshMs: LOCK_FRESH_MS }) }))) return end("another data layer already reports this session");
   } catch (err) {
-    if (detached) {
-      emit({ type: "log", text: `stopping: couldn't take the session lock: ${String((err as Error)?.message ?? err)}` });
-      await logging;
-      return 0;
-    }
+    if (inRunner) return end(`couldn't take the session lock: ${String((err as Error)?.message ?? err)}`);
     emit({ type: "log", text: `couldn't take the session lock, so going on without it: ${String((err as Error)?.message ?? err)}` });
   }
 
   const paths = { ...place, settings: path.join(claudeDir, "settings.json") };
   const start = (args: string[], dir: string, env?: Record<string, string>) => spawn(process.execPath, args, { cwd: dir, env, detached: true, stdio: "ignore", windowsHide: true }).on("error", () => {}).unref();
-  const installing = detached || outdated
+  const installing = inRunner || outdated
     ? Promise.resolve([])
     : installWake(paths, path.join(here, "data-layer.js"), path.join(here, "wake.js"), {
         auto: true,
@@ -291,7 +284,7 @@ async function main(argv: string[]): Promise<number> {
       );
   // The machine's runner answers for its rooms; it is started here as well as by the wake hook.
   // Not while the plugin is disabled for the machine, though this session's project enables it.
-  if (!detached && !outdated) void installing.then(async () => (await pluginState(place, self)) === "enabled" && startRunner({ claudeDir, spawn: start })).catch(() => {});
+  if (!inRunner && !outdated) void installing.then(async () => (await pluginState(place, self)) === "enabled" && startRunner({ claudeDir, spawn: start })).catch(() => {});
 
   let config: Config = await loadConfig(io, defaultsPath, userConfigPath);
   if (outdated) emit({ type: "updated" });
@@ -302,7 +295,7 @@ async function main(argv: string[]): Promise<number> {
   let checking = false;
   let checkedAt = Date.now(); // the timed checks count from the one at start
   const checkUpdate = (gapMs: number) => {
-    if (detached || !pluginId || outdated || checking || !config.updateCheckHours) return;
+    if (inRunner || !pluginId || outdated || checking || !config.updateCheckHours) return;
     checkedAt = Date.now();
     const off = updatesOffBy(process.env);
     if (off) return emit({ type: "log", text: `not checking for a newer version of the plugin: ${off} is set (FORCE_AUTOUPDATE_PLUGINS=1 turns plugin updates back on)` });
@@ -319,20 +312,11 @@ async function main(argv: string[]): Promise<number> {
   };
   // After the wake hook's install, which writes settings.json too: neither then loses the other's change.
   void installing.then(() => checkUpdate(START_GAP_MS));
-  // A hook just installed sees other sessions only on their next turn: they are reported now.
-  void installing
-    .then(async (changes) => {
-      if (!changes.length) return;
-      const found = await recentSessions(io, path.join(claudeDir, "projects"), Date.now() - config.lightsOffHours * 3600000);
-      const started = await backfill(found, { claudeDir, dataLayer: path.join(here, "data-layer.js"), spawn: start });
-      emit({ type: "log", text: `reported ${started} other session(s) from the last ${config.lightsOffHours} hours` });
-    })
-    .catch((err: unknown) => emit({ type: "log", text: `couldn't report the other sessions: ${String((err as Error)?.message ?? err)}` }));
   // The offices are read once: a link that moved servers mid-session would leave a room behind.
   // Plain ws:// to another machine would send facts and the machine's credential unencrypted.
   const offices = officesOf(config);
   for (const { server } of offices.filter((o) => o.plainRefused)) emit({ type: "log", text: `not reporting to ${server}: it is plain ws:// to another machine; use wss://, or set "allowPlainWs": true in config.json` });
-  if (!detached) {
+  if (!inRunner) {
     for (const dir of [answersDir, waitsDir, messagesDir]) await fs.rm(dir, { recursive: true, force: true }).catch(() => {});
     if (await fs.mkdir(waitsDir, { recursive: true }).then(() => true, () => false)) emit({ type: "waits", dir: waitsDir });
     // Made once here, not per message, so each message's line goes out in the order it came.
@@ -349,12 +333,12 @@ async function main(argv: string[]): Promise<number> {
   let candidates: { projects: Project[]; workspace: boolean } | null = null;
   let candidatesAt = -Infinity;
   let dormant: Dormancy | null = null; // why nothing is sent, while it isn't
-  let notApproved: string[] | null = null; // detached, and no office takes any of these: it holds off
+  let notApproved: string[] | null = null; // in the runner, and no office takes any of these: it holds off
   let factsSession = ""; // the session's id as its facts give it, for the hello
   let reported = ""; // the last problem logged, so a lasting one is logged once
   let title: TitleCache | null = null;
   let asked: string | null = null; // the key of the title call in flight
-  let isPlaceless = false; // detached, and git couldn't place the session's folder
+  let isPlaceless = false; // in the runner, and git couldn't place the session's folder
   let passes = 0;
   let shown: Parameters<ReportHold["apply"]> | null = null; // the last facts and patterns the holds were applied to
   let waiting: ReadonlySet<string> = new Set(); // the open questions the hooks module marks it waits on
@@ -382,7 +366,7 @@ async function main(argv: string[]): Promise<number> {
       admit: mayConnect,
       // The list may have changed: it is read again, and the link opens afresh once it has.
       onNotWanted: () => {
-        run.unwanted = detached;
+        run.unwanted = inRunner;
         run.gate.notWanted();
       },
       // Another repo's files, commands and checkouts go only to a server that welcomed them, and
@@ -398,7 +382,7 @@ async function main(argv: string[]): Promise<number> {
           void fs
             .mkdir(answersDir, { recursive: true })
             .then(async () => {
-              const relayed = await relayOwnerAnswer(message, { detached, facts: () => run.sent, file, emit, take: takeFile });
+              const relayed = await relayOwnerAnswer(message, { detached: inRunner, facts: () => run.sent, file, emit, take: takeFile });
               run.gate.current()?.send(relayed.message);
               if (!relayed.gaveUp) return;
               // The hooks module's word may still come: a take that does follows as a late reply.
@@ -415,7 +399,7 @@ async function main(argv: string[]): Promise<number> {
         if (message.type === "request" && message.kind === "owner-message") {
           const file = path.join(messagesDir, `${randomUUID()}.json`);
           // relayOwnerMessage emits its line before its first await: lines go out in arrival order.
-          void relayOwnerMessage(message, { detached, takes: takesMessages, owner: account.id, session: sessionId, file, emit, take: takeFile })
+          void relayOwnerMessage(message, { detached: inRunner, takes: takesMessages, owner: account.id, session: sessionId, file, emit, take: takeFile })
             .then((answer) => run.gate.current()?.send(answer))
             .finally(() => fs.rm(file, { force: true }).catch(() => {}))
             .catch((err: unknown) => emit({ type: "log", text: `couldn't pass the owner's message on: ${String((err as Error)?.message ?? err)}` }));
@@ -456,30 +440,37 @@ async function main(argv: string[]): Promise<number> {
         }
         emit(line.type === "status" || line.type === "pair" ? { ...line, label } : line.type === "asked" || line.type === "ask-rights" ? { ...line, server } : line);
       };
-      run.pairing = createPairing({
-        file: pairingPath(claudeDir),
-        lock: pairingLockPath(claudeDir, office),
-        writeLock: pairingWriteLockPath(claudeDir),
-        server,
-        account: machineAccount,
-        machine,
-        emit: run.emit,
-        allowPlainWs: config.allowPlainWs,
-        legacy: !!office.legacy,
-      });
-      run.approved = createApproved({
-        server,
-        file: approvedPath(claudeDir, server),
-        pairing: run.pairing,
-        refreshMs: config.approvedRefreshMinutes * 60000,
-        maxAgeMs: config.approvedMaxAgeMinutes * 60000,
-        log: (text) => emit({ type: "log", text }),
-      });
+      // The runner's own, shared by every session it reports: one pairing for the office, which a session's link closing leaves answering.
+      const shared = o.shared?.(office);
+      if (shared) {
+        run.pairing = { ...shared.pairing, close: async () => {} };
+        run.approved = shared.approved;
+      } else {
+        run.pairing = createPairing({
+          file: pairingPath(claudeDir),
+          lock: pairingLockPath(claudeDir, office),
+          writeLock: pairingWriteLockPath(claudeDir),
+          server,
+          account: machineAccount,
+          machine,
+          emit: run.emit,
+          allowPlainWs: config.allowPlainWs,
+          legacy: !!office.legacy,
+        });
+        run.approved = createApproved({
+          server,
+          file: approvedPath(claudeDir, server),
+          pairing: run.pairing,
+          refreshMs: config.approvedRefreshMinutes * 60000,
+          maxAgeMs: config.approvedMaxAgeMinutes * 60000,
+          log: (text) => emit({ type: "log", text }),
+        });
+      }
       run.gate = createSessionGate({ approved: run.approved, open: (home, mayConnect) => openLink(run, home, mayConnect) });
       return run;
     }));
   const links = () => runs.flatMap((run) => run.gate.current() ?? []);
-  // Detached, and every office either doesn't want this project or doesn't take its repo, one at least not wanting it.
+  // In the runner, and every office either doesn't want this project or doesn't take its repo, one at least not wanting it.
   const isUnwanted = () => runs.some((r) => r.unwanted) && runs.every((r) => r.unwanted || r.dormant === "not-approved");
   // Whether an office's list now takes the session's home, checked at once with the others'; a check
   // still under way is left running, not started again. What it says is kept, and taken only at a
@@ -527,12 +518,11 @@ async function main(argv: string[]): Promise<number> {
   };
   let pending = false; // an office's list hasn't answered yet
   const startedAt = Date.now();
-  const stopping = (why: string) => (emit({ type: "log", text: `stopping: ${why}` }), false);
   // Whether to go on to the next pass, once this one's wait is over; each reason not to is logged.
   const goOn = async () => {
     if (!(await wait(dormant && !pending ? DORMANT_MS : config.streamSeconds * 1000))) return false;
     if (isUnwanted()) return stopping("no office this reports to wants this session's project or takes its repo, so it holds off");
-    if (detached && (await lockHolder(lock)) !== process.pid) return stopping("another data layer reports this session now");
+    if (inRunner && (await lockHolder(lock)) !== process.pid) return stopping("another data layer reports this session now");
     if (await isOff()) return stopping("Claude Code lists the Isoplan plugin as uninstalled or disabled here now");
     return true;
   };
@@ -540,8 +530,8 @@ async function main(argv: string[]): Promise<number> {
   do {
     const now = Date.now();
     const isFirstPass = passes++ === 0;
-    // A detached data layer that stopped may have deleted this one's lock as it went.
-    if (!detached) {
+    // A data layer of an earlier version that stopped may have deleted this one's lock as it went.
+    if (!inRunner) {
       if ((await lockHolder(lock)) !== process.pid) {
         const reason = await supersededBy();
         if (reason) {
@@ -552,13 +542,7 @@ async function main(argv: string[]): Promise<number> {
       } else await refreshLock(lock, process.pid).catch(() => {});
     }
     config = await loadConfig(io, defaultsPath, userConfigPath).catch(() => config);
-    if (!outdated && (outdated = await isOutdated())) {
-      if (detached) {
-        emit({ type: "log", text: "stopping: a newer version of the Isoplan plugin is installed, which the wake hook starts next" });
-        break;
-      }
-      emit({ type: "updated" });
-    }
+    if (!outdated && (outdated = await isOutdated())) emit({ type: "updated" });
     if (now - checkedAt >= config.updateCheckHours * 3600000) checkUpdate(config.updateCheckHours * 3600000);
     const gitOpts = { now, maxAgeMs: config.gitCacheSeconds * 1000 };
     const resolve = (dir: string) => git.resolve(dir, gitOpts);
@@ -590,16 +574,16 @@ async function main(argv: string[]): Promise<number> {
     pending = runs.some((r) => !r.known);
     dormant = taking.length ? null : pending ? "no-list" : (runs.find((r) => r.dormant && r.dormant !== "not-approved")?.dormant ?? "not-approved");
     if (!taking.length) {
-      // A detached one holds off, as for not-wanted, until the wake hook finds a list takes one of
+      // In the runner it holds off, as for not-wanted, until the runner finds a list takes one of
       // these repos, or the hold ends; one with no list stops once that has lasted LINK_DOWN_MS.
-      if (detached && dormant === "not-approved") {
+      if (inRunner && dormant === "not-approved") {
         notApproved = candidates.projects.map((p) => p.id.toLowerCase());
         stopping(`no office this reports to takes ${notApproved.join(", ") || cwd}, so it holds off until one does`);
         break;
       }
-      const why = detached ? detachedStop({ now, lastActive: new Date(now).toISOString(), idleMinutes: config.idleMinutes, downSince }) : null;
-      if (why) {
-        emit({ type: "log", text: `stopping: ${why}` });
+      const quiet = inRunner ? detachedStop({ now, lastActive: new Date(now).toISOString(), idleMinutes: config.idleMinutes, downSince }) : null;
+      if (quiet) {
+        stopping(quiet);
         break;
       }
       continue;
@@ -616,9 +600,9 @@ async function main(argv: string[]): Promise<number> {
     if (!read.facts) {
       // Nothing to report (lights off with no reply, aged out, the transcript gone): the link
       // closes, so the server marks the room unreachable and ages it out. It opens again if facts
-      // come back; a detached data layer is done, and the wake hook starts another if they do.
-      if (detached) {
-        // A folder git can't place won't be placed on the next turn either: the wake hook holds off.
+      // come back; in the runner it is done, and the runner starts it again once the transcript moves.
+      if (inRunner) {
+        // A folder git can't place won't be placed on the next turn either: the runner holds off.
         isPlaceless = isFirstPass && !(await resolve(cwd));
         if (isPlaceless) {
           stopping(`git can't place ${cwd}, so it holds off`);
@@ -655,7 +639,7 @@ async function main(argv: string[]): Promise<number> {
       emit({ type: "title-ask", model: "haiku", system: TITLE_SYSTEM, prompt: ask.prompt, maxTokens: 40, key: ask.key, file: titleFile });
     }
     // The size stays as last read while the file is missing or half written; there is none until it is written.
-    if (!detached) contextWindow = (await windowOf(windowFile)) ?? contextWindow;
+    if (!inRunner) contextWindow = (await windowOf(windowFile)) ?? contextWindow;
     const titled = read.facts.session.titleFrom === "branch" && title?.title ? { ...read.facts, session: { ...read.facts.session, title: title.title } } : read.facts;
     const sized: Facts = contextWindow ? { ...titled, session: { ...titled.session, contextWindow } } : titled;
     const facts: Facts = takesMessages ? { ...sized, session: { ...sized.session, takesMessages: true } } : sized;
@@ -667,7 +651,7 @@ async function main(argv: string[]): Promise<number> {
       patternLog(`couldn't read the secret patterns, so every report is withheld: ${String((err as Error)?.message ?? err)}`);
       return null;
     });
-    waiting = detached ? new Set() : await waitsOf(waitsDir, facts);
+    waiting = inRunner ? new Set() : await waitsOf(waitsDir, facts);
     shown = [facts, patterns];
     // One office's failure never ends the loop for the others.
     for (const run of taking) {
@@ -677,41 +661,54 @@ async function main(argv: string[]): Promise<number> {
         emit({ type: "log", text: `couldn't send this session's facts to ${run.office.server}: ${String((err as Error)?.message ?? err)}` });
       }
     }
-    const why = detached ? detachedStop({ now, lastActive: facts.session.lastActive, idleMinutes: config.idleMinutes, downSince }) : null;
-    if (why) {
-      emit({ type: "log", text: `stopping: ${why}` });
+    const quiet = inRunner ? detachedStop({ now, lastActive: facts.session.lastActive, idleMinutes: config.idleMinutes, downSince }) : null;
+    if (quiet) {
+      stopping(quiet);
       break;
     }
     // A dormant session waits longer between passes: there is nothing to send, only the list to check.
   } while (await goOn());
 
   for (const link of links()) link.close();
-  // The offices that didn't want the session, each until its hold-off ends; the wake hook reads no
-  // list of theirs, and lists only of the offices configured now (wake.ts).
+  await releaseLock(lock, process.pid).catch(() => {});
+  // The offices that didn't want the session, each until its hold-off ends: the runner reads no list
+  // of theirs, and lists only of the offices configured now (reporting.ts).
   const notWanted = Object.fromEntries(runs.filter((r) => r.unwanted).map((r) => [r.office.server, r.unwantedUntil ?? Date.now() + HOLD_OFF_MS]));
-  const named = { offices: offices.map((o) => o.server), notWanted };
+  const named = { offices: offices.map((office) => office.server), notWanted };
   // An office that doesn't take the repo may yet: then the hold-off ends once one of its lists does.
   if (isUnwanted() && runs.some((r) => r.dormant === "not-approved")) notApproved = (candidates?.projects ?? []).map((p) => p.id.toLowerCase());
-  if ((isUnwanted() && !notApproved) || isPlaceless) await holdOff(lock, process.pid, Date.now() + HOLD_OFF_MS, named).catch(() => {});
-  else if (notApproved) await holdOff(lock, process.pid, Date.now() + HOLD_OFF_MS, { reason: "not-approved", projects: notApproved, ...named }).catch(() => {});
-  else await releaseLock(lock, process.pid).catch(() => {});
-  await logging;
-  return 0;
+  if ((isUnwanted() && !notApproved) || isPlaceless) return { why, holdOff: { until: Date.now() + HOLD_OFF_MS, ...named } };
+  if (notApproved) return { why, holdOff: { until: Date.now() + HOLD_OFF_MS, projects: notApproved, ...named } };
+  return { why };
 }
 
-/** The offices that didn't want this session, each until when, as the wake hook left them as it started this data layer (wake.ts); read once, then gone. */
-async function takeNotWanted(claudeDir: string, sessionId: string): Promise<Record<string, unknown>> {
-  const file = notWantedPath(claudeDir, sessionId);
-  const said = await fs.readFile(file, "utf8").then((text) => JSON.parse(text) as unknown, () => null);
-  await fs.rm(file, { force: true }).catch(() => {});
-  return said && typeof said === "object" ? (said as Record<string, unknown>) : {};
+/**
+ * Where a session the runner reports says what it does: its log lines, the office's errors and
+ * pairing links, in <claude dir>/isoplan/logs/<session>.log; the rest is for a hooks module, so dropped.
+ * `flushed` settles once what was said so far is written.
+ */
+export function sessionLog(claudeDir: string, sessionId: string): { emit: (line: DataLayerLine) => void; say: (text: string) => void; flushed: () => Promise<void> } {
+  const file = path.join(claudeDir, "isoplan", "logs", `${sessionId}.log`);
+  let logging = Promise.resolve();
+  const say = (said: string) => {
+    const text = `${new Date().toISOString()} ${said}
+`;
+    logging = logging.then(() => writeLog(file, text)).catch(() => {});
+  };
+  return {
+    emit: (line) => {
+      if (line.type === "log" || line.type === "error" || line.type === "pair") say(line.type === "log" ? line.text : line.type === "pair" ? pairNote(line) : `the office server says: ${line.message} (${line.code})`);
+    },
+    say,
+    flushed: () => logging,
+  };
 }
 
 /** A pair line as the log says it. */
 const pairNote = (line: { server: string; url: string; expires: string }) =>
   `to report to ${line.server}, pair this machine: click ${line.url} on this computer and approve it in the office (it works until ${line.expires})`;
 
-// Appends to a detached data layer's log, starting it over once it passes LOG_CAP_BYTES.
+// Appends to a session's log, starting it over once it passes LOG_CAP_BYTES.
 async function writeLog(file: string, text: string): Promise<void> {
   const size = (await fs.stat(file).catch(() => null))?.size ?? 0;
   await fs.mkdir(path.dirname(file), { recursive: true });
@@ -768,25 +765,3 @@ async function takeReply(file: string): Promise<TitleReply | null> {
   const r = value as Partial<TitleReply>;
   return typeof r.key === "string" && typeof r.text === "string" ? { key: r.key, text: r.text } : null;
 }
-
-// Detached, nobody reads stderr: an error nothing caught is said in the session's log as it exits (#92).
-function crashed(err: unknown): never {
-  const argv = process.argv.slice(2);
-  const sessionId = value(argv, "--session");
-  const said = String((err as Error)?.stack ?? err);
-  if (argv.includes("--detached") && sessionId && /^[\w-]+$/.test(sessionId)) {
-    try {
-      const file = path.join(claudePaths(process.env, os.homedir()).dir, "isoplan", "logs", `${sessionId}.log`);
-      mkdirSync(path.dirname(file), { recursive: true });
-      appendFileSync(file, `${new Date().toISOString()} stopping: something went wrong: ${said}\n`);
-    } catch {
-      // Nowhere to say it.
-    }
-  }
-  process.stderr.write(`${said}\n`);
-  process.exit(1);
-}
-process.on("uncaughtException", crashed).on("unhandledRejection", crashed);
-process.exitCode = await main(process.argv.slice(2)).catch(crashed);
-// The link's timers would keep the process up; it is done.
-process.exit();

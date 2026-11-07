@@ -1,26 +1,16 @@
 // One data layer per session: <claude dir>/isoplan/live/<session id>.json holds `{ pid }` of the
-// one reporting it. Every data layer takes it, the plugin's and the detached one the wake hook
-// starts; one that finds another live pid there exits, except the plugin's, which takes it over
-// from a detached one (that one notices on its next pass and exits). A lock whose pid has gone is
-// stale and is taken over. The wake hook reads it to see whether the session is already reported.
-//
-// A detached data layer that stops for a reason the next turn won't change (the server doesn't want
-// the project, git can't place the folder) leaves `{ pid: 0, until }` instead: until then the
-// session counts as held, so the wake hook doesn't start another on every turn. The plugin's data
-// layer still takes it.
+// one reporting it, the plugin's data layer for its hooks module or the machine's runner. The
+// runner's doesn't start while another live pid keeps it fresh; the plugin's takes it over from the
+// runner, which notices on its next pass and stops (src/data-layer/report-session.ts). A lock whose
+// pid has gone is stale and is taken over. The same takeLock and its hold-offs keep the runner's own
+// lock (src/runner/start.ts) and the pairing's (src/data-layer/pairing.ts).
 
 import fs from "node:fs/promises";
 import path from "node:path";
 
 export const lockPath = (claudeDir: string, sessionId: string) => path.join(claudeDir, "isoplan", "live", `${sessionId}.json`);
 
-/**
- * The offices that didn't want a session, each until when (#105): the wake hook moves them here from
- * a hold-off it ends, for the data layer it starts, which reads the file once and removes it.
- */
-export const notWantedPath = (claudeDir: string, sessionId: string) => path.join(claudeDir, "isoplan", "live", `${sessionId}.not-wanted`);
-
-// How long a hold-off keeps the wake hook from starting another data layer.
+// How long a hold-off lasts: a runner that stopped for a reason a restart won't mend, or a session the runner holds off.
 export const HOLD_OFF_MS = 3600000;
 
 export interface LockBody {
@@ -82,7 +72,7 @@ export async function isHeld(file: string, now = Date.now(), isAlive = alive, ru
 
 /**
  * Takes the lock for `pid`; false when it is held (`isHeld`). With `force` (the plugin's data
- * layer) it is taken regardless: a detached one holding it sees that and steps aside. `extra` is
+ * layer) it is taken regardless: the runner holding it sees that and steps aside. `extra` is
  * written into the lock beside the pid.
  *
  * A new lock is created exclusively, so of two takers at once only one gets it. A stale one is

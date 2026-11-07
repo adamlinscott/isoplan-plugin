@@ -1,9 +1,8 @@
 // The wake hook: a Claude Code command hook on UserPromptSubmit and Stop, once per turn, from the
-// user's settings.json (src/install). It starts a detached data layer for a session that has no
-// data layer reporting it, so every session is seen without the plugin loaded in it, and starts
-// the machine's runner (src/runner) when none is running.
+// user's settings.json (src/install). It starts the machine's runner (src/runner) when none is
+// running; the runner reports every session that has no hooks module (src/runner/reporting.ts).
 //
-//   node <claude dir>/isoplan/wake.mjs     (the hook's JSON on stdin)
+//   node <claude dir>/isoplan/wake.mjs     (the hook's JSON on stdin, of which it reads the folder)
 //
 // It must never get in a session's way: it writes nothing to stdout (UserPromptSubmit would add it
 // to the model's context), every error it can catch exits 0, and it is done well inside a second.
@@ -19,11 +18,11 @@
 // layer wake.json records:
 //
 // - Uninstalled (`/plugin uninstall`, the plugin manager, `claude plugin uninstall`): it starts no
-//   data layer and no runner, and starts itself in the background to uninstall it all (src/install),
+//   runner, and starts itself in the background to uninstall it all (src/install),
 //   so the session isn't kept waiting while it does; unless one is running or holding off.
 // - Disabled for the machine: it stops the runner, starts nothing, and every file stays. Disabled
-//   for this session's project only: it starts nothing for this session. Enabled again, the next
-//   prompt starts them again.
+//   for this session's project only: it starts nothing (the runner doesn't report the session
+//   either). Enabled again, the next prompt starts the runner again.
 //
 //   node <claude dir>/isoplan/wake.mjs --uninstall
 //
@@ -41,7 +40,6 @@ import { isUninstalling, processCommand, recordedState, runnerAppDir, settleMs, 
 import { managedDir, pluginDirsOf, pluginsDir } from "../install/state.js";
 import { startRunner } from "../runner/start.js";
 import { startFromOutside } from "./outside.js";
-import { wake } from "./wake.js";
 
 const STDIN_MS = 500;
 // How long the background uninstall waits for the runner to exit before it removes its files.
@@ -98,13 +96,6 @@ if (session === "uninstalled") {
 }
 const machine = project ? await recordedState(paths).catch(() => "enabled" as const) : session;
 if (machine === "disabled") await stopOurRunner(claudeDir).catch(() => {});
-if (session === "enabled") {
-  try {
-    await wake(input, { claudeDir, spawn: start, project, plugins: paths.plugins });
-  } catch {
-    // Nothing to do: a session is never failed for this.
-  }
-  // The machine's runner, which answers for its rooms, is started again if it isn't running.
-  if (machine === "enabled") await startRunner({ claudeDir, spawn: start }).catch(() => {});
-}
+// The machine's runner, which reports the sessions and answers for its rooms, is started again if it isn't running.
+if (session === "enabled" && machine === "enabled") await startRunner({ claudeDir, spawn: start }).catch(() => {});
 process.exit(0);

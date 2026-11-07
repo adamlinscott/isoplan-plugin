@@ -1,7 +1,7 @@
 // The copy of each office's list of approved repos (approved.ts), in that office's own folder,
-// <claude dir>/isoplan/offices/<id>/approved.json (#105), as the wake hook reads it too: kept free of
-// anything but fs so the hook starts fast. A version before #105 kept one list, in
-// <claude dir>/isoplan/approved.json, which the wake hook still reads.
+// <claude dir>/isoplan/offices/<id>/approved.json (#105), as the runner reads it too, for a session
+// it holds off (src/runner/reporting.ts): kept free of anything but fs. A version before #105 kept
+// one list, in <claude dir>/isoplan/approved.json, which is still read.
 
 import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
