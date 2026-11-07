@@ -73,6 +73,7 @@ import type { LoginItemPlace } from "../install/login-item.js";
 import { managedDir, newestDataLayer, normalPath, pluginDirsOf, pluginIdOf, pluginState, pluginsDir, type Place } from "../install/state.js";
 import type { ContextWindow, DataLayerLine, TitleReply, WaitMark } from "../lines.js";
 import { claudeBinary, claudeCommand, findClaude } from "../runner/claude-binary.js";
+import { SESSION_ENV } from "../pipe/pipe.js";
 import { errorText, loadPatterns, type Pattern } from "../runner/scan.js";
 import { startRunner, type StartOptions, type Started } from "../runner/start.js";
 import { checkForUpdate, commandEnv, gitChoices, START_GAP_MS, updatesOffBy } from "../update/update.js";
@@ -142,6 +143,21 @@ export function takesOver(held: LockBody | null, self: string, since: number, pi
   if (detached !== false || runner === true || typeof dataLayer !== "string") return false;
   return normalPath(dataLayer) !== normalPath(self) || (typeof theirs === "number" && since > theirs);
 }
+
+/** The environment a hooks module's report goes by: the runner's, with the session's own SESSION_ENV in place of the runner's, so one the session doesn't set isn't set. */
+export function hookedEnv(env: Record<string, string> = {}): Record<string, string | undefined> {
+  const base: Record<string, string | undefined> = { ...process.env };
+  for (const name of SESSION_ENV) delete base[name];
+  return { ...base, ...env };
+}
+
+/**
+ * Whether a hooks module's copy of the plugin (its dist/data-layer.js, `self`) is outdated: another
+ * copy is the newest installed for `project` (state.ts). Such a copy's report never takes the lock
+ * over (takesOver), here or in the runner's look (src/runner/reporting.ts).
+ */
+export const outdatedCopy = async (claudeDir: string, env: Record<string, string | undefined>, self: string, project: string) =>
+  (await newestDataLayer(pluginsDir(claudeDir, env), self, project).catch(() => self)) !== self;
 
 export interface ReportSessionOptions {
   sessionId: string;
@@ -315,7 +331,7 @@ async function reporting(o: ReportSessionOptions, c: Containment): Promise<Ended
   // (src/install/state.ts), before it takes the session's lock and on every pass: a session whose
   // plugin is uninstalled or disabled for it is reported no more.
   // The session's own environment where its hooks module passed it on: where its plugins are, and whether it updates.
-  const env: Record<string, string | undefined> = { ...process.env, ...(hooked ? o.env : {}) };
+  const env = hooked ? hookedEnv(o.env) : { ...process.env };
   const place: Place = { claudeDir, plugins: pluginsDir(claudeDir, env), managed: managedDir(process.platform), pluginDirs: pluginDirsOf(env) };
   const project = o.project ?? cwd;
   // The copy of the plugin, by its dist/data-layer.js as Claude Code's records know it: the hooks module's, or the runner's own.
@@ -328,7 +344,7 @@ async function reporting(o: ReportSessionOptions, c: Containment): Promise<Ended
   const lockExtra = hooked ? { dataLayer: self, detached: false, since, parent: process.pid, runner: true, cwd } : { detached: true, runner: true, cwd };
   // The newest copy of the plugin installed for this session (state.ts): another one means the hooks
   // module's is outdated. The runner is kept up to date by its own start (src/runner/start.ts).
-  const isOutdated = async () => hooked && (await newestDataLayer(place.plugins, self, project).catch(() => self)) !== self;
+  const isOutdated = async () => hooked && (await outdatedCopy(claudeDir, env, self, project));
   let outdated = await isOutdated();
   // An earlier version's data layer holds the session's lock (see above): its hooks module is told.
   const takenOver = (reason: string) => {

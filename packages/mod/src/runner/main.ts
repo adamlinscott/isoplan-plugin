@@ -219,7 +219,8 @@ async function worker(): Promise<number> {
     }),
   );
   // Every session on the machine is reported from here (reporting.ts), started first, so a runner
-  // started again has them on the floor again at once (those of hooks modules, once they say hello).
+  // started again has them on the floor again soon: those of hooks modules once they say hello, the
+  // recent ones without once the first look's hold of twice runnerRetrySeconds has passed.
   const paths = { claudeDir, settings: path.join(claudeDir, "settings.json"), plugins: pluginsDir(claudeDir, process.env), managed: managedDir(process.platform), pluginDirs: pluginDirsOf(process.env) };
   const isOff = async (folder: string) => (await recordedState(paths, folder).catch(() => "enabled" as const)) !== "enabled";
   const scanText = async (text: string) => scan(text, await loadPatterns(path.join(appDir, "secret-patterns.json"), path.join(isoplanDir, "secret-patterns.json"), log));

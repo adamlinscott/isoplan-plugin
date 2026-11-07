@@ -7987,6 +7987,92 @@ async function writeWhole(file, text) {
 	}
 }
 //#endregion
+//#region src/pipe/pipe.ts
+const pipeInfoPath = (claudeDir) => path.join(claudeDir, "isoplan", "runner", "pipe.json");
+const newNonce = () => randomBytes(16).toString("hex");
+const proofOf = (token, nonce) => createHmac("sha256", token).update(nonce).digest("hex");
+/** The variables of a session's environment its hooks module's end passes on, which the runner reports that session by (report-session.ts). */
+const SESSION_ENV = [
+	"CLAUDE_CODE_PLUGIN_CACHE_DIR",
+	"CLAUDE_CODE_PLUGIN_DIRS",
+	"DISABLE_UPDATES",
+	"DISABLE_AUTOUPDATER",
+	"CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
+	"FORCE_AUTOUPDATE_PLUGINS"
+];
+/** Those of SESSION_ENV that `env` sets. */
+const sessionEnv = (env) => Object.fromEntries(SESSION_ENV.flatMap((name) => typeof env[name] === "string" ? [[name, env[name]]] : []));
+async function readPipeInfo(claudeDir) {
+	try {
+		const { address, token } = JSON.parse(await fs.readFile(pipeInfoPath(claudeDir), "utf8"));
+		return typeof address === "string" && typeof token === "string" ? {
+			address,
+			token
+		} : null;
+	} catch {
+		return null;
+	}
+}
+const PROOF_WAIT_MS = 5e3;
+/**
+* Connects to the pipe at `info.address` and has the runner prove it knows the token (see above).
+* Resolves the socket once it has, with every later line given to `onLine`; null when the pipe
+* can't be reached or doesn't prove it, and then nothing of the client's went to it.
+*/
+function openPipe(info, onLine) {
+	return new Promise((resolve) => {
+		const nonce = newNonce();
+		const want = Buffer.from(proofOf(info.token, nonce));
+		let proven = false;
+		const socket = net.connect(info.address);
+		const fail = () => {
+			clearTimeout(timer);
+			socket.destroy();
+			resolve(null);
+		};
+		const timer = setTimeout(fail, PROOF_WAIT_MS);
+		socket.once("connect", () => writeLine(socket, {
+			type: "hi",
+			v: 1,
+			nonce
+		}));
+		socket.on("error", () => {}).once("close", () => proven || fail());
+		readLines(socket, (value) => {
+			if (proven) return onLine(value);
+			const said = value;
+			const proof = said?.type === "proof" ? said.proof : void 0;
+			if (typeof proof !== "string" || Buffer.byteLength(proof) !== want.length || !timingSafeEqual(Buffer.from(proof), want)) return fail();
+			proven = true;
+			clearTimeout(timer);
+			resolve(socket);
+		});
+	});
+}
+/** Calls `onLine` with each whole line that comes in on `socket`, parsed; a line that isn't JSON is passed over. */
+function readLines(socket, onLine, maxBytes = 1 << 20) {
+	let buffer = "";
+	socket.setEncoding("utf8").on("data", (piece) => {
+		buffer += piece;
+		let nl;
+		while ((nl = buffer.indexOf("\n")) >= 0) {
+			const text = buffer.slice(0, nl).trim();
+			buffer = buffer.slice(nl + 1);
+			if (!text) continue;
+			let value;
+			try {
+				value = JSON.parse(text);
+			} catch {
+				continue;
+			}
+			onLine(value);
+		}
+		if (buffer.length > maxBytes) socket.destroy();
+	});
+}
+const writeLine = (socket, value) => {
+	if (!socket.destroyed && socket.writable) socket.write(JSON.stringify(value) + "\n");
+};
+//#endregion
 //#region src/data-layer/git.ts
 function isAbsolute(p) {
 	return /^[A-Za-z]:[\\/]/.test(p) || p.startsWith("/") || p.startsWith("\\");
@@ -8160,92 +8246,6 @@ async function writeLog(file, text) {
 	if (size > LOG_CAP_BYTES) await fs.writeFile(file, text);
 	else await fs.appendFile(file, text);
 }
-//#endregion
-//#region src/pipe/pipe.ts
-const pipeInfoPath = (claudeDir) => path.join(claudeDir, "isoplan", "runner", "pipe.json");
-const newNonce = () => randomBytes(16).toString("hex");
-const proofOf = (token, nonce) => createHmac("sha256", token).update(nonce).digest("hex");
-/** The variables of a session's environment its hooks module's end passes on, which the runner reports that session by (report-session.ts). */
-const SESSION_ENV = [
-	"CLAUDE_CODE_PLUGIN_CACHE_DIR",
-	"CLAUDE_CODE_PLUGIN_DIRS",
-	"DISABLE_UPDATES",
-	"DISABLE_AUTOUPDATER",
-	"CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
-	"FORCE_AUTOUPDATE_PLUGINS"
-];
-/** Those of SESSION_ENV that `env` sets. */
-const sessionEnv = (env) => Object.fromEntries(SESSION_ENV.flatMap((name) => typeof env[name] === "string" ? [[name, env[name]]] : []));
-async function readPipeInfo(claudeDir) {
-	try {
-		const { address, token } = JSON.parse(await fs.readFile(pipeInfoPath(claudeDir), "utf8"));
-		return typeof address === "string" && typeof token === "string" ? {
-			address,
-			token
-		} : null;
-	} catch {
-		return null;
-	}
-}
-const PROOF_WAIT_MS = 5e3;
-/**
-* Connects to the pipe at `info.address` and has the runner prove it knows the token (see above).
-* Resolves the socket once it has, with every later line given to `onLine`; null when the pipe
-* can't be reached or doesn't prove it, and then nothing of the client's went to it.
-*/
-function openPipe(info, onLine) {
-	return new Promise((resolve) => {
-		const nonce = newNonce();
-		const want = Buffer.from(proofOf(info.token, nonce));
-		let proven = false;
-		const socket = net.connect(info.address);
-		const fail = () => {
-			clearTimeout(timer);
-			socket.destroy();
-			resolve(null);
-		};
-		const timer = setTimeout(fail, PROOF_WAIT_MS);
-		socket.once("connect", () => writeLine(socket, {
-			type: "hi",
-			v: 1,
-			nonce
-		}));
-		socket.on("error", () => {}).once("close", () => proven || fail());
-		readLines(socket, (value) => {
-			if (proven) return onLine(value);
-			const said = value;
-			const proof = said?.type === "proof" ? said.proof : void 0;
-			if (typeof proof !== "string" || Buffer.byteLength(proof) !== want.length || !timingSafeEqual(Buffer.from(proof), want)) return fail();
-			proven = true;
-			clearTimeout(timer);
-			resolve(socket);
-		});
-	});
-}
-/** Calls `onLine` with each whole line that comes in on `socket`, parsed; a line that isn't JSON is passed over. */
-function readLines(socket, onLine, maxBytes = 1 << 20) {
-	let buffer = "";
-	socket.setEncoding("utf8").on("data", (piece) => {
-		buffer += piece;
-		let nl;
-		while ((nl = buffer.indexOf("\n")) >= 0) {
-			const text = buffer.slice(0, nl).trim();
-			buffer = buffer.slice(nl + 1);
-			if (!text) continue;
-			let value;
-			try {
-				value = JSON.parse(text);
-			} catch {
-				continue;
-			}
-			onLine(value);
-		}
-		if (buffer.length > maxBytes) socket.destroy();
-	});
-}
-const writeLine = (socket, value) => {
-	if (!socket.destroyed && socket.writable) socket.write(JSON.stringify(value) + "\n");
-};
 //#endregion
 //#region src/pipe/client.ts
 const sleepFor = (ms) => new Promise((resolve) => setTimeout(resolve, ms));

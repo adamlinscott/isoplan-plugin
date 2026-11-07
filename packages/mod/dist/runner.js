@@ -15983,6 +15983,69 @@ async function writeWhole(file, text) {
 	}
 }
 //#endregion
+//#region src/pipe/pipe.ts
+const pipeInfoPath = (claudeDir) => path.join(claudeDir, "isoplan", "runner", "pipe.json");
+/** A new address for a worker's pipe, its name random: a named pipe on Windows, else a socket in this user's own folder. */
+function pipeAddress(claudeDir, platform = process.platform, random = () => randomBytes(8).toString("hex")) {
+	if (platform === "win32") return `\\\\.\\pipe\\isoplan-runner-${random()}`;
+	return path.posix.join(claudeDir.replace(/\\/g, "/"), "isoplan", "pipe", `runner-${random()}.sock`);
+}
+const newToken = () => randomBytes(32).toString("hex");
+const proofOf = (token, nonce) => createHmac("sha256", token).update(nonce).digest("hex");
+/** Makes the socket's folder, this user's alone (none on Windows). */
+async function preparePipe(address, platform = process.platform) {
+	if (platform === "win32") return;
+	const dir = path.dirname(address);
+	await fs.mkdir(dir, {
+		recursive: true,
+		mode: 448
+	});
+	await fs.chmod(dir, 448);
+}
+/** The variables of a session's environment its hooks module's end passes on, which the runner reports that session by (report-session.ts). */
+const SESSION_ENV = [
+	"CLAUDE_CODE_PLUGIN_CACHE_DIR",
+	"CLAUDE_CODE_PLUGIN_DIRS",
+	"DISABLE_UPDATES",
+	"DISABLE_AUTOUPDATER",
+	"CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
+	"FORCE_AUTOUPDATE_PLUGINS"
+];
+/** Those of SESSION_ENV that `env` sets. */
+const sessionEnv = (env) => Object.fromEntries(SESSION_ENV.flatMap((name) => typeof env[name] === "string" ? [[name, env[name]]] : []));
+/** Writes pipe.json whole (a reader never sees half of it), readable by this user alone. */
+async function writePipeInfo(claudeDir, info) {
+	const file = pipeInfoPath(claudeDir);
+	await fs.mkdir(path.dirname(file), { recursive: true });
+	const temp = `${file}.${process.pid}.tmp`;
+	await fs.writeFile(temp, JSON.stringify(info) + "\n", { mode: 384 });
+	await fs.rename(temp, file);
+}
+/** Calls `onLine` with each whole line that comes in on `socket`, parsed; a line that isn't JSON is passed over. */
+function readLines(socket, onLine, maxBytes = 1 << 20) {
+	let buffer = "";
+	socket.setEncoding("utf8").on("data", (piece) => {
+		buffer += piece;
+		let nl;
+		while ((nl = buffer.indexOf("\n")) >= 0) {
+			const text = buffer.slice(0, nl).trim();
+			buffer = buffer.slice(nl + 1);
+			if (!text) continue;
+			let value;
+			try {
+				value = JSON.parse(text);
+			} catch {
+				continue;
+			}
+			onLine(value);
+		}
+		if (buffer.length > maxBytes) socket.destroy();
+	});
+}
+const writeLine = (socket, value) => {
+	if (!socket.destroyed && socket.writable) socket.write(JSON.stringify(value) + "\n");
+};
+//#endregion
 //#region src/update/update.ts
 const updateRecordPath = (claudeDir) => path.join(claudeDir, "isoplan", "update.json");
 const updateLockPath = (claudeDir) => path.join(claudeDir, "isoplan", "update.lock");
@@ -16544,6 +16607,21 @@ function takesOver(held, self, since, pid = process.pid) {
 	if (detached !== false || runner === true || typeof dataLayer !== "string") return false;
 	return normalPath(dataLayer) !== normalPath(self) || typeof theirs === "number" && since > theirs;
 }
+/** The environment a hooks module's report goes by: the runner's, with the session's own SESSION_ENV in place of the runner's, so one the session doesn't set isn't set. */
+function hookedEnv(env = {}) {
+	const base = { ...process.env };
+	for (const name of SESSION_ENV) delete base[name];
+	return {
+		...base,
+		...env
+	};
+}
+/**
+* Whether a hooks module's copy of the plugin (its dist/data-layer.js, `self`) is outdated: another
+* copy is the newest installed for `project` (state.ts). Such a copy's report never takes the lock
+* over (takesOver), here or in the runner's look (src/runner/reporting.ts).
+*/
+const outdatedCopy = async (claudeDir, env, self, project) => await newestDataLayer(pluginsDir(claudeDir, env), self, project).catch(() => self) !== self;
 function contained(patterns) {
 	let why = null;
 	let failed = () => {};
@@ -16646,10 +16724,7 @@ async function reporting(o, c) {
 		return false;
 	};
 	const end = (reason) => (stopping(reason), { why });
-	const env = {
-		...process.env,
-		...hooked ? o.env : {}
-	};
+	const env = hooked ? hookedEnv(o.env) : { ...process.env };
 	const place = {
 		claudeDir,
 		plugins: pluginsDir(claudeDir, env),
@@ -16673,7 +16748,7 @@ async function reporting(o, c) {
 		runner: true,
 		cwd
 	};
-	const isOutdated = async () => hooked && await newestDataLayer(place.plugins, self, project).catch(() => self) !== self;
+	const isOutdated = async () => hooked && await outdatedCopy(claudeDir, env, self, project);
 	let outdated = await isOutdated();
 	const takenOver = (reason) => {
 		if (hooked) emit({
@@ -17362,6 +17437,10 @@ function watchSessions(o) {
 				s.notWanted = ended.holdOff.notWanted;
 			}
 		}, (err) => o.log(`couldn't report session ${id}: ${String(err?.stack ?? err)}`)).finally(async () => {
+			if (hooks) {
+				const lock = await readLock(lockPath(claudeDir, id)).catch(() => null);
+				if (lock?.pid && lock.pid !== pid && isAlive(lock.pid)) s.tookBack = lock.pid;
+			}
 			s.endedAt = (await io.stat(s.file))?.mtimeMs ?? s.mtimeMs;
 			s.endedFor = hooks;
 			s.running = null;
@@ -17385,10 +17464,13 @@ function watchSessions(o) {
 		}
 		return false;
 	};
-	/** Whether the session's lock names another live process that keeps it fresh, and that a report for `hooks` wouldn't take it over from. */
-	const heldByAnother = async (id, now, config, hooks) => {
+	/** Whether the session's lock names another live process that keeps it fresh, and that a report for `hooks` wouldn't take it over from (as reportSession decides it). */
+	const heldByAnother = async (id, now, config, hooks, tookBack = null) => {
 		const lock = await readLock(lockPath(claudeDir, id));
-		if (hooks?.root && hooks.since !== void 0 && takesOver(lock, path.join(hooks.root, "dist", "data-layer.js"), hooks.since, pid)) return false;
+		if (hooks?.root && hooks.since !== void 0 && lock?.pid !== tookBack) {
+			const self = path.join(hooks.root, "dist", "data-layer.js");
+			if (takesOver(lock, self, hooks.since, pid) && !await outdatedCopy(claudeDir, hookedEnv(hooks.env), self, hooks.cwd)) return false;
+		}
 		return !!lock?.pid && lock.pid !== pid && isAlive(lock.pid) && now - lock.mtimeMs < lockFreshMs(config);
 	};
 	const look = async () => {
@@ -17417,7 +17499,8 @@ function watchSessions(o) {
 					endedAt: null,
 					holdOff: null,
 					notWanted: {},
-					held: false
+					held: false,
+					tookBack: null
 				});
 				Object.assign(s, {
 					file,
@@ -17434,7 +17517,7 @@ function watchSessions(o) {
 				}
 				if (hooks) {
 					if (s.endedFor === hooks && s.endedAt !== null && st.mtimeMs <= s.endedAt) continue;
-					if (await heldByAnother(id, now, config, hooks)) {
+					if (await heldByAnother(id, now, config, hooks, s.tookBack)) {
 						s.held = true;
 						continue;
 					}
@@ -17806,69 +17889,6 @@ async function machinePairing(office, allowPlainWs, claudeDir, claudeJson, io) {
 		close: () => pairing.close().catch(() => {})
 	};
 }
-//#endregion
-//#region src/pipe/pipe.ts
-const pipeInfoPath = (claudeDir) => path.join(claudeDir, "isoplan", "runner", "pipe.json");
-/** A new address for a worker's pipe, its name random: a named pipe on Windows, else a socket in this user's own folder. */
-function pipeAddress(claudeDir, platform = process.platform, random = () => randomBytes(8).toString("hex")) {
-	if (platform === "win32") return `\\\\.\\pipe\\isoplan-runner-${random()}`;
-	return path.posix.join(claudeDir.replace(/\\/g, "/"), "isoplan", "pipe", `runner-${random()}.sock`);
-}
-const newToken = () => randomBytes(32).toString("hex");
-const proofOf = (token, nonce) => createHmac("sha256", token).update(nonce).digest("hex");
-/** Makes the socket's folder, this user's alone (none on Windows). */
-async function preparePipe(address, platform = process.platform) {
-	if (platform === "win32") return;
-	const dir = path.dirname(address);
-	await fs.mkdir(dir, {
-		recursive: true,
-		mode: 448
-	});
-	await fs.chmod(dir, 448);
-}
-/** The variables of a session's environment its hooks module's end passes on, which the runner reports that session by (report-session.ts). */
-const SESSION_ENV = [
-	"CLAUDE_CODE_PLUGIN_CACHE_DIR",
-	"CLAUDE_CODE_PLUGIN_DIRS",
-	"DISABLE_UPDATES",
-	"DISABLE_AUTOUPDATER",
-	"CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
-	"FORCE_AUTOUPDATE_PLUGINS"
-];
-/** Those of SESSION_ENV that `env` sets. */
-const sessionEnv = (env) => Object.fromEntries(SESSION_ENV.flatMap((name) => typeof env[name] === "string" ? [[name, env[name]]] : []));
-/** Writes pipe.json whole (a reader never sees half of it), readable by this user alone. */
-async function writePipeInfo(claudeDir, info) {
-	const file = pipeInfoPath(claudeDir);
-	await fs.mkdir(path.dirname(file), { recursive: true });
-	const temp = `${file}.${process.pid}.tmp`;
-	await fs.writeFile(temp, JSON.stringify(info) + "\n", { mode: 384 });
-	await fs.rename(temp, file);
-}
-/** Calls `onLine` with each whole line that comes in on `socket`, parsed; a line that isn't JSON is passed over. */
-function readLines(socket, onLine, maxBytes = 1 << 20) {
-	let buffer = "";
-	socket.setEncoding("utf8").on("data", (piece) => {
-		buffer += piece;
-		let nl;
-		while ((nl = buffer.indexOf("\n")) >= 0) {
-			const text = buffer.slice(0, nl).trim();
-			buffer = buffer.slice(nl + 1);
-			if (!text) continue;
-			let value;
-			try {
-				value = JSON.parse(text);
-			} catch {
-				continue;
-			}
-			onLine(value);
-		}
-		if (buffer.length > maxBytes) socket.destroy();
-	});
-}
-const writeLine = (socket, value) => {
-	if (!socket.destroyed && socket.writable) socket.write(JSON.stringify(value) + "\n");
-};
 //#endregion
 //#region src/pipe/server.ts
 const SESSION = /^[\w-]{1,200}$/;

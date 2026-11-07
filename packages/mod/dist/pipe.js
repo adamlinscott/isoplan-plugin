@@ -8036,91 +8036,6 @@ async function writeWhole(file, text) {
 		throw err;
 	}
 }
-new TextEncoder();
-new TextEncoder();
-//#endregion
-//#region src/data-layer/report-session.ts
-const LOG_CAP_BYTES = 65536;
-/** Starts `node <args>` detached and hidden, without waiting for it. */
-const spawnHidden = (args, dir, env) => spawn(process.execPath, args, {
-	cwd: dir,
-	env,
-	detached: true,
-	stdio: "ignore",
-	windowsHide: true
-}).on("error", () => {}).unref();
-/** Where this machine finds the claude binary, and keeps the isoplan:// link handler and the login item (src/install). */
-const systemPlaces = () => ({
-	findClaude: () => findClaude(process.env, process.platform, os.homedir()),
-	linkHandler: {
-		platform: process.platform,
-		home: os.homedir(),
-		dataHome: process.env.XDG_DATA_HOME,
-		node: process.execPath
-	},
-	loginItem: {
-		platform: process.platform,
-		home: os.homedir(),
-		configHome: process.env.XDG_CONFIG_HOME,
-		uid: process.getuid?.(),
-		node: process.execPath
-	}
-});
-/**
-* The machine's part of a current copy of the plugin's start (the hooks module's end of the pipe, src/pipe/main.ts): the wake hook and the runner's copy
-* (src/install), then the runner (src/runner/start.ts), which replaces one running older code. The
-* runner answers for the machine's rooms and reports every session. Not
-* while the plugin is disabled for the machine, though a session's project enables it.
-*/
-function startMachine(o) {
-	const self = path.join(o.here, "data-layer.js");
-	const installed = installWake({
-		...o.place,
-		settings: path.join(o.place.claudeDir, "settings.json")
-	}, self, path.join(o.here, "wake.js"), {
-		auto: true,
-		runnerFrom: path.join(o.here, ".."),
-		findClaude: o.findClaude,
-		linkHandler: o.linkHandler,
-		loginItem: o.loginItem
-	}).then((changes) => changes.forEach((text) => o.log(text)), (err) => o.log(`couldn't install the wake hook: ${String(err?.message ?? err)}`));
-	return {
-		installed,
-		started: installed.then(async () => await pluginState(o.place, self) === "enabled" ? startRunner({
-			claudeDir: o.place.claudeDir,
-			spawn: o.spawn
-		}) : null).catch(() => null)
-	};
-}
-/**
-* Where a session the runner reports says what it does: its log lines, the office's errors and
-* pairing links, in <claude dir>/isoplan/logs/<session>.log; the rest is for a hooks module, so dropped.
-* `flushed` settles once what was said so far is written.
-*/
-function sessionLog(claudeDir, sessionId) {
-	const file = path.join(claudeDir, "isoplan", "logs", `${sessionId}.log`);
-	let logging = Promise.resolve();
-	const say = (said) => {
-		const text = `${(/* @__PURE__ */ new Date()).toISOString()} ${said}
-`;
-		logging = logging.then(() => writeLog(file, text)).catch(() => {});
-	};
-	return {
-		emit: (line) => {
-			if (line.type === "log" || line.type === "error" || line.type === "pair") say(line.type === "log" ? line.text : line.type === "pair" ? pairNote(line) : `the office server says: ${line.message} (${line.code})`);
-		},
-		say,
-		flushed: () => logging
-	};
-}
-/** A pair line as the log says it. */
-const pairNote = (line) => `to report to ${line.server}, pair this machine: click ${line.url} on this computer and approve it in the office (it works until ${line.expires})`;
-async function writeLog(file, text) {
-	const size = (await fs.stat(file).catch(() => null))?.size ?? 0;
-	await fs.mkdir(path.dirname(file), { recursive: true });
-	if (size > LOG_CAP_BYTES) await fs.writeFile(file, text);
-	else await fs.appendFile(file, text);
-}
 //#endregion
 //#region src/pipe/pipe.ts
 const pipeInfoPath = (claudeDir) => path.join(claudeDir, "isoplan", "runner", "pipe.json");
@@ -8207,6 +8122,91 @@ function readLines(socket, onLine, maxBytes = 1 << 20) {
 const writeLine = (socket, value) => {
 	if (!socket.destroyed && socket.writable) socket.write(JSON.stringify(value) + "\n");
 };
+new TextEncoder();
+new TextEncoder();
+//#endregion
+//#region src/data-layer/report-session.ts
+const LOG_CAP_BYTES = 65536;
+/** Starts `node <args>` detached and hidden, without waiting for it. */
+const spawnHidden = (args, dir, env) => spawn(process.execPath, args, {
+	cwd: dir,
+	env,
+	detached: true,
+	stdio: "ignore",
+	windowsHide: true
+}).on("error", () => {}).unref();
+/** Where this machine finds the claude binary, and keeps the isoplan:// link handler and the login item (src/install). */
+const systemPlaces = () => ({
+	findClaude: () => findClaude(process.env, process.platform, os.homedir()),
+	linkHandler: {
+		platform: process.platform,
+		home: os.homedir(),
+		dataHome: process.env.XDG_DATA_HOME,
+		node: process.execPath
+	},
+	loginItem: {
+		platform: process.platform,
+		home: os.homedir(),
+		configHome: process.env.XDG_CONFIG_HOME,
+		uid: process.getuid?.(),
+		node: process.execPath
+	}
+});
+/**
+* The machine's part of a current copy of the plugin's start (the hooks module's end of the pipe, src/pipe/main.ts): the wake hook and the runner's copy
+* (src/install), then the runner (src/runner/start.ts), which replaces one running older code. The
+* runner answers for the machine's rooms and reports every session. Not
+* while the plugin is disabled for the machine, though a session's project enables it.
+*/
+function startMachine(o) {
+	const self = path.join(o.here, "data-layer.js");
+	const installed = installWake({
+		...o.place,
+		settings: path.join(o.place.claudeDir, "settings.json")
+	}, self, path.join(o.here, "wake.js"), {
+		auto: true,
+		runnerFrom: path.join(o.here, ".."),
+		findClaude: o.findClaude,
+		linkHandler: o.linkHandler,
+		loginItem: o.loginItem
+	}).then((changes) => changes.forEach((text) => o.log(text)), (err) => o.log(`couldn't install the wake hook: ${String(err?.message ?? err)}`));
+	return {
+		installed,
+		started: installed.then(async () => await pluginState(o.place, self) === "enabled" ? startRunner({
+			claudeDir: o.place.claudeDir,
+			spawn: o.spawn
+		}) : null).catch(() => null)
+	};
+}
+/**
+* Where a session the runner reports says what it does: its log lines, the office's errors and
+* pairing links, in <claude dir>/isoplan/logs/<session>.log; the rest is for a hooks module, so dropped.
+* `flushed` settles once what was said so far is written.
+*/
+function sessionLog(claudeDir, sessionId) {
+	const file = path.join(claudeDir, "isoplan", "logs", `${sessionId}.log`);
+	let logging = Promise.resolve();
+	const say = (said) => {
+		const text = `${(/* @__PURE__ */ new Date()).toISOString()} ${said}
+`;
+		logging = logging.then(() => writeLog(file, text)).catch(() => {});
+	};
+	return {
+		emit: (line) => {
+			if (line.type === "log" || line.type === "error" || line.type === "pair") say(line.type === "log" ? line.text : line.type === "pair" ? pairNote(line) : `the office server says: ${line.message} (${line.code})`);
+		},
+		say,
+		flushed: () => logging
+	};
+}
+/** A pair line as the log says it. */
+const pairNote = (line) => `to report to ${line.server}, pair this machine: click ${line.url} on this computer and approve it in the office (it works until ${line.expires})`;
+async function writeLog(file, text) {
+	const size = (await fs.stat(file).catch(() => null))?.size ?? 0;
+	await fs.mkdir(path.dirname(file), { recursive: true });
+	if (size > LOG_CAP_BYTES) await fs.writeFile(file, text);
+	else await fs.appendFile(file, text);
+}
 //#endregion
 //#region src/pipe/client.ts
 const sleepFor = (ms) => new Promise((resolve) => setTimeout(resolve, ms));

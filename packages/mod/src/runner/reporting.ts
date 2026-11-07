@@ -22,7 +22,9 @@
 // Either way, not while the session's lock in <claude dir>/isoplan/live names another live process
 // that keeps it fresh: the data layer process of an earlier version of the plugin, for a session
 // still on that version; except one a hooks module's report takes the lock over from (takesOver in
-// report-session.ts), and one that lets it go is reported for its hooks module at the next look. The runner counts a lock as fresh for three of its own slowest passes
+// report-session.ts, for a copy that isn't outdated, as the report itself decides), and one that lets it go is reported for its hooks module at the next look.
+// One that took the lock back from a hooks module's report (its copy goes by another newest copy) is
+// left the session until it lets go, so the two don't take it from each other again and again. The runner counts a lock as fresh for three of its own slowest passes
 // (lockFreshMs, from its config.json).
 //
 // A session it stopped reporting without a hooks module (quiet past `idleMinutes`, nothing to
@@ -41,11 +43,12 @@ import path from "node:path";
 import { approvedFiles, freshRepos, readApproved } from "../data-layer/approved-file.js";
 import { officesOf, type Config } from "../data-layer/config.js";
 import type { NodeIo } from "../data-layer/io.js";
-import { lockFreshMs, takesOver, type Ended } from "../data-layer/report-session.js";
+import { hookedEnv, lockFreshMs, outdatedCopy, takesOver, type Ended } from "../data-layer/report-session.js";
 import { alive, lockPath, readLock } from "../wake/lock.js";
 
 // On its first look, the gap between starting two sessions that are already quiet, so each is
-// mostly reported before the next starts; those still at work start at once.
+// mostly reported before the next starts; those still at work start together, once the first look's
+// hold of twice runnerRetrySeconds has passed.
 export const GAP_MS = 250;
 // How long stop() waits for its reports to end: one stuck in a pass (a slow git call or office)
 // is left behind, so the runner's worker still exits.
@@ -63,11 +66,12 @@ export interface ToReport<H = unknown> {
   hooks?: H;
 }
 
-/** A connected hooks module, as `hooked` gives it: its session's folder, and the plugin's folder it runs from and when its window started. */
+/** A connected hooks module, as `hooked` gives it: its session's folder, the plugin's folder it runs from and when its window started, and the session's own environment it passed on. */
 export interface HookedSession {
   cwd: string;
   root?: string;
   since?: number;
+  env?: Record<string, string>;
 }
 
 export interface ReportingOptions<H extends HookedSession = HookedSession> {
@@ -118,6 +122,8 @@ interface Seen {
   notWanted: Record<string, number>;
   /** Another process held its lock at the last look that checked. */
   held: boolean;
+  /** The process that held its lock as a hooks module's report ended: it took the lock back, and isn't taken it from again. */
+  tookBack: number | null;
 }
 
 const HEAD_BYTES = 65536;
@@ -170,6 +176,10 @@ export function watchSessions<H extends HookedSession>(o: ReportingOptions<H>): 
         (err: unknown) => o.log(`couldn't report session ${id}: ${String((err as Error)?.stack ?? err)}`),
       )
       .finally(async () => {
+        if (hooks) {
+          const lock = await readLock(lockPath(claudeDir, id)).catch(() => null);
+          if (lock?.pid && lock.pid !== pid && isAlive(lock.pid)) s.tookBack = lock.pid;
+        }
         // The write time first: a look between the two would start it again at once.
         s.endedAt = (await io.stat(s.file))?.mtimeMs ?? s.mtimeMs;
         s.endedFor = hooks;
@@ -193,10 +203,13 @@ export function watchSessions<H extends HookedSession>(o: ReportingOptions<H>): 
     return false;
   };
 
-  /** Whether the session's lock names another live process that keeps it fresh, and that a report for `hooks` wouldn't take it over from. */
-  const heldByAnother = async (id: string, now: number, config: Config, hooks?: H) => {
+  /** Whether the session's lock names another live process that keeps it fresh, and that a report for `hooks` wouldn't take it over from (as reportSession decides it). */
+  const heldByAnother = async (id: string, now: number, config: Config, hooks?: H, tookBack: number | null = null) => {
     const lock = await readLock(lockPath(claudeDir, id));
-    if (hooks?.root && hooks.since !== undefined && takesOver(lock, path.join(hooks.root, "dist", "data-layer.js"), hooks.since, pid)) return false;
+    if (hooks?.root && hooks.since !== undefined && lock?.pid !== tookBack) {
+      const self = path.join(hooks.root, "dist", "data-layer.js");
+      if (takesOver(lock, self, hooks.since, pid) && !(await outdatedCopy(claudeDir, hookedEnv(hooks.env), self, hooks.cwd))) return false;
+    }
     return !!lock?.pid && lock.pid !== pid && isAlive(lock.pid) && now - lock.mtimeMs < lockFreshMs(config);
   };
 
@@ -216,7 +229,7 @@ export function watchSessions<H extends HookedSession>(o: ReportingOptions<H>): 
         const st = await io.stat(file);
         if (!st) continue;
         let s = seen.get(id);
-        if (!s) seen.set(id, (s = { file, mtimeMs: st.mtimeMs, size: st.size, cwd: null, running: null, endedFor: null, queued: false, endedAt: null, holdOff: null, notWanted: {}, held: false }));
+        if (!s) seen.set(id, (s = { file, mtimeMs: st.mtimeMs, size: st.size, cwd: null, running: null, endedFor: null, queued: false, endedAt: null, holdOff: null, notWanted: {}, held: false, tookBack: null }));
         Object.assign(s, { file, mtimeMs: st.mtimeMs, size: st.size });
         const hooks = o.hooked?.(id) ?? null;
         if (s.running) {
@@ -231,7 +244,7 @@ export function watchSessions<H extends HookedSession>(o: ReportingOptions<H>): 
           // Its hooks module's report ended by itself: not again before the transcript moves.
           if (s.endedFor === hooks && s.endedAt !== null && st.mtimeMs <= s.endedAt) continue;
           // Looked at again each look, so it starts as soon as the lock lets go.
-          if (await heldByAnother(id, now, config, hooks)) {
+          if (await heldByAnother(id, now, config, hooks, s.tookBack)) {
             s.held = true;
             continue;
           }
