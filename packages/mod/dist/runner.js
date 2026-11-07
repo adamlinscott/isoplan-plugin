@@ -18052,7 +18052,7 @@ function watchSessions(o) {
 	const look = async () => {
 		const config = await o.config();
 		const now = Date.now();
-		const windowMs = first ? config.lightsOffHours * 36e5 : config.idleMinutes * 6e4;
+		const windowMs = Math.max(config.idleMinutes * 6e4, first ? config.lightsOffHours * 36e5 : 0);
 		const quiet = [];
 		for (const dir of await io.listDir(projectsDir)) {
 			if (!dir.isDir) continue;

@@ -134,7 +134,7 @@ export function watchSessions(o: ReportingOptions): Reporting {
   const look = async () => {
     const config = await o.config();
     const now = Date.now();
-    const windowMs = first ? config.lightsOffHours * 3600000 : config.idleMinutes * 60000;
+    const windowMs = Math.max(config.idleMinutes * 60000, first ? config.lightsOffHours * 3600000 : 0);
     const quiet: [string, Seen, string][] = [];
     for (const dir of await io.listDir(projectsDir)) {
       if (!dir.isDir) continue;
