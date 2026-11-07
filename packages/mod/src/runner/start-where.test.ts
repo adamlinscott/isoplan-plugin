@@ -2,11 +2,12 @@ import fs from "node:fs";
 import path from "node:path";
 import { expect, test } from "vitest";
 import { tempRoot } from "../data-layer/fixture.js";
+import { fakeClaude } from "../handoff/fixture.js";
 import { createRunGit } from "../handoff/git.js";
 import type { RunOrca } from "../handoff/orca.js";
 import { trustKey, type Background, type Launch, type TakeSettings } from "../handoff/take.js";
 import type { StartElsewhere } from "./session.js";
-import { onCommandLine, startDir, startPlaces, startWhere, taskPrompt, type StartWhereOptions } from "./start-where.js";
+import { desktopTaskPrompt, onCommandLine, startDir, startPlaces, startWhere, taskPrompt, type StartWhereOptions } from "./start-where.js";
 
 const SESSION = "0b5c4d3e-0000-4000-8000-000000000085";
 const SETTINGS: TakeSettings = { gitTimeoutSeconds: 30, setupTimeoutMinutes: 1, cloneSearchDays: 30, desktopReadTimeoutMinutes: 1, desktopReadMaxTurns: 2, desktopTakeBudgetMinutes: 2 };
@@ -19,13 +20,14 @@ test.each([
   expect(startPlaces(platform, orca, desktop)).toEqual(places);
 });
 
-test("a task goes on the command line as it is, unless it starts with - anywhere, or, in a Windows terminal's launcher, has a quote, a line break or a \\ at its end", () => {
+test("a task goes on the command line as it is, unless it starts with - anywhere, or, in a Windows terminal's launcher, has a quote, a line break or a \\ at its end, or is too long for cmd.exe's line", () => {
   for (const platform of ["win32", "darwin"] as const) {
     for (const mode of ["terminal", "headless", "orca", "desktop"] as const) {
       expect(onCommandLine("Write the docs page for 50% of users & more (soon) ^ <now>", mode, platform)).toBe(true);
       expect(onCommandLine("--dangerously-skip-permissions", mode, platform)).toBe(false);
       const launcher = platform === "win32" && (mode === "terminal" || mode === "orca");
-      for (const task of ['Say "hi"', "one\ntwo", "one\r\ntwo", "C:\\docs\\"]) expect(onCommandLine(task, mode, platform)).toBe(!launcher);
+      for (const task of ['Say "hi"', "one\ntwo", "one\r\ntwo", "C:\\docs\\", "Write the docs. ".repeat(300)]) expect(onCommandLine(task, mode, platform)).toBe(!launcher);
+      expect(onCommandLine("Write the docs. ".repeat(250), mode, platform)).toBe(true);
     }
   }
 });
@@ -134,5 +136,26 @@ test("the Claude app: a machine it can't open sessions on opens nothing, and no 
   const r = await startWhere(t.start({ mode: "desktop", branch: "docs" }), "/bin/claude", t.options);
   expect(r.opened).toBe(false);
   expect(r.problem).toContain("only on a Mac or on Windows x64");
+  expect(r.problem).toContain("start it again from the floor another way");
+  expect(r.problem).not.toContain("take");
   expect(t.asked).toEqual([]);
+});
+
+test("the Claude app: the task goes in task.md, the hidden first turn only reads it, under the start's session id, then the app opens that session; an app that won't open leaves it started, with a note", async () => {
+  const t = setUp("win32");
+  const claude = fakeClaude(t.root);
+  expect(await startWhere(t.start({ mode: "desktop" }), claude.bin, { ...t.options, arch: "x64", env: { CLAUDE_CONFIG_DIR: t.claudeDir } })).toEqual({ opened: true, problem: null });
+  const folder = startDir(t.claudeDir, SESSION);
+  const file = path.join(folder, "task.md");
+  expect(fs.readFileSync(file, "utf8")).toBe("Write the docs page.\n");
+  const [, , print, desktop] = claude.calls();
+  expect(print).toEqual({ args: [desktopTaskPrompt(file), "--print", "--output-format", "json", "--permission-mode", "default", "--max-turns", "2", "--session-id", SESSION, "--name", "Isoplan new session", "--add-dir", folder], cwd: t.checkout });
+  expect(desktop).toEqual({ args: ["--desktop", "--resume", SESSION], cwd: t.checkout });
+  expect(t.opened).toEqual([]);
+  expect(t.started).toEqual([]);
+
+  const app = setUp("win32");
+  const closed = fakeClaude(app.root, { desktopFails: "The Claude app isn't installed" });
+  const r = await startWhere(app.start({ mode: "desktop" }), closed.bin, { ...app.options, arch: "x64", env: { CLAUDE_CONFIG_DIR: app.claudeDir } });
+  expect(r).toEqual({ opened: true, problem: expect.stringContaining(`The Claude app didn't open on the session: The Claude app isn't installed. The session is ready: open it from the Claude app's session list, or run \`claude --desktop --resume ${SESSION}\``) });
 });

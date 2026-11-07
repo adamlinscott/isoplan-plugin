@@ -12234,10 +12234,11 @@ function hidden([cmd, ...args], cwd, env, timeoutMs, started) {
 /**
 * What a take into the Claude app needs and this machine lacks, in words, or null: the OS, the
 * binary's version, and a subscription sign-in that `claude auth status` answers for. The runner
-* offers the take only while this is null (runner/main.ts).
+* offers the take only while this is null (runner/main.ts). `again`: how to try again, "take it again"
+* for a take, "start it again" for a start.
 */
-async function desktopProblem(bin, env, platform, arch, machine) {
-	if (!desktopPlatform(platform, arch)) return `The Claude app opens Claude Code sessions only on a Mac or on Windows x64, and ${machine} is neither, so nothing was made: take it again from the floor another way.`;
+async function desktopProblem(bin, env, platform, arch, machine, again = "take it again") {
+	if (!desktopPlatform(platform, arch)) return `The Claude app opens Claude Code sessions only on a Mac or on Windows x64, and ${machine} is neither, so nothing was made: ${again} from the floor another way.`;
 	const version = await claudeVersion(bin, env);
 	if (!version || !atLeast(version, "2.1.285")) return `${INSTALL_FOR_DESKTOP} ${machine} has ${version ? `version ${version}` : "a version that didn't say which it is"}, so nothing was made.`;
 	const r = await hidden([
@@ -12254,10 +12255,10 @@ async function desktopProblem(bin, env, platform, arch, machine) {
 			return null;
 		}
 	})();
-	if (r.code !== 0 || r.timedOut || !status) return `Couldn't check Claude Code's sign-in on ${machine}: \`claude auth status\` ${r.timedOut ? "didn't answer within 30 seconds" : r.code !== 0 ? `exited with code ${r.code}` : "didn't say whether it is signed in"}, so nothing was made. Run it there to see why, then take it again.`;
-	if (status.loggedIn === false) return `Claude Code for the terminal isn't signed in on ${machine}, so nothing was made: run \`claude auth login\` with your Claude subscription, then take it again.`;
+	if (r.code !== 0 || r.timedOut || !status) return `Couldn't check Claude Code's sign-in on ${machine}: \`claude auth status\` ${r.timedOut ? "didn't answer within 30 seconds" : r.code !== 0 ? `exited with code ${r.code}` : "didn't say whether it is signed in"}, so nothing was made. Run it there to see why, then ${again}.`;
+	if (status.loggedIn === false) return `Claude Code for the terminal isn't signed in on ${machine}, so nothing was made: run \`claude auth login\` with your Claude subscription, then ${again}.`;
 	const provider = typeof status.apiProvider === "string" && status.apiProvider !== "firstParty";
-	if (provider || typeof status.authMethod === "string" && /api.?key/i.test(status.authMethod)) return `The Claude app opens only sessions signed in with a Claude subscription, and Claude Code for the terminal on ${machine} uses ${provider ? `${status.apiProvider}` : "an API key"}, so nothing was made: sign it in with \`claude auth login\`, or take it again from the floor another way.`;
+	if (provider || typeof status.authMethod === "string" && /api.?key/i.test(status.authMethod)) return `The Claude app opens only sessions signed in with a Claude subscription, and Claude Code for the terminal on ${machine} uses ${provider ? `${status.apiProvider}` : "an API key"}, so nothing was made: sign it in with \`claude auth login\`, or ${again} from the floor another way.`;
 	return null;
 }
 /**
@@ -15867,13 +15868,17 @@ function startPlaces(platform, orca, desktop) {
 }
 /** The start's own folder: its launcher, and its task when that can't go on the command line. */
 const startDir = (claudeDir, session) => path.join(claudeDir, "isoplan", "starts", session);
+/** The longest task a Windows launcher's line takes, leaving room in cmd.exe's 8,191 for the rest of it. */
+const LAUNCHER_TASK_MAX = 4e3;
 /** Whether `task` can go on Claude Code's command line as it is, for `mode` on `platform`. */
 function onCommandLine(task, mode, platform) {
 	if (task.startsWith("-")) return false;
-	return !((mode === "terminal" || mode === "orca") && platform === "win32" && (/["\r\n]/.test(task) || task.endsWith("\\")));
+	return !((mode === "terminal" || mode === "orca") && platform === "win32" && (task.length > LAUNCHER_TASK_MAX || /["\r\n]/.test(task) || task.endsWith("\\")));
 }
 /** The first message, when the task is in `file`. */
 const taskPrompt = (file) => `Your task, typed on the Isoplan floor, is in ${file}. Read it, then do it.`;
+/** The Claude app's hidden first turn: it reads the task in `file` and changes nothing. */
+const desktopTaskPrompt = (file) => `Your task, typed on the Isoplan floor, is in ${file}. Read it and say briefly how you will do it; wait for the person in the Claude app before changing anything.`;
 /** Opens the start where it asks; never throws for what it expects. */
 async function startWhere(start, bin, o) {
 	const startedAt = (o.now ?? Date.now)();
@@ -15888,7 +15893,7 @@ async function startWhere(start, bin, o) {
 		};
 	}
 	if (start.mode === "desktop") {
-		const problem = await desktopProblem(bin, env, o.platform, o.arch ?? process.arch, o.machine);
+		const problem = await desktopProblem(bin, env, o.platform, o.arch ?? process.arch, o.machine, "start it again");
 		if (problem) return {
 			opened: false,
 			problem
@@ -15904,12 +15909,13 @@ async function startWhere(start, bin, o) {
 	}
 	const folder = startDir(o.claudeDir, start.session);
 	await fs.mkdir(folder, { recursive: true });
-	const plain = onCommandLine(start.instruction, start.mode, o.platform);
+	const desktop = start.mode === "desktop";
+	const plain = !desktop && onCommandLine(start.instruction, start.mode, o.platform);
 	let prompt = start.instruction;
 	if (!plain) {
 		const file = path.join(folder, "task.md");
 		await fs.writeFile(file, start.instruction + "\n");
-		prompt = taskPrompt(file);
+		prompt = desktop ? desktopTaskPrompt(file) : taskPrompt(file);
 	}
 	const words = {
 		read: "start on the task",

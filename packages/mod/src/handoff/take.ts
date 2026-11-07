@@ -435,10 +435,11 @@ function hidden([cmd, ...args]: string[], cwd: string, env: Record<string, strin
 /**
  * What a take into the Claude app needs and this machine lacks, in words, or null: the OS, the
  * binary's version, and a subscription sign-in that `claude auth status` answers for. The runner
- * offers the take only while this is null (runner/main.ts).
+ * offers the take only while this is null (runner/main.ts). `again`: how to try again, "take it again"
+ * for a take, "start it again" for a start.
  */
-export async function desktopProblem(bin: string, env: Record<string, string>, platform: NodeJS.Platform, arch: string, machine: string): Promise<string | null> {
-  if (!desktopPlatform(platform, arch)) return `The Claude app opens Claude Code sessions only on a Mac or on Windows x64, and ${machine} is neither, so nothing was made: take it again from the floor another way.`;
+export async function desktopProblem(bin: string, env: Record<string, string>, platform: NodeJS.Platform, arch: string, machine: string, again = "take it again"): Promise<string | null> {
+  if (!desktopPlatform(platform, arch)) return `The Claude app opens Claude Code sessions only on a Mac or on Windows x64, and ${machine} is neither, so nothing was made: ${again} from the floor another way.`;
   const version = await claudeVersion(bin, env);
   if (!version || !atLeast(version, DESKTOP_MIN_VERSION)) return `${INSTALL_FOR_DESKTOP} ${machine} has ${version ? `version ${version}` : "a version that didn't say which it is"}, so nothing was made.`;
   // A sign-in that can't be checked is refused too: nothing is made on a guess.
@@ -452,12 +453,12 @@ export async function desktopProblem(bin: string, env: Record<string, string>, p
     }
   })();
   if (r.code !== 0 || r.timedOut || !status) {
-    return `Couldn't check Claude Code's sign-in on ${machine}: \`claude auth status\` ${r.timedOut ? "didn't answer within 30 seconds" : r.code !== 0 ? `exited with code ${r.code}` : "didn't say whether it is signed in"}, so nothing was made. Run it there to see why, then take it again.`;
+    return `Couldn't check Claude Code's sign-in on ${machine}: \`claude auth status\` ${r.timedOut ? "didn't answer within 30 seconds" : r.code !== 0 ? `exited with code ${r.code}` : "didn't say whether it is signed in"}, so nothing was made. Run it there to see why, then ${again}.`;
   }
-  if (status.loggedIn === false) return `Claude Code for the terminal isn't signed in on ${machine}, so nothing was made: run \`claude auth login\` with your Claude subscription, then take it again.`;
+  if (status.loggedIn === false) return `Claude Code for the terminal isn't signed in on ${machine}, so nothing was made: run \`claude auth login\` with your Claude subscription, then ${again}.`;
   const provider = typeof status.apiProvider === "string" && status.apiProvider !== "firstParty";
   if (provider || (typeof status.authMethod === "string" && /api.?key/i.test(status.authMethod))) {
-    return `The Claude app opens only sessions signed in with a Claude subscription, and Claude Code for the terminal on ${machine} uses ${provider ? `${status.apiProvider}` : "an API key"}, so nothing was made: sign it in with \`claude auth login\`, or take it again from the floor another way.`;
+    return `The Claude app opens only sessions signed in with a Claude subscription, and Claude Code for the terminal on ${machine} uses ${provider ? `${status.apiProvider}` : "an API key"}, so nothing was made: sign it in with \`claude auth login\`, or ${again} from the floor another way.`;
   }
   return null;
 }
@@ -849,7 +850,7 @@ export async function openSession(x: OpenSession, o: OpenOptions): Promise<{ ope
     const before = stopped();
     if (before) return failed(`${capital(w.stopped)} before Claude Code ${w.read}: ${before}. ${w.at} ${dir}: ${w.again}.`);
     try {
-      // The floor told the receiver: this trusts the worktree, so its settings, hooks and scripts run.
+      // The person chose this folder on the floor (a take's receiver, or a start's owner): trusting it runs its settings, hooks and scripts.
       await trustFolder(o.claudeJson, dir, o.platform);
     } catch (err) {
       return failed(`The session couldn't be readied for the Claude app: ${(err as Error).message}. ${w.at} ${dir}.`);
@@ -889,7 +890,7 @@ export async function openSession(x: OpenSession, o: OpenOptions): Promise<{ ope
   }
   if (headless) {
     try {
-      // The floor told the receiver: this trusts the worktree, so its settings, hooks and scripts run.
+      // The person chose this folder on the floor (a take's receiver, or a start's owner): trusting it runs its settings, hooks and scripts.
       await trustFolder(o.claudeJson, dir, o.platform);
       await (o.start ?? startBackground)({ argv, cwd: dir }, env);
     } catch (err) {
@@ -910,7 +911,7 @@ export async function openSession(x: OpenSession, o: OpenOptions): Promise<{ ope
   if (x.mode === "orca") {
     if (!x.orca) return failed(`Orca wasn't found on this computer, so nothing was opened. ${w.at} ${dir}.`);
     try {
-      // The floor told the receiver: this trusts the worktree, so its settings, hooks and scripts run.
+      // The person chose this folder on the floor (a take's receiver, or a start's owner): trusting it runs its settings, hooks and scripts.
       await trustFolder(o.claudeJson, dir, o.platform);
       await fs.writeFile(l.file, l.text, { mode: 0o755 });
     } catch (err) {

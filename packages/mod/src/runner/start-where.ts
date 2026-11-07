@@ -10,9 +10,13 @@
 // - The task goes on Claude Code's command line as it is, unless it can't safely: one that starts
 //   with `-` would be read as an option, and on Windows a terminal runs it from a .cmd launcher, where
 //   a quote or a line break would end the argument and a `\` at its end would escape the closing
-//   quote. Such a task is written to task.md in the start's own folder (<claude dir>/isoplan/starts/
+//   quote, and cmd.exe can't run a line much over 8,000 characters, so a long task can't go there
+//   either. Such a task is written to task.md in the start's own folder (<claude dir>/isoplan/starts/
 //   <session>/, which holds the launcher too), which is added to the session, and the first message
 //   says to read it.
+// - For the Claude app the task is always in task.md: its hidden first turn runs with no one to
+//   approve what it does, so it only reads the task and says how it will go about it, and the work
+//   itself runs in the app, which asks the person as it goes.
 
 import fs from "node:fs/promises";
 import path from "node:path";
@@ -44,15 +48,21 @@ export function startPlaces(platform: NodeJS.Platform, orca: boolean, desktop: b
 /** The start's own folder: its launcher, and its task when that can't go on the command line. */
 export const startDir = (claudeDir: string, session: string) => path.join(claudeDir, "isoplan", "starts", session);
 
+/** The longest task a Windows launcher's line takes, leaving room in cmd.exe's 8,191 for the rest of it. */
+const LAUNCHER_TASK_MAX = 4000;
+
 /** Whether `task` can go on Claude Code's command line as it is, for `mode` on `platform`. */
 export function onCommandLine(task: string, mode: StartElsewhere["mode"], platform: NodeJS.Platform): boolean {
   if (task.startsWith("-")) return false;
   const launcher = mode === "terminal" || mode === "orca";
-  return !(launcher && platform === "win32" && (/["\r\n]/.test(task) || task.endsWith("\\")));
+  return !(launcher && platform === "win32" && (task.length > LAUNCHER_TASK_MAX || /["\r\n]/.test(task) || task.endsWith("\\")));
 }
 
 /** The first message, when the task is in `file`. */
 export const taskPrompt = (file: string) => `Your task, typed on the Isoplan floor, is in ${file}. Read it, then do it.`;
+
+/** The Claude app's hidden first turn: it reads the task in `file` and changes nothing. */
+export const desktopTaskPrompt = (file: string) => `Your task, typed on the Isoplan floor, is in ${file}. Read it and say briefly how you will do it; wait for the person in the Claude app before changing anything.`;
 
 /** Opens the start where it asks; never throws for what it expects. */
 export async function startWhere(start: StartElsewhere, bin: string, o: StartWhereOptions): Promise<{ opened: boolean; problem: string | null }> {
@@ -65,7 +75,7 @@ export async function startWhere(start: StartElsewhere, bin: string, o: StartWhe
     if (!orca) return { opened: false, problem: `Orca wasn't found on ${o.machine}, so nothing was started: ${again}.` };
   }
   if (start.mode === "desktop") {
-    const problem = await desktopProblem(bin, env, o.platform, o.arch ?? process.arch, o.machine);
+    const problem = await desktopProblem(bin, env, o.platform, o.arch ?? process.arch, o.machine, "start it again");
     if (problem) return { opened: false, problem };
   }
   const dir = orca ? await o.orcaFolder(orca, start.folder, start.branch) : start.branch !== undefined ? await o.branchFolder(start.folder, start.branch) : start.folder;
@@ -75,12 +85,13 @@ export async function startWhere(start: StartElsewhere, bin: string, o: StartWhe
   }
   const folder = startDir(o.claudeDir, start.session);
   await fs.mkdir(folder, { recursive: true });
-  const plain = onCommandLine(start.instruction, start.mode, o.platform);
+  const desktop = start.mode === "desktop";
+  const plain = !desktop && onCommandLine(start.instruction, start.mode, o.platform);
   let prompt = start.instruction;
   if (!plain) {
     const file = path.join(folder, "task.md");
     await fs.writeFile(file, start.instruction + "\n");
-    prompt = taskPrompt(file);
+    prompt = desktop ? desktopTaskPrompt(file) : taskPrompt(file);
   }
   const words: OpenWords = {
     read: "start on the task",
