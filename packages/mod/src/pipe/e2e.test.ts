@@ -43,18 +43,20 @@ type Sent = { type: string; id?: string; account?: { id: string }; facts?: { ses
 
 /** A stand-in office that takes github.com/team/app; it answers a question for the room at once. */
 async function office() {
-  const connections: { messages: Sent[]; closed: boolean; send(message: unknown): void }[] = [];
+  const connections: { messages: Sent[]; closed: boolean; openAtHello: number; send(message: unknown): void }[] = [];
   const server = http.createServer((request, response) => {
     if (!request.url?.startsWith("/data-layer/repos")) return void response.writeHead(404).end();
     response.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ version: "v1", repos: ["github.com/team/app"] }));
   });
   const wss = new WebSocketServer({ server });
   wss.on("connection", (ws) => {
-    const c = { messages: [] as Sent[], closed: false, send: (message: unknown) => ws.send(JSON.stringify(message)) };
+    const c = { messages: [] as Sent[], closed: false, openAtHello: 0, send: (message: unknown) => ws.send(JSON.stringify(message)) };
     connections.push(c);
     ws.on("message", (data) => {
       const message = JSON.parse(String(data)) as Sent & { question?: string; key?: string };
       c.messages.push(message);
+      // How many of the session's links were still open as this one said hello.
+      if (message.type === "hello") c.openAtHello = links().filter((l) => !l.closed).length;
       if (message.type === "ask-room") c.send({ type: "asked", v: 1, question: "q-1", text: message.question, state: "answered", answer: "Because the tests needed it.", owner: "Sam", key: message.key });
     });
     ws.on("close", () => (c.closed = true));
@@ -199,7 +201,7 @@ test("through the runner: the status line, a floor answer and a floor message re
   await first.stop();
   await until(() => h.of("runner").length > 0);
   expect(h.of("runner")).toEqual([{ type: "runner", state: "down" }]);
-  expect(link!.closed).toBe(true);
+  await until(() => link!.closed);
   await runner(claudeDir);
   await until(() => o.links().length === 2);
   expect(h.of("runner")).toEqual([
@@ -207,8 +209,8 @@ test("through the runner: the status line, a floor answer and a floor message re
     { type: "runner", state: "up" },
   ]);
   // One link at a time: the first had closed before the second said hello.
-  expect(o.links().filter((c) => !c.closed)).toHaveLength(1);
   const again = o.links()[1]!;
+  expect(again.openAtHello).toBe(0);
   again.send({ type: "request", v: 1, id: "m2", kind: "owner-message", session: "claude-code:s1", from: { id: owner.id, name: "Ada" }, text: "And push." });
   await until(() => h.of("owner-message").length === 2);
   fs.writeFileSync(h.of("owner-message")[1]!.file, JSON.stringify({ taken: true }));
