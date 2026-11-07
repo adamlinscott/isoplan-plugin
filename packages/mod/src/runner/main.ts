@@ -73,6 +73,8 @@ import { createRegistry, registryPath } from "./registry.js";
 import { branchFolder, createCheckouts, createRemoteBranches } from "./checkouts.js";
 import { repoFolders } from "./repo-folders.js";
 import { createDriver, type DriveOffice, type Driver, type DriveSettings } from "./session.js";
+import { keepReported, type ReportedSettings } from "./reported.js";
+import { managedDir, pluginDirsOf, pluginsDir } from "../install/state.js";
 import { runnerEnvPath } from "./environment.js";
 import { applyClaudeDir, LOCK_REFRESH_MS, RUNNER_FRESH_MS, runnerCode, runnerLockPath } from "./start.js";
 
@@ -154,13 +156,13 @@ async function supervisor(): Promise<number> {
 async function worker(): Promise<number> {
   const io = nodeIo();
   const config = () => loadConfig(io, path.join(appDir, "config.json"), path.join(isoplanDir, "config.json"));
-  const settings = () => loadSettings<RunnerSettings & TakeSettings & DriveSettings & { claudeModel: string; repoSearchDepth: number; startAtLogin: boolean }>(io, path.join(appDir, "runner.json"), path.join(isoplanDir, "runner.json"));
+  const settings = () => loadSettings<RunnerSettings & TakeSettings & DriveSettings & ReportedSettings & { claudeModel: string; repoSearchDepth: number; startAtLogin: boolean }>(io, path.join(appDir, "runner.json"), path.join(isoplanDir, "runner.json"));
   const first = await config();
   // Plain ws:// to another machine would send the machine's credential unencrypted.
   const offices = officesOf(first);
   for (const { server } of offices.filter((o) => o.plainRefused)) log(`the runner doesn't answer through ${server}: it is plain ws:// to another machine; use wss://, or set "allowPlainWs": true in config.json`);
   if (offices.every((o) => o.plainRefused)) return 0;
-  await settings(); // a broken runner.json of the plugin's is a crash to see at once
+  const firstSettings = await settings(); // a broken runner.json of the plugin's is a crash to see at once
 
   // Every process it starts is recorded; what an earlier run left that is Isoplan's ends now. Only a
   // worker whose supervisor holds the runner's lock gets here.
@@ -381,6 +383,8 @@ async function worker(): Promise<number> {
     scan: scanText,
     log,
     projectOf: async (folder) => (await homeIo.projectOf(await homeIo.resolve(folder), folder)).id,
+    // Each driven session is reported by a data layer of its own, kept running while it runs (#92).
+    report: keepReported({ paths: { claudeDir, settings: path.join(claudeDir, "settings.json"), plugins: pluginsDir(claudeDir, process.env), managed: managedDir(process.platform), pluginDirs: pluginDirsOf(process.env) }, everySeconds: async () => (await settings().catch(() => firstSettings)).drivenReportSeconds, idleMinutes: async () => (await config()).idleMinutes, log }),
     // An install or sign-in ends with the Claude app's check again, for the next hello.
     setup: (m) => {
       claude.take(m);

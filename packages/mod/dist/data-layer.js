@@ -1,10 +1,10 @@
 import { execFile, spawn, spawnSync } from "node:child_process";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
+import { appendFileSync, mkdirSync, statSync } from "node:fs";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { statSync } from "node:fs";
 import http from "node:http";
 //#region ../../node_modules/.pnpm/zod@4.6.7/node_modules/zod/v4/core/util.js
 function getEnumValues(entries) {
@@ -9719,6 +9719,10 @@ function createClaudeCode(io) {
 			errors
 		});
 		const c = await candidate(sessionId, cwd, now, config);
+		if (c === "unstarted") return {
+			...none(),
+			unstarted: true
+		};
 		if (!c) return none();
 		let main;
 		try {
@@ -9729,7 +9733,13 @@ function createClaudeCode(io) {
 		}
 		try {
 			if (leftOut(main, c, config)) return none();
-			if (!main.cwd) return none(main.seen && (!main.parsed || main.messages) ? "transcript format not recognised" : null);
+			if (!main.cwd) {
+				if (main.seen && (!main.parsed || main.messages)) return none("transcript format not recognised");
+				return {
+					...none(),
+					unstarted: true
+				};
+			}
 			const home = await resolve(cwd);
 			const workspace = !home && await isWorkspace(cwd, now, config);
 			const where = workspace ? {
@@ -9797,7 +9807,7 @@ function createClaudeCode(io) {
 	async function candidate(sessionId, cwd, now, config) {
 		const path = await locate(sessionId, cwd, now);
 		const st = path && await io.stat(path);
-		if (!path || !st) return null;
+		if (!path || !st) return "unstarted";
 		const idleMs = config.idleMinutes * 6e4;
 		const keepMs = Math.max(idleMs, config.lightsOffHours * 36e5);
 		const agentWindowMs = Math.max(idleMs, config.touchedWindowMinutes * 6e4);
@@ -12443,8 +12453,9 @@ async function main(argv) {
 	if (await isOff()) {
 		emit({
 			type: "log",
-			text: "Claude Code lists the Isoplan plugin as uninstalled or disabled here, so this session isn't reported"
+			text: "stopping: Claude Code lists the Isoplan plugin as uninstalled or disabled here, so this session isn't reported"
 		});
+		await logging;
 		return 0;
 	}
 	const since = Number(value(argv, "--since")) || Date.now();
@@ -12497,10 +12508,22 @@ async function main(argv) {
 	try {
 		if (!await takeLock(lock, process.pid, alive, !detached, Date.now(), { extra: lockExtra })) {
 			process.stderr.write(`another data layer already reports session ${sessionId}\n`);
+			emit({
+				type: "log",
+				text: "stopping: another data layer already reports this session"
+			});
+			await logging;
 			return 0;
 		}
 	} catch (err) {
-		if (detached) return 0;
+		if (detached) {
+			emit({
+				type: "log",
+				text: `stopping: couldn't take the session lock: ${String(err?.message ?? err)}`
+			});
+			await logging;
+			return 0;
+		}
 		emit({
 			type: "log",
 			text: `couldn't take the session lock, so going on without it: ${String(err?.message ?? err)}`
@@ -12864,6 +12887,18 @@ async function main(argv) {
 		}
 	};
 	let pending = false;
+	const startedAt = Date.now();
+	const stopping = (why) => (emit({
+		type: "log",
+		text: `stopping: ${why}`
+	}), false);
+	const goOn = async () => {
+		if (!await wait(dormant && !pending ? DORMANT_MS : config.streamSeconds * 1e3)) return false;
+		if (isUnwanted()) return stopping("no office this reports to wants this session's project or takes its repo, so it holds off");
+		if (detached && await lockHolder(lock) !== process.pid) return stopping("another data layer reports this session now");
+		if (await isOff()) return stopping("Claude Code lists the Isoplan plugin as uninstalled or disabled here now");
+		return true;
+	};
 	do {
 		const now = Date.now();
 		const isFirstPass = passes++ === 0;
@@ -12929,6 +12964,7 @@ async function main(argv) {
 		if (!taking.length) {
 			if (detached && dormant === "not-approved") {
 				notApproved = candidates.projects.map((p) => p.id.toLowerCase());
+				stopping(`no office this reports to takes ${notApproved.join(", ") || cwd}, so it holds off until one does`);
 				break;
 			}
 			const why = detached ? detachedStop({
@@ -12970,6 +13006,16 @@ async function main(argv) {
 		if (!read.facts) {
 			if (detached) {
 				isPlaceless = isFirstPass && !await resolve(cwd);
+				if (isPlaceless) {
+					stopping(`git can't place ${cwd}, so it holds off`);
+					break;
+				}
+				if (read.unstarted && !factsSession) {
+					if (Date.now() - startedAt < config.factsWaitSeconds * 1e3) continue;
+					stopping(`the session's transcript had nothing to report within ${config.factsWaitSeconds} seconds`);
+					break;
+				}
+				stopping("the session has nothing to report now (lights off with no reply, left out, aged out, or its transcript gone)");
 				break;
 			}
 			for (const run of taking) {
@@ -13063,7 +13109,7 @@ async function main(argv) {
 			});
 			break;
 		}
-	} while (await wait(dormant && !pending ? DORMANT_MS : config.streamSeconds * 1e3) && !isUnwanted() && (!detached || await lockHolder(lock) === process.pid) && !await isOff());
+	} while (await goOn());
 	for (const link of links()) link.close();
 	const notWanted = Object.fromEntries(runs.filter((r) => r.unwanted).map((r) => [r.office.server, r.unwantedUntil ?? Date.now() + 36e5]));
 	const named = {
@@ -13140,7 +13186,20 @@ async function takeReply(file) {
 		text: r.text
 	} : null;
 }
-process.exitCode = await main(process.argv.slice(2));
+function crashed(err) {
+	const argv = process.argv.slice(2);
+	const sessionId = value(argv, "--session");
+	const said = String(err?.stack ?? err);
+	if (argv.includes("--detached") && sessionId && /^[\w-]+$/.test(sessionId)) try {
+		const file = path.join(claudePaths(process.env, os.homedir()).dir, "isoplan", "logs", `${sessionId}.log`);
+		mkdirSync(path.dirname(file), { recursive: true });
+		appendFileSync(file, `${(/* @__PURE__ */ new Date()).toISOString()} stopping: something went wrong: ${said}\n`);
+	} catch {}
+	process.stderr.write(`${said}\n`);
+	process.exit(1);
+}
+process.on("uncaughtException", crashed).on("unhandledRejection", crashed);
+process.exitCode = await main(process.argv.slice(2)).catch(crashed);
 process.exit();
 //#endregion
 export {};
