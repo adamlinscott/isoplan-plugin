@@ -277,7 +277,7 @@ test("into the Claude app, a CLI that is too old, signed in with an API key, who
   const unsaid = await takeHandoff({ handoff: t.handoff, mode: "desktop", session: SESSION }, intoDesktop(t, { auth: { authMethod: "claude.ai" } }).options);
   expect(unsaid.failures).toEqual([{ step: "open", output: expect.stringContaining("didn't say whether it is signed in") }]);
   const old = await takeHandoff({ handoff: t.handoff, mode: "desktop", session: SESSION }, intoDesktop(t, { version: "2.1.284" }).options);
-  expect(old.failures).toEqual([{ step: "open", output: "Install Claude Code for the terminal, version 2.1.285 or newer, to open handoffs in the Claude app. sam-laptop has version 2.1.284, so nothing was made." }]);
+  expect(old.failures).toEqual([{ step: "open", output: "Install Claude Code for the terminal, version 2.1.285 or newer, to open sessions in the Claude app. sam-laptop has version 2.1.284, so nothing was made." }]);
   const key = await takeHandoff({ handoff: t.handoff, mode: "desktop", session: SESSION }, intoDesktop(t, { auth: { loggedIn: true, authMethod: "api_key", apiProvider: "firstParty" } }).options);
   expect(key.failures).toEqual([{ step: "open", output: expect.stringContaining("only sessions signed in with a Claude subscription") }]);
   const arm = await takeHandoff({ handoff: t.handoff, mode: "desktop", session: SESSION }, intoDesktop(t, {}, "arm64").options);

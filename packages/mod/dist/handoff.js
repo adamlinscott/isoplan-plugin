@@ -5997,6 +5997,13 @@ const Withheld = object({ id: DriveId }).optional();
 * project whose office allows it (`drive-policy`).
 */
 const DrivePermissionsSchema = _enum(["auto", "bypassPermissions"]);
+/** Where a new session from the floor opens other than run from the floor (protocol 0.10.0): a start's `mode`, as a take's. */
+const StartModeSchema = _enum([
+	"terminal",
+	"headless",
+	"orca",
+	"desktop"
+]);
 /** The first message on a connection: who is reporting, from where, about which session. */
 const HelloMessageSchema = object({
 	type: literal("hello"),
@@ -6021,6 +6028,11 @@ const HelloMessageSchema = object({
 * driven sessions, a take into a terminal and a headless one all need. A runner that says it says it
 * on every hello, says `driven` `claude` whenever it changes, and takes the `install-claude` and
 * `sign-in-claude` drive requests; the server sends neither to a runner that didn't say it.
+* `starts` (protocol 0.10.0, isoplan-plugin#85): the places other than the floor a new session from
+* the floor can open in on this machine, the start's `mode`: `terminal` and `headless` where this
+* runner can open them, and `orca` and `desktop` only where `orca` and `desktop` are said. The server
+* sends a start with a `mode` only to a runner that says `starts`, and only one of its places: a
+* runner from before 0.10.0 drops the field it doesn't know and would run the session from the floor.
 */
 const RunnerHelloMessageSchema = object({
 	type: literal("runner"),
@@ -6031,7 +6043,8 @@ const RunnerHelloMessageSchema = object({
 	orca: boolean().optional(),
 	desktop: boolean().optional(),
 	drive: boolean().optional(),
-	claude: ClaudeCliSchema.optional()
+	claude: ClaudeCliSchema.optional(),
+	starts: array(StartModeSchema).max(4).optional()
 });
 /** All of the session's facts. Sent on connect and on repair. */
 const FullMessageSchema = object({
@@ -6336,6 +6349,15 @@ discriminatedUnion("type", [
 				"failed",
 				"stopped"
 			])
+		}),
+		object({
+			...driven,
+			kind: literal("opened"),
+			id: DriveId,
+			session: DrivenSessionId,
+			room: Room,
+			mode: StartModeSchema,
+			note: Detail.optional()
 		}),
 		object({
 			...driven,
@@ -6668,8 +6690,27 @@ const OfficeServerMessageSchema = discriminatedUnion("type", [
 			project: ProjectSchema,
 			roomSessions: array(DrivenSessionId).max(20).optional(),
 			instruction: Instruction.optional(),
-			permissions: DrivePermissionsSchema
+			permissions: DrivePermissionsSchema,
+			mode: _enum([
+				"terminal",
+				"headless",
+				"orca",
+				"desktop",
+				"driven"
+			]).optional()
 		}).superRefine((message, context) => {
+			if (message.mode !== void 0 && message.mode !== "driven") {
+				if (message.folder === void 0) context.addIssue({
+					code: "custom",
+					path: ["folder"],
+					message: "a start that opens outside the floor names a folder"
+				});
+				if (message.instruction === void 0) context.addIssue({
+					code: "custom",
+					path: ["instruction"],
+					message: "a start that opens outside the floor names its first instruction"
+				});
+			}
 			if (message.folder === void 0) {
 				if (message.room === void 0) context.addIssue({
 					code: "custom",

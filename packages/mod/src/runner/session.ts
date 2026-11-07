@@ -65,6 +65,11 @@
 //   the office's list stays current. A start with `branch` too is refused `no-folder` unless that
 //   branch was listed for the repo; it opens in the checkout when the checkout is on that branch, and
 //   otherwise in a worktree of it (`office.branchFolder`), never switching the checkout's branch.
+// - A start with a `mode` other than `driven` (#85), in a folder listed as above and on a branch
+//   listed for it, opens there as a take does (start-where.ts, handoff/take.ts openSession), with
+//   its instruction the first message and nothing from any room; it is answered `opened` with the
+//   session's id and room, or `refused` `unavailable` with why. Its `permissions` and the cap don't
+//   count: the runner doesn't hold it, and its own data layer reports it to the floor.
 // - A turn is named by the instruction that started it; one at a time (`busy`). Each tool use is
 //   sent as `tool` with a short summary of what for; the turn's `result` text as `reply`; then
 //   `turn-ended`. The turn's full output (instruction, the agent's words, tools and their results) is
@@ -153,6 +158,7 @@ import {
   type DrivePolicyMessage,
   type DrivenMessage,
   type DriveRefusalReason,
+  type StartMode,
 } from "@isoplan/protocol";
 import { pathKey } from "../data-layer/git.js";
 import { claudeCommand } from "./claude-binary.js";
@@ -195,6 +201,16 @@ export interface DriveOffice {
   branchFolder(folder: string, branch: string): Promise<string | { error: string }>;
 }
 
+/** A start that opens outside the floor (#85): where, in the folder the runner listed, on `branch` if named, with `instruction` its first message, under `session`, a fresh bare uuid. */
+export interface StartElsewhere {
+  id: string;
+  mode: StartMode;
+  folder: string;
+  branch?: string;
+  instruction: string;
+  session: string;
+}
+
 /** A handoff taken as a driven session, once its worktree is ready. */
 export interface PreparedTake {
   /** The take's session id, the bare uuid: the session's id and its first turn's name. */
@@ -224,6 +240,8 @@ export interface DriverOptions {
   log: (text: string) => void;
   /** The id of the project a folder is in, for a driven take's cap. */
   projectOf: (folder: string) => Promise<string | null>;
+  /** Opens a start outside the floor (start-where.ts): `opened`, and what still needs the person, or why it didn't open. */
+  elsewhere?: (start: StartElsewhere, bin: string) => Promise<{ opened: boolean; problem: string | null }>;
   /** Installs Claude Code, or signs it in, for a request whose `by` is the runner's own person (claude-setup.ts). */
   setup?: (m: Extract<DriveMessage, { kind: "install-claude" | "sign-in-claude" }>) => void;
   /** Keeps a session reported while its process runs (reported.ts): called as it opens, with the session's uuid, folder and when it last did anything (ms); what it returns, as it ends. */
@@ -306,6 +324,8 @@ const NOT_LISTED = "That folder isn't one this computer offers for this repo any
 const BRANCH_NOT_LISTED = "That branch isn't one this computer offers for this repo any more, so nothing was started. Pick one of the branches it offers now.";
 const NO_WORKTREE = "A separate folder for that branch couldn't be made on this computer, so nothing was started. Its runner log says why.";
 const NOT_STARTED = "Claude Code couldn't be started on this computer. Its runner log says why.";
+const NOT_ELSEWHERE = "This computer's Isoplan can only run new sessions from the floor, so nothing was started.";
+const PROBLEM_WITHHELD = "What went wrong is held back on this computer: it may contain a secret. Its runner log says what.";
 const BUSY = "The agent is still working on the last instruction. Wait for it to finish, or stop it.";
 const NOT_CLOSED = "Claude Code couldn't be closed for this session on this computer, so it is still running there. Try again in a moment.";
 const TURN_GONE = "This computer no longer has that instruction's output (Isoplan restarted since, or it was long ago). Ask for the whole session's output instead.";
@@ -518,6 +538,7 @@ function fit(m: DrivenMessage): DrivenMessage {
   limit("command", MAX_COMMAND_LENGTH);
   limit("folder", MAX_FOLDER_LENGTH);
   limit("detail", MAX_DETAIL_LENGTH);
+  limit("note", MAX_DETAIL_LENGTH);
   limit("description", MAX_PROMPT_LENGTH);
   limit("text", m.kind === "reply" ? MAX_REPLY_LENGTH : m.kind === "output" ? MAX_OUTPUT_LENGTH : MAX_DETAIL_LENGTH);
   if (m.kind === "holding") out.sessions = m.sessions.map((s) => ({ ...s, room: cutStart(s.room, MAX_ROOM_ID_LENGTH).text, session: s.session.slice(0, MAX_DRIVEN_SESSION_ID_LENGTH) }));
@@ -968,7 +989,9 @@ export function createDriver(o: DriverOptions): Driver {
     starts.add(m.id);
     if (starts.size > STARTS_KEPT) starts.delete(starts.values().next().value!);
     const project = m.project.id.toLowerCase();
-    if (m.permissions === "bypassPermissions" && !bypassAllowed(server, project)) return refuse(server, m.id, "bypass-off", { detail: BYPASS_OFF });
+    // Opened anywhere but the floor, it isn't the runner's to hold: its permissions are Claude Code's own, as a take's are.
+    const elsewhere = m.mode !== undefined && m.mode !== "driven" ? m.mode : null;
+    if (!elsewhere && m.permissions === "bypassPermissions" && !bypassAllowed(server, project)) return refuse(server, m.id, "bypass-off", { detail: BYPASS_OFF });
     const bin = await o.binary();
     if (!bin) return refuse(server, m.id, "no-claude", { detail: NO_CLAUDE });
     const office = offices.get(server)!;
@@ -979,8 +1002,9 @@ export function createDriver(o: DriverOptions): Driver {
       const own = repo?.folders.get(pathKey(m.folder));
       folder = own !== undefined && (await office.home(own).catch(() => null)) === project ? own : null;
       if (!folder) return refuse(server, m.id, "no-folder", { detail: NOT_LISTED });
+      if (m.branch !== undefined && !repo!.branches.has(m.branch)) return refuse(server, m.id, "no-folder", { detail: BRANCH_NOT_LISTED });
+      if (elsewhere) return startElsewhere(server, m, elsewhere, folder, bin);
       if (m.branch !== undefined) {
-        if (!repo!.branches.has(m.branch)) return refuse(server, m.id, "no-folder", { detail: BRANCH_NOT_LISTED });
         // A start the cap refuses now makes no worktree. One made for a start refused later (the cap
         // reached meanwhile, or the session not opening) is kept, and the next start on that branch reuses it.
         const cap = capOf(await o.settings());
@@ -1024,6 +1048,20 @@ export function createDriver(o: DriverOptions): Driver {
       sayPromptsOn(s);
       if (m.instruction) await beginTurn(s, m.id, m.instruction);
     });
+  }
+
+  // A start that opens outside the floor (#85), in the folder checked above: answered `opened`, in a
+  // room of its own, or refused `unavailable` with why, through the secret scan. Not held here, so
+  // not under the cap: its data layer reports it, as any session its person opened.
+  async function startElsewhere(server: string, m: Extract<DriveMessage, { kind: "start" }>, mode: StartMode, folder: string, bin: string): Promise<void> {
+    if (!o.elsewhere || m.instruction === undefined) return refuse(server, m.id, "unavailable", { detail: NOT_ELSEWHERE });
+    const uuid = newId();
+    const r = await o.elsewhere({ id: m.id, mode, folder, ...(m.branch !== undefined ? { branch: m.branch } : {}), instruction: m.instruction, session: uuid }, bin);
+    if (r.problem) o.log(`start ${m.id} (${mode}): ${r.problem}`);
+    const said = r.problem && (await o.scan(r.problem)) ? PROBLEM_WITHHELD : r.problem;
+    if (!r.opened) return refuse(server, m.id, "unavailable", { detail: said ?? NOT_STARTED });
+    const session = `claude-code:${uuid}`;
+    sendTo(server, { ...driven, kind: "opened", id: m.id, session, room: `room:${session}`, mode, ...(said ? { note: said } : {}) });
   }
 
   async function instruct(s: Session, id: string, text: string): Promise<void> {

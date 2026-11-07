@@ -5996,6 +5996,13 @@ const Withheld = object({ id: DriveId }).optional();
 * project whose office allows it (`drive-policy`).
 */
 const DrivePermissionsSchema = _enum(["auto", "bypassPermissions"]);
+/** Where a new session from the floor opens other than run from the floor (protocol 0.10.0): a start's `mode`, as a take's. */
+const StartModeSchema = _enum([
+	"terminal",
+	"headless",
+	"orca",
+	"desktop"
+]);
 /** The first message on a connection: who is reporting, from where, about which session. */
 const HelloMessageSchema = object({
 	type: literal$1("hello"),
@@ -6020,6 +6027,11 @@ const HelloMessageSchema = object({
 * driven sessions, a take into a terminal and a headless one all need. A runner that says it says it
 * on every hello, says `driven` `claude` whenever it changes, and takes the `install-claude` and
 * `sign-in-claude` drive requests; the server sends neither to a runner that didn't say it.
+* `starts` (protocol 0.10.0, isoplan-plugin#85): the places other than the floor a new session from
+* the floor can open in on this machine, the start's `mode`: `terminal` and `headless` where this
+* runner can open them, and `orca` and `desktop` only where `orca` and `desktop` are said. The server
+* sends a start with a `mode` only to a runner that says `starts`, and only one of its places: a
+* runner from before 0.10.0 drops the field it doesn't know and would run the session from the floor.
 */
 const RunnerHelloMessageSchema = object({
 	type: literal$1("runner"),
@@ -6030,7 +6042,8 @@ const RunnerHelloMessageSchema = object({
 	orca: boolean().optional(),
 	desktop: boolean().optional(),
 	drive: boolean().optional(),
-	claude: ClaudeCliSchema.optional()
+	claude: ClaudeCliSchema.optional(),
+	starts: array(StartModeSchema).max(4).optional()
 });
 /** All of the session's facts. Sent on connect and on repair. */
 const FullMessageSchema = object({
@@ -6349,6 +6362,15 @@ const DrivenMessageSchema = discriminatedUnion("kind", [
 			"failed",
 			"stopped"
 		])
+	}),
+	object({
+		...driven$2,
+		kind: literal$1("opened"),
+		id: DriveId,
+		session: DrivenSessionId,
+		room: Room,
+		mode: StartModeSchema,
+		note: Detail.optional()
 	}),
 	object({
 		...driven$2,
@@ -6696,8 +6718,27 @@ const OfficeServerMessageSchema = discriminatedUnion("type", [
 			project: ProjectSchema,
 			roomSessions: array(DrivenSessionId).max(20).optional(),
 			instruction: Instruction.optional(),
-			permissions: DrivePermissionsSchema
+			permissions: DrivePermissionsSchema,
+			mode: _enum([
+				"terminal",
+				"headless",
+				"orca",
+				"desktop",
+				"driven"
+			]).optional()
 		}).superRefine((message, context) => {
+			if (message.mode !== void 0 && message.mode !== "driven") {
+				if (message.folder === void 0) context.addIssue({
+					code: "custom",
+					path: ["folder"],
+					message: "a start that opens outside the floor names a folder"
+				});
+				if (message.instruction === void 0) context.addIssue({
+					code: "custom",
+					path: ["instruction"],
+					message: "a start that opens outside the floor names its first instruction"
+				});
+			}
 			if (message.folder === void 0) {
 				if (message.room === void 0) context.addIssue({
 					code: "custom",
@@ -12193,10 +12234,11 @@ function hidden([cmd, ...args], cwd, env, timeoutMs, started) {
 /**
 * What a take into the Claude app needs and this machine lacks, in words, or null: the OS, the
 * binary's version, and a subscription sign-in that `claude auth status` answers for. The runner
-* offers the take only while this is null (runner/main.ts).
+* offers the take only while this is null (runner/main.ts). `again`: how to try again, "take it again"
+* for a take, "start it again" for a start.
 */
-async function desktopProblem(bin, env, platform, arch, machine) {
-	if (!desktopPlatform(platform, arch)) return `The Claude app opens Claude Code sessions only on a Mac or on Windows x64, and ${machine} is neither, so nothing was made: take it again from the floor another way.`;
+async function desktopProblem(bin, env, platform, arch, machine, again = "take it again") {
+	if (!desktopPlatform(platform, arch)) return `The Claude app opens Claude Code sessions only on a Mac or on Windows x64, and ${machine} is neither, so nothing was made: ${again} from the floor another way.`;
 	const version = await claudeVersion(bin, env);
 	if (!version || !atLeast(version, "2.1.285")) return `${INSTALL_FOR_DESKTOP} ${machine} has ${version ? `version ${version}` : "a version that didn't say which it is"}, so nothing was made.`;
 	const r = await hidden([
@@ -12213,10 +12255,10 @@ async function desktopProblem(bin, env, platform, arch, machine) {
 			return null;
 		}
 	})();
-	if (r.code !== 0 || r.timedOut || !status) return `Couldn't check Claude Code's sign-in on ${machine}: \`claude auth status\` ${r.timedOut ? "didn't answer within 30 seconds" : r.code !== 0 ? `exited with code ${r.code}` : "didn't say whether it is signed in"}, so nothing was made. Run it there to see why, then take it again.`;
-	if (status.loggedIn === false) return `Claude Code for the terminal isn't signed in on ${machine}, so nothing was made: run \`claude auth login\` with your Claude subscription, then take it again.`;
+	if (r.code !== 0 || r.timedOut || !status) return `Couldn't check Claude Code's sign-in on ${machine}: \`claude auth status\` ${r.timedOut ? "didn't answer within 30 seconds" : r.code !== 0 ? `exited with code ${r.code}` : "didn't say whether it is signed in"}, so nothing was made. Run it there to see why, then ${again}.`;
+	if (status.loggedIn === false) return `Claude Code for the terminal isn't signed in on ${machine}, so nothing was made: run \`claude auth login\` with your Claude subscription, then ${again}.`;
 	const provider = typeof status.apiProvider === "string" && status.apiProvider !== "firstParty";
-	if (provider || typeof status.authMethod === "string" && /api.?key/i.test(status.authMethod)) return `The Claude app opens only sessions signed in with a Claude subscription, and Claude Code for the terminal on ${machine} uses ${provider ? `${status.apiProvider}` : "an API key"}, so nothing was made: sign it in with \`claude auth login\`, or take it again from the floor another way.`;
+	if (provider || typeof status.authMethod === "string" && /api.?key/i.test(status.authMethod)) return `The Claude app opens only sessions signed in with a Claude subscription, and Claude Code for the terminal on ${machine} uses ${provider ? `${status.apiProvider}` : "an API key"}, so nothing was made: sign it in with \`claude auth login\`, or ${again} from the floor another way.`;
 	return null;
 }
 /**
@@ -12258,7 +12300,7 @@ async function changedSince(run, dir, timeoutMs) {
 	});
 	return ahead.code === 0 && Number(ahead.stdout.trim()) > 0;
 }
-const INSTALL_FOR_DESKTOP = `Install Claude Code for the terminal, version ${DESKTOP_MIN_VERSION} or newer, to open handoffs in the Claude app.`;
+const INSTALL_FOR_DESKTOP = `Install Claude Code for the terminal, version ${DESKTOP_MIN_VERSION} or newer, to open sessions in the Claude app.`;
 /** Starts `claude --bg`, hidden, which returns once the background session is up; rejects when it couldn't. */
 async function startBackground({ argv, cwd }, env) {
 	const r = await hidden(argv, cwd, env, 6e4);
@@ -12341,8 +12383,7 @@ function sessionArgv(bin, { prompt, session, name, folder, headless, print }) {
 		session,
 		"--name",
 		name,
-		"--add-dir",
-		folder
+		...folder ? ["--add-dir", folder] : []
 	];
 }
 /** The commits this machine took of a handoff before, which a re-take may move past. */
@@ -12400,7 +12441,7 @@ const noHooks = async () => ["-c", `core.hooksPath=${await (emptyHooks ??= fs.mk
 /** Takes the handoff on this machine; never throws. */
 async function takeHandoff(message, o) {
 	const { handoff } = message;
-	const headless = message.mode === "headless";
+	message.mode;
 	const driven = message.mode === "driven";
 	let orca = null;
 	const failures = [];
@@ -12483,7 +12524,10 @@ async function takeHandoff(message, o) {
 				return done();
 			}
 			const exempt = await takenBefore(folder);
-			const made = orca ? await orcaWorktree(orca, o.run, clone, branch, handoff.id, exempt, timeoutMs) : await worktreeFor(o.run, clone.dir, clone.remote, branch, handoff.id, exempt, timeoutMs);
+			const made = orca ? await orcaWorktree(orca, o.run, clone, branch, {
+				name: `handoff-${handoff.id}`,
+				comment: `Isoplan handoff ${handoff.id}`
+			}, (existing) => worktreeFor(o.run, clone.dir, clone.remote, branch, handoff.id, exempt, timeoutMs, existing), timeoutMs) : await worktreeFor(o.run, clone.dir, clone.remote, branch, handoff.id, exempt, timeoutMs);
 			if (typeof made !== "string") {
 				await fail("worktree", made.error);
 				return done();
@@ -12579,130 +12623,35 @@ async function takeHandoff(message, o) {
 			o.log(`handoff ${handoff.id}: Claude Code session ${id} opens in ${dir}, run from the floor`);
 			return done(`claude-code:${id}`);
 		}
-		const argv = sessionArgv(bin, {
-			prompt: takePrompt(handoff.id, briefFile, setupLog, failedRepos, taskFile),
+		const words = {
+			read: "read the handoff",
+			did: "Claude Code read the handoff",
+			stopped: "the take stopped",
+			again: "take it again from the floor",
+			at: "The worktree is",
+			yourself: `The worktree is ${dir} and the brief is ${briefFile}${taskFile ? `, and its task is ${taskFile}` : ""}: open Claude Code there yourself.`,
+			changed: " Tracked files in it have changed since it was made (by its setup or that turn), and a take again leaves a worktree with changes alone: run `git reset --hard` in it to drop them first."
+		};
+		const prompt = takePrompt(handoff.id, briefFile, setupLog, failedRepos, taskFile);
+		const opened = await openSession({
+			mode: message.mode,
+			bin,
+			env,
+			dir,
+			folder,
+			addDir: true,
+			prompt,
 			session: id,
 			name,
-			folder,
-			headless,
-			...desktop ? { print: { maxTurns: s.desktopReadMaxTurns } } : {}
-		});
-		if (desktop) {
-			const budgetMs = s.desktopTakeBudgetMinutes * 6e4;
-			const left = () => budgetMs - (Date.now() - startedAt);
-			const stopped = () => o.dropped?.() ? "it was cancelled or timed out on the floor" : left() <= 0 ? `it ran past ${s.desktopTakeBudgetMinutes} minutes` : null;
-			const before = stopped();
-			if (before) {
-				await fail("open", `The take stopped before Claude Code read the handoff: ${before}. The worktree is ${dir}: take it again from the floor.`);
-				return done();
-			}
-			try {
-				await trustFolder(o.claudeJson, dir, o.platform);
-			} catch (err) {
-				await fail("open", `The session couldn't be readied for the Claude app: ${err.message}. The worktree is ${dir}.`);
-				return done();
-			}
-			const readMs = Math.min(s.desktopReadTimeoutMinutes * 6e4, left());
-			const read = await hidden(argv, dir, env, readMs, (child) => o.track?.(child, {
-				kind: "desktop-read",
-				session: `claude-code:${id}`,
-				folder: dir
-			}));
-			const said = (() => {
-				try {
-					return JSON.parse(read.stdout.trim().split(/\r?\n/).at(-1) ?? "");
-				} catch {
-					return null;
-				}
-			})();
-			if (read.code !== 0 || said?.is_error === true || said?.session_id !== id) {
-				o.log(`handoff ${handoff.id}: the first turn of ${id} failed (code ${read.code}): ${read.stderr.trim().slice(-500)}`);
-				const kind = typeof said?.subtype === "string" && /^[a-z_]+$/.test(said.subtype) ? ` (${said.subtype})` : "";
-				const why = read.timedOut ? `it was stopped after ${Math.round(readMs / 6e4)} minutes` : read.code !== 0 ? `claude exited with code ${read.code}` : said?.is_error === true ? `it ended in an error${kind}` : `it didn't say it ran session ${id}`;
-				const removed = await removeTranscript(o.claudeDir, id);
-				const changed = await changedSince(o.run, dir, timeoutMs);
-				await fail("open", `Claude Code couldn't read the handoff before the Claude app took it over: ${why}; this machine's runner log has more. ${removed ? "Its unfinished session was deleted." : `Its unfinished session ${id} may be left in Claude Code's session list.`} The worktree is ${dir}.${changed ? " Tracked files in it have changed since it was made (by its setup or that turn), and a take again leaves a worktree with changes alone: run `git reset --hard` in it to drop them first." : ""}`);
-				return done();
-			}
-			const after = stopped();
-			if (after) {
-				await fail("open", `Claude Code read the handoff, but the take stopped before the Claude app was opened: ${after}. Its session ${id} is in ${dir}; take it again from the floor, or open it yourself with \`claude --resume ${id}\` there.`);
-				return done();
-			}
-			const opened = await hidden([
-				...claudeCommand(bin),
-				"--desktop",
-				"--resume",
-				id
-			], dir, env, 6e4);
-			if (opened.code !== 0) {
-				await fail("open", `The Claude app didn't open on the session: ${opened.timedOut ? "it didn't return within a minute" : opened.stderr.trim() || `claude exited with code ${opened.code}`}. The session is ready: open it from the Claude app's session list, or run \`claude --desktop --resume ${id}\` in ${dir}.`);
-				o.log(`handoff ${handoff.id}: Claude Code session ${id} is ready in ${dir}, but the Claude app didn't open on it`);
-				return done(`claude-code:${id}`);
-			}
-			o.log(`handoff ${handoff.id}: opened Claude Code session ${id} in the Claude app, in ${dir}`);
-			return done(`claude-code:${id}`);
-		}
-		if (headless) {
-			try {
-				await trustFolder(o.claudeJson, dir, o.platform);
-				await (o.start ?? startBackground)({
-					argv,
-					cwd: dir
-				}, env);
-			} catch (err) {
-				await fail("open", `The headless session couldn't be started: ${err.message}. The worktree is ${dir}.`);
-				return done();
-			}
-			const end = Date.now() + (o.confirmMs ?? 15e3);
-			let listed = false;
-			while (!listed && Date.now() < end) {
-				listed = (await (o.agents ?? listAgents)(bin, dir, env)).includes(id);
-				if (!listed) await new Promise((r) => setTimeout(r, 500));
-			}
-			if (!listed) {
-				await fail("open", `claude --bg returned, but \`claude agents\` doesn't list session ${id} in ${dir}, so it may not have started. Open Claude Code there yourself.`);
-				return done();
-			}
-			o.log(`handoff ${handoff.id}: started background Claude Code session ${id} in ${dir}`);
-			return done(`claude-code:${id}`);
-		}
-		const l = launch(o.platform, {
-			folder,
-			dir,
-			argv,
-			title: name,
-			configDir: o.env.CLAUDE_CONFIG_DIR ?? null
-		});
-		if (!l) {
-			await fail("open", `Opening a terminal isn't supported on ${o.platform} yet. The worktree is ${dir} and the brief is ${briefFile}${taskFile ? `, and its task is ${taskFile}` : ""}: open Claude Code there yourself.`);
-			return done();
-		}
-		if (orca) {
-			try {
-				await trustFolder(o.claudeJson, dir, o.platform);
-				await fs.writeFile(l.file, l.text, { mode: 493 });
-			} catch (err) {
-				await fail("open", `The session couldn't be readied for Orca: ${err.message}. The worktree is ${dir}.`);
-				return done();
-			}
-			const opened = await orca(orcaTerminal(o.platform, dir, name, l.file, false));
-			if (!opened.ok) {
-				await fail("open", `Orca couldn't open Claude Code in ${dir}: ${opened.error}`);
-				return done();
-			}
-			await recordOrca(folder, terminalHandle(opened.result), dir).catch((err) => o.log(`handoff ${handoff.id}: couldn't record its Orca terminal: ${err.message}`));
-			o.log(`handoff ${handoff.id}: opened Claude Code session ${id} in Orca, in ${dir}`);
-			return done(`claude-code:${id}`);
-		}
-		try {
-			await (o.open ?? openLaunch)(l, env);
-		} catch (err) {
-			await fail("open", `The terminal couldn't be opened: ${err.message}. The worktree is ${dir}.`);
-			return done();
-		}
-		o.log(`handoff ${handoff.id}: opened Claude Code session ${id} in ${dir}`);
-		return done(`claude-code:${id}`);
+			orca,
+			settings: s,
+			startedAt,
+			label: `handoff ${handoff.id}`,
+			words
+		}, o);
+		if (opened.problem) await fail("open", opened.problem);
+		if (opened.terminal !== void 0) await recordOrca(folder, opened.terminal, dir).catch((err) => o.log(`handoff ${handoff.id}: couldn't record its Orca terminal: ${err.message}`));
+		return done(opened.opened ? `claude-code:${id}` : void 0);
 	} catch (err) {
 		o.log(`handoff ${handoff.id}: taking it failed: ${err?.stack ?? String(err)}`);
 		if (!failures.length) failures.push({
@@ -12711,6 +12660,143 @@ async function takeHandoff(message, o) {
 		});
 		return done();
 	}
+}
+const capital = (text) => text.charAt(0).toUpperCase() + text.slice(1);
+/**
+* Opens Claude Code in `dir` under `session`, with `prompt` its first message, as `mode` says (see
+* step 5 above): a terminal window, a background session, a terminal in Orca in a worktree Orca
+* already sees, or the Claude app, its first turn run hidden first. `opened`: the session is there,
+* and `problem`, when set, says what still needs the person; else `problem` says why none opened.
+* `terminal`: for Orca, the handle of the terminal it opened, or null when Orca gave none.
+*/
+async function openSession(x, o) {
+	const { bin, env, dir, folder, session: id, name, settings: s, words: w, label } = x;
+	const desktop = x.mode === "desktop";
+	const headless = x.mode === "headless";
+	const argv = sessionArgv(bin, {
+		prompt: x.prompt,
+		session: id,
+		name,
+		folder: x.addDir ? folder : null,
+		headless,
+		...desktop ? { print: { maxTurns: s.desktopReadMaxTurns } } : {}
+	});
+	const failed = (problem) => ({
+		opened: false,
+		problem
+	});
+	if (desktop) {
+		const budgetMs = s.desktopTakeBudgetMinutes * 6e4;
+		const left = () => budgetMs - (Date.now() - x.startedAt);
+		const stopped = () => o.dropped?.() ? "it was cancelled or timed out on the floor" : left() <= 0 ? `it ran past ${s.desktopTakeBudgetMinutes} minutes` : null;
+		const before = stopped();
+		if (before) return failed(`${capital(w.stopped)} before Claude Code ${w.read}: ${before}. ${w.at} ${dir}: ${w.again}.`);
+		try {
+			await trustFolder(o.claudeJson, dir, o.platform);
+		} catch (err) {
+			return failed(`The session couldn't be readied for the Claude app: ${err.message}. ${w.at} ${dir}.`);
+		}
+		const readMs = Math.min(s.desktopReadTimeoutMinutes * 6e4, left());
+		const read = await hidden(argv, dir, env, readMs, (child) => o.track?.(child, {
+			kind: "desktop-read",
+			session: `claude-code:${id}`,
+			folder: dir
+		}));
+		const said = (() => {
+			try {
+				return JSON.parse(read.stdout.trim().split(/\r?\n/).at(-1) ?? "");
+			} catch {
+				return null;
+			}
+		})();
+		if (read.code !== 0 || said?.is_error === true || said?.session_id !== id) {
+			o.log(`${label}: the first turn of ${id} failed (code ${read.code}): ${read.stderr.trim().slice(-500)}`);
+			const kind = typeof said?.subtype === "string" && /^[a-z_]+$/.test(said.subtype) ? ` (${said.subtype})` : "";
+			const why = read.timedOut ? `it was stopped after ${Math.round(readMs / 6e4)} minutes` : read.code !== 0 ? `claude exited with code ${read.code}` : said?.is_error === true ? `it ended in an error${kind}` : `it didn't say it ran session ${id}`;
+			const removed = await removeTranscript(o.claudeDir, id);
+			const changed = w.changed !== null && await changedSince(o.run, dir, s.gitTimeoutSeconds * 1e3);
+			return failed(`Claude Code couldn't ${w.read} before the Claude app took it over: ${why}; this machine's runner log has more. ${removed ? "Its unfinished session was deleted." : `Its unfinished session ${id} may be left in Claude Code's session list.`} ${w.at} ${dir}.${changed ? w.changed : ""}`);
+		}
+		const after = stopped();
+		if (after) return failed(`${w.did}, but ${w.stopped} before the Claude app was opened: ${after}. Its session ${id} is in ${dir}; ${w.again}, or open it yourself with \`claude --resume ${id}\` there.`);
+		const opened = await hidden([
+			...claudeCommand(bin),
+			"--desktop",
+			"--resume",
+			id
+		], dir, env, 6e4);
+		if (opened.code !== 0) {
+			const why = opened.timedOut ? "it didn't return within a minute" : opened.stderr.trim() || `claude exited with code ${opened.code}`;
+			o.log(`${label}: Claude Code session ${id} is ready in ${dir}, but the Claude app didn't open on it`);
+			return {
+				opened: true,
+				problem: `The Claude app didn't open on the session: ${why}. The session is ready: open it from the Claude app's session list, or run \`claude --desktop --resume ${id}\` in ${dir}.`
+			};
+		}
+		o.log(`${label}: opened Claude Code session ${id} in the Claude app, in ${dir}`);
+		return {
+			opened: true,
+			problem: null
+		};
+	}
+	if (headless) {
+		try {
+			await trustFolder(o.claudeJson, dir, o.platform);
+			await (o.start ?? startBackground)({
+				argv,
+				cwd: dir
+			}, env);
+		} catch (err) {
+			return failed(`The headless session couldn't be started: ${err.message}. ${w.at} ${dir}.`);
+		}
+		const end = Date.now() + (o.confirmMs ?? 15e3);
+		let listed = false;
+		while (!listed && Date.now() < end) {
+			listed = (await (o.agents ?? listAgents)(bin, dir, env)).includes(id);
+			if (!listed) await new Promise((r) => setTimeout(r, 500));
+		}
+		if (!listed) return failed(`claude --bg returned, but \`claude agents\` doesn't list session ${id} in ${dir}, so it may not have started. Open Claude Code there yourself.`);
+		o.log(`${label}: started background Claude Code session ${id} in ${dir}`);
+		return {
+			opened: true,
+			problem: null
+		};
+	}
+	const l = launch(o.platform, {
+		folder,
+		dir,
+		argv,
+		title: name,
+		configDir: o.env.CLAUDE_CONFIG_DIR ?? null
+	});
+	if (!l) return failed(`Opening a terminal isn't supported on ${o.platform} yet. ${w.yourself}`);
+	if (x.mode === "orca") {
+		if (!x.orca) return failed(`Orca wasn't found on this computer, so nothing was opened. ${w.at} ${dir}.`);
+		try {
+			await trustFolder(o.claudeJson, dir, o.platform);
+			await fs.writeFile(l.file, l.text, { mode: 493 });
+		} catch (err) {
+			return failed(`The session couldn't be readied for Orca: ${err.message}. ${w.at} ${dir}.`);
+		}
+		const opened = await x.orca(orcaTerminal(o.platform, dir, name, l.file, false));
+		if (!opened.ok) return failed(`Orca couldn't open Claude Code in ${dir}: ${opened.error}`);
+		o.log(`${label}: opened Claude Code session ${id} in Orca, in ${dir}`);
+		return {
+			opened: true,
+			problem: null,
+			terminal: terminalHandle(opened.result)
+		};
+	}
+	try {
+		await (o.open ?? openLaunch)(l, env);
+	} catch (err) {
+		return failed(`The terminal couldn't be opened: ${err.message}. ${w.at} ${dir}.`);
+	}
+	o.log(`${label}: opened Claude Code session ${id} in ${dir}`);
+	return {
+		opened: true,
+		problem: null
+	};
 }
 /**
 * How many commits `ref` has that neither the new tip nor any commit this machine took of the
@@ -13009,12 +13095,13 @@ async function inOrca(orca, dir) {
 	return added.ok ? null : `Orca couldn't add ${dir}: ${added.error}`;
 }
 /**
-* The worktree for a take into Orca: made by Orca, on the handoff's branch from the remote's, when
-* this machine has no worktree on it, no local branch of its name and no core.hooksPath in the
-* clone; else the take's own (worktreeFor), which Orca finds by its path. Either way the clone is a
-* repo in Orca, added when it isn't.
+* The worktree for a take into Orca, or for a start from the floor on a branch (runner/checkouts.ts):
+* made by Orca, on `branch` from the remote's, fetched already, named `made.name`, when this machine
+* has no worktree on it, no local branch of its name and no core.hooksPath in the clone; else
+* `otherwise`'s (for a take, its own, worktreeFor), given the worktree already on the branch, which
+* Orca finds by its path. Either way the clone is a repo in Orca, added when it isn't.
 */
-async function orcaWorktree(orca, run, clone, branch, id, exempt, timeoutMs) {
+async function orcaWorktree(orca, run, clone, branch, made, otherwise, timeoutMs) {
 	const git = (args, cwd = clone.dir) => run(args, {
 		cwd,
 		timeoutMs
@@ -13040,7 +13127,7 @@ async function orcaWorktree(orca, run, clone, branch, id, exempt, timeoutMs) {
 			"--repo",
 			`path:${clone.dir}`,
 			"--name",
-			`handoff-${id}`,
+			made.name,
 			"--branch",
 			branch,
 			"--base-branch",
@@ -13049,12 +13136,12 @@ async function orcaWorktree(orca, run, clone, branch, id, exempt, timeoutMs) {
 			"--setup",
 			"skip",
 			"--comment",
-			`Isoplan handoff ${id}`
+			made.comment
 		]);
-		if (!created.ok) return { error: `Orca couldn't make the handoff's worktree: ${created.error}` };
-		const made = created.result.worktree?.path;
-		if (typeof made !== "string") return { error: "Orca made a worktree but didn't say where." };
-		const dir = path.resolve(made);
+		if (!created.ok) return { error: `Orca couldn't make the worktree for ${branch}: ${created.error}` };
+		const at = created.result.worktree?.path;
+		if (typeof at !== "string") return { error: "Orca made a worktree but didn't say where." };
+		const dir = path.resolve(at);
 		const head = (await git([
 			"rev-parse",
 			"--abbrev-ref",
@@ -13062,7 +13149,7 @@ async function orcaWorktree(orca, run, clone, branch, id, exempt, timeoutMs) {
 		], dir)).stdout.trim();
 		if (head !== branch) return { error: `Orca made ${dir} on ${head || "no branch"}, not ${branch}, so nothing was opened there.` };
 		const tip = await resolved(run, clone.dir, `refs/remotes/${clone.remote}/${branch}`, timeoutMs);
-		if (!tip || await resolved(run, dir, "HEAD", timeoutMs) !== tip) return { error: `Orca made ${dir}, but not at the handoff as handed over now, so nothing was opened there.` };
+		if (!tip || await resolved(run, dir, "HEAD", timeoutMs) !== tip) return { error: `Orca made ${dir}, but not at ${branch} as it is on ${clone.remote} now, so nothing was opened there.` };
 		const tracked = await git([
 			"branch",
 			`--set-upstream-to=${clone.remote}/${branch}`,
@@ -13070,7 +13157,7 @@ async function orcaWorktree(orca, run, clone, branch, id, exempt, timeoutMs) {
 		], dir);
 		return tracked.code === 0 ? dir : { error: `${branch} in ${dir} couldn't be set to track ${clone.remote}/${branch}:\n${tracked.stderr}` };
 	}
-	const dir = await worktreeFor(run, clone.dir, clone.remote, branch, id, exempt, timeoutMs, existing);
+	const dir = await otherwise(existing);
 	if (typeof dir !== "string") return dir;
 	const seen = await orca([
 		"worktree",
@@ -13947,6 +14034,8 @@ function createRemoteBranches({ run, timeoutMs, refreshMs, log, now = Date.now }
 		return branches;
 	};
 }
+/** A branch name as a folder's: characters other than letters, digits, . _ - as -, none of . - at its end. */
+const asName = (branch) => branch.replace(/[^A-Za-z0-9._-]+/g, "-").replace(/[.-]+$/, "");
 /**
 * The folder a session on `branch` opens in: `checkout` when it is on that branch; else a worktree
 * already on it; else a new one beside the checkout, from the local branch of that name as it is, or,
@@ -13969,7 +14058,7 @@ async function branchFolder(run, checkout, branch, timeoutMs) {
 	if (existing && await isDir(existing)) return spelledAs(checkout, existing);
 	if (existing) await git(["worktree", "prune"]);
 	const hooksOff = await noHooks();
-	const base = `${normalize(checkout)}-branch-${branch.replace(/[^A-Za-z0-9._-]+/g, "-").replace(/[.-]+$/, "")}`;
+	const base = `${normalize(checkout)}-branch-${asName(branch)}`;
 	for (let n = 1; n < 10; n++) {
 		const dir = spelledAs(checkout, n === 1 ? base : `${base}-${n}`);
 		if (await fs.stat(dir).then(() => true, () => false)) continue;
@@ -14005,6 +14094,53 @@ async function branchFolder(run, checkout, branch, timeoutMs) {
 		return made.code === 0 ? dir : { error: `git worktree add ${dir} failed${made.timedOut ? " (it took too long)" : ""}:\n${made.stderr}` };
 	}
 	return { error: `${base} and the next eight names beside it are taken by other folders` };
+}
+/**
+* The folder a start from the floor into Orca opens in (#85), as branchFolder's, but in Orca: the
+* checkout when there is no `branch` or the checkout is on it; else a worktree Orca makes in the
+* repo's Orca workspace, `branch-<branch>`, from origin's branch, fetched now, when the repo has no
+* worktree on it and no local branch of its name (take.ts orcaWorktree); else the one branchFolder
+* finds or makes, which Orca finds by its path. The checkout is a repo in Orca, added when it isn't.
+*/
+async function orcaBranchFolder(orca, run, checkout, branch, timeoutMs) {
+	const git = (args) => run(args, {
+		cwd: checkout,
+		timeoutMs
+	});
+	const head = await git([
+		"symbolic-ref",
+		"-q",
+		"--short",
+		"HEAD"
+	]);
+	if (branch === void 0 || head.code === 0 && head.stdout.trim() === branch) {
+		const unknown = await inOrca(orca, checkout);
+		return unknown ? { error: unknown } : checkout;
+	}
+	if ((await git([
+		"rev-parse",
+		"--verify",
+		"-q",
+		`refs/heads/${branch}`
+	])).code !== 0) {
+		const fetched = await git([
+			...await noHooks(),
+			"fetch",
+			"origin",
+			`+refs/heads/${branch}:refs/remotes/origin/${branch}`
+		]);
+		if (fetched.code !== 0) return { error: `git fetch origin ${branch} in ${checkout} failed${fetched.timedOut ? " (it took too long)" : ""}:
+${fetched.stderr}` };
+	}
+	const made = {
+		name: `branch-${asName(branch)}`,
+		comment: `Isoplan: a new session on ${branch}`
+	};
+	const dir = await orcaWorktree(orca, run, {
+		dir: checkout,
+		remote: "origin"
+	}, branch, made, () => branchFolder(run, checkout, branch, timeoutMs), timeoutMs);
+	return typeof dir === "string" ? spelledAs(checkout, dir) : dir;
 }
 //#endregion
 //#region src/runner/repo-folders.ts
@@ -14103,6 +14239,8 @@ const NOT_LISTED = "That folder isn't one this computer offers for this repo any
 const BRANCH_NOT_LISTED = "That branch isn't one this computer offers for this repo any more, so nothing was started. Pick one of the branches it offers now.";
 const NO_WORKTREE = "A separate folder for that branch couldn't be made on this computer, so nothing was started. Its runner log says why.";
 const NOT_STARTED = "Claude Code couldn't be started on this computer. Its runner log says why.";
+const NOT_ELSEWHERE = "This computer's Isoplan can only run new sessions from the floor, so nothing was started.";
+const PROBLEM_WITHHELD = "What went wrong is held back on this computer: it may contain a secret. Its runner log says what.";
 const BUSY = "The agent is still working on the last instruction. Wait for it to finish, or stop it.";
 const NOT_CLOSED = "Claude Code couldn't be closed for this session on this computer, so it is still running there. Try again in a moment.";
 const TURN_GONE = "This computer no longer has that instruction's output (Isoplan restarted since, or it was long ago). Ask for the whole session's output instead.";
@@ -14266,6 +14404,7 @@ function fit(m) {
 	limit("command", 500);
 	limit("folder", MAX_FOLDER_LENGTH);
 	limit("detail", MAX_DETAIL_LENGTH);
+	limit("note", MAX_DETAIL_LENGTH);
 	limit("description", MAX_PROMPT_LENGTH);
 	limit("text", m.kind === "reply" ? MAX_REPLY_LENGTH : m.kind === "output" ? MAX_OUTPUT_LENGTH : MAX_DETAIL_LENGTH);
 	if (m.kind === "holding") out.sessions = m.sessions.map((s) => ({
@@ -14839,7 +14978,8 @@ function createDriver(o) {
 		starts.add(m.id);
 		if (starts.size > STARTS_KEPT) starts.delete(starts.values().next().value);
 		const project = m.project.id.toLowerCase();
-		if (m.permissions === "bypassPermissions" && !bypassAllowed(server, project)) return refuse(server, m.id, "bypass-off", { detail: BYPASS_OFF });
+		const elsewhere = m.mode !== void 0 && m.mode !== "driven" ? m.mode : null;
+		if (!elsewhere && m.permissions === "bypassPermissions" && !bypassAllowed(server, project)) return refuse(server, m.id, "bypass-off", { detail: BYPASS_OFF });
 		const bin = await o.binary();
 		if (!bin) return refuse(server, m.id, "no-claude", { detail: NO_CLAUDE });
 		const office = offices.get(server);
@@ -14849,8 +14989,9 @@ function createDriver(o) {
 			const own = repo?.folders.get(pathKey(m.folder));
 			folder = own !== void 0 && await office.home(own).catch(() => null) === project ? own : null;
 			if (!folder) return refuse(server, m.id, "no-folder", { detail: NOT_LISTED });
+			if (m.branch !== void 0 && !repo.branches.has(m.branch)) return refuse(server, m.id, "no-folder", { detail: BRANCH_NOT_LISTED });
+			if (elsewhere) return startElsewhere(server, m, elsewhere, folder, bin);
 			if (m.branch !== void 0) {
-				if (!repo.branches.has(m.branch)) return refuse(server, m.id, "no-folder", { detail: BRANCH_NOT_LISTED });
 				const cap = capOf(await o.settings());
 				if (heldIn(project) >= cap) return refuse(server, m.id, "cap-reached", {
 					limit: cap,
@@ -14923,6 +15064,31 @@ function createDriver(o) {
 			}));
 			sayPromptsOn(s);
 			if (m.instruction) await beginTurn(s, m.id, m.instruction);
+		});
+	}
+	async function startElsewhere(server, m, mode, folder, bin) {
+		if (!o.elsewhere || m.instruction === void 0) return refuse(server, m.id, "unavailable", { detail: NOT_ELSEWHERE });
+		const uuid = newId();
+		const r = await o.elsewhere({
+			id: m.id,
+			mode,
+			folder,
+			...m.branch !== void 0 ? { branch: m.branch } : {},
+			instruction: m.instruction,
+			session: uuid
+		}, bin);
+		if (r.problem) o.log(`start ${m.id} (${mode}): ${r.problem}`);
+		const said = r.problem && await o.scan(r.problem) ? PROBLEM_WITHHELD : r.problem;
+		if (!r.opened) return refuse(server, m.id, "unavailable", { detail: said ?? NOT_STARTED });
+		const session = `claude-code:${uuid}`;
+		sendTo(server, {
+			...driven,
+			kind: "opened",
+			id: m.id,
+			session,
+			room: `room:${session}`,
+			mode,
+			...said ? { note: said } : {}
 		});
 	}
 	async function instruct(s, id, text) {
@@ -15690,6 +15856,94 @@ function keepReported(o) {
 	};
 }
 //#endregion
+//#region src/runner/start-where.ts
+/** Where a start may open other than the floor, for the runner's hello: a terminal only where take.ts can open one, Orca and the Claude app only where they are found. */
+function startPlaces(platform, orca, desktop) {
+	return [
+		...platform === "win32" || platform === "darwin" ? ["terminal"] : [],
+		"headless",
+		...orca ? ["orca"] : [],
+		...desktop ? ["desktop"] : []
+	];
+}
+/** The start's own folder: its launcher, and its task when that can't go on the command line. */
+const startDir = (claudeDir, session) => path.join(claudeDir, "isoplan", "starts", session);
+/** The longest task a Windows launcher's line takes, leaving room in cmd.exe's 8,191 for the rest of it. */
+const LAUNCHER_TASK_MAX = 4e3;
+/** Whether `task` can go on Claude Code's command line as it is, for `mode` on `platform`. */
+function onCommandLine(task, mode, platform) {
+	if (task.startsWith("-")) return false;
+	return !((mode === "terminal" || mode === "orca") && platform === "win32" && (task.length > LAUNCHER_TASK_MAX || /["\r\n]/.test(task) || task.endsWith("\\")));
+}
+/** The first message, when the task is in `file`. */
+const taskPrompt = (file) => `Your task, typed on the Isoplan floor, is in ${file}. Read it, then do it.`;
+/** The Claude app's hidden first turn: it reads the task in `file` and changes nothing. */
+const desktopTaskPrompt = (file) => `Your task, typed on the Isoplan floor, is in ${file}. Read it and say briefly how you will do it; wait for the person in the Claude app before changing anything.`;
+/** Opens the start where it asks; never throws for what it expects. */
+async function startWhere(start, bin, o) {
+	const startedAt = (o.now ?? Date.now)();
+	const env = forkEnv(o.env);
+	const again = "start it again from the floor another way";
+	let orca = null;
+	if (start.mode === "orca") {
+		orca = await o.orca();
+		if (!orca) return {
+			opened: false,
+			problem: `Orca wasn't found on ${o.machine}, so nothing was started: ${again}.`
+		};
+	}
+	if (start.mode === "desktop") {
+		const problem = await desktopProblem(bin, env, o.platform, o.arch ?? process.arch, o.machine, "start it again");
+		if (problem) return {
+			opened: false,
+			problem
+		};
+	}
+	const dir = orca ? await o.orcaFolder(orca, start.folder, start.branch) : start.branch !== void 0 ? await o.branchFolder(start.folder, start.branch) : start.folder;
+	if (typeof dir !== "string") {
+		o.log(`start ${start.id}: no folder for ${start.branch ?? "its folder"} of ${start.folder}: ${dir.error}`);
+		return {
+			opened: false,
+			problem: `A folder for ${start.branch ? `the branch ${start.branch}` : start.folder} couldn't be readied on ${o.machine}, so nothing was started. Its runner log says why.`
+		};
+	}
+	const folder = startDir(o.claudeDir, start.session);
+	await fs.mkdir(folder, { recursive: true });
+	const desktop = start.mode === "desktop";
+	const plain = !desktop && onCommandLine(start.instruction, start.mode, o.platform);
+	let prompt = start.instruction;
+	if (!plain) {
+		const file = path.join(folder, "task.md");
+		await fs.writeFile(file, start.instruction + "\n");
+		prompt = desktop ? desktopTaskPrompt(file) : taskPrompt(file);
+	}
+	const words = {
+		read: "start on the task",
+		did: "Claude Code started on the task",
+		stopped: "the new session stopped",
+		again: "start it again from the floor",
+		at: "The folder is",
+		yourself: `The folder is ${dir}: open Claude Code there yourself.`,
+		changed: null
+	};
+	return openSession({
+		mode: start.mode,
+		bin,
+		env,
+		dir,
+		folder,
+		addDir: !plain,
+		prompt,
+		session: start.session,
+		name: "Isoplan new session",
+		orca,
+		settings: await o.settings(),
+		startedAt,
+		label: `start ${start.id}`,
+		words
+	}, o);
+}
+//#endregion
 //#region src/runner/main.ts
 const LOG_CAP_BYTES = 262144;
 const CHECK_MS = 6e4;
@@ -16030,6 +16284,20 @@ async function worker() {
 			idleMinutes: async () => (await config()).idleMinutes,
 			log
 		}),
+		elsewhere: (start, bin) => startWhere(start, bin, {
+			run: git,
+			claudeDir,
+			claudeJson,
+			platform: process.platform,
+			env: process.env,
+			log,
+			machine: os.hostname(),
+			settings,
+			orca: takeOrca,
+			branchFolder: async (folder, branch) => branchFolder(git, folder, branch, await gitMs()),
+			orcaFolder: async (orca, folder, branch) => orcaBranchFolder(orca, git, folder, branch, await gitMs()),
+			track: registry.track
+		}),
 		setup: (m) => {
 			claude.take(m);
 			claude.settled().then(checkDesktop).catch(() => {});
@@ -16060,7 +16328,8 @@ async function worker() {
 					...hasOrca ? { orca: true } : {},
 					...hasDesktop ? { desktop: true } : {},
 					drive: true,
-					claude: claude.state()
+					claude: claude.state(),
+					starts: startPlaces(process.platform, hasOrca, hasDesktop)
 				}
 			});
 		},

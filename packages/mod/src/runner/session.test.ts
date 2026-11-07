@@ -4,7 +4,7 @@ import fs from "node:fs";
 import type { AddressInfo } from "node:net";
 import path from "node:path";
 import { PassThrough } from "node:stream";
-import { MAX_TOOL_NAME_LENGTH, PROTOCOL_VERSION, type DriveMessage, type DrivenMessage, type RunnerHelloMessage } from "@isoplan/protocol";
+import { MAX_DETAIL_LENGTH, MAX_TOOL_NAME_LENGTH, PROTOCOL_VERSION, type DriveMessage, type DrivenMessage, type RunnerHelloMessage } from "@isoplan/protocol";
 import { afterEach, expect, test, vi } from "vitest";
 import { WebSocketServer, type WebSocket as ServerSocket } from "ws";
 import { modDir, tempRoot } from "../data-layer/fixture.js";
@@ -14,7 +14,7 @@ import type { Spawn } from "./claude.js";
 import { createRegistry, registryPath, type ProcessRecord } from "./registry.js";
 import { loadPatterns, scan } from "./scan.js";
 import type { RepoFolders } from "./repo-folders.js";
-import { createDriver, drivenArgs, promptDescription, type DriveOffice, type DriverOptions, type DriveSettings } from "./session.js";
+import { createDriver, drivenArgs, promptDescription, type DriveOffice, type DriverOptions, type DriveSettings, type StartElsewhere } from "./session.js";
 
 // Each test starts real (fake) claude processes, which is slow on Windows under load.
 vi.setConfig({ testTimeout: 30000 });
@@ -163,7 +163,7 @@ type Of<K extends Kind> = Extract<DrivenMessage, { kind: K }>;
 
 // `policy`: the drive-policy the office's server sends first on the connection, as a server that
 // drives sessions does; null for none yet. What it sends with it (holding) isn't kept in `sent`.
-async function setUp({ settings = {}, linger = false, records = [] as ProcessRecord[], spawn, policy: first = [] as string[] | null, setup, report }: { settings?: Partial<DriveSettings>; linger?: boolean; records?: ProcessRecord[]; spawn?: Spawn; policy?: string[] | null; setup?: DriverOptions["setup"]; report?: DriverOptions["report"] } = {}) {
+async function setUp({ settings = {}, linger = false, records = [] as ProcessRecord[], spawn, policy: first = [] as string[] | null, setup, report, elsewhere }: { settings?: Partial<DriveSettings>; linger?: boolean; records?: ProcessRecord[]; spawn?: Spawn; policy?: string[] | null; setup?: DriverOptions["setup"]; report?: DriverOptions["report"]; elsewhere?: DriverOptions["elsewhere"] } = {}) {
   const root = tempRoot();
   const claudeDir = path.join(root, ".claude");
   const state = path.join(root, "state");
@@ -224,6 +224,7 @@ async function setUp({ settings = {}, linger = false, records = [] as ProcessRec
     ...(spawn ? { spawn } : {}),
     ...(setup ? { setup } : {}),
     ...(report ? { report } : {}),
+    ...(elsewhere ? { elsewhere } : {}),
   });
   const fakeLog = () => (fs.existsSync(path.join(state, "log.jsonl")) ? fs.readFileSync(path.join(state, "log.jsonl"), "utf8").trim().split("\n").map((l) => JSON.parse(l)) : []);
   // Every process the fake started ends with the test.
@@ -308,6 +309,73 @@ test("start on a branch: a listed one opens in the folder the office gives for i
   expect(t.listing.branchAsked).toEqual([`${t.folder} feat/dark`, `${t.folder} feat/broken`]);
   expect(t.logs.some((l) => l.includes("git worktree add failed"))).toBe(true);
   expect(t.fakeLog().filter((l) => l.argv)).toHaveLength(1);
+});
+
+test("start elsewhere: in a listed folder, on a listed branch, it opens where asked with its instruction and is answered opened, in a room of its own, held nowhere here and whatever permissions it asked for; a branch not listed opens nothing", async () => {
+  const asked: StartElsewhere[] = [];
+  const t = await setUp({ policy: null, elsewhere: async (start, bin) => (asked.push(start), expect(bin).toBe(t.bin), { opened: true, problem: null }) });
+  t.listing.repos = [{ project: PROJECT.id, folders: [t.folder], branches: ["main", "feat/docs"] }];
+  t.policy([]);
+  await t.until(() => t.folders.length === 1);
+  t.drive({ id: "d1", kind: "start", folder: t.folder, branch: "feat/docs", project: PROJECT, permissions: "bypassPermissions", instruction: "Write the docs page.", mode: "orca" });
+  await t.until(() => t.of("opened").length === 1);
+  expect(asked).toEqual([{ id: "d1", mode: "orca", folder: t.folder, branch: "feat/docs", instruction: "Write the docs page.", session: UUIDS[0] }]);
+  expect(t.of("opened")).toEqual([{ type: "driven", v: 1, kind: "opened", id: "d1", session: S1, room: `room:${S1}`, mode: "orca" }]);
+  // Nothing of the runner's own runs or is held for it, so the floor's cap and the bypass check aren't its.
+  expect(t.fakeLog()).toEqual([]);
+  expect(t.driver.held()).toBe(0);
+  expect(t.registry.list()).toEqual([]);
+  expect(t.listing.branchAsked).toEqual([]);
+  t.drive({ id: "d2", kind: "start", folder: t.folder, branch: "feat/gone", project: PROJECT, permissions: "auto", instruction: "x", mode: "terminal" });
+  t.drive({ id: "d3", kind: "start", folder: path.join(t.root, "elsewhere"), project: PROJECT, permissions: "auto", instruction: "x", mode: "headless" });
+  await t.until(() => t.of("refused").length === 2);
+  expect(t.of("refused").map((m) => [m.id, m.reason]).sort()).toEqual([
+    ["d2", "no-folder"],
+    ["d3", "no-folder"],
+  ]);
+  expect(asked).toHaveLength(1);
+});
+
+test("start elsewhere: one that didn't open is refused unavailable with why, one that opened with something left to do says it, and either through the secret scan; a runner that can't is unavailable", async () => {
+  const answers = [
+    { opened: false, problem: "Orca wasn't found on sam-laptop, so nothing was started." },
+    { opened: true, problem: `The Claude app didn't open on the session: ${"x".repeat(2000)}` },
+    { opened: false, problem: `git said ${AWS_KEY}` },
+  ];
+  const t = await setUp({ policy: null, elsewhere: async () => answers.shift()! });
+  t.listing.repos = [{ project: PROJECT.id, folders: [t.folder] }];
+  t.policy([]);
+  await t.until(() => t.folders.length === 1);
+  const answered = () => t.sent.filter((m) => m.kind === "opened" || m.kind === "refused");
+  const elsewhere = (id: string, mode: string) => t.drive({ id, kind: "start", folder: t.folder, project: PROJECT, permissions: "auto", instruction: "Write the docs page.", mode });
+  elsewhere("d1", "orca");
+  await t.until(() => answered().length === 1);
+  elsewhere("d2", "desktop");
+  await t.until(() => answered().length === 2);
+  elsewhere("d3", "terminal");
+  await t.until(() => answered().length === 3);
+  expect(answered()).toEqual([
+    { type: "driven", v: 1, kind: "refused", id: "d1", reason: "unavailable", detail: "Orca wasn't found on sam-laptop, so nothing was started." },
+    { type: "driven", v: 1, kind: "opened", id: "d2", session: `claude-code:${UUIDS[1]}`, room: `room:claude-code:${UUIDS[1]}`, mode: "desktop", note: expect.stringMatching(/^The Claude app didn't open on the session: x+/) },
+    { type: "driven", v: 1, kind: "refused", id: "d3", reason: "unavailable", detail: expect.stringContaining("held back on this computer") },
+  ]);
+  expect(JSON.stringify(t.sent)).not.toContain(AWS_KEY);
+  // Cut to the protocol's limit, so the server takes it.
+  expect(t.of("opened")[0]!.note!.length).toBeLessThanOrEqual(MAX_DETAIL_LENGTH);
+  // Someone other than the runner's own person opens nothing.
+  t.driver.take(SERVER, { type: "drive", v: PROTOCOL_VERSION, by: { id: "github:999", name: "Eve" }, id: "d4", kind: "start", folder: t.folder, project: PROJECT, permissions: "auto", instruction: "x", mode: "headless" } as DriveMessage);
+  await t.until(() => answered().length === 4);
+  expect(answered()[3]).toMatchObject({ id: "d4", reason: "not-owner" });
+  expect(answers).toHaveLength(0);
+
+  const old = await setUp({ policy: null });
+  old.listing.repos = [{ project: PROJECT.id, folders: [old.folder] }];
+  old.policy([]);
+  await old.until(() => old.folders.length === 1);
+  old.drive({ id: "d5", kind: "start", folder: old.folder, project: PROJECT, permissions: "auto", instruction: "x", mode: "headless" });
+  await old.until(() => old.of("refused").length === 1);
+  expect(old.of("refused")[0]).toMatchObject({ kind: "refused", id: "d5", reason: "unavailable" });
+  expect(old.fakeLog()).toEqual([]);
 });
 
 test("folders: a listing slower than the check waits for the next check, so checks never pile up", async () => {
