@@ -60,3 +60,10 @@ export function scan(text: string, patterns: Pattern[] | null): string | null {
   if (!patterns) return UNREADABLE;
   return patterns.find((p) => p.regex.test(text))?.name ?? null;
 }
+
+/** An error's stack (or its text) to log; in its place, a note when it matches a secret pattern, or the patterns can't be read. */
+export function errorText(err: unknown, patterns: Pattern[] | null): string {
+  const text = String((err as Error)?.stack ?? err);
+  const hit = scan(text, patterns);
+  return hit === null ? text : hit === UNREADABLE ? "(its text is left out: the secret patterns can't be read)" : `(its text is left out: it matches the secret pattern ${hit})`;
+}

@@ -63,7 +63,7 @@ import { openLedger } from "./caps.js";
 import { createClaudeAnswerer, forkableId, forkEnv } from "./claude.js";
 import { claudeBinary } from "./claude-binary.js";
 import { createClaudeSetup } from "./claude-setup.js";
-import { anyRoomSince, askableMs, NOT_WANTED_CODE, supervise, UNPAIRED_CODE } from "./lifecycle.js";
+import { anyRoomSince, askableMs, NOT_WANTED_CODE, onEscapes, supervise, UNPAIRED_CODE } from "./lifecycle.js";
 import { loadPrompts } from "./prompts.js";
 import { createRunGit, gitFailed, handoffBranch, handoffNote, HandoffGitError, prepare, pushHandoff, type Prepared } from "../handoff/git.js";
 import { focusHandoff } from "../handoff/focus.js";
@@ -72,7 +72,7 @@ import { desktopProblem, sessionFolders, takeHandoff, type TakeSettings } from "
 import { recordTakenOffice } from "../handoff/taken-office.js";
 import { answerOffices } from "./offices.js";
 import { createForkSlots, createRunner, PushFailed, type RunnerSettings } from "./runner.js";
-import { loadPatterns, scan } from "./scan.js";
+import { errorText, loadPatterns, scan } from "./scan.js";
 import { createRegistry, registryPath } from "./registry.js";
 import { branchFolder, createCheckouts, createRemoteBranches, orcaBranchFolder } from "./checkouts.js";
 import { repoFolders } from "./repo-folders.js";
@@ -162,6 +162,12 @@ async function supervisor(): Promise<number> {
 }
 
 async function worker(): Promise<number> {
+  onEscapes({
+    on: (event, handler) => void process.on(event, handler),
+    said: async (err) => errorText(err, await loadPatterns(path.join(appDir, "secret-patterns.json"), path.join(isoplanDir, "secret-patterns.json"), () => {})),
+    log,
+    exit: () => void logging.then(() => process.exit(1)),
+  });
   const io = nodeIo();
   const config = () => loadConfig(io, path.join(appDir, "config.json"), path.join(isoplanDir, "config.json"));
   const settings = () => loadSettings<RunnerSettings & TakeSettings & DriveSettings & { claudeModel: string; repoSearchDepth: number; startAtLogin: boolean }>(io, path.join(appDir, "runner.json"), path.join(isoplanDir, "runner.json"));
