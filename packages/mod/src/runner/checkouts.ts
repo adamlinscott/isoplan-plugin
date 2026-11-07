@@ -15,12 +15,15 @@
 //   checkout, `<checkout>-branch-<branch>`, characters other than letters, digits, . _ - as -. The
 //   checkout's own branch is never switched, and none of the repo's hooks runs while the branch is
 //   checked out: they would be whoever pushed it, from that branch.
+// - A start into Orca (#85, start-where.ts) gets a worktree Orca makes in the repo's Orca workspace
+//   where one is needed and Orca can make it (orcaBranchFolder), else branchFolder's.
 
 import fs from "node:fs/promises";
 import path from "node:path";
 import { dirname, isWindowsPath, normalize, pathKey, type Where } from "../data-layer/git.js";
 import type { RunGit } from "../handoff/git.js";
-import { noHooks, worktreeOn } from "../handoff/take.js";
+import type { RunOrca } from "../handoff/orca.js";
+import { inOrca, noHooks, orcaWorktree, worktreeOn } from "../handoff/take.js";
 
 /** The main checkout of the repo at `where`: the folder holding its shared `.git`, or, for a bare repo's worktree, the worktree itself. */
 export function mainCheckout(where: Where): string {
@@ -138,6 +141,9 @@ export function createRemoteBranches({ run, timeoutMs, refreshMs, log, now = Dat
   };
 }
 
+/** A branch name as a folder's: characters other than letters, digits, . _ - as -, none of . - at its end. */
+const asName = (branch: string) => branch.replace(/[^A-Za-z0-9._-]+/g, "-").replace(/[.-]+$/, "");
+
 /**
  * The folder a session on `branch` opens in: `checkout` when it is on that branch; else a worktree
  * already on it; else a new one beside the checkout, from the local branch of that name as it is, or,
@@ -154,7 +160,7 @@ export async function branchFolder(run: RunGit, checkout: string, branch: string
   if (existing) await git(["worktree", "prune"]);
   const hooksOff = await noHooks();
   const main = normalize(checkout);
-  const base = `${main}-branch-${branch.replace(/[^A-Za-z0-9._-]+/g, "-").replace(/[.-]+$/, "")}`;
+  const base = `${main}-branch-${asName(branch)}`;
   for (let n = 1; n < 10; n++) {
     const dir = spelledAs(checkout, n === 1 ? base : `${base}-${n}`);
     if (await fs.stat(dir).then(() => true, () => false)) continue;
@@ -167,4 +173,28 @@ export async function branchFolder(run: RunGit, checkout: string, branch: string
     return made.code === 0 ? dir : { error: `git worktree add ${dir} failed${made.timedOut ? " (it took too long)" : ""}:\n${made.stderr}` };
   }
   return { error: `${base} and the next eight names beside it are taken by other folders` };
+}
+
+/**
+ * The folder a start from the floor into Orca opens in (#85), as branchFolder's, but in Orca: the
+ * checkout when there is no `branch` or the checkout is on it; else a worktree Orca makes in the
+ * repo's Orca workspace, `branch-<branch>`, from origin's branch, fetched now, when the repo has no
+ * worktree on it and no local branch of its name (take.ts orcaWorktree); else the one branchFolder
+ * finds or makes, which Orca finds by its path. The checkout is a repo in Orca, added when it isn't.
+ */
+export async function orcaBranchFolder(orca: RunOrca, run: RunGit, checkout: string, branch: string | undefined, timeoutMs: number): Promise<string | { error: string }> {
+  const git = (args: string[]) => run(args, { cwd: checkout, timeoutMs });
+  const head = await git(["symbolic-ref", "-q", "--short", "HEAD"]);
+  if (branch === undefined || (head.code === 0 && head.stdout.trim() === branch)) {
+    const unknown = await inOrca(orca, checkout);
+    return unknown ? { error: unknown } : checkout;
+  }
+  if ((await git(["rev-parse", "--verify", "-q", `refs/heads/${branch}`])).code !== 0) {
+    const fetched = await git([...(await noHooks()), "fetch", "origin", `+refs/heads/${branch}:refs/remotes/origin/${branch}`]);
+    if (fetched.code !== 0) return { error: `git fetch origin ${branch} in ${checkout} failed${fetched.timedOut ? " (it took too long)" : ""}:
+${fetched.stderr}` };
+  }
+  const made = { name: `branch-${asName(branch)}`, comment: `Isoplan: a new session on ${branch}` };
+  const dir = await orcaWorktree(orca, run, { dir: checkout, remote: "origin" }, branch, made, () => branchFolder(run, checkout, branch, timeoutMs), timeoutMs);
+  return typeof dir === "string" ? spelledAs(checkout, dir) : dir;
 }

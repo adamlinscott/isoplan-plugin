@@ -70,11 +70,12 @@ import { answerOffices } from "./offices.js";
 import { createForkSlots, createRunner, PushFailed, type RunnerSettings } from "./runner.js";
 import { loadPatterns, scan } from "./scan.js";
 import { createRegistry, registryPath } from "./registry.js";
-import { branchFolder, createCheckouts, createRemoteBranches } from "./checkouts.js";
+import { branchFolder, createCheckouts, createRemoteBranches, orcaBranchFolder } from "./checkouts.js";
 import { repoFolders } from "./repo-folders.js";
 import { createDriver, type DriveOffice, type Driver, type DriveSettings } from "./session.js";
 import { keepReported, type ReportedSettings } from "./reported.js";
 import { managedDir, pluginDirsOf, pluginsDir } from "../install/state.js";
+import { startPlaces, startWhere } from "./start-where.js";
 import { runnerEnvPath } from "./environment.js";
 import { applyClaudeDir, LOCK_REFRESH_MS, RUNNER_FRESH_MS, runnerCode, runnerLockPath } from "./start.js";
 
@@ -385,6 +386,22 @@ async function worker(): Promise<number> {
     projectOf: async (folder) => (await homeIo.projectOf(await homeIo.resolve(folder), folder)).id,
     // Each driven session is reported by a data layer of its own, kept running while it runs (#92).
     report: keepReported({ paths: { claudeDir, settings: path.join(claudeDir, "settings.json"), plugins: pluginsDir(claudeDir, process.env), managed: managedDir(process.platform), pluginDirs: pluginDirsOf(process.env) }, everySeconds: async () => (await settings().catch(() => firstSettings)).drivenReportSeconds, idleMinutes: async () => (await config()).idleMinutes, log }),
+    // A start that opens outside the floor (#85), as a take opens its session.
+    elsewhere: (start, bin) =>
+      startWhere(start, bin, {
+        run: git,
+        claudeDir,
+        claudeJson,
+        platform: process.platform,
+        env: process.env,
+        log,
+        machine: os.hostname(),
+        settings,
+        orca: takeOrca,
+        branchFolder: async (folder, branch) => branchFolder(git, folder, branch, await gitMs()),
+        orcaFolder: async (orca, folder, branch) => orcaBranchFolder(orca, git, folder, branch, await gitMs()),
+        track: registry.track,
+      }),
     // An install or sign-in ends with the Claude app's check again, for the next hello.
     setup: (m) => {
       claude.take(m);
@@ -422,6 +439,7 @@ async function worker(): Promise<number> {
           ...(hasDesktop ? { desktop: true } : {}),
           drive: true,
           claude: claude.state(),
+          starts: startPlaces(process.platform, hasOrca, hasDesktop),
         },
       });
     },

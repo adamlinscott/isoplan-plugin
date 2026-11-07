@@ -5,8 +5,9 @@ import { createGit, pathKey } from "../data-layer/git.js";
 import { nodeIo } from "../data-layer/io.js";
 import { tempRoot } from "../data-layer/fixture.js";
 import { createRunGit } from "../handoff/git.js";
-import { git, remoteAndClone, setIdentity } from "../handoff/fixture.js";
-import { branchFolder, createCheckouts, createRemoteBranches, mainCheckout, parseHeads } from "./checkouts.js";
+import { fakeOrca, git, remoteAndClone, setIdentity } from "../handoff/fixture.js";
+import { orcaRunner } from "../handoff/orca.js";
+import { branchFolder, createCheckouts, createRemoteBranches, mainCheckout, orcaBranchFolder, parseHeads } from "./checkouts.js";
 
 const run = createRunGit();
 const isDir = async (p: string) => fs.existsSync(p) && fs.statSync(p).isDirectory();
@@ -172,3 +173,30 @@ test("none of the repo's hooks runs when a worktree is made for a branch", async
   expect(typeof made).toBe("string");
   expect(fs.existsSync(ran)).toBe(false);
 });
+
+test("in Orca: the checkout when it is on the branch or none is named; else Orca's own worktree of the remote's branch, in its workspace; one with a local branch of that name gets branchFolder's, which Orca finds by its path", async () => {
+  const root = tempRoot();
+  const { clone } = remoteAndClone(root, "app");
+  const { clone: other } = remoteAndClone(root, "other");
+  git(other, "push", "-q", "origin", "main:feat/dark");
+  const fake = fakeOrca(root);
+  const orca = orcaRunner(fake.bin, { ...process.env } as Record<string, string>);
+  expect(await orcaBranchFolder(orca, run, clone, "main", 30000)).toBe(clone);
+  expect(await orcaBranchFolder(orca, run, clone, undefined, 30000)).toBe(clone);
+  const made = await orcaBranchFolder(orca, run, clone, "feat/dark", 30000);
+  same(made as string, path.join(fake.workspaces, "branch-feat-dark"));
+  expect(git(made as string, "rev-parse", "--abbrev-ref", "HEAD")).toBe("feat/dark");
+  expect(git(made as string, "rev-parse", "--abbrev-ref", "@{upstream}")).toBe("origin/feat/dark");
+  expect(git(clone, "rev-parse", "--abbrev-ref", "HEAD")).toBe("main");
+  expect(fake.calls().map((c) => c.slice(0, 2).join(" "))).toEqual(["repo show", "repo add", "repo show", "repo show", "worktree create"]);
+  expect(fake.calls()[4]).toEqual(["worktree", "create", "--repo", `path:${clone}`, "--name", "branch-feat-dark", "--branch", "feat/dark", "--base-branch", "origin/feat/dark", "--no-parent", "--setup", "skip", "--comment", "Isoplan: a new session on feat/dark"]);
+  // The branch has a worktree now: that one again, which Orca is asked to see, and no other is made.
+  same((await orcaBranchFolder(orca, run, clone, "feat/dark", 30000)) as string, made as string);
+  expect(fake.calls().slice(5).map((c) => c.slice(0, 2).join(" "))).toEqual(["repo show", "worktree show"]);
+  git(clone, "branch", "mine");
+  git(clone, "push", "-q", "origin", "mine");
+  const mine = await orcaBranchFolder(orca, run, clone, "mine", 30000);
+  same(mine as string, path.join(root, "app-branch-mine"));
+  expect(fake.calls().at(-1)!.slice(0, 2)).toEqual(["worktree", "show"]);
+});
+
